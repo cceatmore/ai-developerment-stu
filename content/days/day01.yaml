@@ -1,0 +1,884 @@
+day: 1
+phase: 1
+title: 从 JS 到 Python
+goals:
+  - 能说清一个 .py 文件从启动到报错经历了哪些步骤，并判断某个错误是「启动/导入时」还是「运行到那一行时」才出现
+  - 能用「名字绑定对象」解释赋值、参数传递、is 与 == 的行为，看懂「改了 A 却影响了 B」的 bug
+  - 能识别真值判断、环境变量字符串、`x or 默认值` 导致的隐蔽 bug
+  - 能用 uv 初始化项目和管理依赖，并对照 npm 说清 pyproject.toml、uv.lock、.venv 各自的作用和差异
+minutes: 60
+resources:
+  - title: "Python 官方教程（中文）"
+    url: "https://docs.python.org/zh-cn/3/tutorial/index.html"
+    kind: doc
+    lang: zh
+    minutes: 25
+    note: "只看第 2 章「使用 Python 解释器」和第 3 章「Python 速览」，对照今天的运行方式和真值判断；第 12 章「虚拟环境和包」可以对照 uv 的 .venv 一起看"
+  - title: "廖雪峰 Python 教程 - 数据类型和变量"
+    url: "https://liaoxuefeng.com/books/python/basic/data-types/index.html"
+    kind: article
+    lang: zh
+    minutes: 15
+    note: "重点看最后「变量在内存中的表示」那段 a = 'ABC'、b = a 的图解，正好对应今天的「名字绑定」知识点"
+  - title: "uv 官方文档 - Working on projects"
+    url: "https://docs.astral.sh/uv/guides/projects/"
+    kind: doc
+    lang: en
+    minutes: 15
+    note: "看 Project structure 一节（pyproject.toml、.python-version、.venv、uv.lock 各是什么）和 Managing dependencies 一节，对照 npm 的 package.json / lock 文件理解"
+knowledge_points:
+  - id: d01-k1
+    name: 解释执行与运行方式
+    level: P1
+    summary: CPython 先把整个文件编译成字节码再由虚拟机执行；语法错误启动即报，其余错误运行到那一行才报
+    analogy: |
+      **像 Node 跑 JS**：`python app.py` ≈ `node app.js`，都是「拿源码直接跑」，不需要像 Java 那样先 `javac`。`if __name__ == "__main__":` ≈ CommonJS 里的 `if (require.main === module)`：只有「被直接运行」时才执行，被 import 时跳过。
+
+      **不一样的地方**：
+      - V8 有成熟的 JIT，热点代码会被编译成机器码；**CPython 默认是字节码解释执行**（3.13 起有实验性 JIT，默认不开），所以纯 Python 计算比 Node 慢不少。
+      - Python 的 import 会**执行被导入模块的全部顶层代码**（ES Module 也会，但前端打包工具常帮你做了 tree-shaking，你很少感知到）。
+      - Python 没有 `npm run` 那种脚本表；常用 `python -m 包.模块` 或 `uv run` 来跑。
+    why: |
+      你让 AI 生成的 FastAPI、RAG 脚本都跑在 CPython 上。**不懂它怎么执行，就分不清报错发生在「启动/导入时」还是「请求走到那一行时」**，也解释不了为什么相对导入在一种运行方式下能跑、换一种就报错。面试里「Python 是解释型语言吗」也是常见开场题。
+    problem: |
+      它帮你回答三个日常问题：**为什么一个从没走到的分支里的拼写错误会潜伏到线上**；为什么 `python app/main.py` 报 `ImportError` 而 `python -m app.main` 正常；为什么 import 一个模块会「顺便」执行里面的 print 或连接数据库。
+    principle: |
+      **一、「解释型」其实分两步：先编译，再解释**
+
+      官方实现 CPython 运行一个 `.py` 文件时：
+
+      1. **解析**：源码 → Token → 抽象语法树（AST）。`SyntaxError`、`IndentationError` 在这一步报出，**整个文件一行都不会执行**。
+      2. **编译**：AST → 字节码（code object），里面是 `LOAD_FAST`、`CALL` 这样的指令。
+      3. **执行**：解释器循环逐条执行字节码。**名字查找、类型检查都发生在这一步**，所以 `NameError`、`TypeError` 只有执行到那一行才出现。
+
+      ```mermaid
+      flowchart LR
+        A["源码 app.py"] --> B["解析为 AST"]
+        B -->|"语法错误"| X["SyntaxError 一行都不执行"]
+        B --> C["编译为字节码"]
+        C --> D["被 import 的模块写入 __pycache__ 中的 .pyc"]
+        C --> E["解释器循环逐条执行"]
+        E -->|"执行到出错的那一行"| Y["NameError TypeError KeyError 等"]
+      ```
+
+      **二、.pyc 只省编译时间**
+
+      被 import 的模块会缓存到 `__pycache__/xxx.cpython-313.pyc`，下次源码没变就跳过编译。它**加速启动，不加速运行**；直接运行的入口脚本不缓存。
+
+      **三、import 会执行模块顶层代码，而且只执行一次**
+
+      第一次 `import utils` 时，Python 执行 utils.py 的全部顶层语句，把结果放进 `sys.modules` 缓存；之后再 import 同一个模块直接拿缓存，**不会重复执行**。所以：
+      - 模块顶层不要写耗时操作或副作用（连数据库、发请求），否则一 import 就触发。
+      - 模块级的全局变量在**同一进程内只有一份**，所有请求共享（Day 02 的可变对象 bug 根源之一）。
+
+      **四、三种运行方式**
+
+      | 方式 | 适用 | 关键区别 |
+      |---|---|---|
+      | `python app.py` | 单文件脚本 | 把**脚本所在目录**放进 `sys.path[0]`，该文件不属于任何包，**相对导入会失败** |
+      | `python -m app.main` | 包内模块、项目入口 | 把**当前目录**放进 `sys.path`，模块知道自己属于 `app` 包，相对导入正常 |
+      | `uv run ...` | uv 项目 | 先确保 .venv 与锁文件同步，再用项目环境执行后面的命令 |
+
+      `if __name__ == "__main__":`：直接运行（含 `-m`）时 `__name__` 是 `"__main__"`，被 import 时是模块名。它只控制**这个 if 块**是否执行，挡不住模块里其他顶层代码。
+
+      **不这样理解会怎样**：把「服务能启动」误当成「代码没问题」；遇到 `attempted relative import with no known parent package` 只会让 AI 乱改 import 路径。
+    scenarios: |
+      - **定位报错阶段**：`SyntaxError` 启动即报；`KeyError`、`TypeError` 只在某个请求走到时报，需要看 traceback 定位到具体行。
+      - **跑项目入口**：在项目根目录用 `uv run python -m app.main` 或 `uv run uvicorn app.main:app`，而不是 cd 进子目录直接跑文件。
+      - **审查 AI 代码**：发现模块顶层直接 `requests.get(...)` 或创建数据库连接，要求改成函数内或应用启动钩子里执行。
+    code: |
+      ```python
+      # app/utils.py
+      print("loading utils")          # 顶层代码：第一次 import 时执行，且只执行一次
+
+      def handle(event: str) -> str:
+          if event == "rare":
+              return undefined_name   # 编译不报错，只有 event == "rare" 时才 NameError
+          return "ok"
+
+      # app/main.py
+      from . import utils             # 相对导入：必须以 python -m app.main 方式运行
+
+      if __name__ == "__main__":
+          print(utils.handle("normal"))  # ok，rare 分支的错误一直潜伏
+      ```
+    pitfalls: |
+      - **误区：Python 是逐行翻译执行的。** 实际是整个文件先编译，语法错误会让整个文件一行都不执行。
+      - **误区：有 .pyc 就跑得更快。** 只省编译时间，执行速度不变。
+      - **误区：`if __name__ == "__main__"` 能阻止模块的所有代码在 import 时执行。** 它只管自己那个 if 块。
+      - **误区：相对导入报错就改成绝对路径或改 sys.path。** 多数情况是运行方式错了，用 `python -m` 从项目根目录运行即可。
+    interview_asks:
+      - question: "Python 是解释型还是编译型语言？.pyc 是什么，能让代码跑得更快吗？"
+        answer: "两步都有。运行前先把整个文件编译成字节码，再逐条执行。语法错误在编译时就报，名字写错这类要执行到那一行才报。.pyc 只是编译结果的缓存，下次启动少编译一次，不会让代码本身跑得更快。"
+      - question: "为什么 Python 很多错误要到运行时才发现？工程上怎么弥补？"
+        answer: "变量没有固定类型，很多问题要执行到那一行、那个分支才知道。工程上用类型注解加 pyright 或 mypy 在提交前检查，再用 pytest 把关键分支跑到。注解本身不拦运行，拦的是检查工具和测试。"
+      - question: "python xxx.py 和 python -m xxx 有什么区别？"
+        answer: "直接跑文件时，当前目录会进模块搜索路径，包内相对导入容易失败。python -m 按包来跑，搜索路径是你启动时所在的项目根目录，相对导入才稳定。项目入口和测试都用 -m。"
+    project_example: |
+      在 p1 企业知识库项目里，`app/ingest/pdf.py` 的「加密 PDF」兜底分支把 `logger` 拼成了 `loger`。这个分支只有遇到加密文件才走到，服务上线两周都正常，直到客户上传加密 PDF，接口直接 500，原始错误还被 `NameError` 掩盖。复盘后加了 ruff 静态检查（能发现未定义名字）和覆盖异常分支的单元测试，并约定所有入口统一用 `uv run python -m app.xxx` 运行。
+    freshness: |
+      核对于 2026-11：python.org 显示 3.15 为最新稳定版（3.15.0 于 2026-10-09 发布，当前 3.15.2），3.14 处于 bugfix，3.11~3.13 只接受安全修复，3.10 已于 2026-10 停止支持。CPython 的 JIT 自 3.13 起为实验特性，默认不开启。3.15 新增显式 `lazy import`（PEP 810），模块在名字首次被使用时才加载，用来加速启动（Day 04 再讲）。
+    sources:
+      - {title: "Python.org - Download（Active Python releases）", url: "https://www.python.org/downloads/"}
+      - {title: "What's new in Python 3.15", url: "https://docs.python.org/3/whatsnew/3.15.html"}
+      - {title: "Python 文档 - dis 字节码反汇编模块", url: "https://docs.python.org/3/library/dis.html"}
+
+  - id: d01-k2
+    name: 变量即名字绑定
+    level: P0
+    summary: 变量只是贴在对象上的名字；赋值和传参都不复制对象，is 比身份、== 比值
+    analogy: |
+      **像 JS 里的对象引用**：`const b = a` 之后 `b.push(3)`，`a` 也变了——Python 的 list、dict 完全一样。Python 的参数传递也和 JS 一样是「传引用的副本」（共享传参）：函数里修改对象，外面能看到；函数里给参数重新赋值，外面看不到。
+
+      **不一样的地方**：
+      - **Python 里一切皆对象**，连 `1`、`"abc"` 都是对象，只是它们不可变，所以看起来像「值传递」。JS 的 number/string 是原始值。
+      - Python **没有 `const`**：名字永远可以重新绑定；全大写 `MAX_TOKENS` 只是约定。
+      - `is` 不是 `===`。`===` 比的是「值且类型相同」，`is` 比的是「是不是同一个对象」。Python 里比值用 `==`（且不会隐式转换类型），比 None 用 `is`。
+    why: |
+      AI 生成的后端代码里到处是「把同一个 dict/list 传来传去再修改」。**如果你以为赋值会复制一份，就看不懂为什么改了 A 却影响了 B**，也看不懂为什么默认配置被某个请求改坏了。这是 Day 02 可变对象、Day 03 参数机制和闭包的地基。
+    problem: |
+      Python 用统一的「名字 → 对象」引用模型管理所有数据。掌握它，你才能判断**哪些操作会共享数据、哪些会创建新对象、函数会不会改掉调用方的数据、对象什么时候被回收**，从而在代码评审中抓住串数据类 bug。
+    principle: |
+      **一、名字是标签，对象是盒子**
+
+      `x = [1, 2]` 的含义：先创建一个 list 对象，再让名字 `x` **指向（绑定）**它。名字本身没有类型、不存数据，它只是命名空间（本质是一个 dict）里的一个键。
+
+      ```mermaid
+      flowchart LR
+        subgraph NS["命名空间 名字表"]
+          X["x"]
+          Y["y"]
+        end
+        subgraph HEAP["对象"]
+          L["list 对象 值为 1, 2, 3"]
+        end
+        X --> L
+        Y --> L
+      ```
+
+      执行 `y = x` 后，两个名字指向**同一个对象**；`y.append(3)` 后通过 `x` 也能看到 3。
+
+      **二、重新绑定 vs 原地修改（最重要的区分）**
+
+      | 写法 | 发生了什么 | 别的名字受影响吗 |
+      |---|---|---|
+      | `x = x + [4]` | 创建**新对象**，x 改指新对象 | 不受影响 |
+      | `x.append(4)` | **原地修改**同一个对象 | 受影响 |
+      | `x += [4]`（list） | list 的 `+=` 是**原地修改** | 受影响 |
+      | `n += 1`（int） | int 不可变，只能创建新对象再重新绑定 | 不受影响 |
+
+      **三、参数传递 = 把名字绑定到同一个对象**
+
+      调用 `f(lst)` 时，函数的参数名和外面的 `lst` 指向同一个对象：
+      - 函数里 `tags.append("x")` → **外面能看到**。
+      - 函数里 `tags = []` → 只是让函数内的名字改指新对象，**外面不变**。
+
+      **四、is 与 ==**
+
+      - `a is b`：是不是**同一个对象**（比较 `id()`）。
+      - `a == b`：**值**是否相等，调用 `__eq__`，可被类自定义。
+      - **判断 None 一律用 `is None`**：None 是单例；而 `== None` 会调用 `__eq__`，有些库（NumPy 数组、SQLAlchemy 列）重载了 `==`，返回的不是布尔值。
+      - CPython 会缓存 -5~256 的小整数、驻留部分字符串，所以 `a is b` 对小数字「有时对」——这是**实现细节**，比较数值和字符串永远用 `==`。
+
+      **五、对象什么时候被回收**
+
+      CPython 主要靠**引用计数**：没有任何名字或容器引用时立即释放；循环引用由周期性的垃圾回收器处理。**文件、数据库连接不要依赖回收来关闭**，用 `with` 显式管理（见 Day 05）。
+
+      **不这样理解会怎样**：会写出「以为复制了一份默认配置再改，结果把全局默认改坏」的 bug；会用 `is` 比字符串导致偶发失败；会被「函数里明明改了参数，外面没变」搞糊涂。
+    scenarios: |
+      - **请求间数据串号**：模块级的默认参数 dict 被某个请求原地修改，后续所有请求都受影响。
+      - **函数副作用审查**：AI 写的 `def build_messages(history): history.append(...)` 会悄悄改掉调用方的会话历史，需要改成返回新列表。
+      - **判断可选值**：`if user is None:` 判断是否查到用户，而不是 `if not user:`。
+    code: |
+      ```python
+      DEFAULT_PARAMS = {"model": "qwen-plus", "temperature": 0.7}
+
+      def params_for(tenant_overrides: dict) -> dict:
+          params = DEFAULT_PARAMS            # 错误：没有复制，指向同一个 dict
+          params.update(tenant_overrides)    # 原地修改 → 全局默认被改坏
+          return params
+
+      def params_for_fixed(tenant_overrides: dict) -> dict:
+          return {**DEFAULT_PARAMS, **tenant_overrides}   # 每次创建新 dict
+
+      a = [1, 2]
+      b = a
+      a = a + [3]      # a 指向新列表
+      b.append(4)      # 修改的是原来那个列表
+      print(a, b)      # [1, 2, 3] [1, 2, 4]
+      ```
+    pitfalls: |
+      - **误区：`y = x` 会复制一份。** 只是多了一个名字，复制要显式 `copy`（见 Day 02）。
+      - **误区：`x += y` 永远创建新对象。** 对 list 是原地修改，对 int/str/tuple 才是新对象。
+      - **误区：用 `is` 比较字符串或数字。** 小整数缓存让它「有时对」，换个值就错；Python 3.8 起 `x is 5` 这种写法会给出 SyntaxWarning。
+      - **误区：Python 是「值传递」或「引用传递」二选一。** 准确说法是共享传参：传的是对象引用，函数内重新赋值不影响外部。
+    interview_asks:
+      - question: "Python 中 is 和 == 有什么区别？为什么判断 None 要用 is？"
+        answer: "== 比的是值，is 比的是是不是同一个对象。None 在进程里只有一个，所以用 is None。小整数、短字符串有时碰巧是同一个对象，不能拿 is 判断业务值。"
+      - question: "Python 是值传递还是引用传递？函数里修改 list 参数，外面会变吗？"
+        answer: "传进去的是「这个对象的名字」，不是拷贝。函数里 append 会改到外面那个 list。如果函数里写参数 = 新列表，只是这个名字改指向，外面不变。想隔离就显式拷贝。"
+      - question: "CPython 的内存怎么回收？为什么不能依赖回收来关闭文件或连接？"
+        answer: "主要靠引用计数，计数到 0 就释放；循环引用靠周期性垃圾回收。释放时机不确定，文件、数据库连接、HTTP 客户端必须用 with 或显式 close，不能等对象被回收。"
+    project_example: |
+      在 p2 智慧园区 Agent 里，不同园区租户有各自的模型参数。最初代码在模块顶层定义 `DEFAULT_PARAMS`，每个请求里 `params = DEFAULT_PARAMS` 再按租户覆盖 `temperature`。结果第一个低温度租户请求之后，所有租户都变成了 0。原因是 `params` 和 `DEFAULT_PARAMS` 指向同一个 dict。修复为 `{**DEFAULT_PARAMS, **overrides}` 每次创建新 dict，并补了「连续两个租户请求互不影响」的单元测试。
+    sources:
+      - {title: "Python 文档 - 数据模型：对象、值与类型", url: "https://docs.python.org/3/reference/datamodel.html"}
+      - {title: "Python FAQ - 为什么修改了 y 后 x 也变了", url: "https://docs.python.org/3/faq/programming.html"}
+
+  - id: d01-k3
+    name: 动态类型与真值判断
+    level: P0
+    summary: Python 是动态类型但强类型，不做隐式转换；空容器、0、空字符串、None 都为假
+    analogy: |
+      **像 JS 的 truthy/falsy**：`if (x)`、`x || 默认值` 在 Python 里写作 `if x:`、`x or 默认值`，`and`/`or` 同样返回「其中一个操作数」而不是布尔值。`None` ≈ `null`。
+
+      **不一样的地方**（最容易踩坑）：
+      - **空列表 `[]`、空字典 `{}` 在 Python 里是假**，在 JS 里是真。
+      - Python **不做隐式类型转换**：`"1" + 1` 直接 `TypeError`，JS 得到 `"11"`；Python 的 `==` 也不会像 JS 的 `==` 那样把 `"1"` 和 `1` 当成相等。
+      - Python **没有 `undefined`**：访问不存在的变量是 `NameError`，访问不存在的 dict 键是 `KeyError`，不会静默得到 undefined。
+      - JS 有 `??` 只在 null/undefined 时取默认值；**Python 没有 `??`**，要写 `x if x is not None else 默认值`。
+    why: |
+      AI 后端里到处是类型转换：环境变量读出来是字符串，JSON 解析出来是 dict，LLM 返回的 token 数是 int，相似度是 float。**真值判断写错一处，就可能出现「配置了 false 却开启了调试」「temperature=0 被改成默认值」这类隐蔽 bug**，而且不会报错。
+    problem: |
+      帮你在读代码时快速判断：这个值实际是什么类型、`if x:` 在什么情况下为假、`x or 默认值` 会不会吞掉合法的 0 和空字符串、为什么同样的拼接在 JS 能跑在 Python 会报错。这些判断直接决定配置解析、参数默认值、计费统计是否正确。
+    principle: |
+      **一、动态类型 + 强类型**
+
+      - **动态类型**：变量没有类型，**对象才有类型**。`x = 1` 之后可以 `x = "hi"`。类型检查推迟到运行时（和 JS 一样）。
+      - **强类型**：不同类型之间**不偷偷转换**。`"1" + 1` → `TypeError`；`"1" == 1` → `False`。错误更早、更明确。
+
+      | 表达式 | JavaScript | Python |
+      |---|---|---|
+      | `"1" + 1` | `"11"` | TypeError |
+      | `"1" == 1` | true | False |
+      | `[]` 作为条件 | 真 | **假** |
+      | `{}` 作为条件 | 真 | **假** |
+      | 访问不存在的键 | undefined | KeyError |
+
+      **二、哪些值为假**
+
+      `False`、`None`、`0`、`0.0`、`""`、`[]`、`{}`、`set()`、`()`。其余一般为真。注意 **`"0"`、`"false"`、`" "` 都是非空字符串，为真**。
+
+      **三、`or` 设默认值的陷阱**
+
+      `a or b`：a 为真返回 a，否则返回 b。所以 `temperature = req.temperature or 0.7` 会把用户**显式传的 0** 换成 0.7。**当 0、空字符串、空列表是合法值时，必须用 `is None` 判断**：
+
+      ```python
+      temperature = 0.7 if req.temperature is None else req.temperature
+      ```
+
+      **四、环境变量永远是字符串**
+
+      `os.getenv("X")` 只会返回 **str 或 None**。`bool("false")` 是 True——这正是很多「关不掉的调试模式」的来源。要么显式比较 `value.lower() in {"1", "true", "yes"}`，要么交给 pydantic-settings 按类型解析（见 Day 04）。
+
+      ```mermaid
+      flowchart TB
+        A["os.getenv 读取 DEBUG"] --> B{"返回值"}
+        B -->|"None 未设置"| C["if 判断为假"]
+        B -->|"空字符串"| C
+        B -->|"字符串 false 或 0"| D["if 判断为真 隐蔽 bug"]
+        D --> E["正确做法 显式解析或用 pydantic-settings"]
+      ```
+
+      **五、数值的几个差异**
+
+      - `int` 无限精度，不会像 JS Number 超过 2^53 丢精度（但返回给前端时 JS 仍可能丢，大 ID 常转字符串）。
+      - `/` 永远返回 float（`4 / 2 == 2.0`），`//` 向下取整。
+      - `float` 同样有 `0.1 + 0.2 != 0.3` 问题，金额用 `Decimal("0.1")` 或整数「分」。
+      - `bool` 是 `int` 的子类：`isinstance(True, int)` 为 True，做类型判断时要先排除 bool。
+
+      **不这样理解会怎样**：合法的 0 被替换成默认值、`DEBUG=false` 依然开着调试、把 JS 的 `||` 习惯原样搬过来写出一堆「看起来对」的错代码。
+    scenarios: |
+      - **配置解析**：`DEBUG=false`、`ENABLE_RERANK=0` 读出来都是非空字符串，必须显式转换。
+      - **接口参数默认值**：`top_k`、`temperature`、`score_threshold` 允许为 0，默认值逻辑必须用 `is None`。
+      - **空结果判断**：检索结果 `if not docs:` 判断「没检索到」是对的（空列表为假），这里用真值判断正合适。
+      - **计费统计**：token 单价累加用 Decimal，避免对账差几分钱。
+    code: |
+      ```python
+      import os
+
+      os.environ["APP_DEBUG"] = "false"
+      print(bool(os.getenv("APP_DEBUG")))            # True！非空字符串为真
+      debug = os.getenv("APP_DEBUG", "").lower() in {"1", "true", "yes"}
+      print(debug)                                    # False
+
+      temperature = 0.0
+      print(temperature or 0.7)                       # 0.7，合法的 0 被吞了
+      print(0.7 if temperature is None else temperature)  # 0.0
+
+      docs: list[str] = []
+      if not docs:                                    # 空列表为假，JS 里 [] 是真
+          print("没有检索到文档")
+      ```
+    pitfalls: |
+      - **误区：`bool("false")` 是 False。** 任何非空字符串都是 True。
+      - **误区：`x or default` 可以安全设置默认值。** 0、空字符串、空列表是合法值时会被错误替换。
+      - **误区：空列表在 if 中为真（JS 习惯）。** Python 中为假。
+      - **混淆：动态类型 ≠ 弱类型。** Python 是动态 + 强类型，JS 是动态 + 弱类型。
+      - **混淆：`Decimal(0.1)` 和 `Decimal("0.1")`。** 前者会把 float 的误差一起带进来。
+    interview_asks:
+      - question: "动态类型和强类型分别是什么意思？用 Python 和 JavaScript 举例对比。"
+        answer: "动态类型是变量可以先后指向不同类型。强类型是不会悄悄把类型混算。Python 里 \"1\" + 1 直接报错；JavaScript 里 \"1\" + 1 会变成字符串 \"11\"。所以 Python 更严，但错误往往要跑到那一行才出现。"
+      - question: "Python 中哪些值在 if 里为假？和 JS 有什么不同？"
+        answer: "假值只有：None、False、0、0.0、空字符串、空列表、空字典、空集合。空列表是假，这点和 JS 相反，JS 里 [] 是真。不要用 if x 表示「有没有传这个字段」，0 和空字符串会被当成没传。"
+      - question: "从环境变量读取布尔配置有什么坑？你会怎么处理？"
+        answer: "环境变量全是字符串。if os.getenv(\"DEBUG\") 时，字符串 \"false\"、\"0\" 也是真。要自己认 true/false/1/0/yes/no，认不出就报错，不要默默当成真。"
+    project_example: |
+      在 p1 知识库项目的检索接口里，`score_threshold = body.get("score_threshold") or 0.5`。运营想临时放开阈值传了 0，结果仍被替换成 0.5，召回数一直上不去。排查时在日志里打印 `repr(threshold)` 才发现问题。修复为 Pydantic 模型字段 `score_threshold: float | None = None`，业务代码里用 `is None` 判断，并补了「传 0 时阈值确实为 0」的测试。
+    sources:
+      - {title: "Python 文档 - 真值测试", url: "https://docs.python.org/3/library/stdtypes.html#truth-value-testing"}
+      - {title: "Python 文档 - decimal 十进制定点和浮点运算", url: "https://docs.python.org/3/library/decimal.html"}
+
+  - id: d01-k4
+    name: uv 与虚拟环境（对照 Node/npm）
+    level: P0
+    summary: pyproject.toml 声明依赖范围，uv.lock 锁定精确版本，.venv 是项目独立的解释器加包目录
+    analogy: |
+      **对照 npm / pnpm**：
+
+      | Node 世界 | Python + uv |
+      |---|---|
+      | `package.json` | `pyproject.toml` |
+      | `package-lock.json` / `pnpm-lock.yaml` | `uv.lock` |
+      | `node_modules/` | `.venv/` |
+      | `.nvmrc` + `nvm install` | `.python-version` + `uv python install` |
+      | `npm install 包` | `uv add 包` |
+      | `npm ci` | `uv sync --locked` |
+      | `npm run xxx` / `npx 工具` | `uv run 命令` / `uvx 工具` |
+      | `devDependencies` | `[dependency-groups]` 里的 `dev` 组 |
+
+      **不一样的地方**（很重要）：
+      - **一个环境里同一个包只能有一个版本**。npm 可以给不同依赖嵌套装不同版本，Python 不行，版本冲突时解析直接失败。
+      - **.venv 里包含解释器**（指向某个 Python 的可执行文件），node_modules 只有包。
+      - Node 会**逐级向上找 node_modules**；Python **不会自动找 .venv**，你运行的是哪个解释器，就用哪个环境的包。
+      - .venv **不能拷贝到别的机器或改目录后继续用**，只能按锁文件重建。
+    why: |
+      「我本地能跑，服务器上跑不了」是 Python 项目最常见的部署问题，根源几乎都是依赖和解释器：版本不一致、装到了全局、运行时用错了 Python。**AI 生成的项目可能用 pip、Poetry 或 uv，你得看懂并能让项目在任何机器上复现**。本课程后端统一用 uv。
+    problem: |
+      虚拟环境解决「不同项目需要同一个库的不同版本」的冲突；pyproject.toml 解决「项目需要哪些库」；锁文件解决「每台机器、每次部署装的是完全相同的版本」。uv 把装 Python、建环境、解析、锁定、运行合成一个工具，速度也比 pip 快很多。
+    principle: |
+      **一、虚拟环境的原理**
+
+      `.venv` 目录里有：
+      - `pyvenv.cfg`：记录它基于哪个 Python 创建。
+      - `Scripts/`（Windows）或 `bin/`：解释器入口和激活脚本。
+      - `Lib/site-packages/`：**这个环境独立的第三方包目录**。
+
+      Python 启动时发现旁边有 `pyvenv.cfg`，就把 `sys.prefix` 指向这个环境，从它的 site-packages 找包。**「激活」只是把 Scripts/bin 放到 PATH 最前面**，让你敲 `python` 时用的是环境里的解释器；不激活、直接用 `.venv\Scripts\python.exe` 或 `uv run` 效果一样。
+
+      **二、声明 → 锁定 → 同步**
+
+      ```mermaid
+      flowchart LR
+        P["pyproject.toml 直接依赖和版本范围"] --> R["uv 解析 含所有间接依赖"]
+        R --> L["uv.lock 精确版本 跨平台 提交 Git"]
+        L --> S["uv sync 同步到 .venv"]
+        S --> DEV["开发机"]
+        L --> CI["CI 用 --locked"]
+        L --> IMG["Docker 镜像"]
+      ```
+
+      - pyproject.toml 写**范围**（`httpx>=0.27,<1`），今天和下个月解析的结果可能不同。
+      - uv.lock 记录解析出的**精确版本和哈希**，是**跨平台的通用锁文件**（Windows 上生成的能在 Linux CI 用），**必须提交 Git，不要手改**。
+      - **新版本发布不会让锁文件「过期」**：只有你改了 pyproject 的约束，或显式 `uv lock --upgrade-package 包名`，锁定版本才会变。
+
+      **三、日常命令**
+
+      | 目的 | 命令 |
+      |---|---|
+      | 新建项目 | `uv init kb-assistant` |
+      | 固定 Python 版本 | `uv python pin 3.13`（写入 `.python-version`） |
+      | 加依赖 / 开发依赖 | `uv add fastapi httpx` / `uv add --dev pytest ruff` |
+      | 按锁文件同步环境 | `uv sync`；CI 用 `uv sync --locked`（锁文件不一致就失败） |
+      | 在项目环境中运行 | `uv run python -m app.main`（会先自动 lock + sync） |
+      | 升级单个包 | `uv lock --upgrade-package httpx` |
+      | 临时跑一个工具 | `uvx ruff check .` |
+
+      **四、为什么不能装到全局**
+
+      全局环境被所有项目共享：A 要 `pydantic 1.x`、B 要 `2.x` 只能二选一；升级一个包可能悄悄破坏别的项目；部分 Linux 发行版的系统 Python 还会拒绝 pip 安装（PEP 668），以免破坏系统工具。
+
+      **不这样理解会怎样**：部署时装上了新的大版本导致启动即报错；把 .venv 提交到 Git；IDE 选错解释器导致「明明装了却 ModuleNotFoundError」。
+    scenarios: |
+      - **新项目初始化**：`uv init`、`uv add fastapi "uvicorn[standard]" pydantic-settings httpx`、`uv add --dev pytest ruff`，提交 pyproject.toml 和 uv.lock，`.venv` 加入 .gitignore。
+      - **CI 与 Docker**：`uv sync --locked`，锁文件与 pyproject 不一致直接失败，保证与开发环境一致。
+      - **排查 ModuleNotFoundError**：打印 `sys.executable`，确认运行的是不是项目 `.venv` 里的解释器。
+      - **接手旧项目**：只有 requirements.txt 时，可以 `uv add -r requirements.txt` 迁移到 pyproject + uv.lock。
+    code: |
+      ```toml
+      # pyproject.toml（uv 管理的 FastAPI 项目）
+      [project]
+      name = "kb-assistant"
+      version = "0.1.0"
+      requires-python = ">=3.13"
+      dependencies = [
+          "fastapi>=0.115",
+          "pydantic-settings>=2.12",
+          "httpx>=0.27,<1",
+      ]
+
+      [dependency-groups]
+      dev = ["pytest>=8", "ruff>=0.6"]
+      ```
+
+      ```python
+      import sys
+      print(sys.executable)                  # 当前到底是哪个解释器
+      print(sys.prefix != sys.base_prefix)   # True 表示在虚拟环境中
+      ```
+    pitfalls: |
+      - **误区：必须先激活虚拟环境才能用。** 激活只是改 PATH，`uv run` 或直接用环境内的解释器同样有效。
+      - **误区：把 .venv 提交 Git 或拷到服务器。** 虚拟环境不可移动，按锁文件重建。
+      - **误区：有了 pyproject.toml 就能复现环境。** 范围会随时间解析出不同版本，必须配合锁文件。
+      - **误区：新版本发布后 `uv sync` 会自动升级。** 锁文件优先，升级要显式 `uv lock --upgrade-package`。
+      - **混淆：uv.lock 和 requirements.txt。** 后者常由 `pip freeze` 生成，混合了直接和间接依赖，难以维护；需要时可用 `uv export` 从锁文件导出。
+    interview_asks:
+      - question: "虚拟环境的原理是什么？激活时到底发生了什么？"
+        answer: "就是一个独立目录，里面有自己的解释器和已装的包。激活只是把这个目录的 Scripts 或 bin 放到 PATH 最前面，让 python 和 pip 指向这里。不激活也可以直接调用里面的 python。每个项目一个环境，互不污染。"
+      - question: "pyproject.toml 和锁文件分别解决什么问题？为什么锁文件要提交 Git？"
+        answer: "pyproject.toml 写「我要哪个包、允许哪个版本范围」。锁文件写下这次真正装上的每一个包和精确版本。不提交锁文件，同事和线上可能装到不同版本，今天能跑明天不行。"
+      - question: "你为什么选 uv？和 pip、Poetry 比有什么区别？"
+        answer: "uv 用一个工具搞定建环境、装包、锁版本，速度比 pip 和 Poetry 快很多，命令也少。pip 不管锁文件和环境；Poetry 能管，但慢、概念多。选 uv 是为了装得快、版本锁得住。"
+    project_example: |
+      p1 知识库项目的后端从第一天起用 uv 管理：`uv init` 建项目，`uv python pin 3.13` 固定版本，依赖用 `uv add` 写入 pyproject.toml，uv.lock 提交仓库。Dockerfile 先只 COPY `pyproject.toml` 和 `uv.lock` 执行 `uv sync --locked --no-install-project`（利用镜像层缓存），再 COPY 源码执行 `uv sync --locked`。之后升级 openai SDK 改为有意识的 `uv lock --upgrade-package openai`，跑完测试再合并。
+    freshness: |
+      核对于 2026-11：uv 最新为 0.13.7（2026-11-03 发布）；0.13.0（2026-10-09）起把 Python 3.15 作为默认稳定版本。**旧 vs 新**：uv 0.12 之前 `uv init` 默认生成扁平的 `main.py`、不定义构建系统；0.12 起默认生成 `src/包名/__init__.py` 布局并带 `[build-system]`（`uv_build`），想要旧的扁平结构用 `uv init --no-package`。`uv sync` 默认精确同步（会删掉锁文件之外的包），`uv run` 默认不删多余包；`--locked` 在锁文件过期时报错，`--frozen` 直接用锁文件不检查。开发依赖写在 `[dependency-groups]`（PEP 735），`dev` 组默认会被同步。
+    sources:
+      - {title: "uv - Working on projects", url: "https://docs.astral.sh/uv/guides/projects/"}
+      - {title: "uv - Creating projects（uv init 模板与 0.12 的变化）", url: "https://docs.astral.sh/uv/concepts/projects/init/"}
+      - {title: "uv - Locking and syncing", url: "https://docs.astral.sh/uv/concepts/projects/sync/"}
+      - {title: "uv Releases", url: "https://github.com/astral-sh/uv/releases"}
+      - {title: "Python 教程 - 虚拟环境和包", url: "https://docs.python.org/zh-cn/3/tutorial/venv.html"}
+
+test:
+  - id: d01-t1
+    kp: d01-k1
+    type: single
+    question: 一个 `.py` 文件第 80 行少写了冒号（语法错误），第 1~79 行都是正常的 print 语句。直接运行这个文件会发生什么？
+    options:
+      - "先打印前 79 行的内容，执行到第 80 行时报 SyntaxError"
+      - "一行都不打印，直接报 SyntaxError"
+      - "打印全部内容，最后只给出一条语法警告"
+      - "取决于 __pycache__ 里有没有旧的 .pyc 缓存"
+    answer: [1]
+    explain: CPython 先把整个文件解析、编译成字节码，语法错误在编译阶段就被发现，所以一行都不会执行。「执行到第 80 行才报错」是把 Python 想成了逐行翻译；.pyc 只缓存被 import 的模块，且源码变了会重新编译，不会绕过语法检查。
+
+  - id: d01-t2
+    kp: d01-k1
+    type: single
+    question: 运行 `python -m app.main`，下面代码会输出什么？
+    code: |
+      # app/utils.py
+      print("loading utils")
+      def helper():
+          return "ok"
+
+      # app/main.py
+      from app import utils
+      from app import utils
+      print(utils.helper())
+    options:
+      - "loading utils 打印两次，然后打印 ok"
+      - "只打印 ok，import 不会执行模块里的 print"
+      - "loading utils 打印一次，然后打印 ok"
+      - "第二次 import 同一个模块会抛出 ImportError"
+    answer: [2]
+    explain: 模块第一次被导入时会执行全部顶层代码，并缓存到 sys.modules；之后再导入直接返回缓存的模块对象，不会重复执行，所以 loading utils 只打印一次。import 一定会执行顶层代码（这正是不要在模块顶层写副作用的原因），重复 import 也不会报错。
+
+  - id: d01-t3
+    kp: d01-k1
+    type: judge
+    question: 有了 `__pycache__` 里的 .pyc 缓存，Python 代码在执行阶段会比没有缓存时跑得更快。
+    answer: false
+    explain: .pyc 只是省掉了「源码编译成字节码」这一步，加快的是模块导入（启动）速度；字节码的执行速度完全一样。想让计算更快要靠算法、C 扩展或把 CPU 密集任务交给专门的库，而不是靠 .pyc。
+
+  - id: d01-t4
+    kp: d01-k1
+    type: multi
+    question: 关于 `if __name__ == '__main__':`，下列说法正确的是？
+    options:
+      - "用 python file.py 直接运行时，该文件的 __name__ 是 '__main__'"
+      - "该文件被其他模块 import 时，__name__ 是模块名，if 块里的代码不执行"
+      - "用 python -m pkg.mod 运行时，pkg.mod 的 __name__ 也是 '__main__'"
+      - "这个判断可以阻止该文件里所有顶层代码在被 import 时执行"
+    answer: [0, 1, 2]
+    explain: 直接运行和用 -m 运行时，被运行的模块 __name__ 都是 '__main__'；被 import 时则是模块名，if 块跳过。但它只控制这个 if 块本身，文件里写在 if 外面的顶层代码（print、建连接等）在 import 时照样执行，所以第 4 项错误。
+
+  - id: d01-t5
+    kp: d01-k1
+    type: single
+    question: |
+      项目里 `app/validate.py` 的第一行是 `from .config import settings`。在 backend 目录运行 `python app/validate.py` 报 `ImportError: attempted relative import with no known parent package`，而 `python -m app.validate` 正常。最准确的原因是？
+    options:
+      - "直接运行文件时它不属于任何包，相对导入找不到父包"
+      - "-m 会先把 app 目录整体编译成 .pyc，导入更稳定"
+      - "直接运行文件时不会读取虚拟环境，所以找不到 config"
+      - "Windows 下 app/validate.py 的斜杠路径无法被解析"
+    answer: [0]
+    explain: 直接运行文件时，该文件被当作顶层脚本 __main__，没有所属包，`.config` 这种相对导入无从解析；用 -m 运行时 Python 知道它是 app 包里的模块，相对导入正常。这与 .pyc、虚拟环境、路径斜杠都无关，正确的修复是改运行方式，而不是乱改 import 或 sys.path。
+
+  - id: d01-t6
+    kp: d01-k2
+    type: single
+    question: 下面代码输出什么？
+    code: |
+      a = [1, 2]
+      b = a
+      a = a + [3]
+      b.append(4)
+      print(a, b)
+    options:
+      - "[1, 2, 3, 4] [1, 2, 3, 4]"
+      - "[1, 2, 3] [1, 2, 3, 4]"
+      - "[1, 2, 4] [1, 2, 4]"
+      - "[1, 2, 3] [1, 2, 4]"
+    answer: [3]
+    explain: b = a 让两个名字指向同一个列表；a = a + [3] 创建了新列表并让 a 改指它，b 仍指向原来的 [1, 2]；b.append(4) 原地修改原列表。所以 a 是 [1, 2, 3]、b 是 [1, 2, 4]。认为两者始终相同，是忽略了 + 会创建新对象。
+
+  - id: d01-t7
+    kp: d01-k2
+    type: judge
+    question: 对 list 来说，`a += [2]` 和 `a = a + [2]` 效果完全一样，都会创建一个新列表，原来指向同一列表的其他名字不受影响。
+    answer: false
+    explain: list 的 += 是原地扩展（调用 __iadd__），所有指向这个列表的名字都会看到变化；a = a + [2] 才是创建新列表再重新绑定。对 int、str、tuple 这类不可变对象，+= 只能创建新对象，所以两者在不可变类型上才看起来一样。
+
+  - id: d01-t8
+    kp: d01-k2
+    type: single
+    question: 代码规范要求「判断 None 必须写 `x is None`，不要写 `x == None`」。最主要的理由是？
+    options:
+      - "is 比 == 快很多，属于性能优化"
+      - "None 是单例，is 比身份不受 __eq__ 重载影响"
+      - "Python 3 中 == None 会直接抛出 SyntaxError"
+      - "== 会先把两边转成字符串再比较，结果不可靠"
+    answer: [1]
+    explain: None 在进程中只有一个对象，用 is 比较身份最准确；== 会调用对象的 __eq__，NumPy 数组、SQLAlchemy 列等重载了 ==，返回的不是布尔值，会导致判断出错。性能差异可以忽略；== None 不会报语法错误；== 也不会把两边转成字符串。
+
+  - id: d01-t9
+    kp: d01-k2
+    type: multi
+    question: |
+      已知 `def add_tag(tags): tags.append('x')` 和 `def reset(tags): tags = []`，外部有 `lst = ['a']`。下列说法正确的是？
+    options:
+      - "调用 add_tag(lst) 后，外部 lst 变成 ['a', 'x']"
+      - "调用 reset(lst) 后，外部 lst 变成空列表"
+      - "Python 传参传的是对象引用，函数内外的名字指向同一个对象"
+      - "若传入整数 n，函数内执行 n += 1 不会影响外部变量"
+    answer: [0, 2, 3]
+    explain: 参数名和外部变量指向同一个对象，所以 append 原地修改外部可见；reset 里 tags = [] 只是让函数内的名字改指新列表，外部 lst 不变；int 不可变，n += 1 只是让函数内的名字绑定新对象。这就是「共享传参」，和 JS 传对象的行为一致。
+
+  - id: d01-t10
+    kp: d01-k2
+    type: judge
+    question: 因为 CPython 会缓存小整数，所以在业务代码里用 `if status is 200:` 判断 HTTP 状态码是安全的写法。
+    answer: false
+    explain: 小整数缓存是 CPython 的实现细节，不是语言保证；换成大数字或其他实现就可能不成立。Python 3.8 起对字面量使用 is 还会给出 SyntaxWarning。比较数值和字符串应该用 ==，is 只用于 None、True/False 这类单例或确实要判断「同一个对象」的场景。
+
+  - id: d01-t11
+    kp: d01-k3
+    type: single
+    question: 下面代码输出什么？
+    code: |
+      import os
+      os.environ["FEATURE_RAG"] = "false"
+      os.environ["TOP_K"] = "0"
+      enabled = bool(os.getenv("FEATURE_RAG"))
+      top_k = int(os.getenv("TOP_K", "3")) or 5
+      print(enabled, top_k)
+    options:
+      - "False 0"
+      - "True 0"
+      - "False 5"
+      - "True 5"
+    answer: [3]
+    explain: 环境变量永远是字符串，"false" 是非空字符串，bool 之后为 True；int("0") 得到 0，而 0 为假，`0 or 5` 返回 5，用户显式配置的 0 被吞掉了。两个 bug 都不会报错，正确写法是显式解析布尔值、用 is None 判断是否配置。
+
+  - id: d01-t12
+    kp: d01-k3
+    type: single
+    question: 前端同事把 JS 习惯带到 Python，写了 `msg = "第" + page + "页"`，其中 page 是 int。运行结果是？
+    options:
+      - "得到 '第2页'，与 JS 一样自动转成字符串"
+      - "得到 None，并打印一条类型警告"
+      - "抛出 TypeError，Python 不做隐式类型转换"
+      - "抛出 SyntaxError，启动时就无法运行"
+    answer: [2]
+    explain: Python 是强类型语言，str 和 int 相加不会隐式转换，运行到这一行时抛 TypeError（不是语法错误，所以启动时发现不了）。应写成 f"第{page}页" 或 str(page)。认为会自动转换是 JS 弱类型的习惯。
+
+  - id: d01-t13
+    kp: d01-k3
+    type: multi
+    question: 下列哪些值在 Python 的 `if x:` 判断中为假？
+    options:
+      - "[]"
+      - "'0'"
+      - "0.0"
+      - "{}"
+      - "'False'"
+    answer: [0, 2, 3]
+    explain: 空列表、0.0、空字典都为假；'0' 和 'False' 是非空字符串，为真。注意空列表和空字典在 JS 里是真值，这是从前端转过来最容易错的地方；字符串只看是否为空，不看内容。
+
+  - id: d01-t14
+    kp: d01-k3
+    type: judge
+    question: Python 和 JavaScript 一样是动态类型语言，所以 Python 也和 JavaScript 一样属于弱类型语言。
+    answer: false
+    explain: 动态/静态说的是类型检查发生在运行时还是编译时，强/弱说的是会不会隐式转换类型，是两个维度。Python 是动态 + 强类型（"1" + 1 报 TypeError），JavaScript 是动态 + 弱类型（"1" + 1 得到 "11"）。
+
+  - id: d01-t15
+    kp: d01-k3
+    type: single
+    question: 接口里写了 `temperature = req.temperature or 0.7`，其中 `req.temperature` 的类型是 `float | None`。这行代码的问题是？
+    options:
+      - "用户显式传 0 时会被替换成 0.7"
+      - "temperature 为 None 时会抛出 TypeError"
+      - "or 总是返回布尔值，temperature 会变成 True"
+      - "没有问题，or 只在左边为 None 时才取右边"
+    answer: [0]
+    explain: or 在左边为假时返回右边，0.0 为假，所以合法的 0 会被替换成 0.7。None 时不会报错而是正常取 0.7；or 返回的是操作数本身而不是布尔值；Python 没有 JS 的 ?? 运算符，「只在 None 时取默认值」要写成 0.7 if x is None else x。
+
+  - id: d01-t16
+    kp: d01-k4
+    type: single
+    question: 对照 npm 的 node_modules，关于 Python 的 .venv，下列哪个说法正确？
+    options:
+      - "同一个环境里一个包只能装一个版本，不能像 npm 那样嵌套多个版本"
+      - ".venv 里只存放第三方包，与具体用哪个 Python 解释器无关"
+      - ".venv 可以像 node_modules 一样直接拷贝到另一台机器使用"
+      - "Python 会像 Node 一样逐级向上查找父目录里的 .venv"
+    answer: [0]
+    explain: Python 一个环境的 site-packages 里每个包只能有一个版本，依赖冲突时解析直接失败，这是和 npm 嵌套依赖最大的区别。.venv 绑定了创建它的解释器；它包含绝对路径，不可移动或拷贝；Python 也不会自动向上查找 .venv，用哪个解释器运行就用哪个环境。
+
+  - id: d01-t17
+    kp: d01-k4
+    type: multi
+    question: 在 uv 管理的项目里，下列哪些做法是正确的？
+    options:
+      - "把 uv.lock 提交到 Git"
+      - "把 .venv 加入 .gitignore"
+      - "CI 中用 uv sync --locked，锁文件与 pyproject 不一致时直接失败"
+      - "升级单个包用 uv lock --upgrade-package 包名"
+      - "需要改版本时直接手动编辑 uv.lock"
+    answer: [0, 1, 2, 3]
+    explain: 锁文件要提交以保证各环境一致；.venv 不可移动，应忽略并按锁文件重建；CI 用 --locked 能及时发现「改了依赖忘了更新锁文件」；升级用 --upgrade-package 只动目标包。uv.lock 由 uv 管理，官方明确不应手动编辑，否则哈希和依赖关系可能不一致。
+
+  - id: d01-t18
+    kp: d01-k4
+    type: judge
+    question: 不激活虚拟环境（不执行 activate），就无法使用 .venv 里安装的包。
+    answer: false
+    explain: 激活只是把 .venv 的 Scripts/bin 目录放到 PATH 最前面，让你敲 python 时命中环境里的解释器。直接用 .venv 里的 python 可执行文件，或者用 uv run，效果完全一样；在 systemd、Docker、CI 里通常就是这样用的。
+
+  - id: d01-t19
+    kp: d01-k4
+    type: single
+    question: |
+      同事执行了 `uv add httpx`，随后在一个新打开的终端里运行 `python main.py`，报 `ModuleNotFoundError: No module named 'httpx'`。最合理的第一步是？
+    options:
+      - "再执行一次 uv add httpx，强制重新安装"
+      - "删掉 uv.lock 后重新 uv lock 一遍"
+      - "把 httpx 的源码复制到项目目录下"
+      - "打印 sys.executable 确认解释器，或改用 uv run"
+    answer: [3]
+    explain: uv add 已把 httpx 装进项目的 .venv，但新终端里的 python 很可能是全局解释器，根本不看 .venv。先确认实际运行的解释器，再用 uv run main.py 或环境内的 python 运行即可。重装、重建锁文件、复制源码都没有解决「用错解释器」这个根因。
+
+  - id: d01-t20
+    kp: d01-k4
+    type: single
+    question: pyproject.toml 里写着 `httpx>=0.27,<1`，uv.lock 锁定的是 0.28.1。今天 httpx 发布了 0.29.0（仍满足范围）。此时执行 `uv sync`，结果是？
+    options:
+      - "自动升级到 0.29.0，因为它满足版本范围"
+      - "保持 0.28.1，新版本发布不会让锁文件过期"
+      - "报错，要求先执行 uv lock 更新锁文件"
+      - "随机选择一个满足范围的版本安装"
+    answer: [1]
+    explain: uv 判断锁文件是否过期只看它和 pyproject 的约束是否一致，新版本发布不算过期，所以继续安装锁定的 0.28.1。这正是锁文件「可复现」的意义；要升级必须显式执行 uv lock --upgrade-package httpx 并跑测试。
+
+exam:
+  - id: d01-e1
+    kp: d01-k2
+    type: single
+    question: |
+      模块顶层定义了 `DEFAULT = {"model": "qwen-plus", "tags": []}`，每个请求执行 `cfg = dict(DEFAULT); cfg["tags"].append(tenant)`。运行一段时间后会出现什么现象？
+    options:
+      - "每个请求的 cfg 都完全独立，不会有任何问题"
+      - "DEFAULT 的 model 字段会被请求修改"
+      - "DEFAULT['tags'] 越来越长，各请求互相串数据"
+      - "第二个请求开始会抛出 KeyError"
+    answer: [2]
+    explain: dict(DEFAULT) 只复制了外层 dict，内层的 tags 列表仍然是同一个对象，append 会修改共享的列表，导致 DEFAULT['tags'] 不断增长、租户数据互相串。外层的 model 字段是重新绑定才会变，这里没有改它；也不会出现 KeyError。这是浅拷贝问题，Day 02 会系统讲。
+
+  - id: d01-e2
+    kp: d01-k1
+    type: single
+    question: FastAPI 服务的某个模块里，只在「上传文件超过 50MB」的分支中引用了一个未定义的名字。这个错误最可能在什么时候暴露？
+    options:
+      - "服务启动、导入这个模块时就会报 NameError"
+      - "只有某个请求真正走进这个分支时才报 NameError"
+      - "生成 .pyc 缓存时报错，所以首次启动会失败"
+      - "第一次请求任意接口时报错，之后就不会再报"
+    answer: [1]
+    explain: 名字查找发生在执行阶段，编译只检查语法，所以导入、生成字节码都不会发现未定义的名字，只有执行到那一行才抛 NameError，而且每次走到都会报。工程上要靠 ruff/pyright 静态检查和覆盖异常分支的测试提前发现。
+
+  - id: d01-e3
+    kp: d01-k3
+    type: single
+    question: |
+      检索接口参数 `top_k: int | None`，约定「传 0 表示只走关键词检索、不做向量检索」，不传则默认 5。下面哪种写法正确？
+    options:
+      - "top_k = req.top_k or 5"
+      - "top_k = 5 if not req.top_k else req.top_k"
+      - "top_k = req.top_k if req.top_k else 5"
+      - "top_k = 5 if req.top_k is None else req.top_k"
+    answer: [3]
+    explain: 前三种写法本质都是真值判断，0 为假，会把合法的 0 变成 5，「只走关键词检索」的语义就丢了。只有用 is None 区分「没传」和「传了 0」才正确。这类 bug 不报错，只会让效果悄悄变差。
+
+  - id: d01-e4
+    kp: d01-k4
+    type: single
+    question: 为 uv 项目写 Dockerfile，希望依赖不变时能复用镜像层缓存，且镜像与开发环境依赖完全一致。最合理的做法是？
+    options:
+      - "先 COPY 依赖声明和 uv.lock 装依赖（--locked --no-install-project），再 COPY 源码 sync"
+      - "把开发机上已经装好的 .venv 整个 COPY 进镜像，省掉镜像内的安装时间"
+      - "在镜像里先 pip install uv，再对 pyproject 里的每个依赖逐个执行 uv add"
+      - "只 COPY pyproject.toml，在镜像里执行 uv lock 生成新的锁文件后再 uv sync"
+    answer: [0]
+    explain: 先只复制依赖声明和锁文件安装依赖，源码改动不会让这一层失效；--locked 保证与仓库锁文件一致。.venv 不可移动且平台不同；uv add 会修改项目文件；镜像里重新 lock 会解析出与开发机不同的版本，失去可复现性。
+
+  - id: d01-e5
+    kp: d01-k1
+    type: multi
+    question: 关于 Python 的 import 机制，下列说法正确的是？
+    options:
+      - "模块第一次被导入时执行全部顶层代码，之后从 sys.modules 缓存获取"
+      - "两个不同模块 import 同一个模块，拿到的是同一个模块对象"
+      - "修改了模块源码后，正在运行的进程下次 import 会自动用新代码"
+      - "模块级的可变全局变量，在同一进程的所有请求之间共享"
+    answer: [0, 1, 3]
+    explain: 模块只执行一次并被缓存，所有导入方共享同一个模块对象，因此模块级全局变量在进程内只有一份，所有请求共享。运行中的进程不会因为源码改了就重新加载模块（开发时 uvicorn --reload 是重启进程实现的），所以第 3 项错误。
+
+  - id: d01-e6
+    kp: d01-k3
+    type: multi
+    question: 关于从环境变量读取配置，下列说法正确的是？
+    options:
+      - "os.getenv 只会返回 str 或 None"
+      - "布尔配置应显式解析，或交给 pydantic-settings 按类型解析"
+      - "int('') 会返回 0，所以空字符串可以当成未配置"
+      - "Windows 上环境变量名不区分大小写"
+    answer: [0, 1, 3]
+    explain: 环境变量在操作系统层面只是字符串，os.getenv 只返回 str 或 None，布尔、整数都需要显式转换；pydantic-settings 会按字段类型解析（Day 04）。int('') 会抛 ValueError 而不是返回 0。Windows 的环境变量名大小写不敏感，Python 的 os.environ 在 Windows 上会统一成大写。
+
+  - id: d01-e7
+    kp: d01-k2
+    type: judge
+    question: 执行 `x = y = []` 之后再执行 `x.append(1)`，此时 y 的值也是 `[1]`。
+    answer: true
+    explain: 链式赋值是把同一个对象绑定到多个名字，x 和 y 指向同一个列表，append 原地修改后通过 y 也能看到。如果需要两个独立的空列表，应分别写 x = [] 和 y = []。
+
+  - id: d01-e8
+    kp: d01-k4
+    type: judge
+    question: uv.lock 只对生成它的操作系统有效，在 Windows 上生成的锁文件不能用于 Linux 的 CI 和 Docker 镜像。
+    answer: false
+    explain: uv.lock 是跨平台的通用锁文件，解析时会考虑不同平台和 Python 版本的依赖差异，Windows 开发机生成的锁文件可以直接在 Linux CI 和镜像里使用。这也是它比 pip freeze 生成的 requirements.txt 更适合团队协作的原因之一。
+
+  - id: d01-e9
+    kp: d01-k4
+    type: case
+    question: |
+      你接手一个知识库后端，仓库里有 pyproject.toml 和 uv.lock。运维在服务器上执行了 `uv sync`，没有报错；systemd 服务配置是 `ExecStart=/usr/bin/python3 /srv/kb/app/main.py`。服务启动后立刻报 `ModuleNotFoundError: No module named 'pydantic_settings'`，而开发机上用 `uv run python -m app.main` 一切正常。运维怀疑是锁文件坏了。最合理的根因和处理是？
+    options:
+      - "锁文件损坏，应删除 uv.lock 后在服务器上重新 uv lock 并 sync"
+      - "systemd 用的是系统 Python，没用 .venv，应改为 uv run 或 .venv 内解释器以 -m 方式启动"
+      - "服务器缺少 pip，应先用系统 pip 全局安装 pydantic-settings"
+      - "Python 版本不一致，应把服务器 Python 升级到最新 3.15"
+    answer: [1]
+    explain: uv sync 把依赖装进了项目的 .venv，但 systemd 直接用 /usr/bin/python3 运行，这个解释器看不到 .venv 里的包，才报 ModuleNotFoundError；直接运行 app/main.py 还会让包内相对导入失败。应改为在项目目录执行 uv run --locked python -m app.main，或用 .venv 内的 python -m app.main。重建锁文件、全局安装、升级 Python 都没有解决「用错解释器」的根因，全局安装还会污染系统环境。
+
+interview:
+  - id: d01-i1
+    kp: d01-k3
+    type: short
+    difficulty: 2
+    question: 你是前端转后端的，说说 Python 和 JavaScript 在类型和真值判断上最大的几个差异，以及你在代码评审里会重点抓哪类 bug？
+    key_points:
+      - {text: "说明 Python 是动态强类型，不做隐式转换，'1' + 1 报 TypeError", dim: concept}
+      - {text: "指出空列表、空字典在 Python 为假、在 JS 为真，没有 undefined 而是 KeyError/NameError", dim: concept}
+      - {text: "指出 x or 默认值 会吞掉合法的 0 和空字符串，Python 没有 ??，要用 is None", dim: principle}
+      - {text: "指出环境变量都是字符串，'false' 为真，应显式解析或用 pydantic-settings", dim: engineering}
+      - {text: "结合项目举例，比如 temperature 或 score_threshold 传 0 被替换成默认值", dim: project}
+    reference: |
+      **结论**：Python 和 JS 都是动态类型，但 Python 是**强类型**，真值规则也不同，最常见的 bug 是「默认值逻辑吞掉合法的假值」和「环境变量字符串被当成布尔」。
+
+      **差异**：
+      1. **不做隐式转换**：`"1" + 1` 在 JS 得到 "11"，Python 直接 TypeError；Python 的 `==` 也不会把 "1" 和 1 当成相等。
+      2. **真值规则**：Python 中空列表、空字典、空集合为假，JS 中为真；Python 没有 undefined，访问不存在的键是 KeyError。
+      3. **没有 `??`**：`x or 默认值` 等价于 JS 的 `x || 默认值`，0、空字符串会被替换；只在 None 时取默认值要写 `默认值 if x is None else x`。
+      4. **None 判断用 `is None`**，不要用 `== None`。
+
+      **评审重点**：
+      - 参数默认值用了 `or`，而 0、空字符串是合法值（temperature、top_k、score_threshold）。
+      - `bool(os.getenv(...))` 读布尔配置。
+      - 用 `if not x` 区分「没传」和「传了空值」。
+
+      **项目例子**：知识库检索接口的 `score_threshold or 0.5` 让运营传的 0 失效，召回一直上不去；改成 Pydantic 字段 `float | None` 加 `is None` 判断，并补了传 0 的测试。
+    oral: |
+      我觉得最大的差异有两个：一是 Python 是强类型，不会像 JS 那样隐式转换，字符串加数字直接报错；二是真值规则不一样，空列表、空字典在 Python 里是假的，而且 Python 没有 ?? 运算符。所以我评审时会重点盯两类 bug：第一是用 or 设默认值，比如 temperature 或 top_k，用户传 0 会被悄悄换成默认值；第二是直接 bool 环境变量，DEBUG=false 也会被当成真。我之前在知识库项目里就遇到过检索阈值传 0 不生效的问题，后来统一改成 Pydantic 字段加 is None 判断，配置交给 pydantic-settings 按类型解析。
+
+  - id: d01-i2
+    kp: d01-k4
+    type: scenario
+    difficulty: 2
+    question: 新同事拉下你的 Python 后端项目后，说「本地跑不起来」：一会儿是 ModuleNotFoundError，一会儿是某个库的函数参数不对。你怎么帮他排查？又怎么从工程上杜绝这类问题？
+    key_points:
+      - {text: "先确认实际运行的解释器（sys.executable），区分全局 Python 和项目 .venv", dim: engineering}
+      - {text: "区分 pyproject 的版本范围和 uv.lock 的精确版本，参数不对多半是装了不同版本", dim: principle}
+      - {text: "统一用 uv sync 按锁文件安装、uv run 运行，.python-version 固定 Python 版本", dim: engineering}
+      - {text: "CI 用 uv sync --locked 校验锁文件，锁文件提交 Git、.venv 不提交", dim: engineering}
+      - {text: "说明 .venv 不可拷贝、一个环境一个包只有一个版本等与 npm 的差异", dim: concept}
+    reference: |
+      **排查（先定位是哪类问题）**：
+      1. **用错解释器**：让他运行 `python -c "import sys; print(sys.executable)"`，如果是全局 Python 而不是项目 `.venv`，ModuleNotFoundError 就解释通了。改用 `uv run python -m app.main` 或在 IDE 里选择 `.venv` 解释器。
+      2. **版本不一致**：「函数参数不对」通常是装了不同大版本。检查他是不是用 `pip install -r requirements.txt` 或 `uv add` 自己装的，对比 `uv tree` 或 `uv pip list` 与 uv.lock 里的版本。
+      3. **Python 版本不对**：查看 `.python-version` 和 `requires-python`，用 `uv python install` 装对应版本。
+
+      **工程上杜绝**：
+      - 依赖范围写在 pyproject.toml，**uv.lock 提交 Git**，所有人用 `uv sync` 按锁文件装。
+      - `.python-version` 固定解释器版本，README 只写两条命令：`uv sync`、`uv run ...`。
+      - CI 用 `uv sync --locked`，锁文件和 pyproject 不一致直接失败；Docker 同样按锁文件安装。
+      - `.venv` 加入 .gitignore，不在机器间拷贝。
+      - 升级依赖必须走 `uv lock --upgrade-package` + 测试 + 代码评审。
+
+      **和 npm 的差异要提醒他**：Python 不会自动向上找 .venv，运行哪个解释器就用哪个环境；一个环境里每个包只能有一个版本。
+    oral: |
+      我会先分清是哪类问题。ModuleNotFoundError 十有八九是用错了解释器，我会让他打印 sys.executable，看是不是全局 Python，然后改用 uv run 或者在 IDE 里选项目的 .venv。函数参数不对一般是版本不一致，我会对比他环境里的版本和 uv.lock 里锁定的版本，通常是他自己 pip 装了最新版。工程上，我们项目是 pyproject 写范围、uv.lock 提交仓库、.python-version 固定 Python 版本，README 里只有 uv sync 和 uv run 两条命令；CI 里用 uv sync --locked，锁文件对不上直接失败，Docker 也按锁文件装。这样新人拉下来两条命令就能跑，环境和线上一致。
+
+  - id: d01-i3
+    kp: d01-k2
+    type: scenario
+    difficulty: 3
+    question: 线上多租户 AI 问答服务出现诡异问题：租户 A 刚把模型温度调成 0，没过多久租户 B 的回答也变得很死板，重启服务后恢复正常，过一阵又出现。你怎么排查和修复？
+    key_points:
+      - {text: "从「重启恢复、一段时间后复现」推断是进程内共享状态被污染，而不是配置中心或模型问题", dim: principle}
+      - {text: "排查模块级可变对象（默认参数 dict、缓存）是否被请求原地修改，赋值不复制对象", dim: principle}
+      - {text: "用日志打印 id() 或在测试里连续模拟两个租户请求来复现", dim: engineering}
+      - {text: "修复：每次构造新对象（解包合并或深拷贝）、默认配置只读化、用 Pydantic 模型 model_copy", dim: engineering}
+      - {text: "补充回归测试和代码规范（禁止修改模块级默认值），并结合项目说明影响范围", dim: project}
+    reference: |
+      **判断方向**：重启恢复、运行一段时间后复现，说明问题在**进程内的共享状态**，而不是数据库配置或模型本身。Python 模块级变量在进程内只有一份，所有请求共享。
+
+      **排查步骤**：
+      1. 搜索模块级的可变对象：`DEFAULT_PARAMS = {...}`、全局缓存 dict、类属性上的 list/dict。
+      2. 找对它们的**原地修改**：`params = DEFAULT_PARAMS` 后 `params[...] = ...`、`.update()`、`.append()`。**赋值不会复制对象**，这样写等于改了全局默认。
+      3. 复现：写一个测试，先模拟租户 A 请求（温度 0），再模拟租户 B 请求，断言 B 的温度仍是默认值；或者在日志里打印 `id(params)`，确认不同请求拿到的是同一个对象。
+      4. 也要检查**浅拷贝**：`dict(DEFAULT)` 只复制外层，嵌套的 list/dict 仍共享（Day 02）。
+
+      **修复**：
+      - 每次请求构造新对象：`{**DEFAULT_PARAMS, **tenant_overrides}`；有嵌套结构时用 `copy.deepcopy` 或 Pydantic 模型的 `model_copy(update=...)`。
+      - 让默认配置只读：`types.MappingProxyType`，或 Python 3.15+ 的 `frozendict`，被误改时直接报错。
+      - 规范：函数不修改传入的参数，返回新对象。
+
+      **收尾**：补「连续两个租户请求互不影响」的回归测试；排查日志评估受影响时间段和租户，必要时通知业务。
+    oral: |
+      我第一反应是进程内共享状态被污染了，因为重启就好、过一阵又出现，这不像配置中心或模型的问题。Python 的模块级变量在进程里只有一份，赋值也不会复制对象，所以我会先搜模块级的默认参数 dict，看有没有 params 等于 DEFAULT 然后直接改的写法。复现的话我会写个测试，先发租户 A 温度 0 的请求，再发租户 B 的请求，断言 B 还是默认温度。我在园区 Agent 项目里就碰到过这个，修复是每次用解包合并出一个新 dict，嵌套的用 deepcopy，默认配置改成只读的 MappingProxyType，被误改直接报错。最后补了回归测试，并在规范里写明函数不准修改传入参数。

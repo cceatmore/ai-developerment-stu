@@ -1,0 +1,624 @@
+day: 12
+phase: 2
+title: Transformer
+goals:
+  - 能画出 Decoder-only Transformer 的数据流：Token 嵌入 → 多层（自注意力 + 前馈网络）→ 输出下一个 Token 的概率
+  - 能用 Q/K/V 的直觉讲清自注意力的计算流程，并解释因果掩码、多头注意力、缩放因子的作用
+  - 能解释为什么需要位置编码
+  - 能用 prefill / decode 两阶段和 KV Cache 解释首字延迟、输出速度、长上下文成本和 Prompt 缓存
+knowledge_points:
+  - id: d12-k1
+    name: Transformer 整体架构与 Decoder-only
+    level: P0
+    summary: 主流 LLM 是 Decoder-only Transformer：嵌入 → N 层「自注意力 + 前馈网络」→ 输出下一个 Token 的概率
+    why: |
+      Transformer 是几乎所有主流大模型的底座。面试中「讲一下 Transformer」是 LLM 岗位的高频题，**不要求推公式，但要求能讲清数据怎么流、每一层干什么**。
+      对应用开发者，它还能解释很多实际现象：为什么上下文越长越贵、为什么 Embedding 模型和生成模型是两类东西、为什么有上下文长度上限。
+    problem: |
+      Transformer 之前的 RNN/LSTM 按顺序逐字处理文本：**无法并行训练**，且句子一长，前面的信息就逐步衰减。
+      Transformer 用注意力机制让每个位置**直接看到**序列中其他位置，训练可以对整段文本并行计算，长距离依赖也更容易建模，这让「在海量数据上训练超大模型」成为可能。
+    principle: |
+      **一、原始 Transformer 与三种变体**
+
+      2017 年论文《Attention Is All You Need》提出的 Transformer 是 **Encoder-Decoder** 结构，用于机器翻译（原文：编码器和解码器各 6 层，8 个注意力头）。后来分化出三类：
+
+      | 变体 | 代表 | 特点 | 典型用途 |
+      |---|---|---|---|
+      | Encoder-only | BERT 系列 | 每个位置能看到全文（双向） | 理解、分类、**Embedding**（Day 14） |
+      | Decoder-only | GPT 系列、LLaMA、Qwen 等主流 LLM | 每个位置只能看到前面（因果） | **生成** |
+      | Encoder-Decoder | T5、原始 Transformer | 编码输入，解码输出 | 翻译、摘要 |
+
+      当前主流对话大模型基本是 **Decoder-only**（闭源模型的具体结构厂商未必公开，这里指公开资料中的主流做法）。
+
+      **二、Decoder-only 的数据流**
+
+      ```mermaid
+      flowchart TD
+        A["输入文本"] --> B["Tokenizer 切成 Token ID"]
+        B --> C["Token 嵌入 每个 ID 变成一个向量"]
+        C --> D["加入位置信息"]
+        D --> E["第 1 层 Transformer Block"]
+        E --> F["第 2 层 ... 第 N 层"]
+        F --> G["取最后一个位置的向量"]
+        G --> H["输出头 映射到整个词表"]
+        H --> I["Softmax 得到下一个 Token 的概率"]
+      ```
+
+      **三、每个 Transformer Block 里有什么**
+
+      每层结构相同，主要两部分，外加两个「稳定训练」的组件：
+
+      1. **多头自注意力（Self-Attention）**：让每个 Token 去「看」其他 Token，汇总上下文信息（d12-k2）。负责**位置之间的信息交流**。
+      2. **前馈网络（FFN / MLP）**：对每个位置的向量单独做非线性变换。可以粗略理解为**存储和加工知识**的地方，参数量占大头。
+      3. **残差连接**：把层的输入直接加到输出上，避免深层网络信息丢失、训练不稳定。
+      4. **层归一化（LayerNorm 等）**：把数值拉回稳定范围。
+
+      一个直观比喻：**注意力负责「开会交流」，FFN 负责「各自回工位思考」**，重复 N 层后，每个位置的向量都融合了上下文语义。
+
+      **四、训练和生成时的区别**
+
+      - **训练时**：整段文本一次输入，每个位置同时预测它的下一个 Token，借助因果掩码保证不偷看后文，因此可以**大规模并行**。
+      - **生成时**：输入部分可以并行处理，但输出必须一个 Token 一个 Token 地生成（Day 11 的自回归），这就是 prefill 和 decode 两阶段（d12-k4）。
+
+      **不理解会怎样**：你会把 Embedding 模型当成「小号的生成模型」、不理解为什么上下文长度有上限和成本、面试时只会说「Transformer 用了注意力」而讲不出数据流，显得只会调 API。
+    scenarios: |
+      - **模型选型**：知道 Embedding 模型多为 Encoder 结构、生成模型为 Decoder-only，不会拿聊天模型硬做向量检索。
+      - **估算成本与延迟**：理解输入并行、输出串行，就能解释为什么「长输入 + 短输出」和「短输入 + 长输出」的延迟特征完全不同。
+      - **与算法团队沟通**：私有化部署时能听懂「层数、隐藏维度、注意力头数、显存占用」这些参数的含义。
+    pitfalls: |
+      - **误区：Transformer 只有注意力。** 每层还有 FFN、残差和归一化，FFN 参数量往往更大。
+      - **误区：所有 Transformer 都是生成模型。** BERT 类 Encoder-only 模型不做自回归生成，主要用于理解和向量表示。
+      - **混淆：训练时并行 ≠ 生成时并行。** 训练和输入处理可以并行，输出生成仍是逐 Token 串行。
+      - **误区：模型「理解」了文本。** 它是在高维向量空间里做大量矩阵运算，所谓理解是统计意义上的表示能力，不要拟人化地推断它的行为。
+    interview_asks:
+      - 讲一下 Transformer 的整体架构，一个 Token 是怎么变成下一个 Token 的概率的？
+      - Transformer 相比 RNN 有什么优势？
+      - Encoder-only、Decoder-only、Encoder-Decoder 有什么区别？各用于什么场景？
+    project_example: |
+      在一个**私有化部署的知识库项目**中，客户机房只有有限的 GPU，团队一开始打算用同一个生成模型既做回答又做向量检索。
+      讲清架构差异后改为：用 Encoder 类的 Embedding 模型做向量化（小、快、可批量），生成模型只负责最后的回答。向量化吞吐提升明显，GPU 资源主要留给生成，整体响应时间达到验收要求。
+  - id: d12-k2
+    name: 自注意力机制：Q/K/V、因果掩码与多头
+    level: P0
+    summary: 每个 Token 用 Query 去匹配所有 Key，按匹配度加权汇总 Value，得到融合上下文的新表示
+    why: |
+      注意力是 Transformer 的核心，也是面试官判断你「是否只会调 API」的关键题。
+      它还直接解释了应用层的很多现象：**为什么上下文越长计算越多**、为什么模型能理解代词指代、为什么长文本中间信息容易被忽略（Day 13）。
+    problem: |
+      同一个词在不同语境下含义不同：「苹果发布了新手机」和「我吃了一个苹果」中的「苹果」需要不同的表示。
+      自注意力让每个 Token 根据上下文**动态地**从其他 Token 那里汇总信息，从而得到「结合语境」的表示，而不是一个固定的词向量。
+    principle: |
+      **一、Q/K/V 的直觉：一次「检索」**
+
+      每个 Token 的向量会被三个不同的矩阵分别变换成三个向量：
+
+      - **Query（Q，查询）**：我想找什么信息？
+      - **Key（K，键）**：我能提供什么信息的「标签」？
+      - **Value（V，值）**：如果你关注我，我给你的实际内容。
+
+      类比：在图书馆里，你带着问题（Q）去对比每本书的标签（K），越匹配的书你越认真读它的内容（V），最后把读到的内容按认真程度加权汇总。
+
+      **二、计算流程（以一个 Token 为例）**
+
+      ```mermaid
+      flowchart LR
+        X["每个 Token 的向量"] --> Q["乘 Wq 得到 Q"]
+        X --> K["乘 Wk 得到 K"]
+        X --> V["乘 Wv 得到 V"]
+        Q --> S["Q 与每个 K 做点积 得到相关度分数"]
+        K --> S
+        S --> D["除以 根号 d_k 缩放"]
+        D --> M["因果掩码 屏蔽后面的位置"]
+        M --> P["Softmax 变成权重 和为 1"]
+        P --> O["按权重加权求和 V"]
+        V --> O
+        O --> R["融合上下文的新向量"]
+      ```
+
+      写成公式就是 `Attention(Q, K, V) = softmax(Q·Kᵀ / √d_k) · V`。面试时能按上面步骤讲出来即可：
+
+      1. **打分**：当前 Token 的 Q 与所有 Token 的 K 做点积，点积越大越相关。
+      2. **缩放**：除以 `√d_k`（d_k 是 K 的维度）。维度大时点积数值会很大，Softmax 会变得极端（几乎只关注一个位置），梯度很小，训练不稳定。
+      3. **掩码**：Decoder-only 模型用**因果掩码**把「后面位置」的分数设为负无穷，保证预测第 i 个位置时只能看到 i 之前的内容，否则训练时等于偷看答案。
+      4. **归一化**：Softmax 把分数变成和为 1 的权重。
+      5. **加权求和**：用权重对所有 V 加权求和，得到该 Token 的新表示。
+
+      例：句子「小明把书给了小红，因为**她**需要」，「她」的 Q 与「小红」的 K 匹配度高，于是「她」的新向量中融入了大量「小红」的信息，完成指代理解。
+
+      **三、多头注意力（Multi-Head）**
+
+      - 把 Q/K/V 切成多组（多个「头」），每个头独立做一次注意力，最后拼接再变换。
+      - 直觉：不同的头可以关注不同类型的关系，例如有的头关注语法搭配，有的关注指代，有的关注相邻词。原论文指出单头注意力的加权平均会抹平这些不同的关系。
+      - 每个头的维度变小，总计算量与单头全维度相近。
+
+      **四、计算量：长度的平方**
+
+      序列有 n 个 Token 时，每个 Token 都要和所有 Token 打分，打分矩阵是 **n × n**。输入长度翻倍，注意力打分的计算量约变为 4 倍。这是长上下文昂贵、需要各种优化的根本原因之一（Day 13）。
+
+      **不理解会怎样**：你会以为上下文窗口「免费」、越长越好；面试中被问到 Q/K/V 只能背公式，答不出为什么要缩放、为什么要掩码。
+    scenarios: |
+      - **理解长上下文成本**：给客户解释为什么一次塞 50 万 Token 的文档又慢又贵，而 RAG 只放相关片段更合适。
+      - **Prompt 设计**：知道模型通过注意力在上下文中「找」相关信息，所以用清晰的标题、分隔符、标签组织 Prompt，能帮助相关内容被关注到（Day 15）。
+      - **面试与技术方案评审**：能用 Q/K/V 讲清模型如何理解指代和上下文，体现原理功底。
+    pitfalls: |
+      - **误区：注意力权重就是模型的「解释」。** 注意力权重可以提供线索，但不能直接等同于模型做决策的原因。
+      - **误区：Q、K、V 是三份不同的输入。** 在自注意力中，它们来自同一组 Token 向量，只是乘了三个不同的可学习矩阵。
+      - **混淆：自注意力与交叉注意力。** 自注意力的 Q/K/V 来自同一序列；Encoder-Decoder 结构中的交叉注意力 Q 来自解码器、K/V 来自编码器。
+      - **遗漏：忘记因果掩码。** 讲生成模型的注意力时不提掩码，说明没有理解训练为什么能并行又不作弊。
+    interview_asks:
+      - 讲一下自注意力机制，Q、K、V 分别是什么？
+      - 为什么注意力分数要除以根号 d_k？
+      - 多头注意力有什么用？
+      - 为什么 Decoder 需要因果掩码？
+    project_example: |
+      在一个**合同比对助手**评审会上，客户质疑「为什么不能把 300 页合同全部塞进去一次比对」。
+      我用注意力的 n × n 计算量解释了长度翻倍、计算约翻四倍的关系，并结合首字延迟实测数据，提出先按条款切分、只把对应条款成对送入模型比对的方案。最终单次请求的输入从十几万 Token 降到几千 Token，响应从分钟级降到十几秒。
+  - id: d12-k3
+    name: 位置编码：让模型知道顺序
+    level: P1
+    summary: 注意力本身不区分顺序，必须额外注入位置信息，「猫追狗」和「狗追猫」才不一样
+    why: |
+      注意力只看「谁和谁相关」，如果不加位置信息，打乱词序后结果几乎不变，模型就分不清「猫追狗」和「狗追猫」。
+      了解位置编码也能帮助你理解：为什么模型有最大上下文长度、为什么超长上下文的效果会下降。
+    problem: |
+      Transformer 抛弃了 RNN 的顺序处理，换来了并行，但也丢掉了「顺序」这个天然信息。
+      位置编码就是把「第几个位置」的信息补回去，让模型能区分词序、理解远近关系。
+    principle: |
+      **一、为什么注意力不懂顺序**
+
+      注意力对每对 Token 计算相关度再加权求和，**交换两个 Token 的位置，计算结果只是跟着交换**，本身不包含「谁在前谁在后」的信息。
+
+      **二、几种做法（理解思路即可）**
+
+      ```mermaid
+      flowchart LR
+        A["Token 嵌入向量"] --> C["加入位置信息"]
+        B["位置编码"] --> C
+        C --> D["进入注意力层"]
+        B1["正弦余弦 固定公式"] -.-> B
+        B2["可学习位置向量"] -.-> B
+        B3["旋转位置编码 RoPE 作用在 Q 和 K 上"] -.-> B
+      ```
+
+      - **正弦/余弦位置编码**（原始论文）：用不同频率的正弦、余弦函数生成每个位置的向量，加到 Token 嵌入上。论文选择它，是因为相对位置可以用线性关系表示。
+      - **可学习位置向量**：每个位置一个向量，训练中学出来。缺点是训练时没见过的位置无法处理。
+      - **相对位置类方法**（如很多开源模型采用的 RoPE 旋转位置编码）：把位置信息以「旋转」的方式作用在 Q 和 K 上，使注意力分数自然反映两个 Token 的**相对距离**。
+
+      **三、和上下文长度的关系**
+
+      - 模型在训练时见过的序列长度有限，超出训练长度后位置信息的分布是模型「没见过的」，效果会变差。
+      - 厂商通过长文本继续训练、位置编码插值等方法扩展上下文窗口，但**能装下不等于用得好**，超长上下文中信息利用效果仍会下降（Day 13 的 lost in the middle、context rot）。
+    scenarios: |
+      - **选择开源模型做私有化部署**：看清模型宣称的上下文长度和实际训练长度，长文档场景要实测效果，而不是只看参数表。
+      - **解释长上下文效果下降**：客户问「窗口是 100 万为什么 50 万时就答不准」，能从位置信息和注意力分散的角度解释。
+    pitfalls: |
+      - **误区：位置编码只是给 Token 编个号。** 它是向量形式的位置信息，需要和语义向量一起参与计算。
+      - **误区：扩展了上下文窗口，长文本效果就和短文本一样好。** 窗口变大只说明能输入，不代表每个位置都能被同样好地利用。
+      - **混淆：位置编码与 Prompt 中的位置。** Prompt 里信息放在开头还是结尾影响效果，是模型在训练中学到的使用偏好，与位置编码有关但不等同。
+    interview_asks:
+      - Transformer 为什么需要位置编码？
+      - 为什么模型的上下文长度有上限？扩展上下文有什么代价？
+    project_example: |
+      在一个**私有化部署的长报告摘要**项目中，所选开源模型宣称支持很长的上下文，但实测输入超过一定长度后，摘要经常遗漏中间章节。
+      我们改为「按章节分段摘要，再合并总结」的两阶段方案，每段长度控制在模型表现稳定的范围内，漏章节的问题基本消失，同时单次请求的显存占用也更可控。
+  - id: d12-k4
+    name: 推理两阶段与 KV Cache：首字延迟、吞吐与成本
+    level: P0
+    summary: Prefill 并行处理全部输入并建 KV Cache，Decode 逐 Token 生成并复用缓存；前者决定首字延迟，后者决定输出速度
+    why: |
+      这是 Transformer 原理和应用工程**连接最紧密**的知识点：首字延迟（TTFT）为什么和输入长度有关、为什么输出速度和输入关系较小、为什么厂商有 Prompt 缓存折扣、为什么私有化部署时显存总不够。
+      面试中能讲清 prefill/decode 和 KV Cache，是区分「会用」和「懂原理」的重要标志。
+    problem: |
+      朴素地做自回归生成，每生成一个新 Token 都要把前面所有 Token 重新算一遍注意力，长度为 n 时总计算量非常大。
+      KV Cache 把已经算过的 K 和 V **缓存下来**，新 Token 只需计算自己的 Q/K/V 并与缓存做注意力，避免大量重复计算。同时，把推理分成 prefill 和 decode 两阶段，也解释了延迟和成本的构成。
+    principle: |
+      **一、为什么可以缓存 K 和 V**
+
+      因果掩码保证了**前面 Token 的 K、V 不会因为后面出现新 Token 而改变**。所以生成第 101 个 Token 时，前 100 个 Token 在每一层的 K、V 都可以直接复用，只需计算新 Token 自己的 Q、K、V。
+
+      **二、两个阶段**
+
+      ```mermaid
+      sequenceDiagram
+        participant C as 客户端
+        participant S as 推理服务
+        participant G as GPU 与 KV Cache
+        C->>S: 发送 Prompt 共 n 个 Token
+        S->>G: Prefill 并行计算全部输入 Token
+        G-->>G: 每层写入 n 个 Token 的 K 和 V
+        G-->>S: 第 1 个输出 Token
+        S-->>C: 首字到达 TTFT
+        loop Decode 每步 1 个 Token
+          S->>G: 只计算新 Token 的 Q K V
+          G-->>G: 与缓存做注意力并追加新的 K V
+          G-->>S: 下一个 Token
+          S-->>C: 流式推送
+        end
+      ```
+
+      | 阶段 | 做什么 | 特点 | 影响的指标 |
+      |---|---|---|---|
+      | **Prefill** | 并行处理全部输入，建立 KV Cache，产出第 1 个 Token | 计算密集，输入越长越慢 | **首字延迟 TTFT** |
+      | **Decode** | 每步生成 1 个 Token，读取整个 KV Cache | 串行，受显存带宽限制 | **每 Token 延迟、输出速度** |
+
+      **三、KV Cache 的代价：显存**
+
+      - 缓存大小约与「层数 × 序列长度 × 注意力头数 × 每头维度 × 2（K 和 V）× 并发请求数」成正比。
+      - 序列越长、并发越多，显存占用越大。私有化部署时，**显存往往先被 KV Cache 而不是模型参数耗尽**，表现为并发上不去。
+      - 业界有多种优化：多个注意力头共享 K/V（MQA、GQA）、分页管理缓存、缓存量化等，应用开发者知道方向即可。
+
+      **四、Prompt 缓存：跨请求复用前缀的 KV**
+
+      - 多个请求如果有**完全相同的前缀**（同一份 System Prompt、同一组工具定义、同一份长文档），服务端可以复用这段前缀的 KV 计算结果，跳过重复的 prefill。
+      - OpenAI 文档明确说明 Prompt 缓存存的是 KV 张量；缓存命中要求**前缀完全一致**，因此应把**稳定内容放前面、变化内容放后面**（Day 15、Day 20）。
+      - 效果：降低首字延迟，并按厂商规则对缓存命中的输入 Token 打折。
+
+      **五、对应用设计的启示**
+
+      - 长 System Prompt + 短问题：首字延迟主要来自 prefill，用 Prompt 缓存和精简上下文优化。
+      - 短输入 + 长输出：耗时主要在 decode，用流式输出改善体验、控制输出长度降成本。
+      - 推理模型的推理 Token 也在 decode 阶段生成，所以「首个可见 Token」会更晚（Day 11）。
+    scenarios: |
+      - **定位慢请求**：通过 TTFT 和总耗时拆分，判断是输入太长（prefill 慢）还是输出太长（decode 慢）。
+      - **Prompt 模板设计**：把固定的角色说明、规则、工具定义放在最前面且保持不变，用户问题和检索结果放后面，提高缓存命中。
+      - **私有化部署容量规划**：根据最大上下文长度和目标并发估算 KV Cache 显存，决定 GPU 数量和每请求最大长度。
+    pitfalls: |
+      - **误区：KV Cache 是缓存「答案」。** 它缓存的是中间计算结果 K 和 V，和业务层的答案缓存（如 Redis）完全不同。
+      - **误区：Prompt 缓存只要内容差不多就能命中。** 必须前缀完全一致，在开头插入时间戳、用户名会让缓存全部失效。
+      - **误区：输入长度不影响成本。** 输入越长，prefill 越慢、KV Cache 越大、输入 Token 费用越高。
+      - **混淆：TTFT 与总耗时。** 流式输出改善的是用户感知，总耗时取决于输出长度。
+    interview_asks:
+      - 什么是 KV Cache？为什么能加速生成？代价是什么？
+      - 推理分为哪两个阶段？首字延迟主要受什么影响？
+      - Prompt 缓存的原理是什么？Prompt 模板应该怎么组织才能提高命中？
+    project_example: |
+      在一个**带长 System Prompt 的客服机器人**中（规则和话术说明约 6000 Token），首字延迟经常超过 3 秒。
+      排查发现模板第一行写入了「当前时间：xx:xx:xx」和用户昵称，导致每个请求前缀都不同，Prompt 缓存从未命中。把时间和用户信息挪到消息末尾、固定规则部分保持不变后，缓存命中率明显上升，首字延迟显著下降，输入 Token 费用也因缓存折扣而降低。
+    freshness: |
+      核对于 2026-11：OpenAI Prompt caching 文档说明缓存存储的是 KV 张量，复用需要渲染后的前缀完全一致，建议稳定指令在前、动态内容在后；GPT-5.6 及之后模型的最小可缓存长度为 1,024 Token，更早模型因请求设置而异；新模型支持显式缓存断点。具体折扣与规则以官方文档为准。
+    sources:
+      - {title: "OpenAI Docs - Prompt caching", url: "https://developers.openai.com/api/docs/guides/prompt-caching"}
+      - {title: "OpenAI Cookbook - Prompt Caching 101", url: "https://developers.openai.com/cookbook/examples/prompt_caching101"}
+quiz:
+  - id: d12-q1
+    kp: d12-k2
+    type: single
+    question: 在自注意力中，关于 Q、K、V 的说法哪项最准确？
+    options:
+      - Q、K、V 分别来自用户问题、知识库和模型回答三份不同的输入
+      - Q、K、V 来自同一组 Token 向量，分别乘以三个不同的可学习矩阵得到
+      - K 和 V 是固定不变的词向量，只有 Q 会随上下文变化
+      - Q 和 K 用来计算输出内容，V 用来计算相关度
+    answer: [1]
+    explain: |
+      自注意力中 Q、K、V 都由同一序列的 Token 向量分别乘 Wq、Wk、Wv 得到。Q 与 K 的点积用来计算相关度，再用权重对 V 加权求和得到输出。
+      A 把 RAG 的概念和注意力混在一起；C 错，K、V 也是由当前层的输入计算出来的；D 把 K 和 V 的职责弄反了。
+  - id: d12-q2
+    kp: d12-k2
+    type: judge
+    question: Decoder-only 模型在训练时，为了更好地理解句子，每个位置的 Token 都可以注意到它后面的所有 Token。
+    answer: false
+    explain: |
+      Decoder-only 模型使用因果掩码，每个位置只能注意到自己和之前的 Token。训练目标是预测下一个 Token，如果能看到后面的内容就等于偷看答案，训练出来的模型在真正生成时（后面还没有内容）会失效。
+      能看到双向上下文的是 BERT 这类 Encoder-only 模型。
+  - id: d12-q3
+    kp: d12-k4
+    type: multi
+    question: 关于 KV Cache 和推理两阶段，以下哪些说法正确？
+    options:
+      - Prefill 阶段并行处理全部输入 Token，输入越长首字延迟通常越高
+      - Decode 阶段每步只计算新 Token 的 Q、K、V，并与缓存中的 K、V 做注意力
+      - KV Cache 缓存的是模型生成过的完整答案，相同问题可以直接返回
+      - 并发请求多、上下文长时，KV Cache 会占用大量显存，限制并发能力
+      - 在 Prompt 开头加入每次都不同的时间戳，不会影响厂商的 Prompt 缓存命中
+    answer: [0, 1, 3]
+    explain: |
+      A、B、D 正确。C 错：KV Cache 缓存的是中间计算结果 K 和 V，不是业务答案，业务答案缓存是 Redis 这类应用层缓存。
+      E 错：Prompt 缓存要求前缀完全一致，开头插入变化的时间戳会让整个前缀都不同，缓存无法命中，应把动态内容放在后面。
+  - id: d12-q4
+    kp: d12-k1
+    type: short
+    question: 为什么 Transformer 能取代 RNN 成为大模型的主流架构？请从训练效率和长距离依赖两方面说明。
+    key_points:
+      - {text: "指出 RNN 必须按顺序逐个处理 Token，无法在序列维度并行训练", dim: principle}
+      - {text: "指出 Transformer 借助注意力和因果掩码可以对整段序列并行计算", dim: principle}
+      - {text: "指出 RNN 的远距离信息需要逐步传递容易衰减，注意力让任意两个位置直接交互", dim: principle}
+      - {text: "指出并行训练使在海量数据上训练超大模型成为可能", dim: concept}
+    reference: |
+      **训练效率**：RNN 要按顺序处理，第 t 步必须等第 t-1 步算完，序列维度无法并行，在大规模数据上训练非常慢。Transformer 用注意力让每个位置直接与其他位置交互，配合因果掩码，一段文本中所有位置的预测可以同时计算，能充分利用 GPU 并行能力。
+      **长距离依赖**：RNN 中远处的信息需要一步步传递，路径越长越容易衰减；Transformer 中任意两个位置通过注意力一步直接交互，更容易建模长距离关系。
+      正是并行训练的能力，让在万亿级 Token 上训练超大模型变得可行，这是大模型时代的基础。代价是注意力的计算量随长度平方增长。
+  - id: d12-q5
+    kp: d12-k4
+    type: scenario
+    question: |
+      某企业知识问答服务的每个请求结构是：约 8000 Token 的固定规则说明 + 约 3000 Token 的检索片段 + 用户问题，回答通常只有 200 Token。
+      监控显示首字延迟（TTFT）平均 4 秒，而首字之后的输出很快。模板开头还有一行「当前时间：2026-11-12 16:50:03，用户：张三」。
+      请分析慢在哪里，并给出优化方案。
+    key_points:
+      - {text: "判断瓶颈在 prefill 阶段：输入约 1.1 万 Token 需要先全部处理才能产出首字", dim: principle}
+      - {text: "指出开头的动态时间和用户名使每个请求前缀都不同，Prompt 缓存无法命中", dim: principle}
+      - {text: "提出固定规则放在最前且保持不变，动态信息移到末尾以提高缓存命中", dim: engineering}
+      - {text: "提出精简规则和检索片段数量以减少输入 Token", dim: engineering}
+      - {text: "提出用 TTFT、cached tokens 等指标验证优化效果", dim: project}
+    reference: |
+      **分析**：输出只有 200 Token 且首字后很快，说明 decode 不是瓶颈；首字延迟高说明慢在 **prefill**——约 1.1 万 Token 的输入必须全部处理完才能生成第一个 Token。
+      本来 8000 Token 的固定规则可以通过厂商的 Prompt 缓存复用前缀的 KV，跳过大部分 prefill；但模板第一行就是每次都不同的时间和用户名，**前缀从第一行起就不一致**，缓存永远无法命中。
+      **优化**：
+      1. 调整模板顺序：固定规则（以及工具定义等稳定内容）放在最前面并保持逐字不变；时间、用户信息、检索片段、问题放在后面。
+      2. 精简输入：清理规则中的冗余内容；检索片段做 Rerank 后只保留最相关的若干条（Day 27）。
+      3. 体验上配合流式输出。
+      4. **验证**：对比优化前后的 TTFT 分布，并查看响应 usage 中缓存命中的 Token 数（如 cached_tokens）确认缓存生效。
+    followup:
+      question: 如果规则说明每周都会更新一次，会对缓存产生什么影响？
+      key_points:
+        - "更新后前缀变化，首批请求缓存未命中，之后重新建立"
+        - "每周一次影响很小，但不要把频繁变化的内容放进固定前缀"
+      reference: 规则更新后前缀改变，旧缓存失效，新请求会重新写入缓存，之后恢复命中。每周一次的变化影响很小；真正要避免的是每个请求都变化的内容出现在前缀里。
+  - id: d12-q6
+    kp: d12-k3
+    type: short
+    question: 「猫追狗」和「狗追猫」包含完全相同的 Token。请解释如果 Transformer 没有位置编码会出现什么问题，以及位置编码是如何解决的。
+    key_points:
+      - {text: "指出注意力只计算 Token 之间的相关度并加权求和，本身不包含顺序信息", dim: principle}
+      - {text: "指出没有位置信息时两句话对模型几乎等价，无法区分主语和宾语", dim: concept}
+      - {text: "说明位置编码把位置信息加入 Token 向量或作用于 Q 和 K，使相同 Token 在不同位置有不同表示", dim: principle}
+    reference: |
+      注意力对每对 Token 计算相关度再加权求和，交换 Token 的位置，计算结果只是跟着交换，**本身并不知道谁在前谁在后**。所以没有位置编码时，「猫追狗」和「狗追猫」对模型来说几乎是同一组信息，它无法判断谁是追的一方。
+      位置编码把「第几个位置」的信息注入进来：原始论文用不同频率的正弦、余弦向量加到 Token 嵌入上；很多开源模型使用旋转位置编码（RoPE），把位置以旋转方式作用在 Q 和 K 上，让注意力分数反映相对距离。这样同一个「猫」出现在句首和句尾时表示不同，模型就能区分语序。
+  - id: d12-q7
+    kp: d12-k1
+    type: single
+    question: 团队要搭建知识库检索，需要把文档片段转成向量；同时需要一个模型根据检索结果生成回答。下列架构搭配最合理的是？
+    options:
+      - 向量化和生成都使用同一个 Decoder-only 对话模型，减少模型数量
+      - 向量化使用专门的 Embedding 模型（常见为 Encoder 类结构），生成使用 Decoder-only 大模型
+      - 向量化使用 Decoder-only 大模型，生成使用 BERT 这类 Encoder-only 模型
+      - 两者都使用 Encoder-Decoder 翻译模型
+    answer: [1]
+    explain: |
+      Embedding 模型专门训练为输出能衡量语义相似度的向量，常见为双向的 Encoder 类结构，体积小、速度快、适合批量处理；生成回答需要自回归能力，应使用 Decoder-only 大模型。
+      A 用对话模型做向量化既贵又没有针对相似度训练；C 把两者职责颠倒，Encoder-only 模型不做自回归生成；D 的翻译模型不适合这两类任务。
+code_reading:
+  id: d12-c1
+  kp: [d12-k2, d12-k4]
+  title: 带 KV Cache 的单头注意力（教学实现）
+  scenario: 团队在做私有化推理服务的技术预研，算法同事用 numpy 写了一个单头自注意力的教学实现，用来向后端同事演示 prefill 和 decode 的区别。你要读懂它并指出其中的问题。
+  language: python
+  code: |
+    import logging
+
+    import numpy as np
+
+    logger = logging.getLogger(__name__)
+
+
+    def softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
+        x = x - x.max(axis=axis, keepdims=True)
+        e = np.exp(x)
+        return e / e.sum(axis=axis, keepdims=True)
+
+
+    class SingleHeadAttention:
+        """单头因果自注意力，支持 prefill 与带 KV Cache 的 decode。"""
+
+        def __init__(self, d_model: int, d_head: int, max_len: int, seed: int = 0) -> None:
+            rng = np.random.default_rng(seed)
+            self.w_q = rng.normal(0, 0.02, (d_model, d_head))
+            self.w_k = rng.normal(0, 0.02, (d_model, d_head))
+            self.w_v = rng.normal(0, 0.02, (d_model, d_head))
+            self.d_head = d_head
+            self.max_len = max_len
+            self.k_cache: np.ndarray | None = None
+            self.v_cache: np.ndarray | None = None
+
+        def prefill(self, x: np.ndarray) -> np.ndarray:
+            """x 形状为 (seq_len, d_model)：并行处理整段输入并写入缓存。"""
+            q, k, v = x @ self.w_q, x @ self.w_k, x @ self.w_v
+            scores = q @ k.T / np.sqrt(self.d_head)
+            seq_len = x.shape[0]
+            mask = np.triu(np.ones((seq_len, seq_len), dtype=bool), k=1)
+            scores = np.where(mask, -1e9, scores)
+            self.k_cache, self.v_cache = k, v
+            return softmax(scores) @ v
+
+        def decode_step(self, x_new: np.ndarray) -> np.ndarray:
+            """x_new 形状为 (1, d_model)：只算新 Token 的 q/k/v，复用缓存。"""
+            q = x_new @ self.w_q
+            k = x_new @ self.w_k
+            v = x_new @ self.w_v
+            self.k_cache = np.vstack([self.k_cache, k])
+            self.v_cache = np.vstack([self.v_cache, v])
+            scores = q @ self.k_cache.T
+            logger.debug("cache_len=%d", self.k_cache.shape[0])
+            return softmax(scores) @ self.v_cache
+  walkthrough:
+    function: |
+      实现一个单头、带因果掩码的自注意力层，并演示推理的两个阶段：`prefill` 一次性处理整段输入并建立 KV Cache；`decode_step` 每次只处理一个新 Token，复用缓存中的 K、V。
+    key_functions: |
+      - `softmax`：先减去最大值防止指数溢出，再归一化成和为 1 的权重。
+      - `__init__`：随机初始化 Wq、Wk、Wv 三个投影矩阵，准备空的 K、V 缓存。
+      - `prefill`：计算全部 Token 的 Q/K/V、缩放点积分数、上三角因果掩码、Softmax 加权 V，并把 K、V 存入缓存。
+      - `decode_step`：计算新 Token 的 Q/K/V，把 K、V 追加到缓存，用新 Token 的 Q 对全部缓存做注意力。
+    params: |
+      - `x` 是 `(seq_len, d_model)` 的输入向量矩阵（真实模型中来自 Token 嵌入加位置信息）。
+      - `x_new` 是 `(1, d_model)`，代表刚生成的那个 Token。
+      - `d_head` 决定 Q/K/V 的维度，也决定缩放因子 `√d_head`；`max_len` 本意是限制缓存的最大长度。
+    data_flow: |
+      ```mermaid
+      flowchart TD
+        A["prefill 输入 x 共 n 个 Token"] --> B["计算 Q K V"]
+        B --> C["分数 Q 乘 K 转置 除以 根号 d_head"]
+        C --> D["上三角掩码 屏蔽未来位置"]
+        D --> E["Softmax 后乘 V 输出 n 行"]
+        B --> F[("K Cache 与 V Cache 共 n 行")]
+        G["decode 输入 x_new 1 个 Token"] --> H["计算新 Token 的 q k v"]
+        H --> I["k v 追加进缓存 变为 n 加 1 行"]
+        F --> I
+        I --> J["q 乘 缓存 K 转置 得到分数"]
+        J --> K["Softmax 后乘缓存 V 输出 1 行"]
+      ```
+    failure_points: |
+      - **decode 少了缩放**：`decode_step` 的分数没有除以 `√d_head`，与 prefill 不一致，Softmax 分布更尖锐，同一位置在两种路径下结果不同。
+      - **max_len 从未生效**：缓存无限增长，真实服务中会导致显存耗尽。
+      - **未 prefill 就 decode**：`k_cache` 为 None，`np.vstack` 会报错，且错误信息不直观。
+      - **缓存挂在实例上**：如果服务把同一个实例给多个请求共用，不同请求的 K、V 会混在同一个缓存里，产生「串话」。
+      - 掩码使用 `-1e9` 而不是负无穷，在半精度计算下可能有数值问题（教学代码可接受，生产需注意）。
+    debugging: |
+      - **一致性测试**：对同一段输入，分别用「一次 prefill 全部 Token」和「prefill 前 n-1 个 + decode 最后 1 个」计算，比较最后一行输出是否相同（`np.allclose`），差异会直接暴露缺少缩放的问题。
+      - 打开 DEBUG 日志观察 `cache_len` 是否超过 `max_len`。
+      - 在 `decode_step` 入口断言 `self.k_cache is not None`，复现未 prefill 就调用的情况。
+    change_request: |
+      如果需求改为「支持多个请求并发生成」：把 KV Cache 从实例属性中拆出来，按请求 ID 单独保存（或作为参数传入、返回），并在每次追加前检查长度是否超过 `max_len`，超出时拒绝或按策略截断；同时补上 decode 的缩放因子并加入一致性单测。
+  questions:
+    - id: d12-c1-q1
+      kp: d12-k2
+      type: code
+      question: 按执行顺序说明 `prefill` 对一个 4 个 Token 的输入做了什么，并解释 `np.triu(..., k=1)` 生成的掩码长什么样、为什么要用它。
+      key_points:
+        - {text: "按顺序说出：计算 Q K V、点积打分并除以根号 d_head、掩码、Softmax、加权求和 V、写入缓存", dim: concept}
+        - {text: "说明 4 乘 4 掩码中对角线以上为 True，即每行只保留自己和之前的位置", dim: principle}
+        - {text: "解释因果掩码保证第 i 个位置不能看到后面的 Token，防止训练偷看答案并与生成时一致", dim: principle}
+      reference: |
+        执行顺序：1）输入 `x` 为 4×d_model，分别乘 Wq、Wk、Wv 得到 4×d_head 的 Q、K、V；2）`q @ k.T` 得到 4×4 的分数矩阵，第 i 行第 j 列表示第 i 个 Token 对第 j 个 Token 的相关度，再除以 `√d_head` 缩放；3）用掩码把不允许看的位置设为 -1e9；4）按行 Softmax 得到权重；5）权重乘 V，得到 4 行融合上下文的新向量；6）把 K、V 存入缓存，供后续 decode 使用。
+        `np.triu(np.ones((4,4)), k=1)` 生成**对角线以上为 True** 的矩阵：第 0 行只能看位置 0，第 1 行能看 0~1，……，第 3 行能看 0~3。被屏蔽位置的分数变成极小值，Softmax 后权重接近 0。
+        这就是因果掩码：保证每个位置只能利用之前的信息。训练时防止偷看下一个 Token（否则预测任务失去意义），也让训练时的计算方式与生成时（后面确实还没有内容）保持一致。
+    - id: d12-c1-q2
+      kp: d12-k4
+      type: code
+      question: 有人写了一个一致性测试：对同一段 5 个 Token 的输入，方案 A 直接 prefill 全部 5 个；方案 B 先 prefill 前 4 个，再 decode_step 第 5 个。结果两种方案第 5 个位置的输出不一致。请找出原因，并解释为什么 decode 阶段不需要掩码。
+      key_points:
+        - {text: "指出 decode_step 的分数没有除以根号 d_head，而 prefill 有缩放", dim: engineering}
+        - {text: "说明缺少缩放会让 Softmax 分布更尖锐，导致权重和输出不同", dim: principle}
+        - {text: "解释 decode 时新 Token 是序列最后一个，缓存里只有它之前和它自己的 K V，天然不存在未来位置", dim: principle}
+        - {text: "提出修复后用 np.allclose 做回归测试保证两条路径一致", dim: engineering}
+      reference: |
+        **原因**：`prefill` 计算分数时做了 `/ np.sqrt(self.d_head)`，而 `decode_step` 写成了 `scores = q @ self.k_cache.T`，**漏掉了缩放**。没有缩放时分数整体放大，Softmax 后的分布更尖锐，权重集中在少数位置，因此第 5 个位置的输出与 prefill 路径不同。在真实模型里，这种不一致会让「同一段输入」在不同推理路径下得到不同结果，非常难排查。
+        **为什么 decode 不需要掩码**：decode 时新 Token 就是序列的最后一个，缓存里只有它之前的 Token 和它自己的 K、V，不存在「未来位置」，所以对全部缓存做注意力本身就满足因果约束。
+        **修复**：在 `decode_step` 中同样除以 `√d_head`，并把这个对比测试（`np.allclose(A[-1], B)`）加入单元测试，作为回归保护。
+    - id: d12-c1-q3
+      kp: d12-k4
+      type: code
+      question: 如果把这个类直接用于一个多用户在线服务（全局只创建一个实例，所有请求共用），会出现哪些问题？结合 KV Cache 的显存特性说明应该如何改。
+      key_points:
+        - {text: "指出 KV Cache 挂在实例属性上，多个请求共用会把不同会话的 K V 混在一起导致串话", dim: engineering}
+        - {text: "指出 max_len 没有被检查，缓存无限增长会耗尽内存或显存", dim: engineering}
+        - {text: "说明 KV Cache 大小与序列长度和并发数成正比，需要做容量规划和长度限制", dim: principle}
+        - {text: "提出按请求隔离缓存、请求结束释放、超长时拒绝或截断", dim: engineering}
+      reference: |
+        **问题一：串话。** `k_cache`、`v_cache` 是实例属性，所有请求共用一个实例时，用户 A 的 prefill 会写入缓存，用户 B 的 decode 会把自己的 K、V 追加到 A 的缓存后面，B 的注意力会「看到」A 的上下文，输出被污染，甚至泄露 A 的内容，这是严重的数据安全问题。
+        **问题二：无限增长。** `max_len` 只是被保存，从未检查。长对话或异常请求会让缓存不断增长，最终耗尽内存（真实服务中是显存）。
+        **原理**：KV Cache 大小约与层数 × 序列长度 × 头数 × 每头维度 × 2 × 并发数成正比，长上下文、高并发时它往往比模型参数更先耗尽显存。
+        **改法**：缓存按请求（或会话）隔离，例如以请求 ID 为键单独管理，或在函数间显式传入、返回缓存；追加前检查长度，超过 `max_len` 时拒绝或按策略截断；请求结束后释放缓存；服务层根据显存估算设置最大并发和最大上下文长度。
+interview:
+  - id: d12-i1
+    kp: d12-k1
+    type: oral
+    difficulty: 1
+    question: 请讲一下 Transformer 的整体架构。以 GPT 类模型为例，一段输入是怎么变成下一个 Token 的概率的？
+    key_points:
+      - {text: "说明主流 LLM 是 Decoder-only，并提到原始 Transformer 是 Encoder-Decoder", dim: concept}
+      - {text: "讲清数据流：Tokenizer、嵌入、位置信息、N 层 Block、输出头、Softmax", dim: principle}
+      - {text: "说明每个 Block 包含多头自注意力和前馈网络，以及残差和归一化", dim: principle}
+      - {text: "结合工程说明架构知识的用处，例如区分 Embedding 模型与生成模型、理解长度成本", dim: project}
+    reference: |
+      原始 Transformer 是用于翻译的 Encoder-Decoder 结构，当前主流对话大模型基本是 Decoder-only。
+      数据流是：文本经过 Tokenizer 切成 Token ID；每个 ID 查表变成向量（Token 嵌入），并加入位置信息；然后经过 N 层结构相同的 Transformer Block；最后取最后一个位置的向量，经输出头映射到整个词表，Softmax 得到下一个 Token 的概率分布。
+      每个 Block 有两大部分：多头自注意力负责让每个 Token 汇总其他 Token 的信息（位置之间交流）；前馈网络对每个位置单独做非线性变换（加工和存储知识）。外加残差连接和层归一化保证深层网络训练稳定。生成模型的注意力带因果掩码，只能看前文。
+      这些知识在工程上很有用：比如知道 Embedding 模型多为 Encoder 结构，不会拿对话模型做向量化；知道注意力随长度平方增长，就会控制上下文长度。
+    oral: |
+      我以 GPT 这类 Decoder-only 模型来讲。输入先被 Tokenizer 切成 Token，每个 Token 变成一个向量并加上位置信息，然后经过几十层结构相同的 Transformer Block。每层里先做多头自注意力，让每个 Token 结合上下文，再过一个前馈网络做加工，中间有残差和归一化保证稳定。最后取最后一个位置的向量映射到词表，Softmax 得到下一个 Token 的概率。
+      这个架构知识我在项目里用过：私有化知识库项目里，团队想用同一个生成模型做向量化，我建议换成专门的 Encoder 类 Embedding 模型，GPU 留给生成，整体响应时间就达标了。
+  - id: d12-i2
+    kp: d12-k2
+    type: oral
+    difficulty: 2
+    question: 讲一下自注意力机制的计算流程。Q、K、V 分别是什么？为什么要除以根号 d_k？多头有什么用？
+    key_points:
+      - {text: "用检索直觉解释 Q 查询、K 标签、V 内容，三者由同一输入乘不同矩阵得到", dim: concept}
+      - {text: "按顺序讲出点积打分、缩放、掩码、Softmax、加权求和 V", dim: principle}
+      - {text: "解释缩放是为了防止点积过大导致 Softmax 过于极端、梯度变小", dim: principle}
+      - {text: "解释多头让模型在不同子空间关注不同类型的关系", dim: principle}
+      - {text: "指出注意力计算量随序列长度平方增长，并联系到长上下文成本", dim: engineering}
+    reference: |
+      自注意力让每个 Token 根据上下文动态汇总信息。每个 Token 的向量分别乘 Wq、Wk、Wv 三个矩阵得到 Q、K、V：Q 表示「我要找什么」，K 表示「我能提供什么的标签」，V 是「被关注时提供的内容」。
+      计算流程：1）用当前 Token 的 Q 与所有 Token 的 K 做点积得到相关度分数；2）除以 √d_k 缩放；3）生成模型中用因果掩码屏蔽后面的位置；4）Softmax 变成和为 1 的权重；5）对所有 V 加权求和，得到融合上下文的新表示。公式为 softmax(QKᵀ/√d_k)V。
+      缩放的原因：维度越高，点积的数值越大，Softmax 会趋向只关注一个位置，梯度变得很小，训练不稳定。
+      多头：把 Q/K/V 切成多组并行做注意力再拼接，不同头可以关注不同类型的关系（语法、指代、相邻词等），避免单头加权平均把这些关系抹平。
+      工程影响：每个 Token 要和所有 Token 打分，计算量随长度平方增长，所以长上下文又慢又贵。
+    oral: |
+      我用检索来类比：每个 Token 生成一个 Query 表示它想找什么，一个 Key 表示它的标签，一个 Value 表示它的内容，三者都是同一个输入乘不同矩阵得来的。
+      计算时用 Query 和所有 Key 做点积打分，除以根号 d_k 防止数值太大让 Softmax 太极端，生成模型还要加因果掩码只看前文，然后 Softmax 成权重去加权求和 Value。比如「她」这个字会把大部分注意力放在前面的「小红」上，从而理解指代。
+      多头就是并行做多组这样的注意力，让不同的头关注不同关系。工程上我最关心的是它的计算量随长度平方增长，这是我在合同比对项目里坚持先切条款再比对的原因。
+  - id: d12-i3
+    kp: d12-k4
+    type: oral
+    difficulty: 3
+    question: 什么是 KV Cache？推理的 prefill 和 decode 两个阶段分别做什么？这对首字延迟、吞吐和成本有什么影响？
+    key_points:
+      - {text: "说明因果掩码使历史 Token 的 K V 不变，因此可以缓存复用", dim: principle}
+      - {text: "说明 prefill 并行处理全部输入并建立缓存，决定首字延迟", dim: principle}
+      - {text: "说明 decode 每步只算新 Token，串行生成，受显存带宽限制，决定输出速度", dim: principle}
+      - {text: "指出 KV Cache 占用显存且与长度和并发成正比，限制并发", dim: engineering}
+      - {text: "结合 Prompt 缓存说明稳定前缀在前、动态内容在后的模板设计", dim: project}
+    reference: |
+      生成模型有因果掩码，前面 Token 的 K、V 不会因为后面的新 Token 而改变，所以可以缓存。KV Cache 就是把每层历史 Token 的 K、V 保存下来，生成新 Token 时只算它自己的 Q/K/V 并与缓存做注意力，避免每步都重算整个序列。
+      **Prefill**：并行处理全部输入 Token，在每层建立 KV Cache，并产出第一个 Token。计算密集，输入越长越慢，决定**首字延迟 TTFT**。
+      **Decode**：每步生成一个 Token，需要读取整个 KV Cache，串行进行，主要受显存带宽限制，决定**每 Token 延迟和输出速度**。
+      **影响**：KV Cache 大小与层数、序列长度、头数、每头维度和并发数成正比，长上下文和高并发时会先耗尽显存，限制吞吐。厂商的 Prompt 缓存就是跨请求复用相同前缀的 KV 结果，命中后可跳过这部分 prefill，降低延迟并获得输入费用折扣，前提是前缀完全一致。
+      工程上：长输入短输出的场景优化 prefill（精简上下文、利用 Prompt 缓存）；短输入长输出的场景优化 decode 体验（流式输出、控制长度）。
+    oral: |
+      KV Cache 的前提是因果掩码：前面 Token 的 K 和 V 不会被后面的 Token 改变，所以可以存起来复用，新 Token 只需要算自己的那一份。
+      推理分两段。Prefill 并行处理整个输入、建好缓存、吐出第一个字，所以输入越长首字越慢；Decode 每次只生成一个 Token，读整个缓存，决定后面的输出速度。代价是缓存很吃显存，长上下文加高并发时它比模型参数先把显存吃满。
+      我在客服机器人项目里用过这个原理：模板第一行写了当前时间和用户昵称，导致 Prompt 缓存从不命中，首字经常超过 3 秒。把动态信息挪到末尾后，缓存开始命中，首字延迟和输入费用都降下来了。
+  - id: d12-i4
+    kp: d12-k3
+    type: oral
+    difficulty: 3
+    question: Transformer 为什么需要位置编码？现在模型的上下文窗口越来越大，是不是意味着长文本问题已经解决了？
+    key_points:
+      - {text: "说明注意力本身对顺序不敏感，需要位置编码区分语序", dim: principle}
+      - {text: "列举位置编码思路：正弦余弦、可学习位置向量、RoPE 等相对位置方法", dim: concept}
+      - {text: "指出超出训练长度或超长上下文时效果下降，能装下不等于用得好", dim: principle}
+      - {text: "给出工程应对：RAG 精选内容、分段处理再汇总、关键信息放在开头或结尾、实测评估", dim: engineering}
+    reference: |
+      注意力对每对 Token 计算相关度再加权求和，交换位置结果只是跟着交换，本身不包含顺序信息，所以需要位置编码区分「猫追狗」和「狗追猫」。
+      常见做法：原始论文用不同频率的正弦、余弦向量加到嵌入上；也有可学习的位置向量；很多开源模型使用 RoPE 这类旋转位置编码，把相对位置信息作用在 Q、K 上。
+      上下文窗口变大说明模型能接收更长输入，但不代表问题解决了：一方面，长上下文的计算量和显存成本仍然很高；另一方面，研究和厂商文档都指出，随着上下文增长，模型对信息的利用会下降，中间位置的信息容易被忽略（lost in the middle、context rot）。
+      所以工程上仍要：用 RAG 只放相关内容；长文档分段处理再汇总；把关键指令和问题放在合适位置；对长文本场景用真实数据实测，而不是只看参数表。
+    oral: |
+      注意力本身不区分顺序，没有位置编码的话「猫追狗」和「狗追猫」对模型差不多，所以要注入位置信息，原论文用正弦余弦，现在很多开源模型用 RoPE 这种旋转位置编码。
+      至于窗口变大，我的看法是「能装下不等于用得好」。长上下文成本高，而且信息越多，中间部分越容易被忽略。我做长报告摘要时就遇到过，模型宣称支持很长的上下文，但超过一定长度后经常漏掉中间章节。后来改成按章节分段摘要再合并，问题就解决了。所以我会坚持用 RAG 精选内容加实测评估。
+  - id: d12-i5
+    kp: d12-k4
+    type: design
+    difficulty: 4
+    question: 公司要私有化部署一个开源大模型，用于「上传长文档后多轮问答」。上线后发现：首字延迟高、并发一多就排队甚至显存溢出。请从 Transformer 推理原理出发分析原因，并给出应用层和部署层的优化方案。
+    key_points:
+      - {text: "分析首字延迟高来自长文档导致的 prefill 计算量大，多轮对话每轮重复处理同一文档", dim: principle}
+      - {text: "分析并发受限来自 KV Cache 显存占用随上下文长度和并发数增长", dim: principle}
+      - {text: "应用层：RAG 只送相关片段、控制历史轮数、稳定前缀以复用前缀缓存、流式输出", dim: engineering}
+      - {text: "部署层：设置最大上下文和最大并发、使用支持分页 KV 管理和前缀缓存的推理框架、按显存做容量规划", dim: engineering}
+      - {text: "给出验证指标：TTFT、每 Token 延迟、吞吐、显存占用、排队时长", dim: project}
+    reference: |
+      **原因分析**：
+      1. **首字延迟高**：每轮问答都把整份长文档加历史对话送入模型，prefill 要处理大量 Token，而且注意力计算量随长度快速增长；多轮对话中同一份文档被反复 prefill。
+      2. **并发低、显存溢出**：每个请求的 KV Cache 大小与上下文长度成正比，长文档请求单个就占用大量显存，并发数一高，KV Cache 总量超过显存，只能排队或 OOM。
+      **应用层优化**：
+      - 文档入库做切片和向量检索，每轮只送相关片段（RAG），输入从几十万 Token 降到几千；
+      - 控制对话历史轮数，较早的历史做摘要；
+      - Prompt 结构保持「固定说明 + 文档内容」在前、新问题在后，让推理框架的前缀缓存在多轮间复用；
+      - 流式输出改善感知延迟。
+      **部署层优化**：
+      - 选用支持分页管理 KV Cache、前缀缓存、连续批处理的推理框架（具体框架与参数以其官方文档为准）；
+      - 根据显存估算设置每请求最大上下文长度和最大并发，超限时排队或拒绝并给出友好提示；
+      - 必要时选择使用 GQA 等节省 KV 的模型，或增加 GPU。
+      **验证**：用压测对比 TTFT、每 Token 延迟、吞吐、显存峰值和排队时长，确认优化有效。
+    oral: |
+      我会先从推理两阶段拆。首字慢是 prefill 的问题：每轮都把整份长文档重新送进去，输入几十万 Token，还被反复处理。并发上不去是 KV Cache 的问题：缓存大小和上下文长度、并发数成正比，长文档请求一多显存就爆了。
+      应用层我会做三件事：RAG 只送相关片段，把输入压到几千 Token；历史对话做摘要控制轮数；Prompt 保持稳定前缀在前，让框架的前缀缓存在多轮间复用。部署层选支持分页 KV 和前缀缓存的推理框架，按显存算好每请求最大长度和最大并发，超了就排队提示。
+      最后用压测看 TTFT、吞吐和显存峰值验证。我之前的合同比对项目也是靠缩短输入把响应从分钟级降到十几秒的。
+sources:
+  - {title: "Attention Is All You Need（arXiv 1706.03762）", url: "https://arxiv.org/abs/1706.03762"}
+  - {title: "The Annotated Transformer（Harvard NLP）", url: "https://nlp.seas.harvard.edu/annotated-transformer/"}
+  - {title: "OpenAI Docs - Prompt caching", url: "https://developers.openai.com/api/docs/guides/prompt-caching"}

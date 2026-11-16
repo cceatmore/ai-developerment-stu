@@ -1,0 +1,792 @@
+day: 41
+phase: 5
+title: Redis：缓存、会话、过期机制与常见应用
+goals:
+  - "能根据访问模式为缓存、会话、计数、排行等需求选出合适的 Redis 数据结构，并说明理由"
+  - "能解释缓存穿透、击穿、雪崩的成因与对应方案，并能分析 Cache-Aside 下的一致性问题"
+  - "能说清 Redis 的过期删除与内存淘汰机制，避免「设了 TTL 就安全」的误解"
+  - "能设计 LLM 应用中的响应缓存、语义缓存、会话历史存储与限流/分布式锁方案"
+knowledge_points:
+  - id: d41-k1
+    name: Redis 的定位与数据结构选型
+    level: P0
+    summary: Redis 是内存里的「数据结构服务器」，选对结构比会用命令更重要
+    why: |
+      生产级 AI 应用几乎都离不开 Redis：缓存 LLM 回答、存会话、做限流计数、当任务队列的 broker、做分布式锁。
+      面试里「Redis 为什么快」「你用了哪些数据结构」是必问题。**只会 GET/SET 的人，往往把所有东西都序列化成一个大字符串**，后面性能和并发问题全会暴露。
+    problem: |
+      数据库（Day 10 的 PostgreSQL）是磁盘为主、强一致、支持复杂查询，但每次查询有毫秒到几十毫秒的开销，扛不住热点高频读。
+      Redis 把数据放在内存里，用**单线程执行命令 + 丰富的数据结构**，让「读热点、计数、排队、短期状态」这类需求在亚毫秒级完成，同时天然避免了多线程竞争。
+    principle: |
+      **一、Redis 为什么快（面试标准答法）**
+
+      - **数据在内存里**：读写不走磁盘随机 IO，这是最主要的原因。
+      - **命令执行是单线程的**：没有锁竞争和线程切换；一条命令要么完整执行要么不执行，所以 `INCR`、`SETNX` 这类单命令天然是原子的。
+      - **IO 多路复用**：一个线程用 epoll 同时管理成千上万个连接（类比 Node.js 的事件循环）。Redis 6 之后网络读写可以开 IO 线程，但**命令执行仍是单线程**。
+      - **高效的底层编码**：同一种类型会根据数据量自动切换编码（例如小 Hash 用紧凑的 listpack，大了转成哈希表），省内存又快。
+
+      **反面后果**：因为命令执行是单线程，**一个慢命令会卡住所有客户端**。`KEYS *`、对百万元素的集合做 `SMEMBERS`、一次删除一个巨大的 key，都可能让整个服务停顿几百毫秒。生产中要用 `SCAN` 渐进遍历、用 `UNLINK` 异步删除大 key。
+
+      **二、五种核心结构与选型**
+
+      | 结构 | 内部直觉 | 典型 AI 应用场景 |
+      |---|---|---|
+      | String | 二进制安全的字节串，可当整数 | LLM 回答缓存、计数器、分布式锁 |
+      | Hash | 一个 key 下的字段表 | 用户画像、任务状态（status/progress/error 分字段更新） |
+      | List | 双端链表/紧凑列表 | 会话最近 N 轮消息、简单队列 |
+      | Set | 无序去重集合 | 已处理文档 ID 去重、用户标签 |
+      | Sorted Set | 按 score 排序的集合 | 滑动窗口限流、排行榜、延迟任务 |
+
+      还有 Stream（带消费组的消息流，Day 42 会用到）、Bitmap、HyperLogLog（基数估算，统计 UV）等。
+
+      **选型思路：先问「我要怎么读写」**：
+      - 只整体读写 → String（JSON 序列化）。
+      - 经常只改其中一个字段 → Hash，避免「读出整个 JSON → 改 → 写回」带来的并发覆盖。
+      - 要按顺序追加、只取最近 N 条 → List + `LTRIM`。
+      - 要按时间或分数范围查 → Sorted Set。
+
+      ```mermaid
+      flowchart TD
+        A["新需求"] --> B{"整体读写还是改单个字段"}
+        B -->|"整体"| C["String 加 JSON"]
+        B -->|"单字段"| D["Hash"]
+        A --> E{"需要顺序或范围查询吗"}
+        E -->|"只要最近 N 条"| F["List 加 LTRIM"]
+        E -->|"按时间或分数范围"| G["Sorted Set"]
+        A --> H{"只需去重或判断存在"}
+        H -->|"是"| I["Set"]
+      ```
+
+      **三、key 设计规范**
+
+      - 用冒号分层命名：`业务:租户:对象:ID`，例如 `chat:t42:session:9f1c`。便于排查、按前缀统计。
+      - **key 里必须包含能区分数据归属的维度**（租户、用户、知识库版本），否则就会出现「A 用户看到 B 用户的数据」。
+      - 控制单个 value 大小（经验上不超过几十 KB 到 1MB 级别，具体以团队规范为准），大 value 会拖慢网络和单线程执行。
+
+      **四、持久化只是兜底**
+
+      Redis 有 RDB 快照和 AOF 日志两种持久化，但在缓存场景里**应假设 Redis 的数据随时可能丢**。真正的业务真相（订单、文档、权限）放 PostgreSQL，Redis 放可重建的数据或短期状态。
+    scenarios: |
+      - **LLM 回答缓存**：String，key 为规范化后的请求哈希，value 为 JSON 回答。
+      - **会话历史**：List 保存最近 20 轮消息，每次追加后 `LTRIM`，并刷新 TTL。
+      - **文档入库任务状态**：Hash 存 status、progress、error，前端轮询只读这个 key。
+      - **按用户限流**：Sorted Set 做滑动窗口，或 String + `INCR` 做固定窗口。
+    code: |
+      ```python
+      import json
+      import redis.asyncio as redis
+
+      r = redis.from_url("redis://localhost:6379/0", decode_responses=True)
+
+      async def save_job_progress(job_id: str, progress: int) -> None:
+          # Hash 只更新一个字段，不会覆盖并发写入的 status
+          await r.hset(f"ingest:job:{job_id}", mapping={"progress": progress})
+
+      async def append_message(session_id: str, role: str, content: str) -> None:
+          key = f"chat:session:{session_id}"
+          async with r.pipeline(transaction=True) as pipe:
+              pipe.rpush(key, json.dumps({"role": role, "content": content}, ensure_ascii=False))
+              pipe.ltrim(key, -40, -1)      # 只保留最近 40 条
+              pipe.expire(key, 60 * 60 * 24)  # 每次活跃都续期 24 小时
+              await pipe.execute()
+      ```
+    pitfalls: |
+      - **误区：Redis 单线程所以慢。** 瓶颈通常是网络和内存，不是 CPU；但单线程意味着**慢命令会阻塞全部请求**。
+      - **误区：所有数据都存成一个大 JSON 字符串。** 高并发改字段会互相覆盖，应该用 Hash 或原子命令。
+      - **生产用 `KEYS *` 排查问题**，直接把线上卡住；要用 `SCAN`。
+      - **把 Redis 当唯一的数据源**：重启或淘汰后数据丢失，业务无法恢复。
+      - **key 不带用户/租户维度**，导致数据串号，这是安全事故而不只是 bug。
+    interview_asks:
+      - "Redis 为什么这么快？单线程为什么还能扛高并发？"
+      - "你在项目里用过 Redis 的哪些数据结构？分别解决什么问题？"
+      - "什么情况下 Redis 会变慢？你怎么排查？"
+    project_example: |
+      在企业知识库问答项目中，我们用 Redis 承担四件事：Hash 存文档入库任务的状态和进度，前端每 2 秒轮询；List 存每个会话最近 40 条消息，追加后 LTRIM 并续期 24 小时；String 存 LLM 回答缓存，key 由租户、知识库版本和规范化问题哈希组成；Sorted Set 做每个用户每分钟 20 次提问的滑动窗口限流。上线后发现有人用 KEYS 做后台统计导致接口抖动，改成 SCAN 并加了慢日志监控。
+    freshness: |
+      核对于 2026-11：Redis 最新稳定版为 8.10.3（2026-10-26 发布，含安全修复）。许可方面：7.2 及以前为 BSD-3；7.4 为 RSALv2/SSPLv1 二选一；8.0 起增加 AGPLv3，成为 RSALv2/SSPLv1/AGPLv3 三选一，并把 RediSearch、RedisJSON 等模块并入 Redis Open Source。
+      Valkey 是 2024 年许可变更后由 Linux 基金会托管的 BSD 许可分支，最新稳定版 9.1.3（2026-10-26），9.2.0 处于 RC 阶段；命令与 Redis 基本兼容，但新版本各自新增的命令（如 Redis 8.4 的 DELEX）不保证互通，选型时以各自文档为准。
+    sources:
+      - {title: "Redis Licenses", url: "https://redis.io/legal/licenses/"}
+      - {title: "Redis Open Source version management", url: "https://redis.io/docs/latest/operate/oss_and_stack/install/version-mgmt/"}
+      - {title: "Redis 8.10.3 release", url: "https://github.com/redis/redis/releases/tag/8.10.3"}
+      - {title: "Valkey 官网", url: "https://valkey.io/"}
+  - id: d41-k2
+    name: 缓存模式与穿透、击穿、雪崩
+    level: P0
+    summary: Cache-Aside 先查缓存再查库；穿透防不存在、击穿防热点过期、雪崩防集体失效
+    why: |
+      加缓存的初衷是减轻数据库和 LLM 的压力，但**设计不当的缓存会在最关键的时刻把压力全部放回后端**，甚至比不加缓存更糟。
+      「缓存穿透/击穿/雪崩」和「缓存与数据库一致性」是后端面试的高频题，也是线上事故的常见根因。
+    problem: |
+      缓存解决的是「重复的昂贵计算」：同一个问题不必每次都检索 + 调用 LLM。
+      但它引入了三类新问题：**数据不存在时缓存挡不住请求、热点 key 过期瞬间并发打到后端、大量 key 同时过期**；以及缓存和数据库的数据不一致。本知识点就是解决这些问题的标准套路。
+    principle: |
+      **一、Cache-Aside（旁路缓存）——最常用的模式**
+
+      - **读**：先查缓存，命中直接返回；未命中查数据库（或调 LLM），把结果写回缓存并设置 TTL。
+      - **写**：先更新数据库，再**删除**缓存（而不是更新缓存）。
+
+      为什么是「删除」而不是「更新」？因为两个并发写请求更新缓存的顺序可能和更新数据库的顺序相反，最后缓存里留下旧值；删除则让下一次读自己去数据库拿最新值，更简单。
+
+      为什么是「先更新库再删缓存」？如果先删缓存再更新库，在两步之间恰好有读请求进来，会把**旧值**重新读进缓存，并一直保留到 TTL 到期。先更新库再删缓存也有极小概率的不一致窗口，所以**TTL 是最后的兜底**，对一致性要求更高时再配合延迟双删或订阅数据库变更（binlog/CDC）删缓存。
+
+      ```mermaid
+      sequenceDiagram
+        participant C as 客户端
+        participant A as 应用
+        participant R as Redis
+        participant D as 数据库或LLM
+        C->>A: 查询
+        A->>R: GET key
+        alt 命中
+          R-->>A: 缓存值
+        else 未命中
+          A->>D: 查询或生成
+          D-->>A: 结果
+          A->>R: SET key 值 EX ttl
+        end
+        A-->>C: 返回
+      ```
+
+      **二、三大问题对照**
+
+      | 问题 | 现象 | 根因 | 方案 |
+      |---|---|---|---|
+      | **穿透** | 请求的数据根本不存在，每次都打到库 | 缓存只存「有」的结果 | 缓存空值（短 TTL）；布隆过滤器预判；参数校验拦截非法 ID |
+      | **击穿** | 一个热点 key 过期瞬间，大量并发同时回源 | 单 key 失效 + 高并发 | 互斥锁只让一个请求回源（single-flight）；热点 key 逻辑过期、后台刷新 |
+      | **雪崩** | 大量 key 同时过期或 Redis 整体宕机，后端被打垮 | TTL 相同；缓存层单点 | TTL 加随机抖动；多级缓存；Redis 高可用；限流与降级 |
+
+      **三、放到 LLM 场景里理解**
+
+      - **穿透**：攻击者不停发随机问题，缓存永远不命中，每次都消耗 Token。对策是限流 + 按用户配额，而不是只靠缓存。
+      - **击穿**：公司发了新制度，几百人同时问同一个问题，缓存刚好过期，几百次 LLM 调用同时发出。对策是对同一个 key 加短锁，只让第一个请求调 LLM，其他请求等待几百毫秒后读缓存。
+      - **雪崩**：凌晨批量预热了一万条 FAQ 缓存，TTL 都是 24 小时，第二天同一时刻集体过期。对策是 `ttl = base + random(0, base*0.1)`。
+
+      ```mermaid
+      flowchart LR
+        Q["请求"] --> V{"参数合法"}
+        V -->|"否"| X["直接拒绝"]
+        V -->|"是"| C{"缓存命中"}
+        C -->|"命中含空值"| R["返回"]
+        C -->|"未命中"| L{"抢到回源锁"}
+        L -->|"是"| S["回源 写缓存 TTL加抖动"]
+        L -->|"否"| W["短暂等待后重读缓存"]
+        S --> R
+        W --> R
+      ```
+
+      **四、缓存什么、不缓存什么**
+
+      - 适合：读多写少、计算昂贵、允许短暂不一致的数据（FAQ 回答、文档元数据、Embedding 结果）。
+      - 不适合：强一致要求的数据（余额、权限变更后的立即生效），或每个用户都不同、几乎不会重复的请求（命中率极低，白白占内存）。
+      - 一定要监控**命中率**（`INFO stats` 的 keyspace_hits / misses）。命中率低于预期时，缓存可能只是在增加延迟和复杂度。
+    scenarios: |
+      - 知识库 FAQ 回答缓存：Cache-Aside + 24 小时 TTL + 随机抖动，知识库更新时通过版本号让旧缓存自然失效。
+      - 文档详情接口：不存在的文档 ID 缓存空值 60 秒，防止爬虫遍历 ID 打穿数据库。
+      - 新制度发布后的热点问题：对同一缓存 key 用 `SET NX` 短锁，只让一个请求调用 LLM。
+    pitfalls: |
+      - **误区：先删缓存再更新数据库更安全。** 中间窗口的读请求会把旧值写回缓存，反而更容易长期不一致。
+      - **误区：缓存空值不需要 TTL。** 数据后来被创建了，空值仍挡着，用户一直看不到。
+      - **所有 key 使用相同 TTL**，批量写入后会集体过期，形成雪崩。
+      - **混淆击穿和雪崩**：击穿是「一个热点 key」，雪崩是「大量 key 或整个缓存层」。
+      - **Redis 挂了接口也跟着 500**：缓存应该是可降级的旁路，读缓存失败要记录日志后回源（同时配合限流保护后端）。
+    interview_asks:
+      - "缓存穿透、击穿、雪崩分别是什么？怎么解决？"
+      - "更新数据时，你是先更新数据库还是先删缓存？为什么？"
+      - "如果 Redis 整体宕机了，你的系统会怎样？"
+    project_example: |
+      我们的知识库问答接口曾在新员工手册发布当天出现 LLM 调用量暴涨：同一个问题的缓存刚好过期，几百个并发请求同时回源。排查后做了三件事：缓存 key 加上知识库版本号，发布新版本时旧缓存自然失效而不是集中删除；回源前对 key 加 10 秒的 SET NX 锁，没抢到锁的请求每 200 毫秒重读缓存最多 3 次；TTL 改为 24 小时加 0~2 小时随机抖动。之后同类峰值下 LLM 调用量下降了一个数量级。
+  - id: d41-k3
+    name: 过期删除与内存淘汰策略
+    level: P1
+    summary: 过期靠惰性删除加定期抽样；内存满了按 maxmemory-policy 淘汰，二者不是一回事
+    why: |
+      很多人以为「设置了 TTL，到点 key 就消失，内存就安全了」。实际上过期 key 可能还占着内存，而内存满了之后 Redis 的行为取决于淘汰策略——**默认配置下写入会直接报错**。不懂这个，就会遇到「缓存服务突然所有写都失败」的事故。
+    problem: |
+      内存有限，缓存数据不能无限增长。Redis 需要两套机制：**过期机制**处理「到时间就不该再被读到」的数据；**淘汰机制**处理「内存达到上限时该丢掉谁」。理解两者的区别，才能正确配置 maxmemory 和策略，并解释线上的内存曲线。
+    principle: |
+      **一、过期删除：惰性 + 定期**
+
+      - **惰性删除（passive）**：客户端访问某个 key 时，Redis 先检查是否过期，过期就删掉并返回不存在。所以**你永远读不到过期数据**。
+      - **定期删除（active）**：只靠惰性删除，那些再也没人访问的过期 key 会一直占内存。Redis 会周期性地从「设置了过期时间的 key」中**随机抽样**，删除其中已过期的。
+      - 结论：过期 key **在逻辑上立即不可见，但物理上不一定立即释放内存**。
+
+      主从复制时，过期由主节点统一处理，主节点删除过期 key 时向从节点和 AOF 发送 `DEL`，保证一致。
+
+      **二、内存淘汰：maxmemory + maxmemory-policy**
+
+      达到 `maxmemory` 后，每次有命令要写入新数据，Redis 按策略淘汰 key：
+
+      | 策略 | 含义 |
+      |---|---|
+      | `noeviction` | 不淘汰，写入命令直接报错（读仍正常） |
+      | `allkeys-lru` / `volatile-lru` | 淘汰最近最少使用的（所有 key / 只在带 TTL 的 key 中选） |
+      | `allkeys-lfu` / `volatile-lfu` | 淘汰访问频率最低的（Redis 4.0 起） |
+      | `allkeys-lrm` / `volatile-lrm` | 淘汰最近最少被**修改**的（Redis 8.6 起新增） |
+      | `allkeys-random` / `volatile-random` | 随机淘汰 |
+      | `volatile-ttl` | 淘汰剩余 TTL 最短的 |
+
+      注意：`volatile-*` 策略在没有任何 key 设置 TTL 时，行为等同于 `noeviction`。
+
+      ```mermaid
+      flowchart TD
+        W["写命令到达"] --> M{"已用内存超过 maxmemory"}
+        M -->|"否"| OK["正常写入"]
+        M -->|"是"| P{"maxmemory-policy"}
+        P -->|"noeviction"| E["返回错误 写入失败"]
+        P -->|"allkeys-lru 等"| S["随机采样候选 key"]
+        S --> D["淘汰最差候选"] --> M
+      ```
+
+      **三、LRU 是近似的**
+
+      Redis 不维护精确的 LRU 链表（太耗内存），而是**随机采样若干 key（`maxmemory-samples`，默认 5）**，淘汰其中最久未访问的，并维护一个候选池。LFU 用很少的位做概率计数（Morris 计数器）并随时间衰减。
+
+      **四、选型建议**
+
+      - 纯缓存实例：`allkeys-lru` 是官方给出的通用默认选择；访问频率差异明显时可试 `allkeys-lfu`。
+      - 一个实例同时放缓存和必须保留的数据（如会话、任务状态）：可以用 `volatile-lru`，只淘汰带 TTL 的；但**更推荐拆成两个实例**。
+      - 64 位系统 `maxmemory` 默认是 0（不限制），一定要显式设置，并为复制缓冲区预留内存。
+    scenarios: |
+      - LLM 回答缓存实例设为 `allkeys-lru`，内存满了自动丢冷门问题。
+      - 存 Celery broker 和会话的实例使用 `noeviction`，宁可写入报错告警，也不能悄悄丢任务。
+      - 监控 `evicted_keys` 与 `expired_keys`，判断是内存不够还是 TTL 设得太短。
+    pitfalls: |
+      - **误区：key 到期就立即释放内存。** 过期 key 在被访问或被抽样前仍占内存。
+      - **误区：设置了 TTL 就不会 OOM。** 写入速度大于过期速度时内存仍会涨满。
+      - **把任务队列和缓存放同一个实例并用 allkeys-lru**，内存紧张时队列里的任务消息可能被淘汰掉。
+      - **混淆过期和淘汰**：过期是按时间，淘汰是按内存压力，两者独立。
+    interview_asks:
+      - "Redis 的 key 过期之后是怎么被删除的？"
+      - "Redis 内存满了会发生什么？你会怎么配置淘汰策略？"
+    project_example: |
+      我们最初用一个 Redis 实例同时做 LLM 缓存和 Celery broker，配置的是 allkeys-lru。一次批量预热缓存把内存打满后，broker 里排队的文档入库任务消息被淘汰，导致部分文档永远停在「处理中」。后来拆成两个实例：缓存实例 allkeys-lru 并设置 maxmemory 为 4GB；队列实例 noeviction 并对内存使用率超过 80% 告警，问题不再出现。
+    freshness: |
+      核对于 2026-11（Redis 官方 Key eviction 文档）：策略列表包含 LRM（Least Recently Modified，Redis 8.6 起新增的 allkeys-lrm / volatile-lrm）；maxmemory 在 64 位系统默认 0 表示不限制；maxmemory-samples 示例值为 5。Valkey 是否支持 LRM 策略未核实，以 Valkey 文档为准。
+    sources:
+      - {title: "Redis Docs - Key eviction", url: "https://redis.io/docs/latest/develop/reference/eviction/"}
+      - {title: "Redis Docs - EXPIRE（How Redis expires keys）", url: "https://redis.io/docs/latest/commands/expire/"}
+  - id: d41-k4
+    name: LLM 场景的 Redis：响应缓存、语义缓存与会话历史
+    level: P0
+    summary: 精确缓存靠规范化 key，语义缓存靠向量相似度阈值；两者都必须按租户和权限隔离
+    why: |
+      LLM 调用又慢又贵：一次回答几秒钟、几分钱。企业助手里**大量问题是重复或近似重复的**（「年假怎么请」「请年假流程是什么」）。用 Redis 做缓存可以显著降低成本和延迟；同时多轮对话需要一个快速、可过期的地方存会话历史。这是 AI 后端岗位最贴近业务的 Redis 用法。
+    problem: |
+      要解决三个具体问题：
+      1. **完全相同的请求**不要重复调用 LLM（精确缓存）。
+      2. **说法不同但意思相同**的问题也能复用答案（语义缓存）。
+      3. 多轮对话的历史消息要能快速读取、自动过期、长度可控（会话存储）。
+      同时不能引入新的问题：**答案串号、权限泄露、知识库更新后还返回旧答案**。
+    principle: |
+      **一、精确缓存：key 决定一切**
+
+      LLM 的输出不仅取决于用户问题，还取决于：模型名、System Prompt 版本、temperature 等参数、检索到的上下文（取决于用户权限和知识库版本）。所以 key 必须把这些都编码进去：
+
+      `llm:{tenant}:{kb_version}:{model}:{prompt_ver}:{sha256(规范化问题 + 关键参数)}`
+
+      - **规范化**：去首尾空格、统一全半角、合并空白，提升命中率。
+      - **哪些请求不该缓存**：temperature 较高的创作类请求（用户期望每次不同）、包含个人隐私的问题、工具调用会产生副作用的 Agent 请求。
+      - **带 RAG 的回答**：如果检索受权限过滤（Day 30），不同角色看到的上下文不同，**key 必须包含权限维度**（用户 ID 或权限组哈希），否则低权限用户会拿到高权限用户的答案。
+
+      **二、语义缓存：用向量找「意思相近」的问题**
+
+      ```mermaid
+      sequenceDiagram
+        participant U as 用户
+        participant A as 应用
+        participant E as Embedding模型
+        participant R as Redis向量索引
+        participant L as LLM
+        U->>A: 年假怎么请
+        A->>E: 问题向量化
+        E-->>A: 向量
+        A->>R: 带租户过滤的 KNN 查询
+        alt 距离小于阈值
+          R-->>A: 缓存回答
+        else 未命中
+          A->>L: 正常 RAG 流程
+          L-->>A: 回答
+          A->>R: 存问题向量 回答 元数据 TTL
+        end
+        A-->>U: 回答
+      ```
+
+      - 原理就是 Day 14 的 Embedding 相似度：把问题向量存入 Redis 的向量索引，新问题来时做最近邻查询，**距离小于阈值**就直接返回缓存答案。
+      - **阈值是核心风险**：太严几乎不命中；太松会把「年假怎么请」和「病假怎么请」当成同一个问题。必须用真实问题集离线评估误命中率，从严格开始逐步放宽。
+      - 语义缓存额外消耗一次 Embedding 调用，只有当 LLM 调用远比 Embedding 贵、且问题重复率高时才划算。
+      - 必须按租户、知识库版本、权限组做**过滤字段**，不能全局共享。
+
+      **三、会话历史存储**
+
+      - 结构：List，每个元素是一条 JSON 消息；`RPUSH` 追加、`LTRIM` 保留最近 N 条、`EXPIRE` 每次活跃续期。
+      - **为什么不无限保存**：上下文窗口和 Token 成本有限（Day 13），一般只取最近若干轮 + 一段摘要。
+      - Redis 存的是「热会话」，需要审计或长期回看的对话要异步落库到 PostgreSQL。
+      - key 用服务端生成的 session_id，并**在读取前校验 session 属于当前用户**，不能信任前端传来的 session_id 就直接读。
+
+      **四、失效策略**
+
+      知识库更新后，旧答案应该失效。比起扫描删除（`SCAN` + `DEL` 代价大），更推荐**把版本号写进 key**：版本一变，新请求自然落到新 key，旧 key 等 TTL 过期即可。
+    scenarios: |
+      - 员工助手的 FAQ 类问题：精确缓存命中率高，成本下降明显。
+      - 客服机器人：语义缓存复用「怎么退货」「退货流程」等近义问题的答案，阈值通过离线评估确定。
+      - 多轮对话：Redis List 保存最近 20 轮，超过部分由后台任务生成摘要并落库。
+    code: |
+      ```python
+      import hashlib
+      import json
+      import unicodedata
+
+      def normalize(q: str) -> str:
+          q = unicodedata.normalize("NFKC", q)  # 全角转半角等
+          return " ".join(q.split()).lower()
+
+      def llm_cache_key(*, tenant_id: str, acl_hash: str, kb_version: int,
+                        model: str, prompt_ver: str, question: str) -> str:
+          raw = json.dumps({"q": normalize(question), "model": model, "pv": prompt_ver},
+                           ensure_ascii=False, sort_keys=True)
+          digest = hashlib.sha256(raw.encode()).hexdigest()
+          return f"llm:{tenant_id}:{acl_hash}:{kb_version}:{digest}"
+      ```
+    pitfalls: |
+      - **误区：缓存 key 只用问题文本。** 不同租户、不同权限、不同模型和 Prompt 版本的答案会互相串用，这是数据泄露。
+      - **误区：语义缓存阈值调松一点命中率更高更好。** 误命中会给出「看起来很对但答非所问」的回答，比不缓存更伤用户信任。
+      - **缓存了带个人信息的回答**，被其他人语义命中。
+      - **会话 List 不 LTRIM**，长对话无限增长，既占内存又让 Prompt 超长。
+      - **流式回答边生成边缓存**，用户中途断开导致缓存了半截答案；应在完整生成成功后再写缓存。
+    interview_asks:
+      - "你们的 LLM 回答缓存 key 是怎么设计的？为什么要包含这些维度？"
+      - "语义缓存和精确缓存有什么区别？语义缓存的风险是什么？"
+      - "多轮对话历史你存在哪里？为什么？"
+    project_example: |
+      在一个多租户 HR 助手里，我们先上线精确缓存，key 包含租户、权限组哈希、知识库版本、模型和 Prompt 版本，命中率约 30%。后来试点语义缓存，用 300 条真实问题对离线评估，发现默认阈值下「年假」和「调休」会误命中，最终只对标注为 FAQ 类的问题启用语义缓存，并把阈值收紧；同时语义缓存的过滤字段包含租户和权限组。会话历史用 List 存最近 40 条，24 小时无活跃自动过期，完整对话异步写入 PostgreSQL 供审计。
+    freshness: |
+      核对于 2026-11：Redis 官方的 RedisVL 库提供 SemanticCache（`from redisvl.extensions.cache.llm import SemanticCache`），distance_threshold 使用 Redis COSINE 距离（0~2，越小越严格），默认 0.1，支持 ttl 与 filterable_fields 过滤字段；官方建议从严格阈值开始、监控命中质量后逐步放宽。具体参数以所用 RedisVL 版本文档为准。语义缓存依赖向量检索能力：Redis 8 起 Redis Open Source 已内置 Redis Search；使用 Valkey 时需确认对应搜索模块是否可用（本文未核实）。
+    sources:
+      - {title: "RedisVL - LLM Cache API", url: "https://redis.io/docs/latest/develop/ai/redisvl/api/cache/"}
+      - {title: "RedisVL - Cache LLM Responses", url: "https://redis.io/docs/latest/develop/ai/redisvl/user_guide/how_to_guides/llmcache/"}
+      - {title: "Redis semantic cache use case", url: "https://redis.io/docs/latest/develop/use-cases/semantic-cache/"}
+  - id: d41-k5
+    name: 分布式锁与限流计数
+    level: P1
+    summary: 锁用 SET NX PX 加随机值并校验后删除；限流用 INCR 固定窗口或 ZSET 滑动窗口
+    why: |
+      应用部署多个实例后，进程内的锁和计数器就失效了：两个实例可能同时处理同一个文档、同一个用户可以在每个实例上各刷一遍配额。LLM 调用成本高，**按用户限流和防重复执行**是 AI 后端的基本功，Redis 是最常用的实现手段。
+    problem: |
+      需要一个所有实例都能看到的「共享状态」来实现：同一时刻只有一个实例做某件事（分布式锁）；统计某用户在某时间窗口内的请求数（限流计数）。Redis 的单线程原子命令和过期时间正好满足这两点。
+    principle: |
+      **一、单实例分布式锁的正确写法**
+
+      - 加锁：`SET lock:doc:42 <随机值> NX PX 30000`
+        - `NX`：只有 key 不存在时才设置，保证互斥。
+        - `PX 30000`：30 秒后自动过期，**防止持锁进程崩溃后死锁**。
+        - 随机值：标记「这把锁是我的」。
+      - 解锁：**只有值等于自己的随机值才删除**。Redis 8.4 起可用 `DELEX key IFEQ 随机值`；之前的版本用 Lua 脚本 `if get == 我的值 then del` 保证「比较 + 删除」是原子的。
+
+      **为什么不能直接 DEL？** A 持锁后卡顿超过 30 秒，锁自动过期，B 拿到锁；A 恢复后执行 `DEL`，把 B 的锁删了，C 又能进来——互斥被破坏。
+
+      ```mermaid
+      sequenceDiagram
+        participant A as 实例A
+        participant R as Redis
+        participant B as 实例B
+        A->>R: SET lock 值a NX PX 30000
+        R-->>A: OK
+        Note over A: A 卡顿超过 30 秒
+        R-->>R: 锁过期
+        B->>R: SET lock 值b NX PX 30000
+        R-->>B: OK
+        A->>R: 只在值等于a时删除
+        R-->>A: 0 未删除 B 的锁安全
+      ```
+
+      **局限**：锁有过期时间，业务执行超时会导致两个持有者同时运行。所以**锁只能降低并发冲突概率，关键写操作仍要靠幂等或数据库唯一约束兜底**。多主节点的 Redlock 算法存在争议（官方文档也列出了 Martin Kleppmann 的分析与反驳），强一致场景应考虑数据库行锁或 etcd/ZooKeeper 等协调服务。
+
+      **二、限流计数**
+
+      - **固定窗口**：`INCR rate:u42:202611121651`，首次时 `EXPIRE 60`；超过阈值就拒绝。简单，但窗口边界可能出现 2 倍突刺。
+      - **滑动窗口**：Sorted Set，score 为时间戳：`ZREMRANGEBYSCORE` 删除窗口外记录 → `ZCARD` 计数 → `ZADD` 本次 → `EXPIRE`。用 pipeline/Lua 保证原子性。更平滑但占用更多内存。
+      - **按 Token 限流**：LLM 场景更合理的是按 Token 消耗限流，用 `INCRBY` 累加本次消耗的 Token 数。Day 46 会系统讲限流算法。
+    scenarios: |
+      - 同一份文档被重复上传时，用锁避免两个 worker 同时入库同一份文档。
+      - 每用户每分钟最多 20 次提问、每天最多 20 万 Token。
+      - 定时任务多实例部署时，用锁保证只有一个实例执行每日索引重建。
+    pitfalls: |
+      - **`SETNX` 和 `EXPIRE` 分两条命令写**，中间进程崩溃就是永久死锁；必须用一条 `SET ... NX PX`。
+      - **解锁直接 DEL**，可能删掉别人的锁。
+      - **误区：有了分布式锁就绝对不会重复执行。** 锁过期、网络分区都可能让两个持有者并存。
+      - **限流计数 INCR 后忘了设置过期**，计数 key 永久存在、用户永远被限流。
+    interview_asks:
+      - "用 Redis 实现分布式锁要注意哪些问题？"
+      - "如何用 Redis 实现按用户的接口限流？固定窗口和滑动窗口有什么区别？"
+    project_example: |
+      文档入库服务部署了 4 个 worker，用户重复点击上传时同一文档会被并发处理，导致向量库出现重复切片。我们在处理前用 SET NX PX 加锁，key 为文档内容哈希，锁 10 分钟并在处理中每 2 分钟续期；同时在切片表上建立「文档 ID + 切片序号」唯一约束作为兜底。限流方面，用 Sorted Set 做每用户每分钟 20 次的滑动窗口，用 INCRBY 记录每日 Token 消耗，超过配额返回 429。
+    freshness: |
+      核对于 2026-11（Redis 官方 Distributed Locks 文档）：单实例锁推荐 `SET resource_name my_random_value NX PX 30000`；释放锁可使用 Redis 8.4 引入的 `DELEX key IFEQ value`，更早版本使用 Lua 脚本比较后删除。DELEX 是否在 Valkey 中可用未核实。
+    sources:
+      - {title: "Redis Docs - Distributed Locks with Redis", url: "https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/"}
+quiz:
+  - id: d41-q1
+    kp: d41-k1
+    type: single
+    question: 文档入库任务需要存 status、progress、error 三个字段，worker 会频繁只更新 progress，接口只读状态。最合适的 Redis 结构是？
+    options:
+      - "String，把三个字段序列化成 JSON，每次读出修改后整体写回"
+      - "Hash，每个字段独立用 HSET 更新"
+      - "List，每次进度变化追加一条记录"
+      - "Sorted Set，用 progress 作为 score"
+    answer: [1]
+    explain: |
+      Hash 允许只更新单个字段，worker 更新 progress 不会覆盖别人并发写入的 status 或 error。String + JSON 需要「读-改-写」，两个并发写会互相覆盖（丢失更新）。List 适合追加日志但读取当前状态要取最后一条，语义别扭。Sorted Set 用于排序和范围查询，这里不需要按进度排序。
+  - id: d41-q2
+    kp: d41-k3
+    type: judge
+    question: 给 key 设置了 TTL 后，到期那一刻 Redis 会立刻把它从内存中删除，所以只要所有 key 都设置了 TTL，Redis 内存就不会被写满。
+    answer: false
+    explain: |
+      Redis 的过期删除是「惰性删除 + 定期随机抽样删除」：过期 key 在逻辑上立即不可读，但物理上要等被访问或被抽样到才释放内存。而且如果写入速度大于过期速度，内存照样会涨到 maxmemory，此时行为由淘汰策略决定（默认 noeviction 会让写入报错）。
+  - id: d41-q3
+    kp: d41-k2
+    type: multi
+    question: 以下哪些措施能有效缓解缓存问题？（多选）
+    options:
+      - "对不存在的数据缓存空值并设置较短 TTL，缓解缓存穿透"
+      - "热点 key 回源时加互斥锁，只让一个请求查库，缓解缓存击穿"
+      - "给批量写入的缓存 TTL 加随机抖动，缓解缓存雪崩"
+      - "更新数据时先删缓存再更新数据库，彻底消除不一致"
+      - "把所有 key 的 TTL 设成一样，方便统一管理"
+    answer: [0, 1, 2]
+    explain: |
+      前三项分别对应穿透、击穿、雪崩的标准方案。「先删缓存再更新数据库」在两步之间有读请求时会把旧值重新写进缓存，反而更容易长期不一致；推荐先更新库再删缓存，并用 TTL 兜底，任何一种顺序都谈不上「彻底消除」。TTL 完全一致恰恰是雪崩的成因。
+  - id: d41-q4
+    kp: d41-k4
+    type: scenario
+    question: |
+      某公司知识库助手上线 LLM 回答缓存后，一名普通员工问「今年的调薪方案是什么」，得到了只有 HR 才能检索到的内部文件内容。缓存 key 是 `llm:` + sha256(问题文本)。请分析原因，并给出修复方案和上线前的验证方式。
+    key_points:
+      - {text: "指出缓存 key 没有包含用户或权限维度，HR 的回答被缓存后被普通员工命中", dim: principle}
+      - {text: "说明 RAG 回答依赖权限过滤后的检索上下文，不同权限的同一问题答案不同", dim: concept}
+      - {text: "提出 key 加入租户、权限组哈希或用户 ID、知识库版本、模型与 Prompt 版本", dim: engineering}
+      - {text: "提出清理已污染的缓存（按前缀 SCAN 删除或切换 key 版本）并做安全事件评估", dim: engineering}
+      - {text: "提出用不同角色账号问同一问题的自动化测试来验证隔离", dim: project}
+    reference: |
+      **原因**：RAG 的回答取决于检索到的上下文，而检索结果经过了权限过滤（HR 能检索到调薪文件，普通员工不能）。缓存 key 只用问题文本，HR 先问时把含敏感内容的回答写进缓存，普通员工问同一问题直接命中，绕过了权限过滤——**这是数据泄露事故，不是普通 bug**。
+
+      **修复**：
+      1. key 改为 `llm:{tenant}:{acl_hash}:{kb_version}:{model}:{prompt_ver}:{sha256(规范化问题)}`，其中 acl_hash 是用户权限组集合的哈希（权限组相同的用户可共享缓存，兼顾命中率）。
+      2. 立即让旧缓存失效：最简单是给 key 前缀加版本（如 `llm:v2:`），旧 key 等 TTL 过期；或用 `SCAN` 按前缀删除。
+      3. 对含个人数据的问题类别禁止缓存。
+      4. 评估泄露范围：查访问日志中命中这类 key 的用户，按公司安全流程上报。
+
+      **验证**：写自动化测试，用 HR 账号和普通账号先后问同一问题，断言普通账号拿不到 HR 文档的引用来源；把它放进回归测试集。
+    followup:
+      question: 如果每个用户都用独立 key，命中率会大幅下降，你如何权衡？
+      key_points:
+        - 按权限组集合哈希而不是用户 ID 分区，权限相同的人共享缓存
+        - 只缓存不涉及个人数据的问题类别
+      reference: |
+        权限隔离是底线，命中率是优化目标。可以把 key 的隔离维度从「用户」放宽到「权限组集合」，同一组权限的员工检索结果相同，就能共享缓存；涉及个人信息（我的工资、我的假期余额）的问题不缓存。这样既保证安全又保留大部分命中率。
+  - id: d41-q5
+    kp: d41-k4
+    type: design
+    question: 请为一个多租户 AI 客服设计「会话历史存储」方案：说明使用的 Redis 结构、key 设计、长度与过期控制、与数据库的关系，以及如何防止用户读到别人的会话。
+    key_points:
+      - {text: "使用 List 存消息，RPUSH 追加并用 LTRIM 保留最近 N 条", dim: engineering}
+      - {text: "key 包含租户和服务端生成的 session_id，每次活跃用 EXPIRE 续期", dim: engineering}
+      - {text: "说明 Redis 只存热数据，完整对话异步落库用于审计和长期查询", dim: principle}
+      - {text: "读取前校验 session 归属当前用户，不能直接信任前端传来的 session_id", dim: concept}
+      - {text: "提到用追加、截断、续期放进同一 pipeline 保证原子性", dim: engineering}
+    reference: |
+      **结构**：每个会话一个 List，元素为 JSON：`{"role","content","ts"}`。
+
+      **key**：`chat:{tenant_id}:session:{session_id}`，session_id 由服务端生成（UUID），同时用一个 Hash `chat:{tenant_id}:session_meta:{session_id}` 记录 owner_user_id、创建时间。
+
+      **长度与过期**：每次追加用 pipeline 执行 `RPUSH` + `LTRIM key -40 -1` + `EXPIRE key 86400`，保证只保留最近 40 条、24 小时无活跃自动过期。拼 Prompt 时只取最近若干轮，更早的内容由后台任务生成摘要。
+
+      **与数据库的关系**：Redis 是热缓存，可能丢失；每条消息同时通过异步任务写入 PostgreSQL 的 messages 表，用于审计、搜索和会话恢复。Redis 中会话过期后，用户再打开时可从数据库加载最近 N 条回填。
+
+      **防越权**：接口读取会话前先查 session_meta 的 owner，与 JWT 中的用户 ID 比对，不一致返回 404（不暴露会话存在）。
+  - id: d41-q6
+    kp: d41-k5
+    type: short
+    question: 有同事写了这样的锁：先 `SETNX lock:job 1`，成功后再 `EXPIRE lock:job 30`，任务完成后 `DEL lock:job`。请指出其中的问题并给出正确写法。
+    key_points:
+      - {text: "指出 SETNX 与 EXPIRE 分两步不是原子的，中间崩溃会导致永久死锁", dim: principle}
+      - {text: "指出锁值固定为 1，解锁时直接 DEL 可能删掉别人在锁过期后获得的锁", dim: principle}
+      - {text: "给出 SET key 随机值 NX PX 毫秒 的一条命令加锁写法", dim: engineering}
+      - {text: "给出比较值后再删除的原子解锁方式（DELEX IFEQ 或 Lua 脚本）", dim: engineering}
+    reference: |
+      **问题一：加锁不原子。** `SETNX` 成功后、`EXPIRE` 执行前如果进程崩溃或网络断开，这把锁没有过期时间，永远不会释放，所有后续任务都拿不到锁。
+
+      **问题二：解锁可能误删。** 值固定为 1，无法区分锁的主人。如果任务执行超过 30 秒，锁已过期并被另一个实例拿到，原实例完成后 `DEL` 会把别人的锁删掉，互斥失效。
+
+      **正确写法**：加锁用一条命令 `SET lock:job <uuid> NX PX 30000`；解锁时只在值等于自己的 uuid 时删除——Redis 8.4+ 可用 `DELEX lock:job IFEQ <uuid>`，旧版本用 Lua 脚本 `if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end`。另外长任务要考虑续期，并用幂等或数据库唯一约束兜底。
+  - id: d41-q7
+    kp: d41-k2
+    type: short
+    question: 你们的系统中 Redis 只是缓存层。如果 Redis 整个实例宕机，读接口应该如何表现？请说明你的降级设计。
+    key_points:
+      - {text: "缓存读写异常应被捕获并记录日志，降级为直接回源而不是返回 500", dim: engineering}
+      - {text: "指出回源会放大后端和 LLM 压力，需要配合限流或熔断保护", dim: principle}
+      - {text: "提出 Redis 高可用（哨兵或集群）与连接超时设置，避免请求被慢连接拖住", dim: engineering}
+      - {text: "提出监控缓存错误率与命中率并告警", dim: project}
+    reference: |
+      缓存是旁路，不应成为单点：读缓存时设置较短的连接与命令超时（如几百毫秒），出现连接错误或超时就记录告警日志，然后直接走数据库或 LLM，写缓存失败同样只记日志。
+
+      但全部请求回源会让数据库和 LLM 压力瞬间放大，等于发生了「雪崩」，所以要同时启用限流（按用户或全局）和熔断：后端错误率高时对非关键接口直接返回友好提示。
+
+      基础设施层面使用 Redis 哨兵或集群实现高可用；监控缓存异常率、命中率、回源 QPS，Redis 不可用时第一时间告警。对依赖 Redis 的非缓存功能（如会话、限流、锁），要分别设计降级策略，例如限流失效时退回到进程内的粗粒度限流。
+code_reading:
+  id: d41-c1
+  kp: [d41-k2, d41-k4, d41-k1]
+  title: 带 LLM 回答缓存与会话历史的问答接口
+  scenario: 企业知识库助手的 `/chat` 接口，前端传入 session_id 和问题，后端先查 Redis 缓存，未命中则走 RAG 检索与 LLM 生成，并把消息追加到会话历史。系统为多租户、检索按用户权限过滤。
+  language: python
+  code: |
+    import hashlib
+    import json
+    import logging
+
+    import redis.asyncio as redis
+    from fastapi import APIRouter, Depends
+    from pydantic import BaseModel
+
+    from app.auth import CurrentUser, get_current_user
+    from app.rag import answer_with_rag  # 内部按 user 权限过滤检索
+
+    logger = logging.getLogger(__name__)
+    router = APIRouter()
+    r = redis.from_url("redis://redis:6379/0", decode_responses=True)
+
+    class ChatIn(BaseModel):
+        session_id: str
+        question: str
+
+    def cache_key(question: str) -> str:
+        digest = hashlib.sha256(question.strip().encode()).hexdigest()
+        return f"llm:answer:{digest}"
+
+    async def append_history(session_id: str, role: str, content: str) -> None:
+        key = f"chat:session:{session_id}"
+        async with r.pipeline(transaction=True) as pipe:
+            pipe.rpush(key, json.dumps({"role": role, "content": content}, ensure_ascii=False))
+            pipe.ltrim(key, -40, -1)
+            pipe.expire(key, 86400)
+            await pipe.execute()
+
+    @router.post("/chat")
+    async def chat(body: ChatIn, user: CurrentUser = Depends(get_current_user)) -> dict:
+        key = cache_key(body.question)
+        cached = await r.get(key)
+        if cached:
+            logger.info("cache hit key=%s user=%s", key, user.id)
+            answer = json.loads(cached)
+        else:
+            answer = await answer_with_rag(body.question, user=user)
+            await r.set(key, json.dumps(answer, ensure_ascii=False))
+        await append_history(body.session_id, "user", body.question)
+        await append_history(body.session_id, "assistant", answer["text"])
+        return answer
+  walkthrough:
+    function: |
+      实现带缓存的知识库问答：同一问题命中缓存时直接返回，未命中时调用按用户权限过滤的 RAG 流程生成回答并写入缓存；无论是否命中，都把问答追加到 Redis 中的会话历史，保留最近 40 条、24 小时过期。
+    key_functions: |
+      - `cache_key`：把问题去首尾空格后做 SHA-256，拼成缓存 key。
+      - `append_history`：用事务 pipeline 原子执行 RPUSH 追加、LTRIM 截断、EXPIRE 续期。
+      - `chat`：接口入口，依赖注入当前用户，编排「查缓存 → 回源 → 写缓存 → 写历史」。
+      - `answer_with_rag`：外部模块，内部按 user 的权限做检索过滤并调用 LLM。
+    params: |
+      请求体经 Pydantic 校验得到 `ChatIn`（session_id、question）；`get_current_user` 从 JWT 解析出 `user`。question 传给 `cache_key` 和 `answer_with_rag`，user 只传给了 `answer_with_rag`，**没有参与缓存 key 的计算**；session_id 直接来自请求体并用于拼接会话 key。
+    data_flow: |
+      ```mermaid
+      flowchart TD
+        A["POST chat 请求"] --> B["get_current_user 解析用户"]
+        B --> C["cache_key 只用问题文本"]
+        C --> D{"Redis GET 命中"}
+        D -->|"命中"| E["反序列化缓存回答"]
+        D -->|"未命中"| F["answer_with_rag 按权限检索并生成"]
+        F --> G["Redis SET 无 TTL"]
+        E --> H["append_history 用户消息"]
+        G --> H
+        H --> I["append_history 助手消息"]
+        I --> J["返回回答"]
+      ```
+    failure_points: |
+      - **缓存 key 未区分用户/租户/权限**：HR 生成的含敏感内容回答会被普通员工命中，造成数据串号与越权泄露（最严重）。
+      - **写缓存没有 TTL**：知识库更新后旧答案永不过期；缓存只增不减，最终触发内存淘汰或写入报错。
+      - **session_id 未校验归属**：任何人传入别人的 session_id，就能往别人的会话里追加消息。
+      - Redis 不可用时 `r.get` 抛异常，整个接口 500，缓存层没有降级。
+      - 热点问题缓存过期瞬间并发回源，没有互斥锁，存在击穿风险。
+      - 两次 `append_history` 是两个事务，中间失败会只留下用户消息。
+    debugging: |
+      - 复现串号：用两个不同权限的测试账号先后问同一问题，看第二个账号日志里是否出现 `cache hit`，并对比返回的引用来源。
+      - 用 `redis-cli --scan --pattern 'llm:answer:*' | head` 查看 key，再用 `TTL key` 确认返回 -1（无过期）。
+      - 观察 `INFO memory` 的 used_memory 是否持续增长、`INFO stats` 的 evicted_keys 是否开始增加。
+      - 在 `chat` 中给 cache hit/miss 打上 user_id、tenant_id，方便从日志定位哪个用户命中了谁的缓存。
+    change_request: |
+      如果需求改为「知识库更新后旧回答立即失效、并支持多租户」：修改 `cache_key`，签名增加 tenant_id、权限组哈希、kb_version、模型和 Prompt 版本，kb_version 从知识库元数据读取；`r.set` 增加 `ex=基础TTL+随机抖动`；在 `chat` 开头增加 session 归属校验；读写缓存用 try/except 包住并降级回源。
+  questions:
+    - id: d41-c1-q1
+      kp: d41-k4
+      type: code
+      question: 按执行顺序说明，当 HR 账号和普通员工账号先后提交同一个问题时，这段代码分别走了哪些分支？普通员工最终拿到的是什么内容？为什么？
+      key_points:
+        - {text: "HR 请求时缓存未命中，调用 answer_with_rag 按 HR 权限检索并 SET 写入缓存", dim: principle}
+        - {text: "普通员工请求时 cache_key 结果与 HR 相同，因为 key 只由问题文本决定", dim: principle}
+        - {text: "普通员工命中缓存直接返回 HR 的回答，answer_with_rag 的权限过滤完全被绕过", dim: concept}
+        - {text: "提出 key 中加入租户与权限维度的修复", dim: engineering}
+      reference: |
+        1. HR 请求：`get_current_user` 得到 HR 用户 → `cache_key` 对问题做哈希 → `r.get` 未命中 → `answer_with_rag(question, user=HR)` 按 HR 权限检索到调薪文件并生成回答 → `r.set` 写入缓存（无 TTL）→ 追加会话历史 → 返回。
+        2. 普通员工请求：问题文本相同，`cache_key` 计算出**完全相同的 key** → `r.get` 命中 → 打印 cache hit → 直接返回 HR 那份回答，`answer_with_rag` 根本没有被调用。
+
+        所以普通员工拿到了基于 HR 权限上下文生成的回答。根因是 user 只参与了回源，没有参与缓存 key；权限过滤发生在缓存之后，被缓存短路了。修复是把租户、权限组哈希、知识库版本等纳入 key。
+    - id: d41-c1-q2
+      kp: d41-k2
+      type: code
+      question: 这段代码写缓存时调用的是 `r.set(key, value)`。请说明这会导致哪些问题，并写出你会如何修改这一行以及相关逻辑。
+      key_points:
+        - {text: "指出没有设置 ex 或 px，缓存永不过期，知识库更新后仍返回旧答案", dim: principle}
+        - {text: "指出缓存只增不减会让内存涨到 maxmemory，触发淘汰或写入报错", dim: principle}
+        - {text: "修改为带 TTL 且加随机抖动，避免批量同时过期", dim: engineering}
+        - {text: "提出 key 中加入知识库版本号作为主动失效手段", dim: engineering}
+      reference: |
+        `r.set(key, value)` 没有过期时间，带来三个问题：一是**数据陈旧**，制度更新后旧回答一直被返回；二是**内存无限增长**，最终达到 maxmemory，按策略淘汰其他数据，或在 noeviction 下导致所有写入失败；三是如果后来统一补 TTL，又容易出现相同 TTL 集体过期的雪崩。
+
+        修改为：`await r.set(key, payload, ex=BASE_TTL + random.randint(0, BASE_TTL // 10))`，并在 key 中加入 kb_version，让知识库更新后新请求自然落到新 key。另外建议只在 `answer` 完整且没有错误时才写缓存，避免缓存失败结果。
+    - id: d41-c1-q3
+      kp: d41-k1
+      type: code
+      question: 如果 Redis 在请求过程中短暂不可用，这个接口会出现什么现象？请指出代码中哪几行会抛异常，以及你会如何改造使缓存可降级。
+      key_points:
+        - {text: "指出 r.get、r.set 与 append_history 中的 pipe.execute 都会抛出连接异常", dim: principle}
+        - {text: "指出异常未捕获，接口直接返回 500，缓存层成了单点", dim: concept}
+        - {text: "提出对缓存读写 try/except 记录日志后降级回源", dim: engineering}
+        - {text: "提出客户端设置连接与命令超时，并对回源加限流保护", dim: engineering}
+      reference: |
+        Redis 不可用时，第一个 `await r.get(key)` 就会抛出 `redis.exceptions.ConnectionError`（或超时异常），由于没有捕获，FastAPI 返回 500，即使 RAG 和 LLM 都正常，用户也拿不到回答。`r.set` 和 `append_history` 里的 `pipe.execute()` 同理。
+
+        改造：把读缓存封装为 `safe_get`，捕获 `redis.exceptions.RedisError` 后记录 warning 并返回 None，进入回源分支；写缓存和写会话历史失败只记录日志不影响返回（会话历史可同时异步落库兜底）。`redis.from_url` 时设置 `socket_timeout`、`socket_connect_timeout`，避免慢连接拖住请求。同时注意降级回源会放大 LLM 压力，需要配合限流。
+interview:
+  - id: d41-i1
+    kp: d41-k1
+    type: oral
+    difficulty: 1
+    question: Redis 是什么？为什么快？你在 AI 项目里用它做了哪些事？
+    key_points:
+      - {text: "说出内存存储、单线程执行命令、IO 多路复用三个原因", dim: principle}
+      - {text: "指出单线程意味着慢命令会阻塞所有客户端，如 KEYS 和大 key", dim: principle}
+      - {text: "能按场景说出 String、Hash、List、Sorted Set 的选型", dim: concept}
+      - {text: "结合项目说出 LLM 缓存、会话、限流或任务状态中的至少两项", dim: project}
+    reference: |
+      Redis 是基于内存的键值数据库，更准确地说是「数据结构服务器」，支持 String、Hash、List、Set、Sorted Set、Stream 等结构。
+
+      快的原因：数据在内存中，避免磁盘随机 IO；命令执行是单线程的，没有锁竞争和上下文切换，单条命令天然原子；使用 IO 多路复用，一个线程管理大量连接；底层编码针对小数据做了紧凑优化。代价是慢命令会阻塞所有请求，所以生产中禁用 KEYS、避免大 key、用 SCAN 和 UNLINK。
+
+      在 AI 项目中：String 存 LLM 回答缓存，key 带租户、权限组和知识库版本；List 存会话最近 40 条消息；Hash 存文档入库任务状态；Sorted Set 做每用户滑动窗口限流；同时 Redis 还是 Celery 的 broker。
+    oral: |
+      我理解 Redis 是一个内存里的数据结构服务器。它快主要有三点：数据在内存，命令单线程执行没有锁竞争，网络层用 IO 多路复用。单线程也带来一个风险，就是慢命令会卡住所有人，所以我们线上禁用了 KEYS，用 SCAN 代替。
+      在我做的知识库助手里，Redis 主要做四件事：用 String 缓存 LLM 回答，key 里带租户、权限组和知识库版本；用 List 存会话最近 40 条消息；用 Hash 存文档入库任务的进度；用 Sorted Set 给每个用户做每分钟 20 次的限流。
+  - id: d41-i2
+    kp: d41-k2
+    type: oral
+    difficulty: 2
+    question: 讲一讲缓存穿透、击穿、雪崩，以及你在项目中是怎么处理的。
+    key_points:
+      - {text: "准确区分三者：不存在的数据、单个热点 key 过期、大量 key 同时失效或缓存层宕机", dim: concept}
+      - {text: "分别给出空值缓存或布隆过滤器、互斥锁或逻辑过期、TTL 抖动与高可用的方案", dim: principle}
+      - {text: "结合 LLM 场景说明击穿会造成大量重复 LLM 调用与成本激增", dim: project}
+      - {text: "提到限流和降级作为最后防线，以及监控命中率", dim: engineering}
+    reference: |
+      **穿透**：查询的数据根本不存在，缓存永远不命中，请求全部打到后端。方案：参数校验、缓存空值（短 TTL）、布隆过滤器预判存在性。
+
+      **击穿**：某个热点 key 过期的瞬间，大量并发同时回源。方案：回源加互斥锁（SET NX），只让一个请求回源，其他请求短暂等待后重读缓存；或者热点数据采用逻辑过期，由后台异步刷新。
+
+      **雪崩**：大量 key 在同一时间过期，或 Redis 整体不可用，后端瞬间承压。方案：TTL 加随机抖动；Redis 哨兵或集群高可用；多级缓存；限流和降级。
+
+      在 LLM 场景中击穿的代价尤其大：一次回答几分钱、几秒钟，几百个并发同时回源就是几百次 LLM 调用，还可能触发供应商的速率限制。我们在新制度发布日遇到过这种情况，之后加了回源锁、TTL 抖动，并把知识库版本放进 key，避免集中删除缓存；同时监控命中率和回源 QPS。
+    oral: |
+      这三个问题我习惯这样区分：穿透是查不存在的数据，缓存挡不住；击穿是一个热点 key 刚好过期，并发全部回源；雪崩是大量 key 一起过期或者 Redis 整个挂了。
+      对应的方案分别是：空值缓存加参数校验、回源加互斥锁、TTL 加随机抖动加高可用。
+      我们项目在新员工手册发布那天就遇到过击穿，同一个问题几百人同时问，缓存刚好过期，LLM 调用量瞬间暴涨。后来我们回源前用 SET NX 加锁，只让一个请求调 LLM，其他请求等两三百毫秒再读缓存；TTL 加了随机抖动；同时把限流作为最后一道防线。
+  - id: d41-i3
+    kp: d41-k2
+    type: oral
+    difficulty: 3
+    question: 用 Cache-Aside 时，如何保证缓存和数据库的一致性？为什么推荐先更新数据库再删缓存？
+    key_points:
+      - {text: "说明 Cache-Aside 读写流程：读未命中回源写缓存，写时更新库后删缓存", dim: concept}
+      - {text: "解释先删缓存再更新库时，并发读会把旧值写回缓存", dim: principle}
+      - {text: "说明为什么删缓存而不是更新缓存：并发写顺序可能与数据库提交顺序不一致", dim: principle}
+      - {text: "提出 TTL 兜底、延迟双删、订阅数据库变更删缓存等增强手段及适用场景", dim: engineering}
+      - {text: "指出强一致需求不适合用缓存，需要按业务容忍度选择方案", dim: engineering}
+    reference: |
+      Cache-Aside 的流程：读时先查缓存，未命中查数据库并写回缓存；写时先更新数据库，再删除缓存。
+
+      **为什么删除而不是更新缓存**：两个并发写请求 A、B，数据库提交顺序是 A→B，但更新缓存的顺序可能是 B→A，最后缓存里留下 A 的旧值。删除缓存则让下一次读去数据库拿最新值，避免了顺序问题，也避免为不常读的数据做无用计算。
+
+      **为什么先更新库再删缓存**：如果先删缓存，在「删缓存」和「更新库」之间有读请求进来，读到旧值并写回缓存，旧值会一直存在到 TTL 到期。先更新库再删缓存的不一致窗口要小得多：只有在读请求读了旧值、写请求完成更新并删除缓存之后，读请求才把旧值写回，这需要读比写还慢，概率较低。
+
+      **增强手段**：TTL 作为最终兜底；延迟双删（删除后延迟几百毫秒再删一次）；删除失败放入重试队列；订阅数据库变更（CDC）统一删缓存，解耦业务代码。对余额、权限这类强一致数据，最好不要缓存，或者使用极短 TTL。
+    oral: |
+      我们用的是 Cache-Aside：读时缓存没有就查库再写回，写时先更新数据库，再删除缓存。
+      选择删除而不是更新，是因为并发写时更新缓存的顺序可能和数据库提交顺序相反，最后缓存留下旧值。选择先更新库，是因为先删缓存的话，中间进来的读请求会把旧值重新写回缓存。
+      即使这样仍有很小的不一致窗口，所以 TTL 是兜底。在知识库项目里，文档元数据更新后我们先提交数据库，再删除缓存，删除失败会进重试队列；而权限相关的数据我们不缓存，因为权限撤销必须立即生效。
+  - id: d41-i4
+    kp: d41-k4
+    type: design
+    difficulty: 3
+    question: 请设计一个 LLM 应用的缓存层，要求同时支持精确缓存与语义缓存，并能安全用于多租户、带权限的 RAG 系统。
+    key_points:
+      - {text: "精确缓存 key 包含租户、权限组、知识库版本、模型、Prompt 版本和规范化问题哈希", dim: engineering}
+      - {text: "语义缓存基于问题向量最近邻与距离阈值，并用租户与权限字段过滤", dim: principle}
+      - {text: "阈值通过真实问题集离线评估误命中率确定，从严格开始", dim: engineering}
+      - {text: "说明哪些请求不缓存：高 temperature、含个人信息、有副作用的 Agent 工具调用", dim: concept}
+      - {text: "说明只在完整成功生成后写缓存，并用版本号实现失效，监控命中率与误命中", dim: project}
+    reference: |
+      **分层查找**：请求进来先查精确缓存，未命中再查语义缓存，都未命中走 RAG + LLM，成功后同时写入两层。
+
+      **精确缓存**：key = `llm:{tenant}:{acl_hash}:{kb_ver}:{model}:{prompt_ver}:{sha256(规范化问题+关键参数)}`；value 为回答 JSON（含引用来源），TTL = 基础值 + 随机抖动。
+
+      **语义缓存**：在 Redis 向量索引中存「问题向量、回答、tenant、acl_hash、kb_ver、类别」，查询时带上这些过滤条件做 KNN，距离小于阈值才命中。阈值用标注好的近义/非近义问题对离线评估，选择误命中率可接受的最严值；只对 FAQ 类问题启用。
+
+      **不缓存**：temperature 高的创作类、包含个人数据的问题（我的工资）、会触发工具副作用的 Agent 请求、生成失败或被中断的回答。
+
+      **失效**：知识库或 Prompt 更新时版本号变化，新请求落到新 key，旧数据靠 TTL 清理。
+
+      **安全与监控**：权限维度是隔离底线；记录每次命中的层级、距离值，抽样人工评审语义命中质量；监控命中率、节省的 Token、误命中投诉。Redis 不可用时降级回源并限流。
+    oral: |
+      我会做两层缓存。第一层是精确缓存，key 里带租户、权限组哈希、知识库版本、模型和 Prompt 版本，再加规范化后问题的哈希，这样不同权限的人不会串答案。第二层是语义缓存，把问题向量存到 Redis 的向量索引里，查询时必须带租户和权限组过滤，距离小于阈值才算命中。
+      阈值不能拍脑袋，我们用三百对真实问题离线评估，发现「年假」和「调休」在宽松阈值下会误命中，所以只对 FAQ 类问题开语义缓存。
+      另外高 temperature、含个人信息、有副作用的请求都不缓存，只有完整生成成功才写入。知识库更新靠版本号自然失效，并监控命中率和误命中。
+  - id: d41-i5
+    kp: d41-k5
+    type: design
+    difficulty: 4
+    question: 你们的文档入库服务有多个 worker，需要保证同一文档不会被并发重复处理，同时要按租户限制每天的 Embedding Token 用量。请说明你基于 Redis 的方案、它的可靠性边界，以及你会用什么兜底。
+    key_points:
+      - {text: "锁使用 SET NX PX 加随机值，解锁比较值后删除，长任务续期", dim: engineering}
+      - {text: "指出锁过期、GC 停顿、主从切换都可能导致两个持有者并存，锁不能保证绝对互斥", dim: principle}
+      - {text: "提出幂等写入或数据库唯一约束作为最终兜底", dim: engineering}
+      - {text: "Token 配额用 INCRBY 按租户和日期计数并设置过期，超额拒绝或排队", dim: engineering}
+      - {text: "提到 Redis 故障时的降级策略和监控告警", dim: project}
+    reference: |
+      **防重复处理**：以文档内容哈希为锁 key：`SET lock:ingest:{hash} {uuid} NX PX 600000`。拿到锁才处理，处理中每隔一段时间用「值相等才续期」的脚本延长过期；结束后用 `DELEX ... IFEQ`（Redis 8.4+）或 Lua 脚本释放。
+
+      **可靠性边界**：锁有过期时间，如果 worker 长时间 GC 停顿或网络分区，锁过期后另一个 worker 会拿到锁，两者同时运行；主从异步复制下主节点宕机，新主节点可能没有这把锁。Redlock 在多主节点上提高了可用性，但其安全性存在争议。所以 **Redis 锁只用来降低冲突概率**。
+
+      **兜底**：切片表建立 `(document_id, chunk_index)` 唯一约束，写入使用 upsert；任务本身设计为幂等（先删除该文档旧切片再写入新切片，在同一事务内）；文档表的状态机字段用条件更新（`UPDATE ... WHERE status='pending'`）实现乐观抢占。
+
+      **Token 配额**：`INCRBY quota:{tenant}:{yyyymmdd} tokens`，首次设置 2 天过期；处理前预估 Token 数，超额则任务进入等待队列或拒绝并通知。计数和检查用 Lua 原子执行。
+
+      **降级与监控**：Redis 不可用时，锁降级为数据库条件更新抢占，配额降级为数据库按小时汇总；监控锁冲突次数、续期失败、配额拒绝率。
+    oral: |
+      我的方案是两层：Redis 锁挡住大部分并发，数据库约束保证正确性。
+      锁用文档内容哈希做 key，SET NX PX 加随机值，处理中定期续期，释放时比较值再删除。但我很清楚 Redis 锁不是绝对可靠的，GC 停顿、主从切换都可能让两个 worker 同时拿到锁。所以切片表上有文档 ID 加切片序号的唯一约束，写入是 upsert，整个任务是幂等的，重复执行也不会产生重复数据。
+      Token 配额用 INCRBY 按租户加日期计数，超额的任务进入等待队列。Redis 出问题时，锁退化成数据库的条件更新抢占，同时会告警。
+sources:
+  - {title: "Redis Docs - Key eviction", url: "https://redis.io/docs/latest/develop/reference/eviction/"}
+  - {title: "Redis Docs - Distributed Locks", url: "https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/"}
+  - {title: "Redis Licenses", url: "https://redis.io/legal/licenses/"}
+  - {title: "endoflife.date - Redis", url: "https://endoflife.date/redis"}
+  - {title: "Valkey Download", url: "https://valkey.io/download/"}
+  - {title: "RedisVL - LLM Cache API", url: "https://redis.io/docs/latest/develop/ai/redisvl/api/cache/"}

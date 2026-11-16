@@ -1,0 +1,776 @@
+day: 17
+phase: 2
+title: LLM API
+goals:
+  - 能说清一次 LLM API 请求的结构（messages、参数、返回体、usage、finish_reason），并解释「API 无状态」的工程含义
+  - 能解释 SSE 流式响应的数据格式，说出后端转发和前端消费的关键实现点
+  - 能按错误类型（401/400/429/5xx/超时/上下文超长）给出对应处理策略
+  - 能说明 Chat Completions 与 Responses API 的关系，以及 OpenAI 兼容接口的常见差异
+knowledge_points:
+  - id: d17-k1
+    name: LLM API 请求结构：messages、usage 与无状态
+    level: P0
+    summary: API 本身不记得上一轮，对话记忆靠你每次把历史 messages 带上；usage 告诉你花了多少 Token
+    why: |
+      你平时用的 ChatGPT「记得」上下文，是产品层帮你做的。直接调 API 时，**每次请求都是独立的**。
+      不理解这一点，就会写出「第二轮模型不认识用户」「历史越聊越长导致超长报错」「成本随轮数暴涨」的系统。
+      面试中「多轮对话怎么实现」「为什么聊久了会变贵变慢」都从这里展开。
+    problem: |
+      解决「**应用如何和模型交换数据**」的问题：输入怎么组织（角色、历史、参数），输出怎么读（内容、结束原因、用量），
+      以及多轮对话的状态由谁来保存。
+    principle: |
+      **一、一次 Chat Completions 请求长什么样**
+
+      ```json
+      {
+        "model": "模型名",
+        "messages": [
+          {"role": "system", "content": "你是客服助手，只回答订单相关问题"},
+          {"role": "user", "content": "我的订单什么时候到？"},
+          {"role": "assistant", "content": "请提供订单号"},
+          {"role": "user", "content": "A123"}
+        ],
+        "temperature": 0.3,
+        "max_completion_tokens": 500
+      }
+      ```
+
+      **角色（role）**：
+      - `system`（OpenAI 新模型也用 `developer`）：开发者给的规则，Day 15 讲过。
+      - `user`：用户输入。
+      - `assistant`：模型之前的回复（由你回填）。
+      - `tool`：工具执行结果（Day 18）。
+
+      **二、返回体里要看的四样东西**
+
+      | 字段 | 含义 | 为什么重要 |
+      |---|---|---|
+      | `choices[0].message.content` | 回复文本 | 业务结果 |
+      | `choices[0].finish_reason` | 结束原因 | length 表示被截断（Day 16） |
+      | `usage` | prompt / completion / total tokens，及缓存、推理 Token 明细 | 计费、限流、成本监控 |
+      | `id` 与请求 ID | 本次调用标识 | 排障、找厂商支持 |
+
+      **三、无状态：模型不记得上一轮**
+
+      ```mermaid
+      sequenceDiagram
+        participant U as 用户
+        participant S as 你的后端
+        participant DB as 会话存储
+        participant M as LLM API
+        U->>S: 第 3 轮提问
+        S->>DB: 读取前 2 轮历史
+        DB-->>S: 历史 messages
+        S->>M: system 加历史 加本轮问题
+        M-->>S: 回复与 usage
+        S->>DB: 追加本轮问答
+        S-->>U: 返回回复
+      ```
+
+      - 每次请求都要带上**完整需要的上下文**，模型在两次请求之间不保留任何东西。
+      - 所以**输入 Token 随轮数线性增长**，成本和延迟也随之增长，最终会撞上上下文窗口上限（Day 13）。
+      - 常见处理：只保留最近 N 轮、对早期对话做摘要、把长期信息放进检索（RAG）。
+
+      **四、Responses API 的状态管理（2026-11 核对）**
+
+      OpenAI 的 Responses API 可以用 `previous_response_id` 或 Conversations API 让服务端帮你串联历史。
+      但官方文档明确：**即使用了 previous_response_id，链上历史的输入 Token 仍按输入计费**——省的是你的代码，不是 Token。
+      另外 Responses 默认会存储响应（可设 `store: false`），涉及敏感数据时要关注。
+
+      **五、不这样做会怎样？**
+
+      - 不回填历史：用户说「就按刚才那个方案」，模型完全不知道「刚才」是什么。
+      - 无限回填历史：第 50 轮时每次请求几万 Token，又慢又贵，最后报上下文超长。
+      - 让前端传完整 messages 且后端不校验：用户可以伪造 system 消息绕过规则。
+    scenarios: |
+      - **多轮客服**：后端按 session_id 从 Redis/数据库读历史，裁剪后拼接请求。
+      - **成本监控**：每次调用把 usage 写入日志或计费表，按用户、功能统计。
+      - **问题排查**：记录请求 ID，向厂商提工单时直接给出。
+      - **长对话产品**：超过阈值时自动摘要早期对话，控制输入 Token。
+    code: |
+      ```python
+      import os
+      from openai import OpenAI
+
+      client = OpenAI(api_key=os.environ["LLM_API_KEY"], base_url=os.getenv("LLM_BASE_URL"))
+
+      history = [{"role": "system", "content": "你是订单客服，回答简洁。"}]
+
+      def chat(user_text: str) -> str:
+          history.append({"role": "user", "content": user_text})
+          resp = client.chat.completions.create(
+              model=os.getenv("LLM_MODEL", "gpt-5.5"),
+              messages=history[-21:] if len(history) > 21 else history,  # 演示：粗略裁剪
+              max_completion_tokens=500,
+          )
+          msg = resp.choices[0].message
+          history.append({"role": "assistant", "content": msg.content or ""})
+          print("finish_reason:", resp.choices[0].finish_reason, "usage:", resp.usage)
+          return msg.content or ""
+      ```
+      注意：示例中的裁剪会把 system 消息裁掉，真实项目要单独保留 system，只裁剪对话部分。
+    pitfalls: |
+      - **以为模型有记忆**：「上一轮说过了」只在你把上一轮放进 messages 时成立。
+      - **以为 previous_response_id 能省 Token**：只省了传输和代码，历史输入仍计费。
+      - **只看 content 不看 finish_reason 和 usage**：截断和成本异常都发现不了。
+      - **信任前端传来的完整 messages**：应由后端按会话 ID 组装历史，前端只传本轮输入。
+      - **裁剪历史时把 system 一起裁掉**：模型突然「忘了自己是谁」。
+    interview_asks:
+      - 大模型 API 是有状态还是无状态的？多轮对话是怎么实现的？
+      - 为什么对话越聊越慢、越聊越贵？你怎么处理？
+      - usage 里有哪些字段？你们怎么用它？
+    project_example: |
+      在一个内部知识助手项目中，最初前端把整个聊天记录（含 system）放在请求里发给后端，后端原样转发给模型。
+      测试同学在浏览器里改了 system 内容，助手就开始回答与业务无关的问题；同时长会话用户的单次请求输入达到 3 万 Token。
+      改造后：前端只传 session_id 和本轮输入；后端从 Redis 读取历史，固定拼接服务端的 system，保留最近 10 轮并对更早内容做摘要；
+      每次调用把 usage 写入计费表。单次平均输入 Token 下降约 60%，越权改 system 的问题消失。
+    freshness: |
+      核对于 2026-11：openai-python 当前版本为 3.x（PyPI 3.49.0），README 写明 Responses API 是「primary API」，Chat Completions 为「previous standard（supported indefinitely）」。
+      Responses 支持 previous_response_id 与 Conversations API，但历史输入 Token 仍计费；Responses 默认存储，可设 store: false。
+      旧写法 `openai.ChatCompletion.create`（SDK 0.x）已废弃，新写法为 `client.chat.completions.create` 或 `client.responses.create`。
+    sources:
+      - {title: "openai-python README", url: "https://raw.githubusercontent.com/openai/openai-python/main/README.md"}
+      - {title: "OpenAI Docs - Migrate to the Responses API", url: "https://developers.openai.com/api/docs/guides/migrate-to-responses"}
+
+  - id: d17-k2
+    name: 流式响应与 SSE
+    level: P0
+    summary: 流式让用户边生成边看到结果，降低首字等待时间；底层是 HTTP 长连接上的 SSE 文本事件流
+    why: |
+      LLM 生成一段长回答可能要十几秒，非流式时用户盯着空白页面等待，体验很差。几乎所有 AI 对话产品都用流式输出。
+      作为前后端都做过的工程师，你要能讲清 SSE 的数据格式、后端如何转发、前端如何解析，以及部署时 Nginx 缓冲等坑。
+    problem: |
+      解决「**生成时间长，用户等待焦虑**」的问题：把整体响应拆成很多小片段（delta），生成一点推送一点。
+      关键指标从「总耗时」变成「**首 Token 时间（TTFT）**」——总耗时基本不变，但用户感知快得多。
+    principle: |
+      **一、SSE 是什么**
+
+      SSE（Server-Sent Events）是基于普通 HTTP 的**服务端单向推送**协议：
+      - 响应头 `Content-Type: text/event-stream`，连接保持不关闭；
+      - 服务端不断写入文本，每个事件由若干行 `字段: 值` 组成，**以空行结束**；
+      - 常用字段：`data`（数据）、`event`（事件类型）、`id`、`retry`；以冒号开头的行是注释，常用作心跳。
+
+      **二、OpenAI 兼容接口的流式数据长这样**
+
+      Chat Completions 设置 `stream=true` 后：
+
+      ```text
+      data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+      data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"您好"},"finish_reason":null}]}
+
+      data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+      data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":20,"completion_tokens":35,"total_tokens":55}}
+
+      data: [DONE]
+      ```
+
+      - 每个 chunk 的增量在 `choices[0].delta.content`，**客户端负责拼接**。
+      - 流式默认**不返回 usage**；需设置 `stream_options={"include_usage": true}`，会在 `[DONE]` 之前多一个 `choices` 为空数组、带 usage 的 chunk（OpenAI 参考文档与阿里云百炼文档均如此说明）。注意：流中途断开时可能收不到这个 usage chunk。
+      - `data: [DONE]` 表示流结束。
+      - Responses API 的流式是**语义化事件**：如 `response.created`、`response.output_text.delta`、`response.completed`、`error`，按事件类型处理。
+
+      **三、完整链路：模型 → 后端 → 前端**
+
+      ```mermaid
+      sequenceDiagram
+        participant B as 浏览器
+        participant N as Nginx
+        participant S as FastAPI 后端
+        participant M as LLM API
+        B->>N: POST 聊天请求 携带鉴权
+        N->>S: 转发 需关闭缓冲
+        S->>M: stream 为 true 的请求
+        M-->>S: SSE chunk 1 增量文本
+        S-->>N: 转换为自己的 SSE 事件
+        N-->>B: 立即推送
+        M-->>S: 更多 chunk 和 usage
+        S-->>B: 继续推送 最后发送结束事件
+        S->>S: 记录完整文本与 usage
+      ```
+
+      **后端要点**：
+      - 不要把上游原始 chunk 直接透传给前端，而是转换为**自己定义的事件格式**（如 delta / done / error），屏蔽厂商差异。
+      - FastAPI 用 `StreamingResponse` + 异步生成器，`media_type="text/event-stream"`。
+      - 部署在 Nginx 后面要关闭缓冲（`proxy_buffering off` 或响应头 `X-Accel-Buffering: no`），否则前端会「一次性」收到全部内容。
+      - 出错时要发送 **error 事件**再结束，而不是悄悄断开。
+      - 用户关闭页面后应停止消费上游流，避免继续花 Token。
+
+      **前端要点**：
+      - 浏览器原生 `EventSource` 只支持 GET、不能自定义请求头，聊天接口通常是 POST + 鉴权头，所以常用 `fetch` + `ReadableStream` 自己解析：按 `\n\n` 切分事件、处理半包。
+      - 根据事件类型更新 UI，收到 error 事件要提示用户。
+
+      **四、不这样做会怎样？**
+
+      - 不用流式：长回答等待十几秒，用户以为卡死，重复点击。
+      - 透传上游格式：换模型厂商时前端也要改。
+      - 不处理流中错误：前端拿到半截回答，以为正常结束。
+    scenarios: |
+      - **聊天产品**：逐字显示回复，提升感知速度。
+      - **长文生成**：边生成边展示，用户可提前「停止生成」，节省 Token。
+      - **工具调用进度**：在流中推送「正在查询订单…」等状态事件。
+      - **后端到后端**：批处理任务不需要流式，直接非流式更简单可靠。
+    pitfalls: |
+      - **以为流式能缩短总耗时**：它改善的是首字时间，总生成时间基本不变。
+      - **忘了 include_usage**：流式下拿不到用量，成本统计缺失。
+      - **按 chunk 直接 JSON.parse**：网络分包可能把一个事件切成两半，要缓冲到空行再解析。
+      - **Nginx/网关缓冲**：本地正常，部署后变成一次性输出。
+      - **以为 SDK 会自动重试流**：openai-python 文档说明流消费过程中的错误**不会自动重试**，因为重放请求可能导致重复输出。
+      - **用 EventSource 发 POST**：原生不支持。
+    interview_asks:
+      - SSE 和 WebSocket 有什么区别？为什么 LLM 对话多用 SSE？
+      - 流式输出的后端和前端分别怎么实现？有哪些坑？
+      - 流式模式下怎么统计 Token 用量？
+    project_example: |
+      做企业知识助手时，非流式版本平均 9 秒才出结果，用户反馈「卡」。改成流式后首字时间降到约 1 秒，总时长不变但投诉明显减少。
+      上线测试环境时却发现回答仍一次性出现，排查发现 Nginx 默认开启了代理缓冲；在后端响应头加 `X-Accel-Buffering: no` 并在 Nginx 配置关闭缓冲后恢复。
+      后续又补了三点：流中出错时发送 error 事件；开启 include_usage 记录用量；前端点击「停止」时中断请求，后端检测断开后停止读取上游。
+    freshness: |
+      核对于 2026-11：OpenAI Chat Completions 参考文档说明 include_usage 会在 data: [DONE] 前追加一个 choices 为空、带 usage 的 chunk，流中断时可能收不到；
+      Responses API 流式使用语义化事件（response.created、response.output_text.delta、response.completed、error）。
+      openai-python README：流消费过程中的读超时抛 APITimeoutError、其他传输错误抛 APIConnectionError，且流消费不会自动重试。
+    sources:
+      - {title: "OpenAI Docs - Streaming API responses", url: "https://developers.openai.com/api/docs/guides/streaming-responses"}
+      - {title: "OpenAI API Reference - Chat（stream_options.include_usage）", url: "https://developers.openai.com/api/reference/resources/chat"}
+      - {title: "阿里云百炼 - 流式输出", url: "https://help.aliyun.com/zh/model-studio/stream"}
+
+  - id: d17-k3
+    name: 错误处理：错误码分类与应对
+    level: P0
+    summary: 先分清「请求本身错了」和「暂时失败」，前者修请求不重试，后者退避重试
+    why: |
+      LLM API 是外部依赖，**一定会失败**：Key 过期、限流、服务过载、网络抖动、上下文超长……
+      错误处理写得好不好，直接决定线上是「偶发小波动」还是「全站不可用」。面试官很爱问「遇到 429 怎么办」「哪些错误该重试」。
+    problem: |
+      解决「**不同错误该怎么处理**」的问题：哪些该立即报警、哪些该修改请求、哪些可以重试、哪些要降级，
+      以及如何把错误信息有用地传给前端和日志。
+    principle: |
+      **一、按「能不能靠重试解决」分类**
+
+      | 状态 / 异常 | SDK 异常类（openai-python） | 典型原因 | 处理 |
+      |---|---|---|---|
+      | 400 | BadRequestError | 参数不支持、格式错误、**上下文超长** | 不重试；修请求（裁剪历史、删参数） |
+      | 401 | AuthenticationError | Key 错误或失效 | 不重试；告警、检查配置 |
+      | 403 | PermissionDeniedError | 无权限、地区不支持 | 不重试 |
+      | 404 | NotFoundError | 模型名错误或已下线 | 不重试；检查模型名 |
+      | 429 | RateLimitError | **限流**或**额度耗尽** | 限流可退避重试；额度耗尽不重试 |
+      | 5xx | InternalServerError | 服务端错误、过载（503） | 退避重试，持续失败则降级 |
+      | 无状态码 | APITimeoutError / APIConnectionError | 超时、网络断开 | 有限次重试 |
+
+      **二、429 要细分**
+
+      OpenAI 错误码文档中，429 既可能是「请求太快」（rate limit、slow_down），也可能是**额度/信用余额耗尽、支出上限**（如 credit_balance_exhausted、project_spend_limit_exceeded）。
+      后者**重试没有任何意义**，要看错误体里的 `error.code` 再决定。限流类优先遵循响应头 `Retry-After`。
+
+      **三、SDK 的默认行为（openai-python，2026-11 核对）**
+
+      - 默认**超时 10 分钟**，可用 `timeout` 配置（全局或 `with_options` 单次）。
+      - 默认**自动重试 2 次**（短指数退避），对象是连接错误、408、409、429、>=500；可用 `max_retries` 配置。
+      - 流式消费过程中的错误**不自动重试**。
+      - 响应对象有 `_request_id`（来自 `x-request-id` 响应头），失败时可从 `APIStatusError.request_id` 拿到。
+
+      ```mermaid
+      flowchart TD
+        A["调用 LLM API 出错"] --> B{"有 HTTP 状态码吗"}
+        B -- "没有 超时或网络错误" --> C["有限次退避重试"]
+        B -- "有" --> D{"状态码类别"}
+        D -- "400 401 403 404" --> E["不重试 记录并修复请求或配置"]
+        D -- "429" --> F{"error.code 是额度类吗"}
+        F -- "是" --> G["不重试 告警充值或调额"]
+        F -- "否 限流" --> H["按 Retry-After 或指数退避重试"]
+        D -- "500 503" --> I["退避重试 失败后降级"]
+        C --> J["仍失败则返回友好错误并记录 request id"]
+        H --> J
+        I --> J
+      ```
+
+      **四、上下文超长的处理**
+
+      输入加上输出上限超过模型上下文窗口时会返回 400（错误体通常带有上下文长度相关的 code 或提示，以返回为准）。
+      处理方式是**修请求**：裁剪或摘要历史、减少检索片段、降低输出上限，或换更长上下文的模型；更好的做法是在**发送前**用 Token 计数预判（Day 13）。
+
+      **五、不这样做会怎样？**
+
+      - 对 400/401 也重试：白白浪费时间和配额，故障时放大流量。
+      - 不区分额度耗尽：重试风暴持续数小时，没人收到真正的告警。
+      - 吞掉异常：用户看到空白，日志里也没有线索。
+    scenarios: |
+      - **对话接口**：把异常映射成统一的错误码和用户提示（如「当前排队人数较多，请稍后重试」）。
+      - **批处理任务**：429 时降低并发、按 Retry-After 等待；额度类错误直接暂停任务并告警。
+      - **监控告警**：按异常类型统计，401 和额度类错误单独设高优先级告警。
+      - **长对话**：发送前预估 Token，超限时自动摘要，而不是等 400。
+    pitfalls: |
+      - **把所有 429 当限流**：额度耗尽也是 429，必须看 error.code。
+      - **自己再包一层重试却不关 SDK 重试**：重试次数相乘（Day 20 详述）。
+      - **用默认 10 分钟超时**：上游卡住时请求线程长期被占用。
+      - **`except Exception: pass`**：最常见、最难排查的写法。
+      - **不记录 request id**：向厂商反馈问题时无从查起。
+      - **把原始错误信息直接返回给前端**：可能泄露内部配置，应转换为友好提示。
+    interview_asks:
+      - 调用大模型 API 时遇到 429 你会怎么处理？
+      - 哪些错误应该重试，哪些不应该？为什么？
+      - 上下文超长报错怎么处理？怎么提前避免？
+    project_example: |
+      某次月底，客服机器人大面积报错，日志里全是 429，团队以为是限流，把重试次数从 3 加到 10，结果情况更糟。
+      后来查看错误体才发现 `error.code` 是额度类错误——项目设置的月度支出上限已用完。改进措施：
+      异常处理按状态码和 error.code 分类；额度类错误不重试，直接触发高优先级告警并切换到备用供应商；
+      所有错误日志记录 request id、模型名、Token 估算值。此后同类问题能在几分钟内定位。
+    freshness: |
+      核对于 2026-11：openai-python README 的异常映射为 400 BadRequestError、401 AuthenticationError、403 PermissionDeniedError、404 NotFoundError、422 UnprocessableEntityError、429 RateLimitError、>=500 InternalServerError、无状态码 APIConnectionError；
+      默认超时 10 分钟、默认重试 2 次（连接错误、408、409、429、>=500），流消费不自动重试。
+      OpenAI 错误码文档：429 包含 credit_balance_exhausted、spend limit 等额度类 code，重试无法恢复；503 server_is_overloaded 与 429 slow_down 建议遵循 Retry-After。
+    sources:
+      - {title: "openai-python README - Handling errors / Retries / Timeouts", url: "https://raw.githubusercontent.com/openai/openai-python/main/README.md"}
+      - {title: "OpenAI Docs - Error codes", url: "https://developers.openai.com/api/docs/guides/error-codes"}
+      - {title: "OpenAI Docs - Rate limits", url: "https://developers.openai.com/api/docs/guides/rate-limits"}
+
+  - id: d17-k4
+    name: Chat Completions、Responses 与 OpenAI 兼容接口
+    level: P1
+    summary: 国内外多数厂商兼容 Chat Completions 格式，换 base_url 即可接入，但扩展参数和行为细节各不相同
+    why: |
+      国内项目很少只用一家模型：DeepSeek、通义千问等都提供「OpenAI 兼容接口」。你需要知道「兼容」到什么程度，
+      哪些地方必须按厂商单独处理；同时 OpenAI 自己也在推 Responses API，你要知道新项目该选哪种。
+    problem: |
+      解决「**用一套 SDK 和代码对接多家模型**」的问题，以及「**Chat Completions 和 Responses 选哪个**」的问题。
+    principle: |
+      **一、Chat Completions 与 Responses 的关系**
+
+      - Responses 是 OpenAI 的新接口，官方称其为 Chat Completions 的演进，**推荐新项目使用**；Chat Completions 继续长期支持。
+      - 主要差异：输入用 `input` + `instructions`，输出是类型化的 `output` 数组（message、function_call、reasoning 等），SDK 提供 `output_text`；
+        结构化输出参数从 `response_format` 变为 `text.format`；工具调用结果用 `function_call_output` 项而不是 `role: tool` 消息。
+      - 官方说明：推理模型在 Responses 上效果更好；从 GPT-5.4 起，Chat Completions 不支持在 reasoning_effort 非 none 时进行工具调用；GPT-6 Astra 的工具调用要求使用 Responses。
+
+      **二、兼容接口：改 base_url 就能用**
+
+      ```python
+      from openai import OpenAI
+      client = OpenAI(api_key=..., base_url="https://api.deepseek.com")
+      ```
+
+      阿里云百炼的兼容地址形如 `https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1`（按地域和工作空间不同）。
+
+      **三、常见差异点（以各自文档为准）**
+
+      | 方面 | 差异举例 |
+      |---|---|
+      | 扩展参数 | DeepSeek 用 `thinking` 开关、百炼用 `enable_thinking`，OpenAI SDK 中需放进 `extra_body` |
+      | 返回扩展字段 | DeepSeek、千问思考模式返回 `reasoning_content` |
+      | 多轮回传 | DeepSeek 思考模式下带 tools 的请求必须回传历史 `reasoning_content`，否则 400 |
+      | JSON 输出 | DeepSeek 与百炼的 json_object 模式都要求提示词里出现 json 字样 |
+      | 采样参数 | 部分模式下 temperature 不报错但不生效 |
+      | Responses 支持 | 部分厂商也提供 Responses 风格接口，但覆盖范围不一 |
+
+      ```mermaid
+      flowchart LR
+        A["业务代码"] --> B["统一 LLM 客户端"]
+        B --> C["厂商适配 OpenAI"]
+        B --> D["厂商适配 DeepSeek"]
+        B --> E["厂商适配 百炼"]
+        C --> F["参数裁剪 扩展参数 字段归一化"]
+        D --> F
+        E --> F
+        F --> G["统一返回 文本 usage finish_reason"]
+      ```
+    scenarios: |
+      - **多供应商容灾**：主模型故障时切换到另一家，统一客户端屏蔽差异。
+      - **成本优化**：简单任务走便宜的国产模型，复杂任务走强模型。
+      - **新项目选型**：只用 OpenAI 且需要推理模型 + 工具时优先 Responses；需要多厂商兼容时 Chat Completions 格式覆盖面更广。
+    pitfalls: |
+      - **以为兼容 = 完全一样**：扩展参数、返回字段、错误码、限流策略都可能不同。
+      - **把扩展参数直接作为关键字参数传给 SDK**：OpenAI SDK 不认识的参数要放进 `extra_body`。
+      - **忽略 reasoning_content 回传规则**：DeepSeek 带工具的思考模式会 400。
+      - **认为 Chat Completions 已废弃**：官方说明它继续长期支持，只是新功能优先在 Responses 上。
+    interview_asks:
+      - Chat Completions 和 Responses API 有什么区别？新项目你选哪个？
+      - 你们怎么接入多家大模型？遇到过哪些兼容性问题？
+    project_example: |
+      项目同时接入 OpenAI 和 DeepSeek，统一用 Chat Completions 格式。接入 DeepSeek 思考模式做工具调用时，第二轮请求总是 400，
+      查文档发现带 tools 的思考模式要求把历史 `reasoning_content` 原样回传，而我们的会话存储只保存了 content。
+      修复后在统一客户端里增加「按厂商保存与回传扩展字段」的适配层，并用 extra_body 传递厂商特有参数，业务代码无需感知。
+    freshness: |
+      核对于 2026-11：OpenAI 迁移指南写明 Responses 推荐用于新项目、Chat Completions 继续支持；GPT-5.4 起 Chat Completions 不支持 reasoning_effort 非 none 时的工具调用。
+      DeepSeek 文档：OpenAI 格式 base_url 为 https://api.deepseek.com，思考模式通过 thinking 参数与 reasoning_effort 控制，带 tools 时须回传 reasoning_content。
+      阿里云百炼文档：兼容模式 base_url 含 WorkspaceId 与地域；enable_thinking 等非标准参数通过 extra_body 传入；流式用量需 stream_options include_usage。
+    sources:
+      - {title: "OpenAI Docs - Migrate to the Responses API", url: "https://developers.openai.com/api/docs/guides/migrate-to-responses"}
+      - {title: "DeepSeek API Docs - Your First API Call", url: "https://api-docs.deepseek.com/"}
+      - {title: "DeepSeek API Docs - Thinking Mode", url: "https://api-docs.deepseek.com/guides/thinking_mode.md"}
+      - {title: "阿里云百炼 - 通过 OpenAI 接口调用千问模型", url: "https://help.aliyun.com/zh/model-studio/compatibility-of-openai-with-dashscope"}
+      - {title: "阿里云百炼 - OpenAI 兼容 Chat 参数说明", url: "https://help.aliyun.com/zh/model-studio/qwen-api-via-openai-chat-completions"}
+quiz:
+  - id: d17-q1
+    kp: d17-k1
+    type: judge
+    question: 使用 Chat Completions API 时，只要两次请求使用同一个 API Key，模型就能记住上一次请求中用户说过的话。
+    answer: false
+    explain: |
+      LLM API 是无状态的，模型在两次请求之间不保留任何信息，与 API Key 无关。多轮对话需要应用把历史 messages 放进每次请求里。
+      Responses API 的 previous_response_id 也只是由服务端帮你串联历史，而且历史输入 Token 仍然计费，本质上模型每次仍要处理完整上下文。
+  - id: d17-q2
+    kp: d17-k2
+    type: single
+    question: 使用 Chat Completions 流式输出时，想在流中拿到本次请求的 Token 用量，正确做法是？
+    options:
+      - "流结束后再发一次非流式请求获取 usage"
+      - "设置 stream_options 的 include_usage 为 true，在 data: [DONE] 前的最后一个 chunk 中读取 usage"
+      - "把每个 chunk 的 delta.content 长度加起来就是 completion tokens"
+      - "流式模式下每个 chunk 都自带累计 usage，取最后一个非空 chunk 即可"
+    answer: [1]
+    explain: |
+      流式默认不返回 usage，开启 include_usage 后会在 [DONE] 之前多发一个 choices 为空、带完整 usage 的 chunk，其他 chunk 的 usage 为 null。
+      再发一次请求会重复计费且结果不同；字符长度不等于 Token 数；默认情况下 chunk 并不带累计 usage。另外流中断时可能收不到这个 chunk。
+  - id: d17-q3
+    kp: d17-k3
+    type: multi
+    question: 以下哪些错误情况适合做「有限次退避重试」？
+    options:
+      - "HTTP 503，错误码为服务过载"
+      - "HTTP 429，错误码表示请求速率过快"
+      - "HTTP 400，提示上下文长度超出模型限制"
+      - "HTTP 401，API Key 无效"
+      - "连接超时，未收到任何响应"
+      - "HTTP 429，错误码表示信用余额已耗尽"
+    answer: [0, 1, 4]
+    explain: |
+      503 过载、429 速率限制、网络超时都是暂时性故障，等待后可能恢复，适合退避重试（429 优先遵循 Retry-After）。
+      400 上下文超长是请求本身的问题，重试结果相同，应裁剪输入；401 是配置问题，应告警修复；
+      额度耗尽虽然也是 429，但重试无法恢复，必须根据 error.code 区分并告警。
+  - id: d17-q4
+    kp: d17-k2
+    type: short
+    question: 有同事说「改成流式输出后，接口变快了」。这句话对吗？请说明流式到底改善了什么指标，又带来了哪些额外工程成本。
+    key_points:
+      - {text: "指出流式改善的是首 Token 时间和感知速度，总生成时间基本不变", dim: principle}
+      - {text: "说明额外成本：前端增量解析、半包处理、错误事件、Nginx 缓冲配置", dim: engineering}
+      - {text: "说明流式下 usage 需要 include_usage 且断流可能丢失", dim: concept}
+    reference: |
+      不完全对。模型生成速度没有变化，流式只是把结果分片尽早推送，所以改善的是首 Token 时间（TTFT）和用户感知速度，总耗时基本不变，甚至因为多次网络写入略有开销。
+      额外工程成本包括：后端要用异步生成器转发并转换成自己的事件格式；前端要用 fetch 读取流、按空行切分事件、处理半包；
+      流中出错要发送 error 事件，不能悄悄断开；部署时要关闭 Nginx 等代理的缓冲；usage 需开启 include_usage 且断流时可能拿不到；
+      SDK 不会自动重试已开始消费的流。批处理等后台任务不需要流式，用非流式更简单。
+  - id: d17-q5
+    kp: d17-k2
+    type: scenario
+    question: |
+      本地开发时聊天接口逐字输出正常；部署到测试环境（浏览器 → Nginx → FastAPI → LLM）后，回答总是等十几秒后一次性全部出现。
+      另外偶尔会出现回答只显示一半就停住、前端也没有任何报错。请分析两个问题的可能原因和修复办法。
+    key_points:
+      - {text: "指出 Nginx 等代理的响应缓冲导致流被攒到最后一次性发送", dim: engineering}
+      - {text: "给出修复：关闭 proxy_buffering 或返回 X-Accel-Buffering no 头", dim: engineering}
+      - {text: "指出半截停住是上游出错或超时但后端吞掉异常、没有发送错误事件", dim: principle}
+      - {text: "提出后端定义 error 事件、记录 request id，前端按结束事件判断是否完整", dim: engineering}
+    reference: |
+      第一个问题通常是中间层缓冲：Nginx 默认开启 proxy_buffering，会把上游响应攒到缓冲区满或连接结束才转发，于是流式变成一次性输出。
+      修复方法是在对应 location 关闭 proxy_buffering（并适当调大读超时），或由后端返回 `X-Accel-Buffering: no` 响应头；如有 CDN、网关也要检查。
+      第二个问题说明流在中途终止了，可能是上游超时、限流、网络中断或服务端错误。如果后端生成器里 `except Exception: pass` 吞掉了异常，
+      连接正常关闭，前端无法区分「正常结束」和「异常中断」。修复：后端捕获异常后记录日志（含 request id）并发送 `error` 事件；
+      正常结束发送明确的 `done` 事件；前端只有收到 done 才认为完整，否则提示「回答中断，可重试」。
+    followup:
+      question: 如果用户点了「停止生成」或直接关闭页面，后端应该怎么处理？
+      key_points: [检测客户端断开, 停止读取并关闭上游流以节省 Token, 记录已生成部分和 usage]
+      reference: 后端应感知客户端断开（框架取消生成器或主动检测断开状态），随即关闭上游流不再消费，避免继续生成浪费 Token；同时保存已生成的部分内容和可获得的用量信息，便于计费和会话恢复。
+  - id: d17-q6
+    kp: d17-k3
+    type: design
+    question: |
+      请设计一个后端接口 `POST /api/chat/stream`，供前端聊天页面使用。要求说明：请求参数、历史消息来源、
+      调用模型的方式、返回给前端的事件格式、错误处理和用量记录。
+    key_points:
+      - {text: "前端只传会话 ID 和本轮输入，历史与 system 由后端组装", dim: engineering}
+      - {text: "定义自有 SSE 事件类型，例如 delta、done、error，屏蔽厂商格式", dim: engineering}
+      - {text: "按错误类型处理：可重试错误在流开始前重试，流开始后发送 error 事件", dim: principle}
+      - {text: "开启 include_usage 并持久化用量与 request id，设置合理超时", dim: engineering}
+    reference: |
+      请求体：`session_id`、`message`，鉴权信息放在请求头。后端校验用户对该会话的权限，从存储中读取历史，固定拼接服务端 system，并按 Token 预算裁剪或摘要。
+      调用：使用 AsyncOpenAI，设置合理超时（如连接 5 秒、总时长 60 秒），`stream=True`，`stream_options={"include_usage": True}`。
+      返回：`text/event-stream`，自定义事件：`delta`（增量文本）、`done`（结束原因与用量摘要）、`error`（错误码与友好提示），并加 `X-Accel-Buffering: no`。
+      错误处理：流开始前的连接错误、429、5xx 可以有限次退避重试；400、401 不重试，转换为友好错误；流开始后出错不自动重放，发送 error 事件并记录 request id。
+      用量与持久化：结束时保存完整回复、finish_reason、usage 到会话表和计费表；客户端断开时停止消费上游并记录已生成部分。
+  - id: d17-q7
+    kp: d17-k1
+    type: short
+    question: 一个多轮客服对话进行到第 40 轮时，接口开始返回 400，错误信息提示上下文长度超限。请解释原因，并给出至少三种处理办法。
+    key_points:
+      - {text: "说明 API 无状态，每轮都回填全部历史，输入 Token 线性增长直到超过窗口", dim: principle}
+      - {text: "提出只保留最近 N 轮并固定保留 system", dim: engineering}
+      - {text: "提出对早期对话做摘要或把长期信息放入检索", dim: engineering}
+      - {text: "提出发送前预估 Token，而不是等 400 后再处理", dim: engineering}
+    reference: |
+      因为 API 无状态，后端每一轮都把完整历史放进 messages，输入 Token 随轮数线性增长；第 40 轮时历史加上本轮输入和预留的输出上限超过了模型上下文窗口，服务端返回 400。
+      这是请求本身的问题，重试不会成功。处理办法：一是滑动窗口，只保留最近 N 轮，但必须单独保留 system；
+      二是摘要，把较早的对话压缩成一段摘要放在 system 之后；三是把用户档案、订单信息等长期信息放到数据库或检索中，按需注入；
+      四是发送前用 Tokenizer 预估 Token 数，超出预算时先裁剪；五是适当降低输出上限或换更长上下文的模型。同时监控每次请求的输入 Token，提前发现异常增长。
+code_reading:
+  id: d17-c1
+  kp: [d17-k2, d17-k3, d17-k1]
+  title: FastAPI 流式聊天转发接口
+  scenario: |
+    公司 AI 助手的后端接口，浏览器调用 `POST /api/chat/stream`，后端调用 OpenAI 兼容接口并以 SSE 把增量文本推给前端。
+    测试反馈「偶尔回答说一半就停，没有任何提示」，而且有一次上游故障时接口卡了好几分钟才结束。请审查这段代码。
+  language: python
+  code: |
+    import json
+    import logging
+    import os
+
+    from fastapi import FastAPI
+    from fastapi.responses import StreamingResponse
+    from openai import AsyncOpenAI
+    from pydantic import BaseModel
+
+    logger = logging.getLogger(__name__)
+    app = FastAPI()
+    client = AsyncOpenAI(api_key=os.environ["LLM_API_KEY"], base_url=os.getenv("LLM_BASE_URL"))
+    MODEL = os.getenv("LLM_MODEL", "gpt-5.5")
+
+
+    class ChatIn(BaseModel):
+        session_id: str
+        messages: list[dict]          # 前端传来的完整对话历史
+
+
+    def sse(payload: dict) -> str:
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+    async def event_stream(body: ChatIn):
+        try:
+            stream = await client.chat.completions.create(
+                model=MODEL,
+                messages=body.messages,
+                stream=True,
+                stream_options={"include_usage": True},
+            )
+            async for chunk in stream:
+                if chunk.usage:
+                    logger.info("session=%s usage=%s", body.session_id, chunk.usage)
+                if not chunk.choices:
+                    continue
+                text = chunk.choices[0].delta.content
+                if text:
+                    yield sse({"type": "delta", "text": text})
+            yield sse({"type": "done"})
+        except Exception:
+            pass
+
+
+    @app.post("/api/chat/stream")
+    async def chat_stream(body: ChatIn):
+        return StreamingResponse(
+            event_stream(body),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+  walkthrough:
+    function: |
+      接收前端的会话 ID 和对话历史，以流式方式调用大模型，把每个增量文本包装成自定义 SSE 事件（delta）推送给浏览器，
+      结束时发送 done 事件，并在日志中记录本次 Token 用量。
+    key_functions: |
+      - `sse()`：把字典序列化为一条 SSE 事件文本，格式为 `data: JSON` 加空行。
+      - `event_stream()`：异步生成器，发起流式请求、遍历上游 chunk、过滤空内容、产出 delta 和 done 事件。
+      - `chat_stream()`：FastAPI 路由，用 `StreamingResponse` 包装生成器，设置 SSE 响应头并关闭 Nginx 缓冲。
+    params: |
+      请求体经 Pydantic 解析为 `ChatIn`，其中 `messages` 由前端提供并原样传给 `client.chat.completions.create`；
+      `stream=True` 让 SDK 返回异步可迭代对象，`stream_options` 要求在流末尾附带 usage；
+      生成器产出的字符串被 `StreamingResponse` 逐段写入 HTTP 响应体。
+    data_flow: |
+      ```mermaid
+      sequenceDiagram
+        participant B as 浏览器
+        participant R as chat_stream 路由
+        participant G as event_stream 生成器
+        participant M as LLM API
+        B->>R: POST 会话 ID 与 messages
+        R->>G: 创建生成器并开始流式响应
+        G->>M: create 且 stream 为 true
+        loop 每个 chunk
+          M-->>G: chunk 含 delta 或 usage
+          G-->>B: data delta 事件
+        end
+        G-->>B: data done 事件
+        Note over G: 任何异常都被 except pass 吞掉
+      ```
+    failure_points: |
+      - **吞掉异常（值得审查的问题 1）**：`except Exception: pass` 让超时、429、5xx、上游中途断开全部静默；连接正常关闭但没有 done 也没有 error，前端看到「说一半就停」，日志里也没有任何记录。
+      - **没有设置超时（值得审查的问题 2）**：`AsyncOpenAI` 默认超时 10 分钟，上游卡住时请求和连接被长时间占用；SDK 默认还会对超时重试 2 次，最坏等待更久。
+      - **信任前端传来的完整 messages**：用户可伪造 system 消息绕过规则，也可塞入超长历史导致上下文超长和成本失控。
+      - 只记录了 usage，没有保存完整回复和 finish_reason；finish_reason 为 length 时前端也不知道回答被截断。
+    debugging: |
+      - 先把 `except Exception: pass` 改为 `logger.exception(...)`，复现「说一半就停」，看具体异常类型（APITimeoutError、RateLimitError 等）。
+      - 捕获 `openai.APIStatusError` 时记录 `status_code` 和 `request_id`；对比上游返回与浏览器收到的事件序列。
+      - 用 curl 加 `-N` 参数直连后端和经过 Nginx 两种方式测试，区分是后端问题还是代理缓冲问题。
+      - 人为把超时设得很短（如 1 秒）复现超时路径，确认 error 事件能到达前端。
+    change_request: |
+      如果需求改成「前端要显示回答是否被截断，并在出错时显示可重试提示」：
+      在遍历 chunk 时记录 `finish_reason`，在 done 事件中带上它；
+      `except` 分支按异常类型生成 `{"type": "error", "code": ..., "message": 友好提示}` 事件并 `yield` 出去，同时记录日志；
+      同时把 messages 改为后端按 session_id 组装，前端只传本轮输入；创建客户端时设置 `timeout` 和合理的 `max_retries`。
+  questions:
+    - id: d17-c1-q1
+      kp: d17-k3
+      type: code
+      question: |
+        假设上游在推送了 30 个 delta 之后网络中断，SDK 在继续读取时抛出异常。请按执行顺序描述这段代码接下来发生了什么，
+        前端和日志分别看到什么，并说明应如何修改。
+      key_points:
+        - {text: "指出异常从 async for 抛出后进入 except 分支并被 pass 吞掉", dim: principle}
+        - {text: "指出 done 事件不会发送，生成器正常结束，HTTP 响应正常关闭", dim: principle}
+        - {text: "指出前端只看到 30 段文本且无错误提示，日志无任何记录", dim: engineering}
+        - {text: "给出修改：记录异常和 request id，yield error 事件，前端以 done 判断完整性", dim: engineering}
+      reference: |
+        异常在 `async for chunk in stream` 读取下一块时抛出（读超时为 APITimeoutError，其他传输错误为 APIConnectionError），
+        程序跳出循环进入 `except Exception`，执行 `pass`，于是 `yield sse({"type": "done"})` 不会执行，生成器直接结束。
+        StreamingResponse 认为响应已经写完，正常关闭连接。前端只收到 30 个 delta，没有 done 也没有 error，界面停在半句话，无法区分正常结束和中断；
+        日志里没有异常记录，usage chunk 也没收到，用量缺失。SDK 也不会自动重试已经开始消费的流。
+        修改：except 分支使用 logger.exception 记录异常类型、会话 ID 和可获得的 request id，然后 yield 一个 error 事件（友好提示加错误码）；
+        前端只有收到 done 才标记完整，收到 error 或连接意外关闭时显示「回答中断，可重试」。
+    - id: d17-c1-q2
+      kp: d17-k2
+      type: code
+      question: 说明 `sse()` 产出的文本格式为什么要以两个换行结尾；如果前端用 fetch 读取这个流，应该如何解析才能避免半包问题？
+      key_points:
+        - {text: "说明 SSE 以空行分隔事件，两个换行表示一个事件结束", dim: concept}
+        - {text: "说明网络分块可能把一个事件拆开或把多个事件合并", dim: principle}
+        - {text: "给出解析方法：累积缓冲区，按两个换行切分，最后不完整的部分留到下次", dim: engineering}
+      reference: |
+        SSE 协议中每个事件由若干「字段: 值」行组成，以一个空行结束；`data: ...` 后面跟 `\n\n`，第一个换行结束 data 行，第二个形成空行，表示这个事件完整了。
+        HTTP 分块传输时，一次 read 读到的字节不一定恰好是一个事件：可能只有半个事件（半包），也可能包含多个事件。
+        前端用 fetch 拿到 `response.body.getReader()`，配合 TextDecoder（stream 模式）把字节解码追加到缓冲字符串，然后按 `\n\n` 切分，
+        除最后一段外都是完整事件，去掉 `data: ` 前缀后 JSON.parse；最后一段可能不完整，保留在缓冲区等下一次读取。
+        不能用原生 EventSource，因为它只支持 GET 且不能自定义鉴权头。
+    - id: d17-c1-q3
+      kp: d17-k1
+      type: code
+      question: 这段代码让前端传完整的 `messages`。请结合「API 无状态」解释这种设计为什么能工作，又会带来哪些安全和成本问题，应如何改造？
+      key_points:
+        - {text: "说明 API 无状态，必须每次传完整历史，所以前端传历史在功能上可行", dim: principle}
+        - {text: "指出用户可篡改或伪造 system 消息，绕过业务规则", dim: engineering}
+        - {text: "指出历史无上限会导致 Token 成本增长和上下文超长", dim: engineering}
+        - {text: "提出后端按会话 ID 组装历史、固定 system、裁剪或摘要", dim: engineering}
+      reference: |
+        因为模型不记得上一轮，每次请求都必须带上需要的历史，所以无论历史由谁提供，只要放进 messages 模型就能「接上话」，这也是这段代码功能上能工作的原因。
+        但由前端提供历史意味着数据完全受用户控制：用户可以在浏览器里修改或伪造 system 消息、伪造 assistant 的历史回答，绕过服务端的规则和权限；
+        也可以塞入超长内容，导致输入 Token 暴涨和上下文超长报错，成本不可控。
+        改造：前端只传 session_id 和本轮输入；后端校验会话归属，从存储读取历史，固定拼接服务端的 system，按 Token 预算保留最近 N 轮并摘要更早内容；
+        回答完成后由后端写回历史，并记录 usage。
+interview:
+  - id: d17-i1
+    kp: d17-k1
+    type: oral
+    difficulty: 1
+    question: 调用一次大模型 API，请求和响应里分别包含哪些关键内容？多轮对话是怎么实现的？
+    key_points:
+      - {text: "说明请求包含 model、messages（各角色）、生成参数", dim: concept}
+      - {text: "说明响应要看 content、finish_reason、usage、请求 ID", dim: concept}
+      - {text: "说明 API 无状态，多轮对话靠应用回填历史", dim: principle}
+      - {text: "说明历史增长带来的成本与超长问题及处理手段", dim: engineering}
+    reference: |
+      请求包含模型名、messages 和生成参数。messages 是一个按顺序排列的列表，角色有 system（或 developer）放规则，user 放用户输入，assistant 放模型之前的回复，tool 放工具结果；
+      参数包括温度、输出上限、是否流式、工具定义等。响应中最重要的是 choices[0].message.content（结果）、finish_reason（stop、length、tool_calls 等结束原因）、
+      usage（输入、输出、总 Token，以及缓存、推理 Token 明细）和请求 ID（排障用）。
+      API 是无状态的，模型不记得之前的请求，多轮对话需要后端把历史保存到数据库或 Redis，每次请求时把 system、历史和本轮问题一起发送。
+      因此输入 Token 随轮数增长，需要滑动窗口、摘要、检索等手段控制；Responses API 可用 previous_response_id 让服务端串联历史，但历史输入仍计费。
+    oral: |
+      一次调用我会从请求和响应两边讲。请求里是模型名、messages 和参数，messages 按角色排列，system 放规则，user 是用户的话，assistant 是模型之前的回答，工具调用时还有 tool。
+      响应里我最关注四个东西：content 是结果，finish_reason 看是不是被截断或者要调工具，usage 用来算成本，请求 ID 用来排障。
+      关键点是 API 无状态，模型不记得上一轮，多轮对话是我们后端把历史存起来每次带上。我做知识助手时，一开始历史全带，长会话单次输入到了 3 万 Token，
+      后来改成固定 system 加最近 10 轮再加早期摘要，平均输入降了约 60%。
+  - id: d17-i2
+    kp: d17-k2
+    type: oral
+    difficulty: 2
+    question: 什么是 SSE？它和 WebSocket 有什么区别？为什么大模型对话一般用 SSE？
+    key_points:
+      - {text: "说明 SSE 是基于 HTTP 的服务端单向推送，text/event-stream，事件以空行分隔", dim: concept}
+      - {text: "对比 WebSocket 是双向全双工、独立协议升级", dim: concept}
+      - {text: "说明 LLM 场景是请求一次、服务端持续推送，SSE 足够且更易部署", dim: principle}
+      - {text: "提到原生 EventSource 只支持 GET，实际常用 fetch 读流", dim: engineering}
+    reference: |
+      SSE 是基于普通 HTTP 的服务端单向推送机制：响应头为 text/event-stream，连接保持打开，服务端持续写入 `data: ...` 形式的文本事件，事件之间用空行分隔，还支持 event、id、retry 字段和注释心跳。
+      WebSocket 需要通过 HTTP 升级握手切换到独立协议，之后是全双工双向通信，适合聊天室、协同编辑、实时游戏等双方都频繁发消息的场景。
+      大模型对话的模式是「客户端发一次请求，服务端持续推送生成结果」，正好是单向推送；SSE 走标准 HTTP，复用现有鉴权、负载均衡、网关和日志体系，部署成本低，OpenAI 等厂商的流式接口本身也是 SSE。
+      实践中浏览器原生 EventSource 只支持 GET 且不能自定义请求头，所以聊天接口通常用 fetch POST 读取 ReadableStream 并自行解析；部署时要关闭代理缓冲。
+      需要双向实时交互（如语音实时对话、用户随时打断）时再考虑 WebSocket。
+    oral: |
+      SSE 就是在一个普通 HTTP 响应上，服务端一段一段地往下推文本，格式是 data 开头、空行结尾。WebSocket 是先升级协议，然后双方都能随时发消息。
+      大模型对话的模式是用户发一次问题，模型不停往回吐字，是典型的单向推送，所以 SSE 就够了，而且它就是 HTTP，鉴权、网关、日志都能复用，厂商的流式接口本身也是 SSE。
+      实际做的时候我用 fetch 发 POST 读流，因为原生 EventSource 只支持 GET、带不了鉴权头。我还踩过 Nginx 缓冲的坑，本地逐字输出、上线变成一次性，关掉缓冲才好。
+  - id: d17-i3
+    kp: d17-k2
+    type: oral
+    difficulty: 3
+    question: 如果让你实现一个生产可用的流式对话接口，后端和前端各要注意什么？
+    key_points:
+      - {text: "后端转换为自定义事件格式，包含 delta、done、error", dim: engineering}
+      - {text: "后端处理异常、超时、客户端断开，不吞异常", dim: engineering}
+      - {text: "开启 include_usage 并持久化完整回复与用量", dim: engineering}
+      - {text: "前端用 fetch 读流并处理半包，以 done 判断完整", dim: engineering}
+      - {text: "部署关闭代理缓冲，结合项目经验说明", dim: project}
+    reference: |
+      后端：使用异步客户端并设置合理超时；流开始前的可重试错误可有限次重试，流开始后出错不自动重放；
+      把上游 chunk 转换为自定义事件（delta 增量、done 带 finish_reason 与用量摘要、error 带错误码和友好提示），屏蔽厂商差异；
+      开启 include_usage，结束时保存完整回复、finish_reason、usage、request id；感知客户端断开后停止消费上游；不要吞掉异常。
+      安全上前端只传会话 ID 和本轮输入，历史和 system 由后端组装。
+      前端：用 fetch + ReadableStream 读取，TextDecoder 流式解码，缓冲后按空行切分事件、处理半包；收到 done 才认为完整，收到 error 或意外断开提示重试；提供「停止生成」按钮，通过 AbortController 中断请求。
+      部署：Nginx 关闭 proxy_buffering 或返回 X-Accel-Buffering: no，读超时要大于最长生成时间；有 CDN 或网关时同样检查缓冲和超时。
+    oral: |
+      我分三块讲。后端，我会把上游格式转换成自己的三种事件：delta、done、error，done 里带 finish_reason 和用量；超时要自己设，不用默认的 10 分钟；
+      异常一定要转换成 error 事件推出去，不能吞，我以前就遇到过 except pass 导致回答说一半就停、日志还一片空白。
+      前端，用 fetch 读流，自己按空行切事件处理半包，只有收到 done 才算完整，再加一个停止按钮用 AbortController 断开，后端感知到断开就停止读取上游，省 Token。
+      部署，关闭 Nginx 缓冲，读超时调大。另外历史由后端组装，前端只传会话 ID 和本轮输入，防止篡改 system。
+  - id: d17-i4
+    kp: d17-k3
+    type: oral
+    difficulty: 3
+    question: 调用大模型 API 遇到 429 你会怎么处理？其他错误码呢？
+    key_points:
+      - {text: "区分限流类 429 与额度耗尽类 429，后者不重试", dim: principle}
+      - {text: "限流类遵循 Retry-After，否则指数退避加抖动，并限制次数", dim: engineering}
+      - {text: "400、401、403、404 不重试，5xx 与超时有限重试", dim: concept}
+      - {text: "说明 SDK 默认重试与超时行为，避免嵌套重试", dim: engineering}
+      - {text: "结合项目说明监控告警与降级", dim: project}
+    reference: |
+      429 先看错误体：如果 error.code 表示额度耗尽、支出上限等，重试没有意义，应立即告警并切换备用模型或提示用户；
+      如果是速率限制，优先按响应头 Retry-After 等待，没有则用指数退避加随机抖动，限制最大次数和总耗时，同时在入口层降低并发或排队。
+      其他错误：400（参数错误、上下文超长）和 401、403、404 都是请求或配置问题，不重试，修请求或告警；5xx（包括 503 过载）和超时、连接错误属于暂时性故障，可以有限次退避重试，持续失败则熔断降级。
+      openai-python 默认会对连接错误、408、409、429、>=500 自动重试 2 次，默认超时 10 分钟；如果应用层自己实现重试，要关闭或计入 SDK 重试，避免次数相乘。
+      所有错误都要记录 request id、模型、状态码和 error.code，按类型监控告警。
+    oral: |
+      遇到 429 我第一件事是看 error.code，因为 429 不一定是限流，也可能是额度用完了。我们就踩过这个坑：月底支出上限用完，大家以为是限流，把重试从 3 次加到 10 次，越重试越糟。
+      如果是限流，我会按 Retry-After 等，没有就指数退避加抖动，次数和总时长都有上限，同时入口降并发；如果是额度类，就不重试，直接告警并切备用供应商。
+      其他错误按能不能靠重试解决来分：400、401、404 是请求或配置错了，不重试；5xx 和超时可以有限重试。还要注意 SDK 默认自己会重试两次，应用层再包一层要把它关掉，不然次数会相乘。
+  - id: d17-i5
+    kp: d17-k4
+    type: design
+    difficulty: 4
+    question: |
+      公司要同时接入 OpenAI、DeepSeek 和通义千问，业务方希望「一套代码随意切换模型」。
+      请设计统一 LLM 调用层，说明如何处理接口格式、扩展参数、流式、错误和用量的差异，以及新项目是否采用 Responses API。
+    key_points:
+      - {text: "设计统一的请求与响应模型，按厂商实现适配器", dim: engineering}
+      - {text: "说明扩展参数通过 extra_body 传递，扩展字段如 reasoning_content 需按厂商保存回传", dim: concept}
+      - {text: "统一流式事件格式与错误分类，归一化 usage", dim: engineering}
+      - {text: "说明 Chat Completions 与 Responses 的取舍依据", dim: principle}
+      - {text: "提出能力表、配置化路由与回归测试", dim: project}
+    reference: |
+      统一层定义自己的请求模型（任务类型、消息、工具、输出格式、流式开关）和响应模型（文本、工具调用、finish_reason、usage、request id、厂商原始字段）。
+      每个厂商一个适配器：负责 base_url 与鉴权、参数裁剪（推理模型移除采样参数）、扩展参数映射（DeepSeek 的 thinking、百炼的 enable_thinking 通过 extra_body 传入）、
+      扩展字段处理（DeepSeek 带工具的思考模式必须回传 reasoning_content，会话存储要保留该字段）。
+      流式：适配器把上游 chunk 或语义事件转换为统一的 delta、tool_call、done、error 事件；统一要求开启 include_usage。
+      错误：把各家状态码和错误码映射成统一的错误类型（可重试、需修请求、配置错误、额度耗尽），由上层统一重试和降级。
+      用量：统一字段（输入、输出、缓存命中、推理 Token），写入计费表。
+      接口选型：只用 OpenAI 且依赖推理模型 + 工具、内置工具或服务端状态时优先 Responses，因为官方推荐且部分新模型的工具调用要求 Responses；需要多厂商兼容时 Chat Completions 格式覆盖面更广，可在适配器内部对 OpenAI 使用 Responses，对外保持统一模型。
+      配套：模型能力表、配置化路由、每个适配器的契约测试和回归测试集。
+    oral: |
+      我会做一个统一调用层，对内定义自己的请求和响应结构，对外每家厂商一个适配器。适配器负责三件事：参数裁剪和映射，比如推理模型去掉温度，厂商特有的思考开关放 extra_body；
+      扩展字段处理，比如我们接 DeepSeek 思考模式做工具调用时，第二轮老是 400，原因是没有回传 reasoning_content，后来就在会话存储里按厂商保存扩展字段；
+      还有错误和流式归一化，统一成 delta、done、error 事件，错误映射成可重试、需修请求、额度耗尽几类。
+      至于 Responses，新项目如果主要用 OpenAI 的推理模型加工具，我会在 OpenAI 适配器里用 Responses，因为官方推荐而且部分新模型工具调用只支持它；对外接口保持统一，业务无感知。
+sources:
+  - {title: "openai-python README", url: "https://raw.githubusercontent.com/openai/openai-python/main/README.md"}
+  - {title: "OpenAI Docs - Streaming API responses", url: "https://developers.openai.com/api/docs/guides/streaming-responses"}
+  - {title: "OpenAI Docs - Error codes", url: "https://developers.openai.com/api/docs/guides/error-codes"}
+  - {title: "OpenAI Docs - Migrate to the Responses API", url: "https://developers.openai.com/api/docs/guides/migrate-to-responses"}
+  - {title: "阿里云百炼 - 流式输出", url: "https://help.aliyun.com/zh/model-studio/stream"}

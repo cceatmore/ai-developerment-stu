@@ -1,0 +1,672 @@
+day: 13
+phase: 2
+title: Token 与上下文
+goals:
+  - 能解释 Token 和 BPE 分词的原理，说明中英文 Token 数差异以及为什么不能用字数换算 Token
+  - 能说清上下文窗口包含哪些内容（输入、输出、推理 Token、工具定义等），并按输入/输出分别估算一次请求和每月的费用
+  - 能为多轮对话或长文档设计上下文溢出时的截断与压缩策略，并说明各策略的代价
+  - 能解释 lost in the middle / context rot 现象，并在 Prompt 布局上做出对应设计
+knowledge_points:
+  - id: d13-k1
+    name: Token 与 Tokenizer：BPE、中英文差异与计数
+    level: P0
+    summary: Token 是模型处理文本的最小单位，由 BPE 等算法把文本切成词表中的片段；Token 数取决于具体 tokenizer
+    why: |
+      **计费、上下文上限、速率限制、输出长度**全部以 Token 计，而不是字数。不会算 Token，你就没法估算成本、没法判断请求会不会超长、没法解释「为什么模型数不清字母」。
+      对中文应用尤其重要：同样一句中文，在不同模型下 Token 数可能差将近一倍。
+    problem: |
+      模型只能处理数字，需要一种方法把任意文本（中文、英文、代码、emoji）稳定地切成有限词表里的片段。
+      按字切：序列太长、效率低；按词切：词表爆炸，遇到新词就无法表示。BPE 这类**子词（subword）**方法在两者之间折中：常见片段合成一个 Token，罕见内容拆成更小的片段，任何文本都能被表示。
+    principle: |
+      **一、BPE（Byte Pair Encoding）的直觉**
+
+      1. 从最小单位开始（现代 tokenizer 多从**字节**开始，所以任何 Unicode 文本都能处理）。
+      2. 统计训练语料中最常相邻出现的一对片段，把它们合并成一个新 Token，加入词表。
+      3. 重复合并，直到词表达到预定大小（如约 10 万、20 万个 Token）。
+
+      结果：高频词（如英文 `the`、常见汉字组合）是一个 Token；低频词被拆成多段。
+
+      ```mermaid
+      flowchart LR
+        A["原始文本"] --> B["转为 UTF-8 字节"]
+        B --> C["按合并规则反复合并相邻片段"]
+        C --> D["得到 Token 片段序列"]
+        D --> E["查词表得到 Token ID 列表"]
+        E --> F["送入模型"]
+        F --> G["模型输出 Token ID"]
+        G --> H["解码回文本"]
+      ```
+
+      **二、实测：中英文差异（用 tiktoken 0.14.0 在本地实测，2026-11）**
+
+      | 文本 | 字符数 | cl100k_base | o200k_base |
+      |---|---|---|---|
+      | 大语言模型的上下文窗口有限，需要做截断。 | 20 | 22 | 13 |
+      | The context window of a large language model is limited, so truncation is needed. | 81 | 17 | 17 |
+      | strawberry | 10 | 3 | 3（切为 st / raw / berry） |
+
+      结论：
+      - **Token 数取决于 tokenizer**：同一句中文，较新的 `o200k_base` 比 `cl100k_base` 少约 40%，因为更大的词表收录了更多中文片段。
+      - **英文一个 Token 平均约等于几个字符**，中文则可能接近「一字一 Token」甚至更多，具体看编码。
+      - **不同厂商 tokenizer 不同**：Anthropic 文档说明，从 Claude Opus 4.7 引入的新 tokenizer 下 1M Token 约合 55.5 万英文单词，而之前的模型约 75 万单词——**同一家厂商换代后 Token 数也会变**。
+
+      **三、Token 化带来的「怪现象」**
+
+      - 模型数不清 `strawberry` 里有几个 r：它看到的是 `st`、`raw`、`berry` 三个整体，而不是 10 个字母。
+      - 要求「写 100 字」常常不准：模型以 Token 为单位生成，对字数没有精确感知。
+      - 罕见词、生僻字、乱码、长数字串会被拆成很多 Token，既贵又更容易出错。
+
+      **四、怎么准确计数**
+
+      - **OpenAI 模型本地估算**：`tiktoken`。`gpt-4o`、`gpt-4.1`、`o` 系列、`gpt-5` 系列映射到 `o200k_base`；`gpt-4`、`gpt-3.5-turbo` 以及 `text-embedding-3-*` 映射到 `cl100k_base`。
+      - 注意：截至 tiktoken 0.14.0，`encoding_for_model("gpt-6-astra")` 会抛 `KeyError`（新模型尚未收录）。本地计数只能作为估算。
+      - **精确计数用官方接口**：OpenAI 提供 `POST /v1/responses/input_tokens`（免费，包含消息角色、工具定义、图片文件等结构开销）；Anthropic 提供 token counting API。
+      - **最终以响应里的 usage 为准**，并记录到日志用于对账。
+
+      **不这样理解会怎样**：用「字数 × 固定系数」估算成本，换模型后预算偏差巨大；用错编码导致截断不准，请求超长报错；对模型数数、控字数的能力抱有不切实际的期待。
+    scenarios: |
+      - **成本预估**：上线前用真实样本跑 Token 计数，按模型的 tokenizer 估算月度费用，而不是按字数拍脑袋。
+      - **请求前检查**：发送前计算 Token，超出预算就触发截断或摘要，避免接口报错。
+      - **模型迁移**：从旧模型换到新模型时，重新测量同一批数据的 Token 数，更新成本模型和截断阈值。
+      - **字数要求场景**：营销文案要求严格字数时，由代码校验字数并重试或截断，不依赖模型自觉。
+    pitfalls: |
+      - **误区：1 个汉字 = 1 个 Token 或 2 个 Token。** 没有固定比例，取决于 tokenizer 和具体文字，必须实测。
+      - **误区：本地 tiktoken 计数 = 账单。** 消息角色、格式标记、工具定义、图片等都占 Token，本地只数正文会偏低。
+      - **误区：所有模型共用一个编码。** 不同厂商、同厂商不同代际的 tokenizer 都可能不同，Embedding 模型和对话模型的编码也可能不同。
+      - **混淆：Token ID 与 Embedding。** Token ID 只是一个整数编号，Embedding 是模型内部（或 Embedding 模型输出）的向量表示（Day 14）。
+    interview_asks:
+      - 什么是 Token？BPE 是怎么工作的？
+      - 为什么中文和英文的 Token 数不一样？怎么准确估算一段文本的 Token 数？
+      - 为什么大模型数不清 strawberry 里有几个 r？
+    code: |
+      ```python
+      import tiktoken
+
+      enc = tiktoken.get_encoding("o200k_base")   # gpt-4o / gpt-5 系列使用的编码
+      ids = enc.encode("大语言模型的上下文窗口有限，需要做截断。")
+      print(len(ids))                              # 实测 13
+      print([enc.decode([i]) for i in enc.encode("strawberry")])  # ['st', 'raw', 'berry']
+      ```
+    project_example: |
+      在一个**中文客服质检**项目中，最初按「每个汉字约 2 个 Token」估算预算，迁移到新模型后实际账单只有预算的一半多，而另一个使用旧编码的服务却频繁超长报错。
+      之后统一做法：每个模型维护自己的计数方式（OpenAI 模型用 tiktoken 对应编码估算，上线前用官方计数接口抽样校准），日志记录每次请求的 usage，按周对比「预估 vs 实际」，误差稳定在可接受范围。
+    freshness: |
+      核对于 2026-11：tiktoken 最新版本为 0.14.0；其 model.py 中 o1/o3/o4-mini、gpt-4o、gpt-4.1、gpt-4.5、gpt-5 前缀映射到 o200k_base，gpt-oss 映射到 o200k_harmony，gpt-4/gpt-3.5-turbo 与 text-embedding-3-* 映射到 cl100k_base；GPT-6 系列尚未收录（本地实测 encoding_for_model("gpt-6-astra") 抛 KeyError，社区有 issue 在询问）。OpenAI 提供免费的 POST /v1/responses/input_tokens 计数接口。Anthropic 文档说明自 Claude Opus 4.7 起使用新 tokenizer。表中 Token 数为本地实测。
+    sources:
+      - {title: "OpenAI Cookbook - How to count tokens with tiktoken", url: "https://developers.openai.com/cookbook/examples/how_to_count_tokens_with_tiktoken"}
+      - {title: "tiktoken model.py（模型到编码的映射）", url: "https://github.com/openai/tiktoken/blob/main/tiktoken/model.py"}
+      - {title: "tiktoken CHANGELOG", url: "https://github.com/openai/tiktoken/blob/main/CHANGELOG.md"}
+      - {title: "OpenAI Docs - Counting tokens", url: "https://developers.openai.com/api/docs/guides/token-counting"}
+      - {title: "Anthropic Docs - Models overview", url: "https://platform.claude.com/docs/en/models/overview"}
+  - id: d13-k2
+    name: 上下文窗口与 Token 计费
+    level: P0
+    summary: 上下文窗口是一次请求能容纳的 Token 总量，包含输入、输出和推理 Token；费用按输入、输出分别计价
+    why: |
+      上下文窗口决定了你**一次能给模型多少信息**、**能让它输出多长**；Token 计费决定了**这个功能能不能赚钱**。
+      面试中「怎么估算和控制 LLM 成本」是工程题必考项，答不出具体算法会显得没做过生产项目。
+    problem: |
+      解决两个问题：
+      1. **请求会不会超限**：系统提示、历史对话、检索结果、工具定义、用户问题、模型输出加起来不能超过窗口。
+      2. **花多少钱**：每次请求的费用 = 输入 Token × 输入单价 + 输出 Token × 输出单价（再考虑缓存折扣等），乘以调用量就是月度成本。
+    principle: |
+      **一、窗口里装了什么**
+
+      上下文窗口可以理解为模型的「工作内存」，一次请求里**所有东西都要放进去**：
+
+      ```mermaid
+      flowchart TD
+        W["上下文窗口 总 Token 上限"] --> I["输入部分"]
+        W --> O["输出部分"]
+        I --> I1["System 或 Developer 指令"]
+        I --> I2["工具定义与 JSON Schema"]
+        I --> I3["对话历史"]
+        I --> I4["检索片段 文件 图片"]
+        I --> I5["当前用户问题"]
+        O --> O1["推理 Token 不可见"]
+        O --> O2["可见回答"]
+      ```
+
+      - Anthropic 文档明确：system prompt、所有消息（含工具结果、图片、文档）、工具定义，以及本轮输出（含 thinking）**都计入窗口**。
+      - 窗口不等于「能输入多少」：还要给输出（尤其是推理模型的推理 Token）预留空间，并且很多模型单独限制**最大输出 Token**。
+
+      **二、当前量级（核对于 2026-11，以官方模型页为准）**
+
+      - OpenAI 当前旗舰 GPT-6 系列：上下文窗口约 **1.05M**，最大输出 **128K**。
+      - OpenAI 上一代 GPT-5（已标记弃用）：总窗口 400K，其中输入最多 272K、输出最多 128K——说明**输入上限可能小于总窗口**。
+      - Anthropic 当前 Claude 主力模型：**1M** 窗口、单次最多 128K 输出；部分旧模型为 200K。
+      - 量级结论：主流旗舰已进入「百万 Token」级别，但单次输出仍在十万级，小模型和私有化模型往往更小。
+
+      **三、计费方式**
+
+      - **输入和输出分别计价，输出单价通常是输入的数倍**（例如 OpenAI GPT-6 Astra 官方标价为输入 $10 / 百万 Token、输出 $50 / 百万 Token）。
+      - **推理 Token 按输出计费**（Day 11）。
+      - **缓存命中的输入有折扣**（Day 12 的 Prompt 缓存），具体比例看厂商。
+      - 部分模型对超长输入有不同价格（例如 Anthropic 文档提到 Haiku 5.5 超过 10 万 Token 的提示价格更高），要看清定价页。
+
+      **四、成本估算示例（单价为假设值，便于计算）**
+
+      假设输入 $2 / 百万 Token、输出 $10 / 百万 Token，每天 10 万次请求，平均输入 3000 Token、输出 500 Token：
+
+      - 输入：10 万 × 3000 = 3 亿 Token = 300 百万 → 300 × $2 = **$600 / 天**
+      - 输出：10 万 × 500 = 5000 万 Token = 50 百万 → 50 × $10 = **$500 / 天**
+      - 合计约 **$1100 / 天**，约 $3.3 万 / 月。
+
+      降本杠杆：减少不必要的输入（精简 Prompt、少放检索片段、压缩历史）、控制输出长度、利用 Prompt 缓存、简单任务换小模型（Day 20）。
+
+      **不这样做会怎样**：只按「调用次数」估算预算，上线后发现长对话用户的单次成本是普通用户的几十倍；不预留输出空间，长回答被截断；不看最大输出限制，以为能一次生成几十万字的报告。
+    scenarios: |
+      - **功能定价与预算**：上线前用样本数据估算每次调用和每月成本，评估功能是否值得做、是否需要限流。
+      - **长文档功能设计**：判断一份 300 页合同能否一次放进窗口，以及放进去的费用是否可接受，对比 RAG 方案。
+      - **监控告警**：按用户、按功能统计输入/输出 Token，发现异常大请求（如被刷接口、Prompt 膨胀）。
+    pitfalls: |
+      - **误区：窗口 1M = 能输入 1M。** 输出和推理 Token 也占窗口，而且部分模型的输入上限小于总窗口。
+      - **误区：成本主要看输入。** 输出单价通常更高，推理模型的推理 Token 还会把输出成本推高。
+      - **误区：窗口越大越好，全塞进去最省事。** 输入越长越贵、越慢，效果还可能下降（d13-k4）。
+      - **混淆：上下文窗口与最大输出。** 两个独立限制，需要分别检查。
+    interview_asks:
+      - 上下文窗口是什么？一次请求里有哪些内容会占用窗口？
+      - 你怎么估算一个 LLM 功能的成本？有哪些降本手段？
+    project_example: |
+      在一个**智能周报生成**功能评审中，产品希望「把员工一周所有聊天记录和文档都给模型」。我用样本统计：单人一周平均约 6 万 Token 输入，全员每周生成一次的输入成本可以接受，但如果允许无限次重新生成，成本会失控。
+      最终方案：先用规则和小模型筛选与工作相关的内容，把输入压到约 1 万 Token；每人每天限制重新生成次数；监控每用户 Token 消耗并设置告警。
+    freshness: |
+      核对于 2026-11：OpenAI 模型页显示 GPT-6 Astra 等当前旗舰上下文窗口 1.05M、最大输出 128K，GPT-6 Astra 标价输入 $10/MTok、输出 $50/MTok；GPT-5（已弃用）为 400K 总窗口（输入上限 272K、输出 128K）。Anthropic 文档显示 Claude Fable 5.2、Opus 5.5、Sonnet 5.5、Haiku 5.5 等为 1M 窗口、最大输出 128K，部分旧模型为 200K；1M 窗口默认开启，长上下文按标准价格计费（Haiku 5.5 超过 10 万 Token 的提示除外）。价格与上限变化频繁，使用前以官方页面为准。
+    sources:
+      - {title: "OpenAI Docs - Models", url: "https://developers.openai.com/api/docs/models"}
+      - {title: "OpenAI Docs - GPT-5 模型页（400K 窗口示例）", url: "https://developers.openai.com/api/docs/models/gpt-5"}
+      - {title: "Anthropic Docs - Context windows", url: "https://platform.claude.com/docs/en/build-with-claude/context-windows"}
+      - {title: "Anthropic Docs - Models overview", url: "https://platform.claude.com/docs/en/models/overview"}
+  - id: d13-k3
+    name: 上下文溢出与截断策略
+    level: P0
+    summary: 超出预算时按优先级取舍：保住指令和当前问题，保留最近对话，较早内容摘要化，检索内容按相关度裁剪
+    why: |
+      多轮对话、长文档、Agent 工具调用都会让上下文持续膨胀。没有截断策略，系统迟早会遇到**请求超长报错**、**费用暴涨**或**模型忘记关键信息**。
+      这是 AI 应用后端最常写、也最容易写错的代码之一，面试中常以「长对话超过上下文怎么办」的形式出现。
+    problem: |
+      在固定的 Token 预算内，决定**放什么、丢什么、压缩什么**，让模型在有限窗口里拿到最有用的信息。
+      写错的典型后果：丢掉了最近一轮问题却保留了很早的寒暄；把 System Prompt 截掉导致模型「人设崩了」；把 JSON 或代码从中间截断导致格式损坏。
+    principle: |
+      **一、先做 Token 预算分配**
+
+      ```text
+      可用输入预算 = 模型上下文窗口 − 预留输出（含推理）− 安全余量
+      可用输入预算 = 固定部分（指令、工具定义）+ 当前问题 + 检索内容 + 历史对话
+      ```
+
+      固定部分和当前问题**必须保留**，剩下的预算再分给检索内容和历史。
+
+      **二、常见策略**
+
+      | 策略 | 做法 | 优点 | 代价 |
+      |---|---|---|---|
+      | 滑动窗口 | 只保留最近 N 轮或最近 N 个 Token | 简单、可预测 | 早期关键信息（如订单号）会丢 |
+      | 摘要压缩 | 较早的对话用模型总结成一段摘要 | 保留要点 | 多一次调用；摘要可能丢细节或失真 |
+      | 关键信息抽取 | 把订单号、偏好等结构化存为「记忆」字段 | 精确、稳定 | 需要定义抽取规则或 Schema |
+      | 检索式历史 | 历史存起来，按当前问题检索相关的几轮 | 适合超长会话 | 实现复杂，可能检索不到 |
+      | 检索结果裁剪 | 按相关度排序，只保留前若干片段 | 直接省 Token | 可能漏掉答案所在片段 |
+
+      **三、一个常用的组合流程**
+
+      ```mermaid
+      flowchart TD
+        A["组装候选上下文"] --> B["计算 Token 总数"]
+        B --> C{"超出输入预算吗"}
+        C -->|"否"| Z["发送请求"]
+        C -->|"是"| D["固定保留 指令 工具定义 当前问题"]
+        D --> E["检索片段按相关度裁剪"]
+        E --> F["历史对话从最早开始移出"]
+        F --> G["被移出的历史合并进摘要或记忆字段"]
+        G --> B
+      ```
+
+      **四、截断的细节**
+
+      - **从哪头删**：对话历史通常**保留最近的、删除最早的**；但 System Prompt 永远不删。
+      - **按完整单元删**：按消息、按片段整体移除，不要从一条消息中间按字符截断，否则可能截断 JSON、代码或半个句子；工具调用和工具结果要成对保留或成对删除。
+      - **按 Token 计**：用对应模型的 tokenizer 或官方计数接口计算，不要用字符数近似。
+      - **记录日志**：记录截断前后的 Token 数和被丢弃的内容数量，方便排查「模型忘了」类问题。
+      - **超出时的行为因厂商而异**：有的直接报错，有的接受请求但输出可能被截断，务必在应用层自己控制，不要依赖服务端行为。
+
+      **不这样做会怎样**：长会话用户突然报错无法继续；模型忘记用户一开始给的关键信息；费用随对话轮数线性甚至更快增长。
+    scenarios: |
+      - **多轮客服**：保留最近 10 轮 + 早期对话摘要 + 已抽取的订单号、手机号等关键字段。
+      - **RAG 问答**：检索 Top-20 后经 Rerank 只保留 Top-5 送入模型（Day 27）。
+      - **Agent 长任务**：工具结果很长时只保留摘要或关键字段，原始结果存储在外部，需要时再取（Day 37）。
+    pitfalls: |
+      - **误区：从最早的消息开始依次保留，直到满为止。** 这样会保留最早的寒暄而丢掉最近的上下文，方向反了。
+      - **误区：按字符截断最后一条消息。** 可能截断 JSON、代码，甚至截掉用户真正的问题。
+      - **误区：工具调用消息可以单独删。** 删掉工具调用而保留工具结果（或反过来），很多 API 会报格式错误或让模型困惑。
+      - **误区：摘要一定可靠。** 摘要也是模型生成的，可能丢失数字等关键细节，重要信息应结构化保存。
+    interview_asks:
+      - 多轮对话超过上下文窗口怎么办？有哪些策略，各自的代价是什么？
+      - 截断时哪些内容必须保留？为什么不能按字符截断？
+    project_example: |
+      在一个**售后多轮客服**项目中，用户常在第一轮报订单号，聊到二三十轮后机器人开始「忘记订单号」反复追问。
+      原因是简单的滑动窗口只保留最近 10 轮。改为三层结构：System Prompt + 结构化「会话记忆」（订单号、问题类型、已尝试方案，由每轮抽取更新）+ 最近 8 轮原文；更早的对话合并进摘要。改造后重复追问的投诉基本消失，单次请求输入 Token 也稳定在预算之内。
+  - id: d13-k4
+    name: 长上下文的利用率：Lost in the Middle 与 Context Rot
+    level: P1
+    summary: 窗口装得下不等于用得好；信息放在长上下文中间更容易被忽略，内容越多准确率越可能下降
+    why: |
+      很多人以为「窗口够大就把全部资料塞进去」，结果效果反而变差。
+      理解长上下文利用率的规律，才能正确设计 Prompt 布局、决定检索片段数量，以及回答面试中「百万上下文了还要 RAG 吗」这类问题。
+    problem: |
+      解决「信息给了，模型却没用上」的问题：答案明明在上下文里，模型却说找不到，或被无关内容干扰给出错误答案。
+    principle: |
+      **一、Lost in the Middle（2023，斯坦福等）**
+
+      - 实验：多文档问答中，把包含答案的文档放在不同位置。
+      - 发现：答案在**开头或结尾**时效果最好，在**中间**时明显下降，呈 **U 形曲线**；甚至出现过「答案在中间时的准确率低于不给任何文档」的情况。
+      - 另一发现：检索文档从 20 篇增加到 50 篇，效果只提升约 1 个百分点左右，但输入长度和成本大幅增加。
+
+      **二、Context Rot（Anthropic 文档用语）**
+
+      Anthropic 文档指出：随着 Token 数量增长，准确率和召回会下降，因此**上下文里放什么，和窗口有多大一样重要**。
+
+      **三、布局建议（核对于 2026-11 的厂商文档）**
+
+      ```mermaid
+      flowchart TD
+        A["稳定的角色与规则"] --> B["长文档或检索资料 用标签分隔并带来源"]
+        B --> C["本次具体指令"]
+        C --> D["用户问题放在最后"]
+        E["相关度最高的片段"] -.-> B
+      ```
+
+      - Anthropic：处理 2 万 Token 以上的长文档时，**把长文档放在提示词前面，问题放在最后**；其测试中这样做可使回答质量提升最多约 30%。多文档时用标签包裹每篇文档及其元数据。
+      - OpenAI：建议开发者消息按「身份、指令、示例、上下文」组织，**上下文通常放在靠后的位置**。
+      - 两家共同点：**问题和关键指令不要淹没在资料中间**；资料要有清晰的分隔和来源标注。
+      - 检索结果：按相关度排序，**最相关的放在靠前或紧挨问题的位置**，并控制数量。
+
+      **四、工程结论**
+
+      - 少而精优于多而全：用 RAG、Rerank 控制送入的片段数量。
+      - 长文档任务优先考虑「分段处理再汇总」或「先定位再精读」。
+      - 用评估集验证：把答案放在不同位置测试，确认你的模型和布局在目标长度下是否稳定。
+    scenarios: |
+      - **RAG 片段排序**：Rerank 后把最相关的片段放在资料区的开头，并控制在若干条以内。
+      - **长合同审查**：先让模型定位相关条款，再只把相关条款送入第二次调用做精读。
+      - **评估长上下文能力**：选型时构造「答案在不同位置」的测试集，而不是只看宣传的窗口大小。
+    pitfalls: |
+      - **误区：窗口越大，塞得越多越准。** 研究和厂商文档都表明，内容越多，利用率可能越低。
+      - **误区：lost in the middle 已经被新模型完全解决。** 新模型长上下文能力明显提升，但 Anthropic 文档仍提示 context rot，应以自己的场景实测为准。
+      - **误区：只要把问题重复两遍就行。** 重复可以缓解，但无法替代精简和排序。
+    interview_asks:
+      - 什么是 lost in the middle？对 RAG 的 Prompt 设计有什么启示？
+      - 现在模型都有百万 Token 上下文了，还需要 RAG 吗？
+    project_example: |
+      在一个**投标文件问答**系统中，初版每次检索 30 个片段并按文档顺序拼接，用户反馈「明明文件里有，回答说没找到」。
+      实验发现答案片段排在中间时命中率明显偏低。改为 Rerank 后保留前 6 个片段、最相关的放在最前、问题放在最后，并给每个片段加来源标签。在内部评估集上，答案命中率明显提升，输入 Token 降低了约四分之三。
+    freshness: |
+      核对于 2026-11：Lost in the Middle 论文（Liu 等，arXiv 2307.03172，TACL 2024）结论为 U 形曲线。Anthropic Context windows 文档使用「context rot」描述 Token 增长导致的准确率和召回下降；其 Prompting best practices 建议 2 万 Token 以上长文档放在前面、问题放在最后，测试中质量最多提升约 30%。OpenAI Prompt engineering 指南建议上下文通常放在开发者消息靠后位置。
+    sources:
+      - {title: "Lost in the Middle: How Language Models Use Long Contexts", url: "https://arxiv.org/abs/2307.03172"}
+      - {title: "Anthropic Docs - Context windows", url: "https://platform.claude.com/docs/en/build-with-claude/context-windows"}
+      - {title: "Anthropic Docs - Prompting best practices", url: "https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/claude-prompting-best-practices"}
+      - {title: "OpenAI Docs - Prompt engineering", url: "https://developers.openai.com/api/docs/guides/prompt-engineering"}
+quiz:
+  - id: d13-q1
+    kp: d13-k1
+    type: single
+    question: 关于 Token 数的估算，以下哪项说法最准确？
+    options:
+      - 中文固定按 1 个汉字 = 2 个 Token 估算即可，各模型通用
+      - 同一段文本在不同 tokenizer 下 Token 数可能差别很大，应使用对应模型的编码或官方计数接口
+      - 只要用 tiktoken 数出正文的 Token 数，就与账单上的输入 Token 完全一致
+      - 英文和中文的 Token 数只与字符数有关，与词表无关
+    answer: [1]
+    explain: |
+      Token 数由具体 tokenizer 的词表和合并规则决定。实测同一句 20 字中文，cl100k_base 为 22 个 Token，o200k_base 只有 13 个，所以没有通用的固定比例（A、D 错）。
+      C 错：消息角色、格式标记、工具定义、图片等也占 Token，本地只数正文会偏低，精确计数应使用官方计数接口并以响应的 usage 为准。
+  - id: d13-q2
+    kp: d13-k2
+    type: judge
+    question: 某模型的上下文窗口是 1M Token，因此可以输入 1M Token 的资料，同时仍然得到一段完整的长回答。
+    answer: false
+    explain: |
+      上下文窗口是输入和输出共享的总量，模型的输出（包括推理模型不可见的推理 Token）也要占用窗口。输入占满窗口就没有空间生成回答；另外很多模型还单独限制最大输出 Token，部分模型的输入上限也小于总窗口（如 GPT-5 总窗口 400K、输入上限 272K）。
+  - id: d13-q3
+    kp: d13-k3
+    type: multi
+    question: 多轮对话超出输入预算时，以下哪些截断做法是合理的？
+    options:
+      - System Prompt 始终保留，不参与截断
+      - 优先移除最早的对话轮次，保留最近的对话
+      - 把最后一条用户消息按字符截掉一半，以便保留更多历史
+      - 被移出的早期对话可以压缩成摘要，订单号等关键信息抽取为结构化字段保存
+      - 工具调用消息和对应的工具结果成对保留或成对移除
+    answer: [0, 1, 3, 4]
+    explain: |
+      A、B、D、E 都是常见的正确做法：指令必须保留；对话历史保留最近、移除最早；早期内容通过摘要和结构化记忆保留要点；工具调用和结果要成对处理，否则 API 可能报错或让模型困惑。
+      C 错：当前问题是最重要的内容之一，按字符截断可能截掉真正的问题，甚至破坏 JSON 或代码格式。
+  - id: d13-q4
+    kp: d13-k1
+    type: short
+    question: 用户发现：让模型数「strawberry」中有几个字母 r 时经常答错；要求「写一段正好 100 字的产品介绍」也总是多几个或少几个字。请从 Token 化的角度解释，并说明工程上怎么处理。
+    key_points:
+      - {text: "指出模型看到的是 Token 而不是字母，strawberry 被切成 st、raw、berry 等片段", dim: principle}
+      - {text: "指出模型以 Token 为单位生成，对字符数没有精确感知，Token 与字数没有固定对应", dim: principle}
+      - {text: "提出计数、字数校验等确定性工作交给代码完成", dim: engineering}
+      - {text: "提出生成后由代码校验字数，不满足时重试或截断", dim: engineering}
+    reference: |
+      模型输入和输出的最小单位是 Token，不是字符。用 o200k_base 实测，`strawberry` 被切成 `st`、`raw`、`berry` 三个 Token，模型「看不到」单独的字母，只能凭训练中学到的模式猜，所以数字母容易错。
+      写固定字数也是同理：模型一次生成一个 Token，一个 Token 可能对应一个字、半个字或几个字，它对「已经写了多少字」没有精确计数能力。
+      工程处理：确定性的计数、长度校验交给代码。比如字母计数直接用 Python 计算；字数要求则在生成后由代码统计，不符合时带上实际字数让模型重写，或在可接受范围内截断，并设置最大重试次数。
+  - id: d13-q5
+    kp: d13-k3
+    type: scenario
+    question: |
+      某客服机器人的上下文管理逻辑是：每次请求带上全部历史消息。上线一个月后出现两个问题：
+      1. 少数长会话用户的请求开始报「超出上下文长度」错误；
+      2. 改成「只保留最近 10 轮」后，不报错了，但用户在第 1 轮提供的订单号，到第 20 轮时机器人又反复追问。
+      请分析原因并设计改进方案。
+    key_points:
+      - {text: "指出全量携带历史会随轮数线性增长，最终超出窗口，费用也同步增长", dim: principle}
+      - {text: "指出简单滑动窗口会丢失早期关键信息，导致重复追问", dim: principle}
+      - {text: "提出分层上下文：System Prompt、结构化会话记忆、早期摘要、最近若干轮原文", dim: engineering}
+      - {text: "提出发送前按 Token 计算预算，超出时按优先级裁剪并记录日志", dim: engineering}
+      - {text: "提出用长会话样例回归测试关键信息是否保留", dim: project}
+    reference: |
+      **原因**：全量携带历史时，输入 Token 随轮数线性增长，长会话最终超过上下文窗口而报错，同时单次请求费用不断上升。改为滑动窗口后虽然控制住了长度，但第 1 轮的订单号随着窗口移动被丢弃，模型自然不知道，只能重复追问。
+      **改进方案：分层上下文**
+      1. **System Prompt**：固定保留。
+      2. **结构化会话记忆**：每轮对话后抽取并更新订单号、问题类型、已尝试方案等关键字段，以固定格式放在上下文中，不受截断影响。
+      3. **早期对话摘要**：超出窗口的旧对话合并为一段摘要。
+      4. **最近若干轮原文**：保留最近 6~10 轮。
+      发送前用对应模型的 tokenizer 或计数接口计算总 Token，超出预算时按「检索内容 → 最早历史」的顺序裁剪，并记录截断前后的 Token 数。
+      **验证**：构造 30 轮以上的长会话测试用例，检查订单号等关键信息是否始终可用，并监控上下文超长错误和重复追问率。
+    followup:
+      question: 结构化会话记忆由模型抽取，如果抽错了订单号怎么办？
+      key_points:
+        - "抽取结果用正则或业务接口校验"
+        - "关键字段变化时向用户确认"
+      reference: 对订单号这类关键字段用格式规则和订单接口校验是否存在且属于该用户；字段被修改或有冲突时向用户确认，不能完全信任模型抽取结果。
+  - id: d13-q6
+    kp: d13-k2
+    type: short
+    question: 某功能每天约 5 万次调用，平均每次输入 4000 Token、输出 800 Token。假设模型单价为输入 $2 / 百万 Token、输出 $10 / 百万 Token。请计算每天费用，并指出至少 3 个降本方向及其依据。
+    key_points:
+      - {text: "正确计算输入费用：5 万乘 4000 等于 2 亿 Token，即 200 百万乘 2 美元等于 400 美元", dim: concept}
+      - {text: "正确计算输出费用：5 万乘 800 等于 4000 万 Token，即 40 百万乘 10 美元等于 400 美元，合计约 800 美元每天", dim: concept}
+      - {text: "指出输出单价更高，控制输出长度效果显著", dim: principle}
+      - {text: "提出精简输入、利用 Prompt 缓存、简单任务换小模型等手段并说明依据", dim: engineering}
+    reference: |
+      **计算**：
+      - 输入：50,000 × 4,000 = 200,000,000 Token = 200 百万 Token，200 × $2 = **$400**；
+      - 输出：50,000 × 800 = 40,000,000 Token = 40 百万 Token，40 × $10 = **$400**；
+      - 合计约 **$800 / 天**，约 $2.4 万 / 月。注意输出 Token 只有输入的五分之一，费用却与输入持平，因为单价是 5 倍。
+      **降本方向**：
+      1. **控制输出长度**：明确输出格式和长度上限，去掉客套话，输出单价高，收益明显；
+      2. **精简输入**：清理冗长的 System Prompt，检索片段 Rerank 后少放几条，历史对话做摘要；
+      3. **Prompt 缓存**：把固定指令放在前缀保持不变，命中缓存的输入 Token 享受折扣并降低延迟；
+      4. **模型分级**：简单任务换更便宜的小模型，复杂任务再升级；
+      5. **结果缓存**：高频相同问题直接复用答案。
+  - id: d13-q7
+    kp: d13-k4
+    type: judge
+    question: 只要模型的上下文窗口足够大，把含有答案的资料放在长上下文的中间位置，与放在开头或紧挨问题的位置，效果基本相同。
+    answer: false
+    explain: |
+      Lost in the Middle 研究发现，相关信息位于开头或结尾时效果最好，位于中间时明显下降，呈 U 形曲线；Anthropic 文档也用 context rot 描述 Token 增长导致的准确率下降。
+      因此要控制资料数量、把最相关的内容放在显眼位置、问题放在最后，并在自己的场景中实测。
+code_reading:
+  id: d13-c1
+  kp: [d13-k1, d13-k3]
+  title: 对话历史的 Token 计数与截断
+  scenario: 客服机器人后端在每次调用模型前调用 `build_messages`，把 System Prompt、历史消息和当前问题组装成 messages，并保证不超出上下文窗口。最近有用户反馈「机器人前言不搭后语」，你需要审查这段代码。
+  language: python
+  code: |
+    import logging
+
+    import tiktoken
+
+    logger = logging.getLogger(__name__)
+
+    MAX_CONTEXT = 128_000
+    RESERVED_OUTPUT = 4_000
+
+
+    def get_encoder(model: str) -> tiktoken.Encoding:
+        try:
+            return tiktoken.encoding_for_model(model)
+        except KeyError:
+            logger.warning("未知模型 %s，回退到 cl100k_base", model)
+            return tiktoken.get_encoding("cl100k_base")
+
+
+    def count_tokens(enc: tiktoken.Encoding, text: str) -> int:
+        return len(enc.encode(text))
+
+
+    def build_messages(
+        model: str, system_prompt: str, history: list[dict], question: str
+    ) -> list[dict]:
+        enc = get_encoder(model)
+        budget = MAX_CONTEXT - RESERVED_OUTPUT
+        used = count_tokens(enc, system_prompt) + count_tokens(enc, question)
+
+        kept: list[dict] = []
+        for msg in history:  # history 按时间正序：最早的在前
+            cost = count_tokens(enc, msg["content"])
+            if used + cost > budget:
+                break
+            kept.append(msg)
+            used += cost
+
+        if used > budget:
+            question = question[: budget * 2]
+
+        logger.info("model=%s kept=%d/%d tokens=%d", model, len(kept), len(history), used)
+        return [
+            {"role": "system", "content": system_prompt},
+            *kept,
+            {"role": "user", "content": question},
+        ]
+  walkthrough:
+    function: |
+      在调用模型前组装 messages：计算 System Prompt 和当前问题的 Token 数，再在剩余预算内尽量放入历史消息，最后返回 system + 历史 + 当前问题的列表，并记录保留了多少条历史。
+    key_functions: |
+      - `get_encoder`：按模型名获取 tiktoken 编码，模型未收录时回退到 `cl100k_base` 并打警告。
+      - `count_tokens`：对一段文本编码并返回 Token 数。
+      - `build_messages`：计算预算、遍历历史决定保留哪些、在极端情况下截断问题，组装并返回 messages。
+    params: |
+      - `model` 决定使用哪种编码；`history` 是按时间正序排列的消息字典列表（含 role、content）；`question` 是本轮用户输入。
+      - 预算由模块常量 `MAX_CONTEXT`、`RESERVED_OUTPUT` 决定，与传入的模型无关。
+    data_flow: |
+      ```mermaid
+      flowchart TD
+        A["model system_prompt history question"] --> B["get_encoder 选择编码"]
+        B --> C["budget 等于 MAX_CONTEXT 减 RESERVED_OUTPUT"]
+        C --> D["used 等于 system 加 question 的 Token"]
+        D --> E["从最早的历史开始逐条累加"]
+        E --> F{"加上这条会超预算吗"}
+        F -->|"否"| G["加入 kept"]
+        G --> E
+        F -->|"是"| H["停止遍历"]
+        H --> I{"used 仍超预算吗"}
+        I -->|"是"| J["按字符截断 question"]
+        I -->|"否"| K["组装 messages 返回"]
+        J --> K
+      ```
+    failure_points: |
+      - **保留方向反了**：从最早的消息开始保留，预算满了就停，结果留下的是会话开头，**丢掉的是最近几轮**，这正是「前言不搭后语」的根因。
+      - **编码回退不准**：新模型（如 GPT-6 系列）不在 tiktoken 0.14.0 的映射中，会回退到 `cl100k_base`，中文计数可能比实际编码偏多不少；换成其他厂商模型更是完全不同的 tokenizer。
+      - **漏算开销**：只数 content，没算消息角色、格式标记、工具定义等开销，实际 Token 偏高，接近上限时仍可能超长。
+      - **按字符截断问题**：`budget * 2` 是字符数而不是 Token 数，逻辑没有意义，还可能截断用户的真实问题。
+      - 窗口常量写死，与实际模型无关；tiktoken 首次加载编码需要联网下载，离线部署环境可能直接失败。
+    debugging: |
+      - 查看 `kept=x/y` 日志：长会话中 kept 远小于总数时，检查保留的是哪几条（打印首尾消息时间）。
+      - 写单元测试：构造 50 条历史、预算只够 10 条，断言保留的是最后 10 条。
+      - 用官方计数接口（如 OpenAI 的 input_tokens）对同一 messages 计数，与本地结果对比，确认误差。
+      - 在离线环境运行一次 `get_encoder`，确认编码文件是否已预先缓存。
+    change_request: |
+      如果需求改为「保留最近对话 + 早期对话摘要」：
+      1. 改为从 `history` 末尾倒序遍历，保留最近的消息，最后再反转回正序；
+      2. 被丢弃的早期消息交给摘要函数，摘要作为一条 system 或单独字段插入在历史之前，并计入预算；
+      3. 按模型配置窗口大小和编码，计数时加入每条消息的固定开销估算；
+      4. 去掉按字符截断问题的逻辑，问题本身超长时直接返回明确错误。
+  questions:
+    - id: d13-c1-q1
+      kp: d13-k3
+      type: code
+      question: 假设预算只够放 10 条历史消息，而 history 有 40 条。按执行过程说明最终发给模型的是哪些消息，并解释为什么用户会觉得机器人「前言不搭后语」。应该怎么改？
+      key_points:
+        - {text: "说明循环从最早的消息开始累加，第 11 条时超预算 break，保留的是第 1 到第 10 条", dim: concept}
+        - {text: "指出最近 30 条对话被丢弃，模型看到的是会话开头加当前问题，上下文断裂", dim: principle}
+        - {text: "提出倒序遍历保留最近消息，再反转为正序", dim: engineering}
+        - {text: "提出被丢弃的早期内容用摘要或结构化记忆保留关键信息", dim: engineering}
+      reference: |
+        执行过程：先计算 system 和 question 的 Token 作为 `used`，然后 `for msg in history` 从第 1 条（最早）开始累加，前 10 条都能放下被加入 `kept`；到第 11 条时 `used + cost > budget`，执行 `break`，循环结束。最终 messages 是：system + 第 1~10 条历史 + 当前问题。
+        结果：模型看到的是会话**最开始**的 10 条（往往是寒暄和最初的问题）以及当前问题，中间和最近的 30 条全部丢失。用户刚刚讨论的内容模型完全不知道，所以回答驴唇不对马嘴。
+        修改：改为 `for msg in reversed(history)` 倒序遍历，先保留最近的消息，满额后停止，再把 `kept` 反转回时间正序；早期被丢弃的内容通过摘要或结构化会话记忆（订单号等关键字段）保留要点，并把这部分 Token 也计入预算。
+    - id: d13-c1-q2
+      kp: d13-k1
+      type: code
+      question: 运维把模型从 `gpt-4o` 切换到 `gpt-6-astra` 后，日志里出现大量「未知模型，回退到 cl100k_base」警告。请解释发生了什么、对截断有什么影响，以及本地计数本身还有哪些不准的地方。
+      key_points:
+        - {text: "说明 tiktoken 0.14.0 未收录 GPT-6 系列，encoding_for_model 抛 KeyError 进入回退分支", dim: concept}
+        - {text: "指出 cl100k_base 与新模型实际编码不同，中文计数可能明显偏多，导致过度截断或估算失真", dim: principle}
+        - {text: "指出只计算 content，漏掉消息格式、工具定义等开销", dim: principle}
+        - {text: "提出按模型显式配置编码、关键路径用官方计数接口校准、以响应 usage 对账", dim: engineering}
+      reference: |
+        `get_encoder` 调用 `tiktoken.encoding_for_model("gpt-6-astra")`，而截至 tiktoken 0.14.0，模型映射表里没有 GPT-6 系列，于是抛出 `KeyError`，进入回退分支使用 `cl100k_base`。
+        影响：`cl100k_base` 是较老的编码，对中文效率较低（实测同一句 20 字中文，cl100k_base 为 22 个 Token，o200k_base 为 13 个），新模型的真实编码也未必与任何本地编码一致。计数偏多会导致**过度截断**，丢掉本可保留的历史；如果换成别的厂商模型，计数可能偏少，导致超长报错。
+        本地计数还漏掉了消息角色、格式分隔符、工具定义、图片等开销，只数 content 必然偏低。
+        改进：按模型在配置中显式指定计数方式；对 OpenAI 模型可用官方免费的 `responses/input_tokens` 接口做精确计数或定期校准；预算留出安全余量；以响应中的 usage 对账并监控偏差。
+    - id: d13-c1-q3
+      kp: d13-k3
+      type: code
+      question: |
+        代码最后有一段 `question = question[: budget * 2]`。请说明它在什么情况下会执行、执行后会发生什么，以及正确的处理方式。
+      key_points:
+        - {text: "指出只有 system 加 question 本身就超过预算时才会执行，因为历史循环不会让 used 超预算", dim: concept}
+        - {text: "指出 budget 乘 2 是字符数，与 Token 预算没有对应关系，截断后仍可能超长", dim: principle}
+        - {text: "指出按字符截断会切断用户问题、JSON 或代码，模型收到不完整输入", dim: principle}
+        - {text: "提出问题超长时返回明确错误或引导用户上传文件走分段处理，System Prompt 过长应在开发期治理", dim: engineering}
+      reference: |
+        历史循环只在「加上不超预算」时才累加，所以循环结束后 `used > budget` 只可能是 **System Prompt + 当前问题本身就已经超过预算**，例如用户粘贴了一份超长文档。
+        这时代码用 `budget * 2` 作为字符上限截断问题：字符数和 Token 数没有固定对应关系，截完后可能仍超长（服务端报错），也可能截掉过多；而且从中间截断会切断用户真正的问题或破坏粘贴的 JSON、代码，模型收到的是残缺输入，回答必然离题，而用户并不知情。
+        正确处理：问题超长时**返回明确的错误提示**（如「内容过长，请上传文件」），或把长内容转为文件走分段处理/RAG 流程；如果是 System Prompt 过长，应在开发阶段精简，而不是在运行时截用户输入。同时记录日志便于统计这类请求。
+interview:
+  - id: d13-i1
+    kp: d13-k1
+    type: oral
+    difficulty: 1
+    question: 什么是 Token？为什么同样内容的中文和英文 Token 数不一样？你在项目里怎么计算 Token？
+    key_points:
+      - {text: "说明 Token 是模型处理文本的最小单位，计费和上下文都按 Token 计", dim: concept}
+      - {text: "说明 BPE 子词合并的原理：高频片段合并成一个 Token", dim: principle}
+      - {text: "说明 Token 数取决于 tokenizer 词表，中文效率随编码不同差异很大，举出实测或具体例子", dim: principle}
+      - {text: "说明工程做法：对应编码本地估算、官方计数接口校准、usage 对账", dim: engineering}
+    reference: |
+      Token 是模型处理文本的最小单位，可能是一个词、一个子词、一个汉字或几个字节。模型的计费、上下文窗口、输出上限、速率限制都按 Token 计算。
+      主流 tokenizer 用 BPE 一类的子词算法：从字节开始，把语料中高频相邻的片段反复合并成新 Token，直到词表达到预定大小。高频内容一个 Token，罕见内容拆成多个。
+      中英文差异来自词表：英文高频词多被收录为单个 Token；中文是否高效取决于词表收录了多少中文片段。用 tiktoken 实测一句 20 字中文，cl100k_base 为 22 个 Token，较新的 o200k_base 只有 13 个，而同等长度的英文句子两者都是 17 个左右。
+      工程上：OpenAI 模型用 tiktoken 对应编码本地估算；关键路径用官方计数接口（如 responses/input_tokens）精确计数，它会包含消息格式和工具定义的开销；最终以响应中的 usage 记录和对账。
+    oral: |
+      Token 是模型处理文本的最小单位，计费、上下文、输出上限都按它算。主流用 BPE，把高频片段合并成一个 Token，罕见内容拆成多个。
+      中英文差异主要取决于词表。我实测过同一句 20 个字的中文，老的 cl100k 编码是 22 个 Token，新的 o200k 只要 13 个，所以绝对不能按字数乘一个固定系数估算。
+      项目里我的做法是：本地用对应模型的编码估算，用官方计数接口抽样校准，日志记录 usage 每周对账。之前中文质检项目就是因为按字数估算，换模型后预算偏差了一倍，后来按这套方法把误差控制住了。
+  - id: d13-i2
+    kp: d13-k2
+    type: oral
+    difficulty: 2
+    question: 什么是上下文窗口？一次请求中哪些内容会占用窗口？窗口大小和最大输出有什么关系？
+    key_points:
+      - {text: "说明上下文窗口是一次请求可容纳的 Token 总量，是模型的工作内存，不是训练数据", dim: concept}
+      - {text: "列出占用项：系统指令、工具定义、历史、检索内容、问题、输出与推理 Token", dim: principle}
+      - {text: "区分窗口与最大输出限制，并说明需要为输出预留空间", dim: principle}
+      - {text: "给出当前量级并说明以官方模型页为准，例如百万级窗口与十万级最大输出", dim: engineering}
+    reference: |
+      上下文窗口是模型在一次请求中能「看到」的 Token 总量，相当于工作内存；它与训练数据无关，模型不会因为窗口大就知道更多事实。
+      占用窗口的内容包括：System/Developer 指令、工具定义和 Schema、对话历史、检索片段、文件和图片、当前问题，以及本轮生成的输出——推理模型不可见的推理 Token 也算在内。Anthropic 文档明确列出了这些都计入窗口。
+      窗口和最大输出是两个限制：模型通常单独限制单次最大输出 Token；部分模型的输入上限还小于总窗口，例如 GPT-5 总窗口 400K，但输入最多 272K、输出最多 128K。所以组装输入时要为输出预留空间。
+      量级上，2026 年主流旗舰模型已达到约百万 Token 窗口（OpenAI GPT-6 系列约 1.05M，Claude 当前主力模型 1M），单次输出上限约 128K；但这些数字变化快，要以官方模型页为准。
+    oral: |
+      上下文窗口就是模型一次请求的工作内存，系统指令、工具定义、历史对话、检索内容、用户问题，还有模型这次的输出，包括看不见的推理 Token，全都要放在里面。
+      要注意它和最大输出是两回事。比如 GPT-5 总窗口 400K，但输入最多 272K、输出最多 128K。现在旗舰模型已经到百万级窗口，但输出上限还是十几万，所以我组装输入时一定会给输出留预算。
+      在周报项目里，我就是按这个思路先算清楚输入能放多少、输出要留多少，再决定要不要先做筛选压缩。
+  - id: d13-i3
+    kp: d13-k2
+    type: oral
+    difficulty: 3
+    question: 如果让你负责一个 LLM 功能的成本控制，你会怎么估算成本？有哪些降本手段？怎么监控？
+    key_points:
+      - {text: "给出公式：输入 Token 乘输入单价加输出 Token 乘输出单价，考虑推理 Token 与缓存折扣", dim: concept}
+      - {text: "说明用真实样本测量平均和分位数 Token，乘以调用量估算月成本", dim: engineering}
+      - {text: "列出降本手段：精简输入、控制输出、Prompt 缓存、模型分级、结果缓存", dim: engineering}
+      - {text: "说明监控：按用户和功能统计 usage、异常请求告警、预估与实际对账", dim: engineering}
+      - {text: "结合项目举出具体数字或决策", dim: project}
+    reference: |
+      **估算**：单次费用 = 输入 Token × 输入单价 + 输出 Token × 输出单价；推理模型的推理 Token 按输出计；缓存命中的输入按折扣价。用 100~1000 条真实样本测量输入、输出 Token 的平均值和 P95，乘以预期日调用量得到日成本和月成本，并按 P95 评估长尾用户的成本。
+      **降本手段**：
+      1. 精简输入：压缩 System Prompt、Rerank 后少放检索片段、历史对话摘要化；
+      2. 控制输出：明确格式与长度，输出单价通常是输入的数倍；
+      3. Prompt 缓存：稳定前缀在前，提高缓存命中；
+      4. 模型分级路由：简单任务走小模型，复杂任务再升级；推理模型按需调 effort；
+      5. 结果缓存：高频重复问题复用答案；
+      6. 业务限流：限制单用户重新生成次数。
+      **监控**：每次请求记录 usage（输入、输出、缓存、推理 Token），按用户、功能、模型维度聚合；设置单请求和单用户日消耗告警；每周对比预估与实际。
+    oral: |
+      估算我用公式：输入 Token 乘输入单价加输出 Token 乘输出单价，推理 Token 算输出，缓存命中的打折。我会拿几百条真实样本测平均值和 P95，乘调用量算月成本，P95 用来看长尾用户。
+      降本我按收益排：先控制输出长度，因为输出贵；再精简输入，比如检索片段 Rerank 后少放几条、历史做摘要；然后用 Prompt 缓存，简单任务换小模型，高频问题做结果缓存。
+      监控上每次记录 usage，按用户和功能聚合，异常大的请求告警。周报项目里我就是靠先筛选内容把单人输入从 6 万压到 1 万左右，再加上重新生成次数限制，把成本控制住的。
+  - id: d13-i4
+    kp: d13-k3
+    type: oral
+    difficulty: 3
+    question: 多轮对话越来越长，超出上下文窗口怎么办？请说出你会采用的策略和实现时的注意事项。
+    key_points:
+      - {text: "说明先做 Token 预算：窗口减输出预留减安全余量，指令和当前问题必须保留", dim: principle}
+      - {text: "比较滑动窗口、摘要压缩、结构化记忆、检索式历史的优缺点", dim: concept}
+      - {text: "说明实现细节：保留最近删除最早、按完整消息删除、工具调用成对处理、按 Token 计数", dim: engineering}
+      - {text: "说明用长会话测试验证关键信息不丢失，并记录截断日志", dim: project}
+    reference: |
+      **先做预算**：可用输入 = 窗口 − 输出（含推理）预留 − 安全余量。System Prompt、工具定义和当前问题必须保留，剩余预算分配给检索内容和历史。
+      **策略对比**：
+      - 滑动窗口：只保留最近 N 轮，简单，但会丢早期关键信息；
+      - 摘要压缩：早期对话总结成摘要，保留要点，但多一次调用且可能丢细节；
+      - 结构化记忆：把订单号、偏好等关键字段抽取保存，精确稳定；
+      - 检索式历史：历史入库，按当前问题检索相关轮次，适合超长会话但更复杂。
+      生产中常组合使用：System Prompt + 结构化记忆 + 早期摘要 + 最近若干轮原文。
+      **实现注意**：用对应模型的 tokenizer 或官方接口计数；保留最近、删除最早；按完整消息删除，不按字符截断；工具调用和工具结果成对处理；记录截断前后 Token 数和丢弃条数。
+      **验证**：用 30 轮以上长会话测试关键信息是否保留，监控超长报错率和重复追问率。
+    oral: |
+      我会先算预算：窗口减掉输出预留和安全余量，剩下的才是输入，其中系统指令和当前问题必须保留。
+      策略上我用分层组合：系统指令、一份结构化会话记忆、早期对话摘要，再加最近几轮原文。滑动窗口简单但会丢早期信息，摘要可能丢数字，所以订单号这类关键字段我用结构化记忆单独存。
+      实现上要注意保留最近、删最早，按整条消息删，工具调用和结果成对处理，按 Token 而不是字符计数。售后客服项目里就是这么改的，「忘记订单号反复追问」的投诉基本消失了。
+  - id: d13-i5
+    kp: d13-k4
+    type: design
+    difficulty: 4
+    question: 现在主流模型都支持约百万 Token 的上下文了。有人提议「知识库问答不用 RAG 了，把所有文档直接放进上下文」。你怎么看？请设计一个你认为合理的上下文管理方案。
+    key_points:
+      - {text: "指出窗口有上限，企业文档总量通常远超百万 Token 且持续增长", dim: concept}
+      - {text: "指出长上下文的成本和首字延迟随输入线性甚至更快增长", dim: engineering}
+      - {text: "指出 lost in the middle 与 context rot，内容越多利用率可能越低", dim: principle}
+      - {text: "指出权限隔离、引用溯源、增量更新在全量塞入方案中难以实现", dim: engineering}
+      - {text: "给出方案：RAG 检索加 Rerank 精选、Prompt 分区布局、Token 预算、按场景实测评估，小规模固定资料可直接放入并利用缓存", dim: project}
+    reference: |
+      **我的观点**：大窗口扩大了可选方案，但不能替代 RAG。
+      1. **容量**：企业知识库常有成千上万份文档，总量远超百万 Token，而且持续增长。
+      2. **成本与延迟**：每次提问都处理全部文档，输入费用和 prefill 时间都非常高，即使有 Prompt 缓存，缓存也会因文档更新而失效。
+      3. **效果**：Lost in the Middle 研究和 Anthropic 的 context rot 说明，内容越多，信息利用率可能越低，无关内容还会干扰回答。
+      4. **工程能力**：权限隔离（不同员工可见不同文档）、引用溯源、增量更新，在「全量塞入」方案中都很难做好。
+      **合理方案**：
+      - 资料少且稳定（例如一份几万 Token 的产品手册）：可以直接放入上下文，放在稳定前缀中利用 Prompt 缓存。
+      - 大规模知识库：RAG 检索 Top-K → Rerank 保留少量高相关片段 → 按权限过滤；
+      - Prompt 分区布局：固定指令在前，资料区用标签分隔并标注来源，最相关的片段放在资料区前部，问题放最后；
+      - Token 预算：为资料、历史、输出分别设上限；
+      - 评估：构造「答案在不同位置、不同长度」的测试集，对比「全量上下文」和「RAG」两种方案的准确率、成本和延迟，用数据决定。
+    oral: |
+      我的看法是大窗口让方案更灵活，但替代不了 RAG。原因有四个：企业文档总量通常远超百万 Token；每次都塞全部文档，费用和首字延迟都扛不住；研究和厂商文档都指出内容越多利用率可能越低，中间的信息容易丢；还有权限隔离、引用溯源、增量更新，全量塞入都很难做。
+      我的方案是分情况：资料少且稳定，比如一份产品手册，就直接放进稳定前缀利用缓存；大知识库就走 RAG 加 Rerank，只放少量高相关片段，按权限过滤，资料带来源标签、问题放最后。
+      最后用评估集对比两种方案的准确率、成本和延迟。之前投标文件问答就是从 30 个片段减到 6 个，命中率反而提升、输入 Token 少了四分之三。
+sources:
+  - {title: "OpenAI Cookbook - How to count tokens with tiktoken", url: "https://developers.openai.com/cookbook/examples/how_to_count_tokens_with_tiktoken"}
+  - {title: "OpenAI Docs - Counting tokens", url: "https://developers.openai.com/api/docs/guides/token-counting"}
+  - {title: "OpenAI Docs - Models", url: "https://developers.openai.com/api/docs/models"}
+  - {title: "Anthropic Docs - Context windows", url: "https://platform.claude.com/docs/en/build-with-claude/context-windows"}
+  - {title: "Lost in the Middle（arXiv 2307.03172）", url: "https://arxiv.org/abs/2307.03172"}

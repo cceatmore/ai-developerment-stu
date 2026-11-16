@@ -1,0 +1,10 @@
+data
+data-smoke
+backend/.venv
+frontend/node_modules
+frontend/dist
+**/__pycache__
+.git
+prototype
+backend/tests
+content/_v1

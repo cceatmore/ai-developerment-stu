@@ -1,0 +1,922 @@
+day: 33
+phase: 4
+title: 工具设计与失败处理
+goals:
+  - 能评审一个工具的名称、描述、参数和返回内容，指出会让模型用错或浪费上下文的地方
+  - 能用 Pydantic 从同一份定义生成工具 Schema 并做业务校验，把校验失败变成模型能看懂的修正提示
+  - 能把工具错误分成「回填给模型 / 执行器重试 / 终止上报」三类，并说清每类怎么处理
+  - 能为写操作设计超时、重试和幂等方案，解释 Agent 为什么会重复下单以及如何从两层防住
+minutes: 60
+resources:
+  - title: "Anthropic - Writing effective tools for agents"
+    url: "https://www.anthropic.com/engineering/writing-tools-for-agents"
+    kind: article
+    lang: en
+    minutes: 30
+    note: "重点看 Principles for writing effective tools 一节：选对工具、命名空间、返回有意义的上下文、优化 Token、写好描述，对应今天的 d33-k1；前半部分讲评测流程，可以先跳过"
+  - title: "LangChain Docs - Prebuilt middleware"
+    url: "https://docs.langchain.com/oss/python/langchain/middleware/built-in"
+    kind: doc
+    lang: en
+    minutes: 15
+    note: "只看 Tool error 和 Tool retry 两个小节，对照 d33-k3、d33-k4 手写的执行器，看框架把「异常转成错误消息」和「指数退避重试」封装成了什么参数"
+  - title: "Stripe API - Idempotent requests"
+    url: "https://docs.stripe.com/api/idempotent_requests"
+    kind: doc
+    lang: en
+    minutes: 10
+    note: "支付行业对幂等键的标准做法：客户端生成键、服务端记住首次结果、相同键重试返回同一结果；读完就能理解 d33-k4 里工单接口为什么要带幂等键"
+knowledge_points:
+  - id: d33-k1
+    name: 工具粒度与描述：写给模型看的接口
+    level: P1
+    summary: 工具是模型与系统之间的契约；按任务而不是按接口设计粒度，名称描述讲清边界，只返回高信号内容
+    analogy: |
+      像给前端同事写接口文档和 TS 类型：接口名要见名知义，参数用 `deviceId: string` 而不是 `id: any`，枚举写成联合类型，文档里写清「什么时候调、返回什么、和另一个接口的区别」。
+      **不一样的地方**：前端同事看不懂会来问你；模型**只能看这几行描述**，看不懂就会猜，猜错了你只会在 trace 里看到它调错了工具或参数。
+    why: |
+      Anthropic 在做 SWE-bench Agent 时提到，他们**优化工具花的时间比优化整体 Prompt 还多**。很多「模型不够聪明」的问题，根源是工具描述含糊、参数容易填错、返回内容又长又难懂。
+      这是投入产出比最高、又最容易被忽视的优化点，面试里「模型总是选错工具怎么办」几乎必问。
+    problem: |
+      常见的糟糕工具：
+      - **直接把后端接口一个个包成工具**：`list_devices`、`list_alarms`、`list_orders`，模型要调三次再自己拼；
+      - 名称含糊：`query`、`search`、`get_data`，多个工具都像能干这件事；
+      - 描述只有一句「查询数据」，不说什么时候用、返回什么；
+      - 返回几百条原始 JSON，夹杂 uuid、内部状态码，把上下文撑爆。
+    principle: |
+      **一、按任务设计，而不是按接口包装**
+
+      Anthropic 的建议：不要只是把现有 API 端点包一层，而是**围绕高频任务做少量精心设计的工具**，必要时在工具内部合并多次 API 调用。
+
+      | 按接口包装 | 按任务设计 |
+      |---|---|
+      | `read_logs` 返回全部日志 | `search_logs` 只返回相关行和上下文 |
+      | `get_device` + `list_alarms` + `list_orders` | `get_device_context` 一次返回设备、近期告警、未完结工单 |
+      | `list_contacts` 让模型逐条翻 | `search_contacts` 按名字查 |
+
+      合并能**减少步数**（Day 31 的错误累积），也减少中间结果占用的上下文。
+
+      **二、五个设计要点**
+
+      | 要点 | 差的写法 | 好的写法 |
+      |---|---|---|
+      | **命名空间** | `search` | `iot_device_search`、`ticket_search`，按服务和资源加前缀 |
+      | **描述写清用途和边界** | 查询告警 | 按区域查最近 24 小时告警；查单台设备请用 get_device_context |
+      | **参数防呆**（poka-yoke） | `id`、自由格式时间 | `device_id`（形如 DEV-000123）、`date`（YYYY-MM-DD，附示例）、枚举 |
+      | **返回高信号内容** | 带 uuid、mime_type 的原始 JSON | 名称、状态、关键数字；需要 ID 时再给 |
+      | **控制返回量** | 一次返回全部 | 分页、过滤、截断，并告诉模型怎么缩小范围 |
+
+      Anthropic 还提到两个细节：把难懂的 UUID 换成有语义的名字或简单序号，能明显减少检索类任务的幻觉；可以给工具加一个 `response_format` 参数（concise / detailed），让模型按需决定要不要返回 ID 等细节。Claude Code 默认把单次工具返回限制在 25000 Token 以内。
+
+      **三、工具数量要克制**
+
+      - 工具越多、功能越重叠，模型越容易选错。Anthropic 的判断标准：**如果人类工程师都说不清某个场景该用哪个工具，就别指望 Agent 做得更好**。
+      - OpenAI 文档的软建议：一个回合开始时可用的函数**少于 20 个**；工具很多时按场景筛选下发（Day 39 讲按需加载）。
+
+      **四、用评测驱动工具改进**
+
+      ```mermaid
+      flowchart LR
+        A["写工具定义"] --> B["用真实任务跑评测"]
+        B --> C["看 trace：选错率 参数错误率 重复调用 Token"]
+        C --> D["改名称 描述 参数 返回格式"]
+        D --> B
+      ```
+
+      参数错误多 → 描述或示例不清；重复调用多 → 分页或返回内容要调整。Anthropic 举过例子：他们发现模型调用网页搜索时总在 query 末尾加年份，改进工具描述后才纠正。
+    scenarios: |
+      - **园区排障**：把「查设备 + 查近期告警 + 查未完结工单」合并成 `get_device_context`，排障平均少走两步。
+      - **两个搜索工具容易混**：`ticket_search`（工单）和 `kb_search`（运维知识库），描述里写清数据范围并各给一个示例问题。
+      - **日志类工具**：默认只返回匹配行数和前 30 行，结果被截断时写明「共 N 条，可用 keyword 或 time_range 缩小范围」。
+    pitfalls: |
+      - **误区：描述越短越省 Token。** 含糊的描述导致选错和重试，浪费的 Token 远多于几十个字的描述。
+      - **误区：工具越多 Agent 越强。** 重叠工具会让模型犹豫和选错；精简到最小可用集合更稳。
+      - **误区：模型能理解业务术语。** 「有效告警」「未完结工单」在你们系统里的定义要写进描述。
+      - **只改 Prompt 不改工具**：模型反复填错参数时，改参数设计（枚举、格式、示例）往往比在 System Prompt 里加警告更有效。
+    interview_asks:
+      - question: "怎样设计一个好的 Agent 工具？"
+        answer: "一个工具做一件用户听得懂的事，不要把整个数据库暴露成一个万能查询。说明写清用途、参数和限制。返回短、稳定的字段，不要把网页或整表倒给模型。"
+      - question: "模型总是选错工具或填错参数，你会怎么优化？"
+        answer: "先看是说明太像，还是参数名有歧义。改说明、合并或拆开工具，必要时减少可用工具。用失败轨迹做例子补进评测。不要先加更长的系统提示碰运气。"
+      - question: "工具返回的数据量很大，怎么处理？"
+        answer: "在工具里截断、分页或只返回模型做决定所需的字段。超长结果会撑爆上下文，后面的步骤全歪。告诉模型结果被截断了，需要就再查下一页。"
+    project_example: |
+      **p2 智慧园区运营 Agent** 的 Day 33 模块要做工具加固。第一版直接包了 IoT 平台的 5 个接口，trace 显示模型常常「查设备 → 查告警 → 再查一次设备」。
+      重构后：
+      - 合并成 `iot_get_device_context(device_id)`，返回设备名称、在线状态、最后心跳、近 24 小时告警摘要、未完结工单数；
+      - 告警列表默认 20 条，超出时写明总数和缩小范围的方法；
+      - 设备编号统一为 DEV 加 6 位数字，描述里给示例，校验失败时回填正确格式；
+      - 用评测集对比重构前后的选错率、平均步数和 Token。
+    freshness: |
+      核对于 2026-11：Anthropic《Writing effective tools for agents》给出的原则包括按任务合并工具、命名空间、返回高信号内容、`response_format` 枚举、分页过滤截断，并写明 Claude Code 默认把工具返回限制在 25000 Token；OpenAI Function calling 指南仍建议回合开始时可用函数少于 20 个（软建议），工具很多时可用 tool_search 延迟加载（文档注明仅 gpt-5.4 及以后模型支持）。
+    sources:
+      - {title: "Anthropic - Writing effective tools for agents", url: "https://www.anthropic.com/engineering/writing-tools-for-agents"}
+      - {title: "Anthropic - Building effective agents（Appendix 2 Prompt engineering your tools）", url: "https://www.anthropic.com/engineering/building-effective-agents"}
+      - {title: "OpenAI Docs - Function calling（Best practices）", url: "https://platform.openai.com/docs/guides/function-calling"}
+
+  - id: d33-k2
+    name: 参数校验与工具注册
+    level: P0
+    summary: 用 Pydantic 模型同时生成给模型看的 Schema 和代码里的校验，格式和业务规则都校验，失败时回填可操作的修正提示
+    analogy: |
+      Pydantic 之于工具参数，就像 **zod 之于前端表单**：一份 schema 既能生成类型（给模型的 JSON Schema），又能在运行时校验（`safeParse`），校验失败返回每个字段的错误信息。
+      **不一样的地方**：前端表单错误是给人看的；这里的错误信息是**给模型看的**，要写成「哪个参数错了、正确格式是什么、给个例子」，模型才能自己修正后重试。
+    why: |
+      模型给出的参数**不可信**：可能缺字段、类型错、格式不对，也可能格式全对但业务上不存在（设备编号查不到）。
+      如果执行器不校验，轻则接口 500，重则用错误参数写了库。面试官问「工具参数怎么校验」「strict 模式够不够」，考的就是这一层。
+    problem: |
+      手写工具 JSON 加一个 if/else 分发函数，常见问题：
+      - 改了函数参数忘了改 Schema，模型按旧参数调用；
+      - 只有 Schema 层校验，设备编号格式对但不存在，接口报错；
+      - 校验失败只返回「ValidationError」，模型不知道改哪里，只能原样重试；
+      - 每个工具的超时、是否有副作用、是否需要审批散落在各处。
+    principle: |
+      **一、两层校验**
+
+      | 层 | 校验什么 | 谁来做 |
+      |---|---|---|
+      | **格式层** | 类型、必填、枚举、正则格式 | JSON Schema（strict 模式）+ Pydantic |
+      | **业务层** | 设备是否存在、用户是否有权、状态是否允许、日期范围是否合理 | 执行器里的代码 |
+
+      OpenAI 文档推荐开启 strict 模式，让调用**可靠地符合 Schema**；但它只管格式，**业务合法性永远要自己查**。注意 Chat Completions 默认是非 strict，要显式开启，strict 模式对 Schema 有额外要求（如 `additionalProperties: false`），以官方文档为准。
+
+      **二、注册表：一份定义，三处使用**
+
+      ```mermaid
+      classDiagram
+        class ToolSpec {
+          name
+          description
+          args_model
+          func
+          timeout_s
+          side_effect
+          needs_approval
+          schema()
+        }
+        class Registry {
+          register(spec)
+          schemas_for(user)
+          get(name)
+        }
+        class Executor {
+          execute(call, ctx)
+        }
+        Registry "1" --> "many" ToolSpec : 管理
+        Executor --> Registry : 按名查表
+      ```
+
+      - **给模型**：`args_model.model_json_schema()` 生成参数 Schema；
+      - **给执行器**：同一个模型做 `model_validate_json` 校验；
+      - **给运行时**：元数据（超时、是否有副作用、是否需要审批、所需权限）决定怎么执行。
+      改参数只改一处，定义和实现不会脱节。注册时检测重名，直接报错。
+
+      **三、校验失败怎么回填**
+
+      差：`ValidationError: 1 validation error for Args`
+      好：
+      ```text
+      参数不合法：device_id 应形如 DEV-000123，你传入的是 123。
+      请修正后重试；如果不知道设备编号，先用 iot_device_search 按名称查询。
+      ```
+      三要素：**哪个参数错了、正确格式是什么、下一步可以怎么做**。
+
+      **四、身份不进参数**
+
+      Day 32 讲过：tenant_id、user_id 不出现在 Schema 里，执行器从请求上下文（ctx）注入。下发工具时也按权限筛选（`schemas_for(user)`），但**执行前还要再查一次权限**，因为模型可能「编造」一个没下发给它的工具名，或被提示注入诱导。
+
+      **五、框架里的对应物**
+
+      LangChain 的 `@tool` 装饰器从函数签名、类型注解和 docstring 自动生成 name、description 和参数 Schema；MCP Server（Day 38）则把注册表放到独立进程，通过协议对外暴露工具列表。原理都是「一份定义生成 Schema」。
+    scenarios: |
+      - **创建工单**：格式层校验 device_id 正则、priority 枚举；业务层校验设备存在、当前用户有该区域权限、同设备是否已有未完结工单。
+      - **查询客流**：日期参数规定 YYYY-MM-DD，校验 start 不晚于 end、跨度不超过 31 天，超出时回填「请缩小到 31 天以内」。
+      - **多租户**：`schemas_for(user)` 只下发该租户开通的集成对应的工具。
+    code: |
+      用 Pydantic v2 做「一份定义，生成 Schema 加校验」：
+
+      ```python
+      from dataclasses import dataclass
+      from typing import Any, Awaitable, Callable, Literal
+
+      from pydantic import BaseModel, Field, ValidationError
+
+
+      class CreateWorkOrderArgs(BaseModel):
+          device_id: str = Field(pattern=r"^DEV-\d{6}$", description="设备编号，如 DEV-000123")
+          title: str = Field(min_length=4, max_length=60, description="一句话描述故障")
+          priority: Literal["low", "mid", "high"] = Field(description="high 仅用于影响通行或安全的故障")
+
+
+      @dataclass
+      class ToolSpec:
+          name: str
+          description: str
+          args_model: type[BaseModel]
+          func: Callable[[BaseModel, dict], Awaitable[Any]]
+          timeout_s: float = 5.0
+          side_effect: bool = False
+          needs_approval: bool = False
+
+          def schema(self) -> dict:
+              return {"type": "function", "function": {
+                  "name": self.name, "description": self.description,
+                  "parameters": self.args_model.model_json_schema()}}
+
+
+      def validate_args(spec: ToolSpec, raw: str) -> BaseModel | str:
+          try:
+              return spec.args_model.model_validate_json(raw or "{}")
+          except ValidationError as e:
+              problems = "；".join(f"{'.'.join(map(str, err['loc']))}：{err['msg']}"
+                                  for err in e.errors())
+              return f"参数不合法：{problems}。请按参数说明修正后重试。"
+      ```
+    pitfalls: |
+      - **误区：开了 strict 就不用校验。** strict 只保证格式，「设备不存在」「无权限」「日期倒置」都要业务校验。
+      - **误区：没下发的工具就不会被调用。** 执行器必须查表，未注册的名字回填错误，有权限要求的再次鉴权。
+      - **手写 Schema 与函数签名两份**：迟早不一致，应从 Pydantic 模型生成。
+      - **把原始 ValidationError 或堆栈回填**：模型看不懂，还可能泄露内部路径和字段名。
+      - **在描述里写身份参数的说明**：只要参数存在，模型就能被诱导去改它。
+    interview_asks:
+      - question: "工具参数你们是怎么校验的？用了 strict 模式还需要自己校验吗？"
+        answer: "需要。strict 只保证类型和字段在。业务规则仍要查：id 是否属于这个用户、状态是否允许这个操作。两层都过才执行。"
+      - question: "你们的工具是怎么注册和管理的？怎么保证定义和实现一致？"
+        answer: "一个工具一份定义加一个实现函数，注册表生成给模型的 Schema。禁止在提示词里再手写一份。改参数就改这一处，并用一条测试保证 Schema 和函数签名一致。"
+      - question: "参数校验失败后，你返回什么给模型？"
+        answer: "返回哪一个字段错了、允许的范围是什么。不要只说「参数错误」，它无法改正。也不要执行到一半。这是一次工具结果，不是把整个 Agent 弄崩。"
+    project_example: |
+      **p2 智慧园区运营 Agent** 的工具都注册在一个 Registry 里，每个工具一个 Pydantic 参数模型，Schema 自动生成。
+      `create_work_order` 标记了 `side_effect=True`、`needs_approval=True`：执行器校验通过后**不直接创建**，而是生成待审批草稿，推送到 Vue3 运营工作台等值班长确认（Day 37 用 LangGraph interrupt 实现）。
+      校验失败时回填「哪个字段错、正确格式、下一步建议」，我们在 trace 里统计「参数错误后下一步修正成功率」，用来判断描述写得够不够清楚。
+    freshness: |
+      核对于 2026-11：OpenAI Function calling 指南建议始终开启 strict 模式，并说明 Chat Completions 请求默认非 strict，Responses 请求在未指定时会尝试规范化为 strict、无法兼容时回退为非 strict；strict 模式对 Schema 有额外要求（以文档为准）。Pydantic v2 用 `model_json_schema()` 生成 JSON Schema、`model_validate_json()` 校验 JSON 字符串；v1 的 `.schema()` / `parse_raw()` 是旧写法。
+    sources:
+      - {title: "OpenAI Docs - Function calling（Strict mode）", url: "https://platform.openai.com/docs/guides/function-calling"}
+      - {title: "Pydantic Docs - JSON Schema", url: "https://docs.pydantic.dev/latest/concepts/json_schema/"}
+
+  - id: d33-k3
+    name: 错误回传给模型
+    level: P0
+    summary: 模型能修正的错误回填给模型，暂时性故障由执行器有限重试，不可恢复的错误终止并上报，绝不能吞掉错误
+    analogy: |
+      像 axios 响应拦截器的分流：401 走无感刷新令牌后重放请求，网络抖动自动重试一次，400 把字段错误交给表单显示给用户，500 上报 Sentry 并给用户一个友好提示。
+      **不一样的地方**：前端是把 400 的错误给**人**看；Agent 里是把错误给**模型**看，它会根据错误信息决定下一步。所以错误信息写得好不好，直接决定 Agent 能不能自己恢复。
+    why: |
+      Agent 线上故障大部分发生在工具执行这一层：参数不对、接口超时、返回数据缺字段、代码 bug。
+      执行器设计得好，Agent 遇到错误能自己修正；设计得差，一个报错要么让整个请求 500，要么被静默吞掉让模型陷入死循环。面试问「Agent 的异常怎么处理」，考的就是这套分类。
+    problem: |
+      两种极端都会出事：
+      - **异常直接抛出**：一个工具超时，整个请求失败，前面几步白做；
+      - **异常被吞掉**（`except: pass`）：模型看不到失败，以为没执行或结果为空，于是原样重试，形成死循环；也没有日志，事后查不到。
+      还有一种隐蔽问题：把**完整堆栈**回填给模型，既浪费 Token，又可能泄露内部路径、SQL、密钥片段。
+    principle: |
+      **一、错误分三类，处理者不同**
+
+      | 类别 | 例子 | 谁处理 | 怎么处理 |
+      |---|---|---|---|
+      | **模型可修正** | 参数不合法、设备不存在、查无结果、日期超范围 | 模型 | 回填可操作的错误，下一步由模型改参数或换工具 |
+      | **暂时性故障** | 超时、连接重置、429、5xx | 执行器 | 有限次退避重试（d33-k4），仍失败再回填「暂不可用，请勿重试」 |
+      | **不可恢复** | 403 无权限、业务规则禁止、代码 bug | 代码 | 不让模型重试；回填简短说明并终止或转人工，同时告警 |
+
+      **关键区分**：执行器重试是**同一步里**重新执行同一个调用；「交给模型修正」是把错误回填进消息，**下一步**由模型决定怎么办。两者不要混淆，更不要把 400 类错误交给执行器无限重试。
+
+      **二、处理流程**
+
+      ```mermaid
+      flowchart TD
+        A["收到 tool_call"] --> B{"工具存在且有权限"}
+        B -- "否" --> R1["回填：工具不存在或无权限"]
+        B -- "是" --> C{"参数校验通过"}
+        C -- "否" --> R2["回填：哪个参数错 正确格式"]
+        C -- "是" --> D["带超时执行"]
+        D --> E{"结果"}
+        E -- "成功" --> OK["序列化 截断 回填"]
+        E -- "暂时性故障" --> F["退避重试 有限次"]
+        F --> E
+        E -- "业务错误" --> R3["回填：原因和建议"]
+        E -- "程序缺陷" --> R4["回填通用错误 告警 计入终止"]
+      ```
+
+      **三、好的错误信息长什么样**
+
+      - 说明**发生了什么**：「设备 DEV-000999 不存在」；
+      - 说明**能做什么**：「请用 iot_device_search 按名称查询正确编号」；
+      - 说明**不要做什么**：「告警接口暂不可用，重试不会成功，请直接告知用户稍后再查」——这句话是防死循环的关键；
+      - **不放堆栈和内部细节**：完整堆栈只进日志和 trace。
+
+      Anthropic 也建议：校验失败时用 Prompt 工程的方式写错误响应，**给出具体可执行的改进建议，而不是晦涩的错误码或堆栈**。
+
+      **四、每个调用都必须有结果**
+
+      无论成功、失败、被拦截，都要按 tool_call_id 回填一条结果（Day 32 规则 2）。吞掉错误不回填，下一轮消息就不完整。
+
+      **五、框架里的对应物**
+
+      LangChain 1.x 提供 `ToolErrorMiddleware`：把工具执行异常转成错误 ToolMessage 交给模型，而不是中断 Agent；它本身**不重试**，需要重试时与 `ToolRetryMiddleware` 组合。和你手写的分类是同一个思路。
+    scenarios: |
+      - **设备编号写错**：回填「未找到 DEV-000999，请先按名称搜索」，模型下一步改调搜索工具。
+      - **告警中心 503**：执行器退避重试 2 次仍失败，回填「告警系统暂不可用，请勿重试」，模型告诉用户已确认的部分并建议稍后再查。
+      - **无权查看该园区**：回填「当前账号无权查看 A 园区」，不重试，模型如实告知。
+      - **代码 bug（KeyError）**：回填「内部错误，已记录」，同时发告警；这类错误计入终止条件，避免模型反复触发。
+    pitfalls: |
+      - **误区：所有异常都回填给模型。** 程序 bug 回填只会让模型反复调用同一个必然失败的调用，应告警并终止或降级。
+      - **误区：吞掉异常更「稳定」。** `except: pass` 让模型看不到失败，是死循环和数据不一致的温床。
+      - **把堆栈原样回填**：浪费 Token，泄露内部信息，模型也看不懂。
+      - **错误信息不说「别重试」**：模型默认会再试，下游故障时成批请求一起空转。
+      - **重试层次混乱**：SDK 重试、执行器重试、模型重试叠加，延迟成倍放大（d33-k4）。
+    interview_asks:
+      - question: "工具调用失败了怎么办？哪些错误回给模型，哪些不回？"
+        answer: "参数不对、暂时查无此数据，回给模型让它换方式。权限不足、内部堆栈、别的租户的数据，不回细节，只说不能执行。系统故障记日志，必要时直接结束，而不是让模型瞎重试。"
+      - question: "为什么不能把工具异常直接吞掉？"
+        answer: "吞掉之后模型看到的是空白或上一次的成功，会当成这件事做完了。失败必须变成一条明确的工具结果，或者让这轮 Agent 失败。"
+      - question: "你们给模型的错误信息是怎么写的？"
+        answer: "写它下一步能用的事实：哪个字段、什么约束、能不能重试。不写 SQL、不写堆栈、不写内部主机名。语气像给同事的一句纠正。"
+    project_example: |
+      **p2 智慧园区运营 Agent** 的执行器把错误统一成一个结构：`{"ok": false, "kind": "invalid_args 或 not_found 或 unavailable 或 forbidden 或 internal", "message": "...", "hint": "..."}`。
+      - `invalid_args`、`not_found` 回给模型修正；
+      - `unavailable` 先由执行器重试，仍失败时 hint 写「请勿重试」；
+      - `forbidden`、`internal` 直接计入终止条件并告警，trace 里保留完整堆栈，但回填给模型的只有一句话。
+      按 kind 统计各工具的错误分布，可以在运营工作台上看到「哪个园区的哪个接口最近不稳定」。
+    freshness: |
+      核对于 2026-11（langchain 1.5.0）：Prebuilt middleware 文档中 `ToolErrorMiddleware` 用于把工具执行异常转换为模型可见的错误 ToolMessage，文档注明它不会自动重试，需与放在其内层、`on_failure="error"` 的 `ToolRetryMiddleware` 组合使用。旧版教程里「LangGraph ToolNode 默认捕获所有异常」的说法与当前默认行为不同，以当前文档为准（Day 36）。
+    sources:
+      - {title: "LangChain Docs - Prebuilt middleware（Tool error）", url: "https://docs.langchain.com/oss/python/langchain/middleware/built-in"}
+      - {title: "Anthropic - Writing effective tools for agents（错误响应与截断）", url: "https://www.anthropic.com/engineering/writing-tools-for-agents"}
+
+  - id: d33-k4
+    name: 超时、重试与幂等
+    level: P0
+    summary: 每个工具有超时且受总预算约束；只对暂时性错误、且幂等的操作自动重试；写操作用幂等键和业务去重两层防重复
+    analogy: |
+      像前端防重复提交：按钮点击后置灰（防用户连点），请求带一个 `requestId`（后端据此去重），axios 重试只对 GET 或带了 requestId 的请求开启。
+      **不一样的地方**：前端只防「人连点」；Agent 里除了网络重试，**模型自己也会重复发起调用**——同一轮返回两个一样的调用，或者下一轮忘了已经建过工单又建一次。每次调用的 tool_call_id 都是新的，所以光靠请求级去重不够，还要业务级去重。
+    why: |
+      「Agent 重复下单 / 重复建工单怎么办」是 Agent 面试的高频场景题。它同时考你对超时语义、重试策略、幂等设计和模型行为的理解。
+      Day 9 讲过任务队列幂等、Day 19 讲过 LLM 调用的重试退避，今天把它们用到**有副作用的工具**上。
+    problem: |
+      - 外部接口可能卡住，不设超时就无限等待；每步都有超时，总时长仍可能超标。
+      - **超时不代表没执行**：请求可能已经到达对方并成功了，只是响应没回来；这时自动重试就会重复创建。
+      - 模型可能在同一轮发出两个相同的 create 调用，或在下一轮重复调用。
+      - 多层重试叠加：SDK 重试 2 次 × 执行器 3 次 × 模型再调 2 次，一次故障被放大成十几次请求。
+    principle: |
+      **一、两层超时**
+
+      - **单工具超时**：查缓存 2 秒、查报表 30 秒，按工具在注册表里配置；
+      - **总预算（deadline）**：整次任务开始时算出截止时间，每一步的超时取 `min(工具上限, 剩余时间)`；剩余时间太少就不再发起注定超时的调用，直接收尾。
+      - Python 异步用 `asyncio.wait_for` 或 3.11+ 的 `asyncio.timeout`；**同步阻塞代码放进线程后，超时只是不再等待，线程里的代码仍在跑**，所以底层 HTTP 客户端也要设自己的 timeout。
+
+      **二、只重试「暂时性 + 幂等」**
+
+      | 情况 | 是否自动重试 |
+      |---|---|
+      | 读操作遇到超时、429、5xx | 是，有限次指数退避 + 抖动 |
+      | 写操作且带幂等键 | 是，同一个键重试 |
+      | 写操作但没有幂等键 | **否**，先查状态再决定 |
+      | 400、403、404 等 | 否，交给模型或终止 |
+
+      退避：等待 `initial × 2^n` 加随机抖动，避免故障恢复瞬间所有请求同时重试；429 带 `Retry-After` 时优先按它等。**只在一层重试**，其他层关掉或减到最少。
+
+      **三、Agent 重复写入的四个来源与两层防线**
+
+      ```mermaid
+      flowchart TD
+        S1["网络或执行器重试同一个调用"] --> L1["第一层 请求级幂等键"]
+        S2["用户连点或前端重放"] --> L1
+        S3["模型同一轮发出两个相同调用"] --> L2["第二层 业务级去重"]
+        S4["模型下一轮又调一次 create"] --> L2
+        L1 --> OK["同一请求只执行一次"]
+        L2 --> OK2["同一业务事实只有一条记录"]
+      ```
+
+      - **第一层：请求级幂等键**。执行器为每次写调用生成键（如 `会话 ID + tool_call_id`），下游接口按键去重：相同键重试返回首次的结果。这是 Stripe 等支付接口的标准做法。它防得住**重试**，防不住模型**重新发起**（新调用有新的 tool_call_id）。
+      - **第二层：业务级去重**。按业务事实判断「是不是同一件事」：同一租户、同一设备、同一故障类型下已有未完结工单，就**返回已有工单而不是新建**，并在结果里明确写「已存在工单 WO-xxx，无需重复创建」。这句话同时告诉模型别再调了。
+      - **再加两道**：写工具在同一轮内**串行执行**并先做签名去重；高风险写操作改成「生成草稿 + 人工审批」，审批提交以草稿 ID 作为幂等键。
+
+      **四、超时后的写操作**
+
+      写操作超时后，不要直接重试，按顺序：用幂等键重试（下游支持时）→ 或先按业务键查询是否已创建 → 都不行就回填「结果未知，已转人工核实」，**绝不告诉模型「失败了」**，否则它会再建一次。
+    scenarios: |
+      - **创建工单**：幂等键 = 会话 ID + tool_call_id；业务去重 = 同设备同故障类型未完结工单；草稿需值班长审批。
+      - **派单通知短信**：按「工单号 + 接收人 + 模板」去重，避免重试导致维修工收到三条短信。
+      - **报表导出**：可能要 2 分钟，不放在同步 Agent 循环里，改为提交异步任务返回任务 ID（Day 9）。
+      - **429 限流**：IoT 平台限流时按 Retry-After 等待，重试受总预算约束，预算不够就回填「系统繁忙」。
+    code: |
+      执行器里的超时、重试与幂等（异步版，`TransientError` 表示超时、429、5xx 这类暂时性故障）：
+
+      ```python
+      import asyncio
+      import random
+      import time
+
+
+      class TransientError(Exception): ...
+
+
+      async def call_tool(spec, args, ctx, deadline: float, attempts: int = 3):
+          for i in range(attempts):
+              left = deadline - time.monotonic()
+              if left < 1.0:
+                  raise TimeoutError("总预算不足，停止重试")
+              try:
+                  return await asyncio.wait_for(spec.func(args, ctx), timeout=min(spec.timeout_s, left))
+              except (TransientError, TimeoutError):
+                  if spec.side_effect and not ctx.get("idempotency_key"):
+                      raise                     # 没有幂等键的写操作不自动重试
+                  if i == attempts - 1:
+                      raise
+                  await asyncio.sleep(0.5 * 2 ** i + random.uniform(0, 0.3))
+
+
+      async def create_work_order(args, ctx) -> dict:
+          existing = await find_open_order(ctx["tenant_id"], args.device_id, args.title)
+          if existing:                          # 第二层：业务级去重
+              return {"ok": True, "order_id": existing.id,
+                      "message": f"该设备已有未完结工单 {existing.id}，无需重复创建"}
+          return await ticket_api.create(args, tenant_id=ctx["tenant_id"],
+                                         idempotency_key=ctx["idempotency_key"])  # 第一层
+      ```
+    pitfalls: |
+      - **超时后直接重试写操作**：请求可能已成功，重试就是重复创建。
+      - **以为幂等键能防住模型重复调用**：模型重新发起的调用有新的 tool_call_id，必须再加业务级去重。
+      - **`except Exception` 一律重试**：参数错误、权限错误也重试，浪费时间还掩盖 bug。
+      - **重试没有抖动**：故障恢复瞬间所有请求同时重试，把刚恢复的服务再次打垮。
+      - **多层重试叠加**：要明确只在一层重试。
+      - **写工具并发执行**：同一轮两个相同 create 并发，业务去重的查询可能同时查不到；写工具应串行，或用数据库唯一约束兜底。
+    interview_asks:
+      - question: "Agent 重复下单或重复建工单，你怎么排查和防止？"
+        answer: "先看轨迹是不是同一步被重试或模型调了两次。写操作要有幂等键，同一个业务请求重复执行只生效一次。超时后不能假定没执行就再下单。"
+      - question: "工具调用超时了，可以直接重试吗？"
+        answer: "只读可以。写操作不行，因为可能已经写成功了，只是响应没回来。要先用幂等键查询结果，或让工具自己保证重复调用不会做第二次。"
+      - question: "哪些错误应该重试？重试有什么副作用？"
+        answer: "网络超时、429、短暂 5xx 可以，并且要有次数和退避。副作用是放大故障、把写操作做成两次。所以重试只包在幂等的调用上。"
+    project_example: |
+      **p2 智慧园区运营 Agent** 的工单链路是这样设计的：
+      1. 模型调用 `create_work_order` 时，执行器只生成**草稿**，按「租户 + 设备 + 故障类型」查是否已有未完结工单，有就返回已有工单号；
+      2. 草稿推送到运营工作台，值班长点「确认派单」时，前端按钮置灰，后端以草稿 ID 作为幂等键调用工单系统；
+      3. 工单系统接口超时时，执行器先按草稿 ID 查询是否已创建，再决定重试；
+      4. 数据库对「草稿 ID」加唯一约束作为最后一道防线。
+      面试时可以讲清这四道防线分别防的是哪一种重复来源。
+    freshness: |
+      核对于 2026-11：Stripe 幂等请求文档说明由客户端生成幂等键、服务端保存首次请求结果、相同键重试返回同一结果，并会比较参数防止误用。LangChain 1.5.0 的 `ToolRetryMiddleware` 默认 `max_retries=2`、`backoff_factor=2.0`，`on_failure` 默认 `continue`（把错误消息返回给模型）、可设为 `error` 直接抛出，可用 `retry_on` 指定只重试哪些异常。`asyncio.timeout()` 自 Python 3.11 起可用。
+    sources:
+      - {title: "Stripe API - Idempotent requests", url: "https://docs.stripe.com/api/idempotent_requests"}
+      - {title: "LangChain Docs - Prebuilt middleware（Tool retry）", url: "https://docs.langchain.com/oss/python/langchain/middleware/built-in"}
+      - {title: "Python Docs - asyncio Timeouts", url: "https://docs.python.org/3/library/asyncio-task.html#timeouts"}
+
+test:
+  - id: d33-t1
+    kp: d33-k1
+    type: single
+    question: 排障 Agent 的 trace 显示，模型几乎每次都按「get_device → list_alarms → list_orders」的顺序调用三个工具。按 Anthropic 的工具设计建议，最值得做的改进是？
+    options:
+      - "在 System Prompt 中写明三个工具的调用顺序"
+      - "把三个工具改名，加上统一的 iot_ 前缀"
+      - "合并成一个 get_device_context 工具，一次返回设备、近期告警和未完结工单"
+      - "给每个工具加 response_format 参数，让模型选择详细程度"
+    answer: [2]
+    explain: |
+      高频串联的操作合并成一个按任务设计的工具，能减少步数和中间结果占用的上下文，Anthropic 举的 get_customer_context 就是这个思路。
+      写死调用顺序是把 workflow 塞进 Prompt；改前缀解决的是选错工具；response_format 控制详略，都没有减少步数。
+  - id: d33-t2
+    kp: d33-k1
+    type: single
+    question: 「ticket_search」和「kb_search」两个工具经常被模型用混。下列哪项改进最直接有效？
+    options:
+      - "在描述里写清各自的数据范围和适用问题，并各给一个示例问题"
+      - "把两个工具的描述都缩短到 10 个字以内，减少干扰"
+      - "删掉其中一个，只保留通用的 search 工具让模型自己判断"
+      - "在每次请求时随机只下发其中一个工具"
+    answer: [0]
+    explain: |
+      模型只能根据名称和描述选工具，相似工具必须在描述里拉开边界并给出示例，Anthropic 称之为写清「与其他工具的明确边界」。
+      缩短描述会更难区分；合并成一个含糊的 search 只是把问题转移到参数上；随机下发会让该用的工具缺席。
+  - id: d33-t3
+    kp: d33-k1
+    type: multi
+    question: 一个日志查询工具每次返回上千行原始日志，导致上下文暴涨。下列哪些改进是合理的？
+    options:
+      - "默认只返回匹配总数和前若干行，并支持按关键词、时间范围过滤"
+      - "结果被截断时，在返回里写明总条数和如何缩小范围"
+      - "去掉 uuid、内部状态码等低信号字段，保留时间、级别、关键信息"
+      - "把返回内容压缩成 base64，减少字符数"
+    answer: [0, 1, 2]
+    explain: |
+      分页、过滤、截断并提示如何缩小范围，是 Anthropic 推荐的 Token 效率做法；去掉低信号标识能提升模型理解准确率。
+      base64 对模型来说既不可读又不一定更省 Token，完全违背「返回高信号内容」的原则。
+  - id: d33-t4
+    kp: d33-k1
+    type: judge
+    question: 工具描述写得越短越好，因为每个工具的描述都会占用上下文，描述越长 Token 成本越高。
+    answer: false
+    explain: |
+      描述含糊会导致选错工具和填错参数，引发的重试和多余步骤消耗的 Token 远超多写几十个字。
+      Anthropic 建议像给新同事写文档一样写工具描述：用途、边界、参数格式、示例，同时通过控制工具数量和返回内容来节省上下文。
+  - id: d33-t5
+    kp: d33-k2
+    type: single
+    question: 工具 Schema 已经开启 strict 模式。模型调用 create_work_order 时传入了格式正确的 device_id「DEV-000999」，但该设备并不存在。这个错误应该由谁发现？
+    options:
+      - "strict 模式会自动拒绝不存在的设备编号"
+      - "执行器中的业务校验，查询设备是否存在"
+      - "模型在下一轮思考时会自行意识到设备不存在"
+      - "工单系统会自动忽略不存在的设备，无需处理"
+    answer: [1]
+    explain: |
+      strict 模式只保证参数符合 JSON Schema 的类型、必填、格式，不知道业务数据。设备是否存在、用户是否有权、状态是否允许，都要执行器做业务校验并回填可操作的错误。
+      指望模型自行察觉或下游静默忽略，都会让错误数据流入系统。
+  - id: d33-t6
+    kp: d33-k2
+    type: single
+    question: 用 Pydantic 模型同时生成工具 Schema 和做参数校验，最主要的好处是什么？
+    options:
+      - "Pydantic 校验比手写 if 判断运行速度快很多"
+      - "可以让模型直接调用 Python 函数，无需执行器"
+      - "定义只写一处，改参数时给模型的 Schema 和代码里的校验不会脱节"
+      - "Pydantic 生成的 Schema 能让模型百分之百填对参数"
+    answer: [2]
+    explain: |
+      一份定义生成 Schema（model_json_schema）又做校验（model_validate_json），保证给模型看的约定和代码实际检查的规则一致，这是注册表「单一事实来源」的核心。
+      性能不是主要理由；模型仍然只能输出调用意图；Schema 能降低错误率但不能保证全对。
+  - id: d33-t7
+    kp: d33-k2
+    type: multi
+    question: 关于工具注册表和下发，下列做法正确的有哪些？
+    options:
+      - "按用户权限筛选下发给模型的工具，执行前仍按注册表元数据再校验一次权限"
+      - "模型请求了注册表里不存在的工具名时，回填错误并列出可用工具"
+      - "两个模块注册了同名工具时，直接报错而不是让后注册的覆盖前一个"
+      - "只要没有下发给模型，执行器就可以跳过该工具的权限检查"
+    answer: [0, 1, 2]
+    explain: |
+      筛选下发减少误用和 Token，执行前二次校验防止模型编造工具名或被注入诱导；未知工具要回填错误；重名覆盖会悄悄改变行为，应在注册时报错。
+      「没下发就不会被调用」是常见误解，模型可能输出任何名字，执行器必须查表并鉴权。
+  - id: d33-t8
+    kp: d33-k2
+    type: judge
+    question: 参数校验失败时，把 Pydantic 的完整 ValidationError 文本和堆栈原样回填给模型，信息最全，最有利于模型修正。
+    answer: false
+    explain: |
+      原始错误和堆栈对模型来说噪声多、可读性差，还可能泄露内部字段名和路径。
+      更好的做法是提炼成「哪个参数错了、正确格式是什么、下一步可以怎么做」，完整堆栈只写入日志和 trace。
+  - id: d33-t9
+    kp: d33-k3
+    type: single
+    question: 下面的执行器代码最大的问题是什么？
+    code: |
+      def execute(call) -> str | None:
+          try:
+              args = json.loads(call.function.arguments)
+              return json.dumps(IMPLS[call.function.name](**args), ensure_ascii=False)
+          except Exception:
+              logger.debug("tool failed")
+              return None
+
+      for call in msg.tool_calls:
+          result = execute(call)
+          if result is not None:
+              messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
+    options:
+      - "json.dumps 应该放在 try 外面执行"
+      - "日志级别应该是 info 而不是 debug"
+      - "IMPLS 应该改成类而不是字典"
+      - "失败的调用被静默跳过，没有回填结果，模型看不到失败原因"
+    answer: [3]
+    explain: |
+      异常被吞掉且不回填，这个调用就缺少对应的 tool 结果：下一轮请求可能报错，即使不报错，模型也会以为没执行而重复调用，形成死循环。日志只有 debug 级别且没记工具名和参数，也无法排查。
+      其他选项都是次要的代码风格问题，不影响正确性。
+  - id: d33-t10
+    kp: d33-k3
+    type: single
+    question: 告警中心接口持续返回 503，执行器已经退避重试 2 次仍失败。此时回填给模型的内容，哪一个最好？
+    options:
+      - "Error 503 Service Unavailable"
+      - "告警系统暂不可用，重试不会成功；请告知用户已确认的信息，并建议稍后再查"
+      - "工具执行失败，请重试"
+      - "把 503 响应的完整 HTML 页面原样回填"
+    answer: [1]
+    explain: |
+      好的错误信息要说明发生了什么、能做什么、不要做什么。明确「重试不会成功」能阻止模型反复调用，并引导它给用户体面的答复。
+      只给状态码模型不知道怎么办；「请重试」会直接诱发死循环；HTML 页面浪费大量 Token 且毫无信号。
+  - id: d33-t11
+    kp: d33-k3
+    type: multi
+    question: 下列哪些工具错误**适合回填给模型、让模型在下一步自行修正**？
+    options:
+      - "日期参数格式不对，应为 YYYY-MM-DD"
+      - "按编号查不到该设备"
+      - "查询的时间跨度超过 31 天上限"
+      - "工具代码里出现 KeyError 这类程序缺陷"
+    answer: [0, 1, 2]
+    explain: |
+      格式错误、查无结果、参数超范围都是模型改参数或换工具就能解决的问题，回填清晰的修正提示即可。
+      程序缺陷无论模型怎么改都会失败，回填只会让它反复重试；应告警、计入终止条件，并只回填一句简短说明。
+  - id: d33-t12
+    kp: d33-k3
+    type: judge
+    question: 执行器的「自动重试」和「把错误回填给模型让它修正」是同一回事，只是写法不同。
+    answer: false
+    explain: |
+      执行器重试是在同一步里重新执行同一个调用，适用于超时、429、5xx 这类暂时性故障；回填给模型是把错误放进消息，由模型在下一步决定改参数、换工具或告知用户，适用于参数错误、查无结果等。
+      混用会出问题：把 400 类错误交给执行器重试毫无意义，把 503 交给模型又会诱发它反复调用。
+  - id: d33-t13
+    kp: d33-k3
+    type: single
+    question: LangChain 1.x 的 ToolErrorMiddleware 主要解决什么问题？
+    options:
+      - "把工具执行时抛出的异常转成模型能看到的错误消息，避免 Agent 中断"
+      - "对所有失败的工具调用自动做指数退避重试，直到成功或达到上限"
+      - "在工具真正执行之前，根据用户角色检查是否有权限调用该工具"
+      - "限制每个工具在一次会话中的调用次数，超出后直接结束 Agent 运行"
+    answer: [0]
+    explain: |
+      文档说明 Tool error 中间件捕获工具执行异常并转成错误 ToolMessage，让模型能看到并恢复；它本身不重试，需要与 Tool retry 中间件组合。
+      权限检查需要自己实现；调用次数限制是 ToolCallLimitMiddleware 的职责。
+  - id: d33-t14
+    kp: d33-k4
+    type: single
+    question: 下面的执行器在工单系统偶发超时时，最可能导致什么问题？
+    code: |
+      async def run_create_order(args, ctx):
+          for i in range(3):
+              try:
+                  return await asyncio.wait_for(ticket_api.create(args), timeout=5)
+              except TimeoutError:
+                  await asyncio.sleep(1)
+          return {"ok": False, "message": "创建失败，请重试"}
+    options:
+      - "超时时间 5 秒太短，工单永远创建不成功"
+      - "asyncio.sleep(1) 会阻塞整个事件循环"
+      - "三次都失败时会抛出异常导致请求 500"
+      - "超时的请求可能已在工单系统成功执行，重试会重复建单，最后还提示模型「请重试」"
+    answer: [3]
+    explain: |
+      超时不代表没执行，对方可能已经建好工单只是响应没回来。没有幂等键就自动重试，可能建出多张工单；最后回填「创建失败，请重试」还会诱导模型再建一次。
+      asyncio.sleep 不阻塞事件循环；代码最后有 return 不会抛异常；5 秒是否合适取决于接口，不是主要问题。
+  - id: d33-t15
+    kp: d33-k4
+    type: single
+    question: 执行器已经给每次写调用生成「会话 ID + tool_call_id」作为幂等键，但线上仍出现同一设备被建了两张工单。最可能的原因是？
+    options:
+      - "幂等键拼接后太长，超过了工单系统允许的最大长度而失效"
+      - "模型下一轮重新发起了 create，新调用的 tool_call_id 不同"
+      - "幂等键只对 GET 请求生效，对创建工单这类 POST 请求不起作用"
+      - "工单系统各节点时钟不同步，导致按时间窗口去重的逻辑失效"
+    answer: [1]
+    explain: |
+      请求级幂等键只能防住「同一个调用被重试」；模型重新发起调用时 tool_call_id 不同，幂等键也不同，下游会当作新请求。
+      还需要业务级去重：同一租户、同一设备、同一故障类型已有未完结工单就返回已有工单，并告诉模型无需重复创建。
+  - id: d33-t16
+    kp: d33-k4
+    type: multi
+    question: 关于工具的超时与重试，下列说法正确的有哪些？
+    options:
+      - "每一步的超时应取「工具自身上限」与「总预算剩余时间」的较小值"
+      - "同步阻塞函数放进线程后被 wait_for 超时，线程里的代码可能仍在继续执行"
+      - "重试等待应加随机抖动，避免故障恢复瞬间大量请求同时重试"
+      - "为了提高成功率，SDK、执行器、模型三层都应开启重试"
+    answer: [0, 1, 2]
+    explain: |
+      总预算约束每一步，避免最后一步还发起注定超时的调用；线程中的同步代码不会被中断，底层客户端要设自己的超时；抖动防止重试风暴。
+      多层重试会把一次故障放大成十几次请求，延迟爆炸，应明确只在一层重试。
+  - id: d33-t17
+    kp: d33-k4
+    type: judge
+    question: 写操作调用超时后，如果下游不支持幂等键，比较稳妥的做法是先按业务键查询是否已经创建成功，再决定是否重试或回填「结果未知，已转人工核实」。
+    answer: true
+    explain: |
+      超时意味着结果未知。先查询状态能避免重复写入；查不到确定结果时，回填「结果未知」而不是「失败」，可以防止模型以为失败而再次创建。
+      有幂等键时则可以用同一个键安全重试。
+  - id: d33-t18
+    kp: d33-k4
+    type: multi
+    question: 为防止 Agent 重复创建工单，下列哪些措施是有效的？
+    options:
+      - "同一轮内的写工具串行执行，并先按工具名加参数做签名去重"
+      - "工单接口按幂等键去重，相同键重试返回首次结果"
+      - "已有未完结工单时返回已有工单号，并写明无需重复创建"
+      - "在 Prompt 中写「不要重复创建工单」，就不必在代码层处理"
+    answer: [0, 1, 2]
+    explain: |
+      签名去重和串行执行挡住同一轮的重复调用；幂等键挡住重试；业务级去重挡住模型跨轮重新发起，并通过返回信息让模型停止。
+      Prompt 约束不可靠，模型在长对话或重试中仍可能重复调用，必须有代码层防线。
+
+exam:
+  - id: d33-e1
+    kp: d33-k1
+    type: single
+    question: 一个工具返回的用户信息里同时有 uuid 和姓名。Anthropic 发现某类改动能显著提升模型在检索类任务中的准确性、减少幻觉，是哪一种？
+    options:
+      - "把返回格式从 JSON 改成 XML"
+      - "把难懂的 UUID 换成有语义的名称或简单的序号"
+      - "在返回结果前加一段「请仔细阅读以下内容」"
+      - "把所有字段名翻译成中文"
+    answer: [1]
+    explain: |
+      Anthropic 在工具文章中写到，把任意字母数字 UUID 解析为更有语义的名称（甚至是 0 起始的序号）能显著提升检索精度、减少幻觉；需要 ID 做后续调用时，可用 response_format 的 detailed 模式再返回。
+      返回格式没有通用最优，要靠评测选择；加提示语和翻译字段名都不是文中的结论。
+  - id: d33-e2
+    kp: d33-k2
+    type: single
+    question: 园区 Agent 的 query_visitor_flow 工具允许 start_date 和 end_date 两个参数。线上发现模型偶尔传入 end_date 早于 start_date，接口返回空结果，模型就回答「当天无客流」。最合理的修复是？
+    options:
+      - "在 System Prompt 中提醒模型：结束日期必须晚于或等于开始日期"
+      - "把两个日期参数合并成一个自由文本参数 date_range 由模型填写"
+      - "让接口在日期倒置时自动交换两个日期，并且不告诉模型发生过交换"
+      - "执行器校验日期顺序，倒置时回填具体错误和正确用法让模型修正"
+    answer: [3]
+    explain: |
+      空结果被模型误解为「无客流」，根因是参数业务不合法却没有被拦下。执行器校验并回填具体修正提示，模型会改参数重试，也不会给出错误结论。
+      Prompt 提醒不可靠；自由文本更难校验；静默交换虽然能出结果，但隐藏了模型的理解错误，也可能交换错。
+  - id: d33-e3
+    kp: d33-k3
+    type: single
+    question: 某工具因代码 bug 每次都抛 KeyError。执行器把错误「内部错误，请重试」回填给模型，结果大量请求跑满最大步数。最合理的改进是？
+    options:
+      - "程序缺陷类错误不让模型重试：回填简短说明、计入终止条件并告警"
+      - "把完整堆栈回填给模型，让它分析 bug 原因"
+      - "把最大步数调高，给模型更多重试机会"
+      - "执行器对 KeyError 自动重试 5 次"
+    answer: [0]
+    explain: |
+      程序缺陷无论重试多少次都会失败，「请重试」只会诱发空转。应归为不可恢复错误：终止或降级、发告警修 bug，回填给模型的信息只需让它体面收尾。
+      堆栈会泄露内部信息且模型修不了代码；调高步数和自动重试都只放大浪费。
+  - id: d33-e4
+    kp: d33-k4
+    type: single
+    question: 运维同学为「发送派单短信」工具加了自动重试 3 次，结果维修工偶尔一次收到三条一样的短信。下列根因分析最准确的是？
+    options:
+      - "短信网关不稳定，应该换一家服务商"
+      - "重试次数太少，应增加到 5 次以确保送达"
+      - "发短信是有副作用的写操作，超时后自动重试却没有幂等键或去重"
+      - "模型在同一轮里调用了三次发短信工具"
+    answer: [2]
+    explain: |
+      超时不代表没发出，没有幂等键就自动重试，会把一次发送变成多次。应按「工单号 + 接收人 + 模板」做去重键，或让短信网关按幂等键去重，没有幂等保护的写操作不应自动重试。
+      换服务商、加重试次数都会加剧问题；题干描述的是工具层重试，不是模型多次调用。
+  - id: d33-e5
+    kp: d33-k1
+    type: multi
+    question: 评审下面这个工具定义时，哪些地方容易让模型用错？
+    code: |
+      {
+        "name": "query",
+        "description": "查询数据",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "id": {"type": "string"},
+            "time": {"type": "string"},
+            "user_id": {"type": "string"}
+          }
+        }
+      }
+    options:
+      - "名称和描述含糊，看不出查什么数据、什么时候用"
+      - "参数 id 和 time 没有说明格式和含义，模型只能猜"
+      - "暴露了 user_id 参数，模型可能被诱导查询他人数据"
+      - "parameters 使用了 JSON Schema，国产模型无法识别"
+    answer: [0, 1, 2]
+    explain: |
+      名称和描述含糊会导致选错；参数没有格式说明会导致填错；身份参数交给模型填写是越权隐患，应由执行器从登录态注入。
+      JSON Schema 是 OpenAI 兼容接口通用的工具参数格式，国产模型普遍支持。
+  - id: d33-e6
+    kp: d33-k4
+    type: multi
+    question: 关于幂等键，下列说法正确的有哪些？
+    options:
+      - "幂等键让同一请求被重试时只执行一次，相同键返回首次结果"
+      - "幂等键通常由调用方生成，下游按键记录首次处理结果"
+      - "只靠请求级幂等键，就能防住模型跨轮重复发起的 create 调用"
+      - "人工审批后提交时，可以用草稿 ID 作为幂等键"
+    answer: [0, 1, 3]
+    explain: |
+      Stripe 文档描述的标准做法是客户端生成键、服务端记录首次结果、相同键重试返回同一结果；草稿 ID 天然唯一，适合做审批提交的幂等键。
+      模型重新发起的调用会生成新的 tool_call_id，派生出的幂等键也不同，必须再加业务级去重。
+  - id: d33-e7
+    kp: d33-k2
+    type: judge
+    question: 只要按用户权限筛选了下发给模型的工具列表，执行器在执行时就不需要再检查权限，因为模型不知道其他工具的存在。
+    answer: false
+    explain: |
+      模型可能输出任何工具名（幻觉或被提示注入诱导），执行器如果直接按名执行就会越权。
+      筛选下发只是第一道防线，执行前必须根据注册表元数据和当前用户身份再次校验。
+  - id: d33-e8
+    kp: d33-k3
+    type: judge
+    question: 对暂时性故障，执行器重试仍失败后，回填信息中明确写出「重试不会成功」，可以有效减少模型反复调用同一工具造成的空转。
+    answer: true
+    explain: |
+      模型默认会把「失败」理解为「再试一次可能成功」。明确告知重试无用并给出替代建议（告知用户、稍后再查），能把模型引导到收尾而不是循环。
+      配合 Day 32 的重复检测和最大步数，可以防住下游故障时的成批空转。
+  - id: d33-e9
+    kp: d33-k4
+    type: case
+    question: |
+      园区运营 Agent 上线「创建维修工单」功能后，物业反馈同一台电梯一天内被建了 3 张一模一样的工单。排查 trace 发现：
+      第一次调用 create_work_order 时工单系统 6 秒才响应，执行器 5 秒超时后自动重试了一次，两次请求都在工单系统里成功了；
+      之后模型收到「创建失败，请重试」，在下一轮又调用了一次 create_work_order。执行器使用「会话 ID + tool_call_id」作为幂等键传给工单系统，但工单系统当时并未实现按幂等键去重。
+      最合理的整改方案是？
+    options:
+      - "把执行器超时从 5 秒提高到 10 秒，让慢请求也能正常返回，避免超时重试"
+      - "在 System Prompt 中加一句「创建工单失败时不要重试，直接告诉用户联系物业」"
+      - "去掉执行器重试，并把超时的回填改成「创建成功」，避免模型下一轮再调一次"
+      - "下游落实幂等键去重；执行器加业务去重返回已有单号；超时回填「结果未知，转人工核实」"
+    answer: [3]
+    explain: |
+      三张工单来自两个来源：执行器超时重试（请求级，幂等键本可防住但下游未实现），以及模型收到「失败请重试」后跨轮再调（业务级，新调用有新键）。第四项分别补上请求级幂等、业务级去重和正确的超时语义，能同时防住两类重复。
+      提高超时只是降低概率；Prompt 约束不可靠；谎报「创建成功」会掩盖真实失败，制造数据不一致。
+
+interview:
+  - id: d33-i1
+    kp: d33-k1
+    type: short
+    difficulty: 2
+    question: 你们 Agent 的工具是怎么设计的？怎样才算一个「好」的工具？
+    key_points:
+      - {text: "按任务而不是按接口设计粒度，高频串联操作合并成一个工具以减少步数", dim: concept}
+      - {text: "名称加命名空间、描述写清用途边界和示例、参数有明确格式或枚举", dim: principle}
+      - {text: "返回高信号字段并控制返回量：分页、过滤、截断并提示如何缩小范围", dim: engineering}
+      - {text: "身份参数不进 Schema，由执行器注入；参数用 Pydantic 生成 Schema 并做业务校验", dim: engineering}
+      - {text: "用评测和 trace 指标（选错率、参数错误率、重复调用）驱动工具迭代", dim: project}
+    reference: |
+      我把工具当作**写给模型看的接口**来设计，标准有五条：
+
+      1. **按任务设计粒度**：不是把后端接口一个个包装，而是围绕高频任务。比如园区排障里模型总是「查设备 → 查告警 → 查工单」，就合并成 `iot_get_device_context`，一次返回，减少步数和中间结果。
+      2. **名称和描述讲清边界**：加服务前缀（iot_、ticket_），描述写清什么时候用、返回什么、和相似工具的区别，再给一个示例问题。
+      3. **参数防呆**：`device_id` 而不是 `id`，写明格式「DEV 加 6 位数字」；能用枚举就用枚举；身份参数（tenant_id、user_id）不进 Schema，由执行器从登录态注入。
+      4. **返回高信号内容并控制量**：去掉 uuid、内部状态码，保留名称、状态、关键数字；列表默认 20 条，截断时写明总数和缩小范围的方法。
+      5. **用数据迭代**：参数定义用 Pydantic 生成 Schema 并做业务校验；在评测集和 trace 上统计选错率、参数错误率、重复调用率，哪个高就改对应的描述、参数或返回格式。
+
+      Anthropic 提到他们优化 SWE-bench Agent 时花在工具上的时间比 Prompt 还多，这和我们的体会一致。
+    oral: |
+      我把工具当成写给模型看的接口文档来设计。第一是按任务设计粒度，不是把后端接口一个个包一层，比如我们排障时模型总是连着查设备、告警和工单，我就合并成一个设备上下文工具，一次返回。
+      第二是名称加前缀、描述写清边界和示例；第三是参数防呆，用 device_id、写清格式、能用枚举就用枚举，身份参数绝不让模型填。第四是返回高信号字段，列表要分页截断并提示怎么缩小范围。
+      最后是用数据迭代，看 trace 里的选错率和参数错误率，哪个高就改哪个。
+  - id: d33-i2
+    kp: d33-k4
+    type: scenario
+    difficulty: 3
+    question: 线上反馈：Agent 偶尔会重复下单（或重复创建工单）。你会怎么排查和修复？
+    key_points:
+      - {text: "用 trace 区分重复来源：执行器或网络重试、模型同轮重复调用、模型跨轮再次调用、用户重复提交", dim: engineering}
+      - {text: "指出超时不代表没执行，没有幂等键的写操作自动重试会重复写入", dim: principle}
+      - {text: "第一层请求级幂等键防重试，第二层业务级去重防模型重新发起，并在结果中告知无需重复", dim: engineering}
+      - {text: "写工具串行执行、同轮签名去重，数据库唯一约束兜底，超时回填结果未知而不是失败", dim: engineering}
+      - {text: "高风险写操作改成草稿加人工审批，审批提交用草稿 ID 作幂等键，并结合项目说明", dim: project}
+    reference: |
+      **第一步：用 trace 找重复来源**。同一业务的多条记录，分别是由什么触发的：
+      - 同一个 tool_call 被执行器或 HTTP 客户端**重试**了多次（常见于超时后重试）；
+      - 模型**同一轮**返回了两个相同的 create 调用并被并发执行；
+      - 模型**下一轮**又调了一次（往往因为上一次回填了「失败，请重试」）；
+      - 用户或前端**重复提交**。
+
+      **关键认知**：超时不代表没执行，对方可能已经成功。没有幂等保护的写操作自动重试，就是重复写入的头号来源。
+
+      **修复（多道防线）**：
+      1. **请求级幂等键**：执行器为每次写调用生成键（会话 ID + tool_call_id），下游按键去重。防住重试。
+      2. **业务级去重**：同一租户、同一设备、同一故障类型已有未完结工单，就返回已有单号，并写明「已存在，无需重复创建」。防住模型重新发起，因为新调用的键不同。
+      3. **执行顺序**：同一轮的写工具串行执行，执行前按「工具名 + 规范化参数」去重。
+      4. **超时语义**：写操作超时先查状态；查不清就回填「结果未知，已转人工核实」，绝不回填「失败请重试」。
+      5. **兜底**：数据库唯一约束；高风险写操作改成「草稿 + 人工审批」，审批提交以草稿 ID 为幂等键，前端按钮点击后置灰。
+
+      **验证**：用 mock 工单接口模拟「超时但已成功」，确认只产生一张工单；并统计上线后的重复率。
+    oral: |
+      我会先看 trace，把重复的记录按来源分类：是执行器超时后重试了同一个调用，是模型同一轮发了两个一样的调用，还是模型下一轮又调了一次，或者用户点了两次。
+      这里有个关键点：超时不代表没执行，对方可能已经建好了，这时候没有幂等键就重试，一定会重复。
+      修复我会做两层：第一层请求级幂等键防重试；第二层业务去重，同一设备同类故障已有未完结工单就直接返回已有单号，并告诉模型不用再建，这一层是防模型重新发起的，因为新调用的键不一样。再加上写工具串行、超时回填结果未知、数据库唯一约束。我们园区项目更进一步，建工单只生成草稿，值班长审批后再用草稿 ID 作幂等键提交。
+  - id: d33-i3
+    kp: d33-k3
+    type: scenario
+    difficulty: 4
+    question: 园区 IoT 平台接口很不稳定（经常超时、偶尔 429 限流、个别园区返回格式还不一致），导致 Agent 近一半排障请求失败或卡死。请设计一套工具失败处理方案，并说明怎么证明它有效。
+    key_points:
+      - {text: "按错误分类处理：模型可修正的回填、暂时性故障执行器有限重试、不可恢复的终止告警", dim: concept}
+      - {text: "单工具超时加总预算，指数退避加抖动，尊重 Retry-After，只在一层重试", dim: engineering}
+      - {text: "错误信息可操作并明确告知是否值得重试，结合重复检测和最大步数防空转", dim: principle}
+      - {text: "在工具层做适配和归一化，处理不同园区的返回格式，缺字段时明确标注", dim: engineering}
+      - {text: "降级与兜底：缓存数据标注时效、返回部分结论、转人工；按错误类型和园区做监控", dim: engineering}
+      - {text: "用故障注入和评测集对比改造前后的成功率、卡死率、延迟和成本", dim: project}
+    reference: |
+      **一、错误分类与统一结构**：执行器把所有失败归为 invalid_args、not_found、unavailable、rate_limited、forbidden、internal 六类，回填统一结构（ok、kind、message、hint）。
+
+      **二、暂时性故障（超时、429、5xx）在执行器处理**：
+      - 单工具超时按接口配置，并受整次任务的总预算约束；
+      - 指数退避加抖动，最多 2 次；429 有 Retry-After 时按它等待，等待时间超过剩余预算就不等了；
+      - 只在执行器这一层重试，关闭 SDK 默认重试，避免叠加；
+      - 仍失败时回填「设备接口暂不可用，重试不会成功」，并结合 Day 32 的重复签名检测和最大步数防空转。
+
+      **三、格式不一致在工具层归一化**：为每个园区的 IoT 适配器写转换层，统一成同一份 Pydantic 输出模型；缺字段时写明「该园区未提供心跳时间」，而不是返回空值让模型误判。
+
+      **四、降级**：实时接口不可用时，返回最近一次缓存的设备状态并标注「数据截至 09:30」；无法完成时给出已确认的部分结论并转人工。
+
+      **五、不可恢复错误**：forbidden、internal 不重试，计入终止，发告警，完整堆栈只进 trace。
+
+      **六、证明有效**：
+      - 故障注入：用 mock 让接口按比例超时、429、返回异常格式，复现线上情况；
+      - 用排障评测集对比改造前后的任务成功率、卡死率（max_steps 和 timeout 占比）、P95 延迟和单次成本；
+      - 上线后按园区和错误类型做监控，unavailable 占比异常时告警给对应园区的运维。
+    oral: |
+      我会先把错误分类，执行器统一输出参数错误、查无结果、暂不可用、限流、无权限、内部错误几类。参数错误和查无结果回给模型修正；超时、限流这类暂时性故障在执行器里处理，单工具超时加总预算，指数退避加抖动，限流按 Retry-After 等，最多重试两次，而且只在这一层重试。还是失败就明确告诉模型别重试了，配合重复检测和最大步数防止卡死。
+      格式不一致的问题在工具层做适配，统一成一个输出模型，缺字段就明确标注。接口挂了就用缓存数据并标注时间，实在不行给部分结论转人工。无权限和内部错误直接终止告警。
+      证明效果的话，我会做故障注入，按比例模拟超时和限流，用排障评测集对比改造前后的成功率、卡死率、延迟和成本，上线后再按园区监控错误分布。

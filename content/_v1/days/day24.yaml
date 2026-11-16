@@ -1,0 +1,727 @@
+day: 24
+phase: 3
+title: Embedding 实践：向量化、维度与相似度计算
+goals:
+  - 能讲清 Embedding 模型从文本到向量的计算流程，以及为什么语义相近的文本向量会靠近
+  - 能解释余弦相似度、内积、欧氏距离的区别，以及归一化后三者排序等价的原因
+  - 能设计大批量向量化任务：分批、并发控制、限流退避、幂等缓存、断点续传
+  - 能说明为什么换 Embedding 模型必须重建索引，并能给出模型选型和平滑迁移方案
+knowledge_points:
+  - id: d24-k1
+    name: Embedding 如何工作
+    level: P0
+    summary: 文本经分词、Transformer 编码、池化得到定长向量；对比学习让「相关的文本」在空间里靠近
+    why: |
+      Day 14 讲了「向量表示语义」的直觉，今天要把它落到工程：向量是怎么算出来的、为什么查询和文档能放在一起比较、它擅长和不擅长什么。
+      面试官问「Embedding 是怎么工作的」，期望你能讲出计算流程和训练目标，而不只是「把文字变成数字」。
+    problem: |
+      检索的本质是「比较问题和文档的语义」，但计算机无法直接比较两段文字的意思。
+      Embedding 模型把任意长度的文本映射成固定长度的向量，使「意思相近」变成「距离相近」，从而可以用数学计算和索引来做语义检索。
+    principle: |
+      **一、从文本到向量的计算流程**
+
+      ```mermaid
+      flowchart LR
+        T["文本 年假可以跨年吗"] --> TK["分词 Tokenizer 得到 Token 序列"]
+        TK --> EN["Transformer 编码器 每个 Token 得到上下文相关向量"]
+        EN --> PL["池化 Pooling 平均或取特殊位置"]
+        PL --> NM["归一化 可选 长度变为 1"]
+        NM --> V["定长向量 例如 1024 维"]
+      ```
+
+      1. **分词**：文本切成 Token（Day 13），超过模型最大长度的部分会被截断或报错。
+      2. **编码**：Transformer（Day 12）让每个 Token 通过自注意力「看到」上下文，得到一组上下文相关的向量。同一个「苹果」在「吃苹果」和「苹果发布会」里的向量不同。
+      3. **池化**：把 N 个 Token 向量合成 1 个向量，常见做法有取平均（mean pooling）、取开头特殊 Token、取最后一个 Token，具体由模型决定。**所以无论输入多长，输出维度都固定**。
+      4. **归一化**：很多模型输出（或建议）把向量长度缩放为 1，之后余弦相似度就等于内积（见本日相似度知识点）。
+
+      **二、为什么相关文本会靠近：对比学习**
+
+      Embedding 模型不是靠「理解」，而是靠训练目标塑造出来的：
+
+      - 训练数据是大量「相关文本对」：问题与答案段落、标题与正文、同义句。
+      - **对比学习（Contrastive Learning）**：让相关对的向量距离变小，让同一批次里其他不相关文本的距离变大。
+      - 训练上亿对之后，模型学会把「讲同一件事」的文本放在空间中相近的位置。
+
+      **这也解释了它的边界**：模型学到的是「是否在谈同一件事」，不是「是否正确」「是否包含答案」（Day 21）。
+
+      **三、双塔结构（Bi-Encoder）：为什么能提前算好**
+
+      ```mermaid
+      sequenceDiagram
+        participant D as 文档 chunk
+        participant M as Embedding 模型
+        participant DB as 向量库
+        participant Q as 用户问题
+        Note over D,DB: 离线 每个 chunk 独立编码一次
+        D->>M: chunk 文本
+        M-->>DB: 文档向量 存储
+        Note over Q,DB: 在线 只编码问题
+        Q->>M: 问题文本
+        M-->>Q: 查询向量
+        Q->>DB: 与已存向量做相似度检索
+      ```
+
+      查询和文档**分别独立编码**，所以文档向量可以离线算好存起来，在线只需算一次问题向量，再做向量比较——这是 RAG 能在毫秒到百毫秒级检索百万文档的前提。
+
+      代价是：问题和文档在编码时「互相看不见」，比较精度有限。把问题和文档拼在一起编码的 **Cross-Encoder** 更准但不能预计算，所以用于对少量候选做重排序（Rerank，Day 27）。
+
+      **四、查询与文档的不对称**
+
+      问题短（十几个字），文档长（几百字），表达方式也不同。不少检索模型为此设计了「查询侧指令或前缀」：
+
+      - 例如 E5 系列要求在文本前加 `query: ` 或 `passage: ` 前缀；Qwen3-Embedding 支持在查询侧加入任务指令（Instruction Aware）。
+      - **用法必须与模型卡说明一致**，离线文档和在线查询各自按规定处理，漏加前缀会明显降低效果。
+
+      **五、Embedding 擅长与不擅长**
+
+      - **擅长**：同义改写（「年假」与「带薪休假」）、跨表达方式的语义匹配、多语言对齐。
+      - **不擅长**：精确编号和型号（「X100」与「X200」）、数字大小、否定词、罕见专有名词。这些需要关键词检索补位（混合检索，Day 26）。
+    scenarios: |
+      - **语义检索**：用户说「怎么请带薪假」，能找到写着「年休假申请流程」的段落。
+      - **相似问题聚类**：把客服工单向量化后聚类，发现高频问题。
+      - **去重**：相似度极高的 chunk 视为重复内容。
+      - **跨语言检索**：中文问题检索英文技术文档（需要多语言模型）。
+    pitfalls: |
+      - **误区：Embedding 理解了文本的「含义和真假」。** 它只学到了「相关性」。
+      - **忽略查询前缀或指令**：模型要求查询加前缀却没加，效果明显变差。
+      - **超长输入被静默截断**：本地模型常见，后半部分内容等于没向量化。
+      - **混淆 Bi-Encoder 与 Cross-Encoder**：后者更准但不能离线预计算，只适合重排少量候选。
+    interview_asks:
+      - Embedding 模型是怎么把文本变成向量的？
+      - 为什么语义相近的文本，向量也会相近？
+      - Bi-Encoder 和 Cross-Encoder 有什么区别？各用在哪里？
+    project_example: |
+      在一个中英文混合的技术文档库中，团队使用了要求加 `query: ` / `passage: ` 前缀的开源模型，但在线查询代码漏加了前缀。
+      评估集上 Recall@5 明显低于模型榜单预期，排查时对比「加前缀 / 不加前缀」两组查询向量的检索结果，差距很大。
+      修复后把前缀规则写进统一的 Embedding 客户端，离线和在线共用同一份代码，避免两边各写一套导致不一致。
+  - id: d24-k2
+    name: 向量维度与相似度计算
+    level: P0
+    summary: 余弦看方向，内积看方向和长度，欧氏看距离；归一化后三者排序一致，维度越高成本越高
+    why: |
+      选错相似度度量或忘记归一化，检索结果会悄悄变差；维度选得过高，存储和索引成本翻倍，还可能超出 pgvector 索引的维度上限。
+      「余弦相似度和内积有什么区别」「向量维度怎么选」是 Embedding 相关的高频面试题。
+    problem: |
+      有了向量，还要决定「怎么算相近」：余弦、内积、欧氏距离各有含义，混用会导致排序错误或索引失效。
+      维度决定了表达能力和成本的平衡，需要结合模型、数据规模和存储方案来选择。
+    principle: |
+      **一、三种常用度量**
+
+      设两个向量 a、b：
+
+      - **余弦相似度** = a·b ÷ (|a| × |b|)，只看**方向**，范围 -1 到 1，越大越相似。余弦距离 = 1 − 余弦相似度。
+      - **内积（点积）** = a·b，同时受方向和**长度**影响，越大越相似。
+      - **欧氏距离（L2）** = 两点间的直线距离，越小越相似。
+
+      **二、归一化后三者等价（排序一致）**
+
+      如果向量都被归一化为长度 1：
+
+      - 余弦相似度 = 内积（分母为 1）。
+      - 欧氏距离的平方 = 2 − 2 × 余弦相似度，余弦越大，距离越小。
+
+      ```mermaid
+      flowchart TD
+        N{"向量已经归一化为长度 1 吗"}
+        N -->|"是"| E["余弦 内积 欧氏 三者排序完全一致 用内积计算最省"]
+        N -->|"否"| D{"长度是否携带有意义的信息"}
+        D -->|"否 只关心语义方向"| C["使用余弦 或先归一化再用内积"]
+        D -->|"是 模型文档明确要求内积"| I["使用内积"]
+      ```
+
+      **工程含义**：
+
+      - OpenAI 的 Embedding 输出已归一化为长度 1，官方说明余弦和内积排序相同、内积略快。pgvector 也建议归一化向量使用内积（Day 25）。
+      - 本地模型不一定默认归一化，例如 sentence-transformers 通常要显式开启 `normalize_embeddings=True`（以所用版本文档为准）。
+      - **度量要和模型训练方式一致**：模型卡写明用余弦就用余弦；未归一化的向量直接用内积，长度大的文本会「被偏爱」。
+      - **离线、在线、索引三处的度量必须一致**。
+
+      **三、维度意味着什么**
+
+      - 维度是向量的长度，如 384、768、1024、1536、3072、4096。**单个维度没有可解释的含义**，语义分布在所有维度上。
+      - 维度越高，表达能力上限越高，但：
+        - **存储**：float32 每维 4 字节，1536 维约 6KB；100 万个向量仅原始数据就约 6GB，索引还要更多。
+        - **计算**：相似度计算和索引构建成本随维度线性增长。
+        - **索引上限**：pgvector 的 `vector` 类型索引最多 2000 维，`halfvec` 最多 4000 维（Day 25）。3072 维的向量要建 HNSW 索引，需要降维或改用半精度。
+
+      **四、降维：Matryoshka 表示（MRL）**
+
+      部分新模型用「套娃式」训练，让向量的**前 N 维本身就是一个有效的低维表示**：
+
+      - OpenAI 的 text-embedding-3 系列支持 `dimensions` 参数，在服务端直接返回缩短的向量（仍归一化）。
+      - Qwen3-Embedding 等模型也标明支持 MRL 自定义输出维度。
+      - **自己截断前 N 维后必须重新归一化**，否则内积不再等于余弦。
+      - 不支持 MRL 的模型**不能随便截断**，否则效果严重下降。
+
+      **五、相似度分数的含义**
+
+      - 分数**不是概率**，不同模型的分数分布差别很大；同一模型、同一数据集上才有可比性。
+      - 阈值（如「低于 X 就拒答」）必须在自己的数据上标定，**换模型或换维度都要重新标定**。
+    scenarios: |
+      - **pgvector 建索引**：OpenAI 向量已归一化，选内积或余弦运算符均可，但索引的运算符类必须与查询一致。
+      - **存储成本优化**：用 `dimensions` 把 3072 维降到 1024 维，存储和索引大幅缩小。
+      - **本地模型接入**：确认是否需要手动归一化。
+      - **拒答阈值**：用评估集标定「相关 / 不相关」的分数分界。
+    pitfalls: |
+      - **未归一化却用内积**：长文本向量长度大，被系统性偏爱。
+      - **手动截断维度不重新归一化**：内积和余弦不再等价，排序出错。
+      - **对不支持 MRL 的模型截断维度**：效果断崖下降。
+      - **跨模型比较分数**：A 模型 0.8 和 B 模型 0.8 含义完全不同。
+      - **维度越高越好**：成本和索引限制都要考虑，很多场景 1024 维已足够，要用评估集验证。
+    interview_asks:
+      - 余弦相似度、内积和欧氏距离有什么区别？什么时候它们等价？
+      - 向量维度怎么选？高维有什么代价？
+      - 你们的相似度阈值是怎么确定的？
+    project_example: |
+      某知识库最初使用 text-embedding-3-large 的默认 3072 维，准备在 pgvector 上建 HNSW 索引时报错，因为 `vector` 类型索引最多支持 2000 维。
+      团队对比了三个方案：用 `dimensions=1024` 重新生成、改用 `halfvec` 存储并建索引、保留 3072 维做精确检索。
+      在评估集上，1024 维的 Recall@5 与 3072 维差距很小，但存储和索引体积约为三分之一，最终选择 `dimensions=1024`，并重新标定了拒答阈值。
+  - id: d24-k3
+    name: 批量向量化工程：分批、限流、重试与幂等
+    level: P1
+    summary: 按条数和 Token 双重分批，控制并发、对可重试错误退避重试、用内容哈希做缓存和断点续传
+    why: |
+      首次入库动辄几十万到上百万个 chunk，向量化是离线链路中**最耗时、最花钱、最容易被限流**的步骤。
+      写得不好会出现：被 429 打爆、重复付费、跑了一半失败只能从头再来。这些都是面试「工程化能力」的考察点。
+    problem: |
+      Embedding API 有单次请求的条数和 Token 上限、有每分钟请求数和 Token 数的限流，网络还会抖动。
+      需要在吞吐、成本、稳定性之间平衡：既要尽快跑完，又不能触发大量限流；失败后能续跑，不重复付费。
+    principle: |
+      **一、为什么要分批**
+
+      - 每次请求有固定开销（网络往返、鉴权），逐条调用非常慢。
+      - API 支持一次传入多条文本。以 OpenAI 为例：单次最多 2048 条输入，每条不超过 8192 Token，**单次请求所有输入合计不超过 30 万 Token**，且不能传空字符串。
+      - **分批要同时看条数和 Token 数**：只按条数分，长文本多的批次可能超过 Token 总量上限。
+      - 本地模型（GPU）同样要分批，批太大会显存溢出，太小 GPU 利用率低。
+
+      **二、限流与并发控制**
+
+      - 服务商通常按每分钟请求数（RPM）和每分钟 Token 数（TPM）限流，超过返回 **HTTP 429**。
+      - 用**信号量（Semaphore）限制并发批次数**，而不是一次性把所有批次都发出去。
+      - 更精细的做法是按 TPM 预算做令牌桶，发请求前先「申请」Token 额度。
+
+      **三、重试策略：只重试该重试的错误**
+
+      | 错误类型 | 是否重试 | 原因 |
+      |---|---|---|
+      | 429 限流 | 是，指数退避加随机抖动 | 过一会儿就能成功 |
+      | 超时、连接错误、5xx | 是，有限次数 | 临时故障 |
+      | 400 参数错误（空字符串、超长） | **否** | 重试一万次也是错，应修数据或单独记录 |
+      | 401、403 鉴权错误 | **否** | 配置问题，应立即告警 |
+
+      - **随机抖动（Jitter）**：大量并发同时被限流，如果都等待相同时间再重试，会同时再次撞墙。
+      - **注意重试叠加**：OpenAI Python SDK 默认会对连接错误、408、409、429、5xx 自动重试 2 次；外层再套 5 次重试，最坏情况是 3 × 5 = 15 次请求。要么关掉 SDK 重试（`max_retries=0`）统一由外层控制，要么只用 SDK 的重试。
+
+      **四、幂等、缓存与断点续传**
+
+      ```mermaid
+      sequenceDiagram
+        participant J as 入库任务
+        participant C as 向量缓存表
+        participant S as 信号量 并发上限 N
+        participant API as Embedding API
+        J->>C: 按 模型名加内容哈希 查已有向量
+        C-->>J: 命中的直接复用 未命中的待计算
+        J->>S: 申请并发名额
+        S-->>J: 获得名额
+        J->>API: 一批文本
+        alt 成功
+          API-->>J: 向量列表 带 index
+          J->>C: 按 index 对齐后写入缓存
+        else 429 或超时
+          API-->>J: 错误
+          J->>J: 指数退避加抖动后重试
+        else 400 参数错误
+          API-->>J: 错误
+          J->>J: 记录坏数据 跳过 不重试
+        end
+        J->>S: 释放名额
+      ```
+
+      - **缓存键 = 模型名 + 维度 + 内容哈希**：同样的文本、同样的模型，不重复付费；文档修改后只有变化的 chunk 需要重新计算。
+      - **断点续传**：每批成功后立即落库，任务中断后重启只处理未完成的部分。
+      - **按 `index` 对齐**：响应中每条结果带 `index` 字段，按它和输入对齐，不要假设顺序并依赖 `zip` 静默截断。
+
+      **五、成本与监控**
+
+      - 向量化费用按输入 Token 计，开工前用分词器估算总 Token 数和费用（价格以官方定价页为准）。
+      - 监控：每分钟处理量、429 比例、平均延迟、失败条数、累计 Token。
+    code: |
+      ```python
+      import asyncio
+      import random
+
+      import openai
+      from openai import AsyncOpenAI
+
+      client = AsyncOpenAI(timeout=30.0, max_retries=0)   # 关闭 SDK 自动重试，由外层统一控制
+      sem = asyncio.Semaphore(4)                           # 同时最多 4 个批次在途
+
+      RETRYABLE = (openai.RateLimitError, openai.APITimeoutError,
+                   openai.APIConnectionError, openai.InternalServerError)
+
+      async def embed_batch(texts: list[str], model: str, max_attempts: int = 5) -> list[list[float]]:
+          async with sem:
+              for attempt in range(max_attempts):
+                  try:
+                      resp = await client.embeddings.create(model=model, input=texts)
+                      ordered = sorted(resp.data, key=lambda d: d.index)
+                      return [d.embedding for d in ordered]
+                  except RETRYABLE:
+                      if attempt == max_attempts - 1:
+                          raise
+                      await asyncio.sleep(min(60, 2 ** attempt) + random.uniform(0, 1))
+          raise AssertionError("unreachable")
+      ```
+    scenarios: |
+      - **首次全量入库**：几十万 chunk，需要并发控制、断点续传和成本预估。
+      - **日常增量入库**：每天几百份文档，靠缓存避免重复计算。
+      - **本地 GPU 模型**：按显存调整批大小，多卡时按卡分配批次。
+      - **多租户系统**：不同租户共享 API 配额，需要全局限流。
+    pitfalls: |
+      - **一次性并发所有批次**：瞬间触发大量 429，反而更慢。
+      - **对 400 错误重试**：空字符串、超长输入重试多少次都失败，还拖慢整个任务。
+      - **SDK 重试与外层重试叠加**：请求数被放大，加剧限流。
+      - **只按条数分批**：长文本批次超过单次 Token 总量上限。
+      - **没有缓存和断点**：中途失败只能从头再来，重复付费。
+    interview_asks:
+      - 几十万个 chunk 的向量化任务，你会怎么设计？
+      - 遇到 429 限流怎么办？哪些错误不应该重试？
+      - 如何避免重复向量化、重复付费？
+    project_example: |
+      某项目首次入库 60 万个 chunk，初版脚本用 `asyncio.gather` 一次发出全部批次，几秒内出现大量 429，SDK 自动重试和外层重试叠加，任务跑了一夜只完成三成，还有一批空文本反复重试。
+      重构后：按条数和 Token 双重分批；信号量限制 4 个并发；只对 429、超时、5xx 指数退避加抖动；400 错误记录到坏数据表；每批成功即写入以「模型名 + 维度 + 内容哈希」为键的缓存表。任务稳定在两小时内完成，中途重启也只处理剩余部分。
+  - id: d24-k4
+    name: 模型一致性与选型：换模型必须重建索引
+    level: P0
+    summary: 不同模型的向量空间互不兼容，换模型必须全量重算并重建索引；选型要用自己的数据评估
+    why: |
+      「我们想换一个更好的 Embedding 模型」是项目中后期的常见需求，处理不当会导致检索结果几乎随机，而且**系统不会报任何错**。
+      面试官很爱问「换 Embedding 模型要注意什么」，用来判断你是否真正理解向量空间。
+    problem: |
+      每个 Embedding 模型都有自己的向量空间，坐标轴的含义各不相同。
+      用模型 A 存的文档向量和用模型 B 算的查询向量做比较，就像拿北京的经纬度和上海地铁站编号比较，毫无意义。
+      需要解决：如何保证一致性、如何平滑迁移、以及一开始如何选对模型。
+    principle: |
+      **一、为什么不同模型的向量不能混用**
+
+      - 向量的每一维没有固定含义，是训练过程中**自动形成**的。两个模型即使维度都是 1024，第 1 维在 A 中和在 B 中代表的东西也完全不同。
+      - 甚至**同一模型的不同版本**（重新训练或微调后），向量空间也可能变化。
+      - 所以「维度相同」不代表「可以混用」。维度不同时数据库会直接报错（反而容易发现）；**维度相同时不会报错，检索结果却接近随机**，这才是最危险的情况。
+
+      **二、一致性要落到数据上**
+
+      - 每个 chunk 记录 `embedding_model`（含版本）和 `embedding_dim`。
+      - Embedding 客户端统一封装：模型名、维度、前缀规则、是否归一化，离线和在线**共用同一份配置和代码**。
+      - 在线检索时校验：查询使用的模型必须和索引中的模型一致，不一致直接报错。
+
+      **三、平滑迁移：影子索引 + 切换 + 回滚**
+
+      ```mermaid
+      stateDiagram-v2
+        [*] --> 旧模型服务中
+        旧模型服务中 --> 影子构建: 新建表或新列 用新模型全量重算
+        影子构建 --> 双写: 新增和修改的文档 同时写新旧两份
+        双写 --> 离线评估: 评估集对比 Recall 和答案正确率 重新标定阈值
+        离线评估 --> 灰度切换: 指标达标 部分流量读新索引
+        离线评估 --> 影子构建: 指标不达标 调整后重来
+        灰度切换 --> 新模型服务中: 线上指标稳定
+        灰度切换 --> 旧模型服务中: 出现问题 回滚
+        新模型服务中 --> [*]: 观察期后下线旧索引
+      ```
+
+      要点：
+
+      - **不能边算边替换**：重算期间如果有一半向量是新模型、一半是旧模型，检索结果会混乱。
+      - 新索引在后台独立构建，**全部完成并评估通过后再切换读流量**。
+      - 迁移期间新增的文档要**双写**，否则切换后会缺数据。
+      - 阈值、Top-K 等参数要在新模型上重新标定。
+      - 估算重算成本：总 Token 数 × 单价，以及耗时。
+
+      **四、模型选型维度**
+
+      | 维度 | 要问的问题 |
+      |---|---|
+      | 语言 | 主要是中文、英文还是多语言？中文效果要看中文评测和自己的数据 |
+      | 领域 | 法律、医疗、代码等专业领域是否有更合适的模型或需要微调 |
+      | 输入长度 | 最大输入 Token 是否覆盖你的 chunk 大小 |
+      | 维度与成本 | 维度越高存储越大，是否支持 MRL 降维 |
+      | 部署方式 | 调用 API 还是私有化部署？数据是否允许出网 |
+      | 许可证 | 开源模型能否商用 |
+      | 附加能力 | 是否支持查询指令、稀疏向量、多向量等 |
+
+      **五、评测榜单只是起点**
+
+      MTEB、C-MTEB 等公开榜单可以用来初筛，但榜单数据和你的业务数据差别很大。**最终要在自己的评估集上比较 Recall@K 和答案正确率**，同时考虑成本和部署约束。
+    scenarios: |
+      - **从 API 模型切换到私有化模型**：客户要求数据不出网，需要全量重算并迁移。
+      - **模型升级**：服务商发布新一代模型，评估收益后迁移。
+      - **多语言扩展**：业务出海，需要换成多语言模型。
+      - **新项目选型**：根据语言、部署、成本用评估集对比 2~3 个候选模型。
+    pitfalls: |
+      - **只对新文档用新模型**：新旧向量混在同一个索引中，检索结果混乱。
+      - **认为维度相同就能混用**：不会报错，但结果接近随机，最难发现。
+      - **在线和离线各自配置模型名**：一边改了另一边没改。
+      - **换模型不重新标定阈值**：拒答过多或过少。
+      - **只看榜单选模型**：在自己的数据上可能表现完全不同。
+    interview_asks:
+      - 为什么换 Embedding 模型必须重建索引？
+      - 线上系统如何平滑地迁移到新 Embedding 模型？
+      - 你们是怎么选 Embedding 模型的？
+    project_example: |
+      某客服知识库原用 API 模型，客户新增了「数据不出网」要求，需要切换到私有化部署的开源模型。
+      团队先用 150 个真实问题对比两个候选开源模型，选出中文效果更好的一个；然后新建 `chunks_v2` 表全量重算向量，迁移期间新文档双写；评估通过后重新标定拒答阈值，按 10%、50%、100% 灰度切换读流量，旧表保留两周后下线。整个过程用户无感知。
+    freshness: |
+      核对于 2026-11：
+      - **OpenAI**：当前 Embedding 模型仍为 `text-embedding-3-small`（默认 1536 维）和 `text-embedding-3-large`（默认 3072 维），旧模型 `text-embedding-ada-002` 不支持 `dimensions` 参数。单条输入上限 8192 Token、单次最多 2048 条、单次请求合计不超过 300,000 Token、不能为空字符串；输出默认 L2 归一化，使用 `dimensions` 缩短后仍归一化。调用方式 `client.embeddings.create(model=..., input=...)`。
+      - **openai-python 3.x**（3.0.0 于 2026-08-12 发布）：默认 HTTP 客户端改为 HTTPX2，`embeddings.create` 和 `AsyncOpenAI` 的用法不变；SDK 默认对连接错误、408、409、429、5xx 自动重试 2 次，默认超时 10 分钟。
+      - **开源模型**：BGE-M3 输出 1024 维、最大 8192 Token，同时支持稠密、稀疏和多向量检索；Qwen3-Embedding 有 0.6B、4B、8B 三档，对应 1024、2560、4096 维，32K 上下文，支持 MRL 自定义维度和查询指令。
+      - 榜单分数只作初筛，价格和限额以官方页面为准。
+    sources:
+      - {title: "OpenAI API Reference - Embeddings", url: "https://developers.openai.com/api/reference/resources/embeddings"}
+      - {title: "OpenAI Model - text-embedding-3-small", url: "https://developers.openai.com/api/docs/models/text-embedding-3-small"}
+      - {title: "OpenAI Help Center - Embeddings FAQ", url: "https://help-lb.openai.com/en/articles/6824809-embeddings-faq"}
+      - {title: "openai-python v3.0.0 Release", url: "https://github.com/openai/openai-python/releases/tag/v3.0.0"}
+      - {title: "BGE-M3 - MTEB Leaderboard", url: "https://leaderboard.mteb.org/models/BAAI/bge-m3"}
+      - {title: "Qwen3-Embedding（GitHub）", url: "https://github.com/qwenlm/qwen3-embedding"}
+quiz:
+  - id: d24-q1
+    kp: d24-k4
+    type: judge
+    question: 模型 A 和模型 B 输出的向量都是 1024 维，所以可以把 B 生成的新文档向量直接写入 A 建好的索引中一起检索。
+    answer: false
+    explain: |
+      错误。向量每一维的含义是各自模型训练时形成的，不同模型（甚至同一模型的不同版本）的向量空间互不兼容。
+      维度相同时数据库不会报错，但用 A 的查询向量去比较 B 的文档向量，结果接近随机，这是最难发现的情况。换模型必须全量重算并重建索引。
+  - id: d24-q2
+    kp: d24-k2
+    type: single
+    question: 所有向量都已经 L2 归一化（长度为 1），关于余弦相似度、内积和欧氏距离，以下哪个说法正确？
+    options:
+      - 余弦和内积排序一致，但欧氏距离给出的近邻排序与它们相反
+      - 三者给出的近邻排序相同，其中内积计算最省
+      - 归一化后只有余弦相似度仍然有意义，内积和欧氏距离失去意义
+      - 归一化后任意两个向量的欧氏距离都等于 1
+    answer: [1]
+    explain: |
+      长度为 1 时，余弦相似度 = 内积；欧氏距离平方 = 2 − 2 × 余弦，余弦越大距离越小，所以按「相似度降序」和按「距离升序」得到的近邻顺序完全相同。
+      A 混淆了「数值大小方向」与「排序结果」；C 错，三者都有意义且等价；D 错，归一化只固定了向量长度，两点距离仍取决于夹角，范围是 0 到 2。
+  - id: d24-q3
+    kp: d24-k3
+    type: multi
+    question: 对 50 万个 chunk 做批量向量化时，以下哪些做法是正确的？
+    options:
+      - 用信号量限制并发批次，遇到 429 时指数退避并加入随机抖动
+      - 遇到 400 参数错误（如空字符串、输入超长）也重试 5 次，提高成功率
+      - 按响应中每条结果的 index 字段与输入对齐
+      - 以「模型名 + 维度 + 内容哈希」为键缓存向量，避免重复计算
+      - 为了最大化吞吐，用 asyncio.gather 一次性并发发出全部批次
+    answer: [0, 2, 3]
+    explain: |
+      A、C、D 正确。B 错误：400 是请求本身有问题，重试多少次都会失败，应修数据或记录跳过。
+      E 错误：一次性并发全部批次会瞬间触发大量 429，加上 SDK 自动重试，请求数被放大，整体反而更慢。
+  - id: d24-q4
+    kp: d24-k4
+    type: scenario
+    question: 团队决定把 Embedding 模型从 A 换成 B。为了节省成本，只把新上传的文档用 B 向量化，老文档保持不变；在线查询改为用 B。上线后检索效果断崖式下降。请分析原因并给出正确的迁移方案。
+    key_points:
+      - {text: "指出新旧模型向量空间不兼容，用 B 的查询向量比较 A 的文档向量结果接近随机", dim: principle}
+      - {text: "指出系统不会报错，维度相同时问题尤其隐蔽", dim: concept}
+      - {text: "给出影子索引全量重算、迁移期双写、评估后切换、保留回滚的方案", dim: engineering}
+      - {text: "提出记录 embedding_model 字段、统一客户端配置、重新标定阈值", dim: project}
+    reference: |
+      **原因**：A 和 B 的向量空间完全不同。在线改用 B 后，查询向量只能和 B 生成的新文档向量正确比较；老文档全部是 A 的向量，与 B 的查询向量比较毫无意义，相当于随机排序。因为老文档占绝大多数，检索效果断崖下降。如果两者维度相同，数据库不会报任何错，问题更隐蔽。
+      **正确方案**：
+      1. 新建表或新向量列，用 B 对全部 chunk 后台全量重算（先估算 Token 成本和耗时）。
+      2. 迁移期间新增和修改的文档同时写入新旧两份。
+      3. 在新索引上跑评估集，对比 Recall@K 和答案正确率，重新标定拒答阈值和 Top-K。
+      4. 达标后灰度切换读流量，保留旧索引用于回滚，观察稳定后下线。
+      5. 每个 chunk 记录 `embedding_model`；离线和在线共用同一个 Embedding 客户端配置；查询时校验模型一致。
+  - id: d24-q5
+    kp: d24-k1
+    type: short
+    question: 请解释 Embedding 模型从输入文本到输出向量的计算过程，以及为什么语义相近的文本向量会相近。
+    key_points:
+      - {text: "说出分词、Transformer 编码得到上下文相关的 Token 向量、池化成定长向量、可选归一化", dim: concept}
+      - {text: "解释池化使输出维度与输入长度无关", dim: principle}
+      - {text: "解释对比学习：相关文本对拉近、不相关文本推远", dim: principle}
+      - {text: "指出模型学到的是相关性，不判断正确性，精确编号和否定等是弱项", dim: concept}
+    reference: |
+      **计算过程**：① 分词器把文本切成 Token，超长部分截断或报错；② Transformer 编码器通过自注意力让每个 Token 结合上下文，输出每个 Token 的向量；③ 池化把 N 个 Token 向量合成一个向量（取平均或取特定位置），所以无论输入多长，输出维度都固定；④ 通常再归一化为长度 1。
+      **为什么相近**：Embedding 模型用大量「相关文本对」（问题—答案、标题—正文、同义句）做对比学习训练，目标是让相关对的向量距离变小、同批次中不相关文本的距离变大。训练足够多之后，模型就会把讲同一件事的文本放在空间中相近的位置。
+      **边界**：它学到的是「是否在谈同一件事」，不判断内容是否正确、是否包含答案；对精确型号、数字、否定词不敏感，需要关键词检索和重排序补充。
+  - id: d24-q6
+    kp: d24-k3
+    type: design
+    question: 请设计一个对 50 万个 chunk 做首次全量向量化的离线任务，要求不被限流打爆、可中断续跑、不重复付费、过程可监控。
+    key_points:
+      - {text: "按条数和 Token 双重分批，并遵守单次请求上限", dim: engineering}
+      - {text: "用信号量或令牌桶控制并发和 TPM，只对 429、超时、5xx 退避重试，400 记录跳过", dim: engineering}
+      - {text: "以模型名、维度、内容哈希为缓存键，每批成功立即落库，支持断点续传", dim: principle}
+      - {text: "开工前估算 Token 和费用，运行中监控吞吐、429 比例、失败数", dim: project}
+    reference: |
+      **1. 准备阶段**：用分词器统计全部 chunk 的 Token 数，估算费用和耗时；过滤空文本，超过模型输入上限的 chunk 回到切片环节处理。
+      **2. 分批**：按「条数不超过上限 且 合计 Token 不超过单次请求上限」双重条件组批，并留出余量。
+      **3. 并发与限流**：信号量限制同时在途的批次数（从 4 起步，根据 429 比例调整），或按 TPM 做令牌桶；关闭 SDK 自动重试或只保留一层重试，避免叠加。
+      **4. 重试**：只对 429、超时、连接错误、5xx 做指数退避加随机抖动，设置最大次数；400 记录到坏数据表并跳过；401、403 立即终止并告警。
+      **5. 幂等与续跑**：先查「模型名 + 维度 + 内容哈希」缓存表，命中直接复用；每批成功后按 `index` 对齐结果，立即写入缓存和 chunk 表；任务记录进度，中断重启只处理未完成部分。
+      **6. 监控**：每分钟处理条数和 Token 数、429 比例、平均延迟、失败数、累计费用；完成后抽样校验向量维度和非空。
+  - id: d24-q7
+    kp: d24-k2
+    type: short
+    question: 团队想用 text-embedding-3-large（默认 3072 维）并存入 pgvector 建 HNSW 索引，会遇到什么问题？有哪些解决方案？各自的取舍是什么？
+    key_points:
+      - {text: "指出 pgvector 的 vector 类型索引最多 2000 维，3072 维无法直接建 HNSW 或 IVFFlat 索引", dim: concept}
+      - {text: "方案一：用 dimensions 参数降到 2000 以下，利用 MRL，向量仍归一化", dim: principle}
+      - {text: "方案二：用 halfvec 存储或半精度表达式索引，最多 4000 维，精度略降", dim: engineering}
+      - {text: "需用评估集比较效果、存储和延迟，并重新标定阈值", dim: project}
+    reference: |
+      **问题**：pgvector 的 `vector` 类型最多可以存 16000 维，但 HNSW、IVFFlat 索引只支持最多 2000 维的 `vector`。3072 维的向量可以存，但不能直接建近似索引，只能全表精确扫描，数据量一大就很慢。
+      **方案**：
+      1. **降维**：调用时传 `dimensions=1024` 或 1536。text-embedding-3 系列用 MRL 训练，缩短后仍保留大部分效果且已归一化；存储和索引体积大幅下降，代价是少量精度损失。
+      2. **半精度**：用 `halfvec(3072)` 存储，或对 `vector` 列建 `halfvec` 表达式索引，半精度索引最多支持 4000 维，存储减半，精度略降。
+      3. **其他**：二值量化索引加原向量重排序，适合超大规模；或者换维度更低的模型。
+      **取舍**：在评估集上比较 Recall@K、存储体积、查询延迟，多数场景降到 1024 维差距很小；无论选哪种，都要重新标定阈值。
+code_reading:
+  id: d24-c1
+  kp: [d24-k3, d24-k4]
+  title: 异步批量向量化
+  scenario: 离线入库任务的向量化步骤。切片模块输出 chunk 字典列表（含 text），embed_chunks() 分批调用 Embedding API，把向量和模型名写回每个 chunk，随后批量写入 pgvector。首次全量入库约 50 万个 chunk。
+  language: python
+  code: |
+    import asyncio
+    import logging
+    import os
+
+    from openai import AsyncOpenAI
+
+    logger = logging.getLogger(__name__)
+
+    client = AsyncOpenAI(timeout=30.0)
+    MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
+    BATCH_SIZE = 256
+
+
+    async def _embed_batch(texts: list[str], max_attempts: int = 5) -> list[list[float]]:
+        for attempt in range(1, max_attempts + 1):
+            try:
+                resp = await client.embeddings.create(model=MODEL, input=texts)
+                return [d.embedding for d in resp.data]
+            except Exception as exc:
+                wait = 2 ** attempt
+                logger.warning("embed failed attempt=%d wait=%ss err=%r", attempt, wait, exc)
+                await asyncio.sleep(wait)
+        raise RuntimeError(f"embedding failed after {max_attempts} attempts")
+
+
+    async def embed_chunks(chunks: list[dict]) -> list[dict]:
+        texts = [c["text"] for c in chunks]
+        batches = [texts[i:i + BATCH_SIZE] for i in range(0, len(texts), BATCH_SIZE)]
+        results = await asyncio.gather(*(_embed_batch(b) for b in batches))
+        vectors = [v for batch in results for v in batch]
+        for chunk, vec in zip(chunks, vectors):
+            chunk["embedding"] = vec
+            chunk["embedding_model"] = MODEL
+        logger.info("embedded %d chunks in %d batches", len(chunks), len(batches))
+        return chunks
+  walkthrough:
+    function: |
+      把 chunk 文本按每批 256 条分组，并发调用 Embedding API，失败时指数退避重试；全部完成后把向量和模型名写回对应的 chunk 字典。
+    key_functions: |
+      - `_embed_batch()`：对一批文本调用 `embeddings.create`，失败时等待 2、4、8……秒后重试，最多 5 次。
+      - `embed_chunks()`：分批 → 用 `asyncio.gather` 并发执行全部批次 → 把结果展平 → 用 `zip` 与 chunk 一一对应写回。
+      - `MODEL`：从环境变量读取模型名，没有则用默认值。
+    params: |
+      - `chunks` 由切片模块传入，每个元素至少有 `text` 字段，函数原地修改并返回。
+      - `BATCH_SIZE=256` 只限制条数，不限制 Token 数。
+      - `max_attempts=5` 是外层重试次数；`AsyncOpenAI` 未设置 `max_retries`，SDK 默认还会自动重试。
+    data_flow: |
+      ```mermaid
+      flowchart LR
+        C["chunks 列表"] --> T["提取 text 列表"]
+        T --> B["按 256 条切成批次"]
+        B --> G["gather 同时发出全部批次"]
+        G --> E["每批 embeddings.create 失败则退避重试"]
+        E --> F["结果按批次顺序展平"]
+        F --> Z["zip 与 chunk 对齐写回"]
+        Z --> O["chunks 带 embedding 和模型名"]
+      ```
+      50 万个 chunk 会产生约 1950 个批次，全部在同一时刻被创建为并发任务。
+    failure_points: |
+      - **并发不受控（值得审查）**：`asyncio.gather` 一次性发出约 1950 个请求，远超 RPM/TPM 限额，瞬间大量 429；SDK 默认自动重试 2 次，外层再重试 5 次，请求被放大，限流更严重。
+      - **所有异常都重试（值得审查）**：`except Exception` 把 400（空字符串、单条超过 8192 Token、批次合计超过 Token 上限）和 401 鉴权错误也重试 5 次，总共等待 2+4+8+16+32 秒后才失败；而 `gather` 中一个批次抛异常，整个函数就失败，已经成功的批次结果全部丢失，没有落库，下次从头再来。
+      - **没有随机抖动**：大量请求在同一时刻被限流、同一时刻重试。
+      - **zip 静默截断**：如果某批返回的条数少于输入，`zip` 不会报错，后面的 chunk 会错位或缺失向量；也没有按 `index` 排序。
+      - **模型名来自环境变量默认值**：离线环境没配置时用默认模型，可能与在线查询使用的模型不一致。
+    debugging: |
+      - 用 2000 条小样本运行，打开 SDK 和自己的日志，统计 429 次数和每个批次的实际请求次数。
+      - 在 `except` 中打印 `type(exc)`，区分 `RateLimitError`、`BadRequestError`、`AuthenticationError`。
+      - 故意放入一个空字符串 chunk，复现 400 被重试 5 次并导致整体失败。
+      - 写回前断言 `len(vectors) == len(chunks)`，并检查每个向量的维度。
+      - 打印启动时的 `MODEL`，与在线服务配置比对。
+    change_request: |
+      - **控制并发**：增加 `asyncio.Semaphore(N)`，在 `_embed_batch` 中 `async with sem:`；或改用按 TPM 的令牌桶。
+      - **区分错误**：只捕获 `openai.RateLimitError`、`APITimeoutError`、`APIConnectionError`、`InternalServerError` 重试，并加随机抖动；`BadRequestError` 记录后跳过该批（或二分定位坏数据）；创建客户端时设 `max_retries=0` 避免叠加。
+      - **断点续传**：每批成功后立即写库或写缓存表，以「模型名 + 内容哈希」为键，启动时跳过已完成的 chunk。
+      - **对齐校验**：按 `d.index` 排序，写回前校验条数，用 `zip(..., strict=True)`。
+      - **按 Token 分批**：组批时同时累计 Token 数，不超过单次请求上限。
+  questions:
+    - id: d24-c1-q1
+      kp: d24-k3
+      type: code
+      question: 对 50 万个 chunk 调用 `embed_chunks()`，在账号限额较低的情况下，请按时间顺序描述会发生什么，并解释为什么任务可能比「串行执行」还慢。
+      key_points:
+        - {text: "gather 一次性创建约 1950 个并发请求，瞬间超过 RPM 和 TPM 限额", dim: concept}
+        - {text: "大量 429 后 SDK 默认重试 2 次，外层再重试，请求数被放大", dim: principle}
+        - {text: "固定退避无抖动，大量请求同时重试再次撞限流，形成重试风暴", dim: principle}
+        - {text: "任一批次最终失败导致 gather 抛异常，已成功结果未落库全部丢失，只能从头再跑", dim: engineering}
+      reference: |
+        1. `asyncio.gather` 立即为约 1950 个批次创建协程，几乎同时向 API 发出请求，远超账号的每分钟请求数和 Token 数限额。
+        2. 少部分请求成功，大部分返回 429。OpenAI SDK 默认对 429 自动重试 2 次（短暂退避），仍然失败后抛出 `RateLimitError`，被外层 `except Exception` 捕获。
+        3. 外层按 2、4、8……秒退避，但所有失败批次的等待时间相同、没有抖动，于是在同一时刻再次集中重试，又一次触发限流，形成「重试风暴」。每个批次最坏会产生 3 × 5 = 15 次请求，大量配额被浪费在失败请求上。
+        4. 某个批次 5 次都失败后抛出 `RuntimeError`，`gather` 把异常向上抛出，`embed_chunks` 失败。此时已经成功的上千个批次结果只在内存中，没有落库，全部丢失，下次只能从头开始。
+        所以它可能比控制好并发的串行或小并发执行还慢，还更费钱。
+    - id: d24-c1-q2
+      kp: d24-k3
+      type: code
+      question: 假设第 37 批中有一个 chunk 的 text 是空字符串。说明这段代码的执行过程和最终结果，并给出改进后的错误处理方案。
+      key_points:
+        - {text: "空字符串导致 API 返回 400，属于不可重试错误", dim: concept}
+        - {text: "except Exception 仍重试 5 次，累计等待约一分钟后抛出 RuntimeError", dim: concept}
+        - {text: "gather 因该批失败而整体失败，其他批次的结果丢失", dim: engineering}
+        - {text: "改进：区分可重试与不可重试错误，400 记录坏数据并跳过或二分定位，入库前过滤空文本", dim: engineering}
+      reference: |
+        **执行过程**：第 37 批请求因输入包含空字符串返回 400，SDK 抛出 `BadRequestError`（SDK 不会自动重试 400）。外层 `except Exception` 捕获后当作临时错误处理，等待 2 秒重试，又是 400；依次等待 4、8、16、32 秒，共 5 次全部失败，抛出 `RuntimeError`。
+        **最终结果**：`gather` 收到异常后让 `embed_chunks` 失败，整个任务失败，其他已成功批次的结果没有落库，全部白算；重跑还会再次失败，因为数据问题没有被修复。
+        **改进**：
+        1. 切片阶段或进入向量化前过滤空文本和超长文本。
+        2. 只对 `RateLimitError`、`APITimeoutError`、`APIConnectionError`、`InternalServerError` 重试，并加随机抖动。
+        3. 捕获 `BadRequestError` 后不重试：把该批拆成两半再试（二分定位），把坏 chunk 写入坏数据表并跳过，其余正常写入。
+        4. 每批成功立即落库，单批失败不影响其他批次。
+    - id: d24-c1-q3
+      kp: d24-k4
+      type: code
+      question: 这段代码通过 `os.getenv("EMBED_MODEL", "text-embedding-3-small")` 读取模型名。请分析这种写法在离线入库与在线检索两个服务之间可能造成什么问题，并说明如何从设计上保证模型一致性。
+      key_points:
+        - {text: "环境变量缺失时静默使用默认模型，可能与在线服务配置的模型不同", dim: concept}
+        - {text: "不同模型向量空间不兼容，维度相同时不会报错但检索接近随机", dim: principle}
+        - {text: "提出统一的 Embedding 客户端和配置，缺少配置时直接失败", dim: engineering}
+        - {text: "提出在 chunk 上记录模型名和维度，在线查询时校验一致", dim: engineering}
+      reference: |
+        **问题**：离线任务所在的机器如果没有配置 `EMBED_MODEL`，就会静默使用默认值；而在线服务可能配置了另一个模型（例如私有化部署的开源模型）。两边的向量空间不同，如果维度恰好相同，写入和检索都不会报错，但检索结果接近随机，问题很难被发现。
+        **设计上保证一致**：
+        1. 把模型名、维度、前缀规则、归一化方式放在统一配置中，离线和在线共用同一个 Embedding 客户端模块；关键配置缺失时启动直接失败，而不是使用默认值。
+        2. 每个 chunk 写入 `embedding_model` 和 `embedding_dim`（这段代码已经写了模型名，是好的做法）。
+        3. 在线检索前校验：当前查询模型必须等于索引中记录的模型，不一致直接报错并告警。
+        4. 换模型时走影子索引迁移流程，而不是改环境变量。
+interview:
+  - id: d24-i1
+    kp: d24-k1
+    type: oral
+    difficulty: 1
+    question: 什么是 Embedding？Embedding 模型是怎么把文本变成向量的？
+    key_points:
+      - {text: "说明 Embedding 是把文本映射为定长向量，语义相近则向量相近", dim: concept}
+      - {text: "说出分词、Transformer 编码、池化、归一化的流程", dim: principle}
+      - {text: "说明对比学习的训练目标", dim: principle}
+      - {text: "结合 RAG 项目说明离线文档向量和在线查询向量的用法", dim: project}
+    reference: |
+      Embedding 是把文本映射成一个固定长度的浮点数向量，使语义相近的文本在向量空间中距离相近，从而可以用数学计算来比较语义。
+      **计算流程**：文本先被分词器切成 Token；Transformer 编码器通过自注意力为每个 Token 生成结合上下文的向量；再通过池化（例如取平均）把多个 Token 向量合成一个定长向量；通常再归一化为长度 1。
+      **为什么有效**：模型用大量相关文本对做对比学习，训练目标是让相关文本的向量靠近、不相关的远离。
+      **在 RAG 中**：离线时每个 chunk 独立编码一次存入向量库；在线时只编码用户问题，再做相似度检索。这种双塔结构让文档向量可以预计算，检索速度很快。它的局限是只衡量相关性，对精确编号、数字、否定不敏感，所以常配合关键词检索和重排序使用。
+    oral: |
+      Embedding 就是把一段文本变成一个固定长度的向量，让意思相近的文本在空间里离得近。
+      计算上是分词、过 Transformer 编码、再池化成一个向量，一般还会归一化。它之所以有效，是因为训练时用了大量相关文本对做对比学习，相关的拉近、不相关的推远。
+      在 RAG 里，我们离线把每个 chunk 编码好存进 pgvector，在线只编码用户问题去检索。
+      但它只懂「相关」不懂「对错」，型号、数字这类精确匹配我们会用关键词检索补位。
+  - id: d24-i2
+    kp: d24-k2
+    type: oral
+    difficulty: 2
+    question: 余弦相似度、内积、欧氏距离有什么区别？什么情况下三者等价？向量维度怎么选？
+    key_points:
+      - {text: "说明余弦看方向、内积受长度影响、欧氏看直线距离", dim: concept}
+      - {text: "说明归一化后余弦等于内积，欧氏距离平方等于 2 减 2 倍余弦，排序一致", dim: principle}
+      - {text: "说明度量要与模型训练方式和索引运算符一致", dim: engineering}
+      - {text: "说明维度的存储计算成本、pgvector 索引上限与 MRL 降维，并用评估集决定", dim: project}
+    reference: |
+      **区别**：余弦相似度只看两个向量的夹角，不受长度影响；内积同时受方向和长度影响；欧氏距离是两点的直线距离，越小越相似。
+      **等价条件**：向量都归一化为长度 1 时，余弦相似度等于内积，欧氏距离的平方等于 2 − 2 × 余弦，三者的近邻排序完全一致，用内积计算最省。OpenAI 的 Embedding 默认已归一化；本地模型要确认是否需要手动归一化。
+      **工程注意**：度量要和模型训练方式一致；离线、在线、索引运算符三处必须一致；分数不是概率，阈值要在自己数据上标定。
+      **维度选择**：维度越高表达能力上限越高，但存储（float32 每维 4 字节）、索引内存、计算都线性增长；pgvector 的 `vector` 类型索引最多 2000 维、`halfvec` 最多 4000 维。支持 MRL 的模型可以用 `dimensions` 降维，手动截断要重新归一化。最终在评估集上比较不同维度的效果和成本。
+    oral: |
+      余弦只看方向，内积还受长度影响，欧氏是直线距离。
+      关键结论是：向量归一化以后，余弦等于内积，欧氏距离平方等于 2 减 2 倍余弦，三者排序完全一样，所以我们用内积，算得最快。
+      维度我会看三点：效果、成本、索引限制。比如 pgvector 的 vector 索引最多 2000 维，我们用 text-embedding-3-large 时就用 dimensions 参数降到 1024，评估集上效果差距很小，存储只有原来的三分之一。
+  - id: d24-i3
+    kp: d24-k3
+    type: oral
+    difficulty: 3
+    question: 如果要对几十万个 chunk 做向量化，你会如何设计这个任务？如何处理限流、失败和重复计算？
+    key_points:
+      - {text: "按条数和 Token 双重分批，遵守单次请求上限，提前估算成本", dim: engineering}
+      - {text: "信号量或令牌桶控制并发，只对 429 超时 5xx 退避加抖动重试，400 不重试", dim: principle}
+      - {text: "注意 SDK 自动重试与外层重试叠加的问题", dim: engineering}
+      - {text: "内容哈希缓存、逐批落库、断点续传与监控，结合项目说明", dim: project}
+    reference: |
+      **分批**：同时按条数和 Token 数组批，例如 OpenAI 单次最多 2048 条、合计不超过 30 万 Token，留出余量；空文本和超长文本提前过滤。开工前用分词器估算总 Token 和费用。
+      **限流**：用信号量限制在途批次数，或者按 TPM 做令牌桶；根据 429 比例动态调整。
+      **重试**：只对 429、超时、连接错误、5xx 做指数退避加随机抖动，设置上限；400 是数据问题，记录到坏数据表、二分定位后跳过；401/403 立即终止告警。SDK 默认自带重试 2 次，要么关掉 SDK 重试统一由外层控制，要么只用 SDK 的，避免请求数被放大。
+      **幂等和续跑**：以「模型名 + 维度 + 内容哈希」为键缓存向量，命中直接复用；每批成功立即落库，任务记录进度，中断后只处理剩余部分；结果按响应的 `index` 对齐。
+      **监控**：吞吐、429 比例、延迟、失败数、累计费用。
+    oral: |
+      我会从分批、限流、重试、幂等四个方面设计。
+      分批要同时看条数和 Token 数，提前过滤空文本和超长文本。限流用信号量控制在途批次。重试只针对 429、超时和 5xx，指数退避加抖动，400 这种数据错误直接记录跳过，而且要注意 SDK 自己会重试两次，不要叠加。
+      最后用内容哈希做缓存键，每批成功立刻落库，中断后能续跑。
+      我们之前 60 万 chunk 的任务就是这样改造后，从跑一夜只完成三成，变成两小时稳定跑完。
+  - id: d24-i4
+    kp: d24-k4
+    type: oral
+    difficulty: 3
+    question: 为什么换 Embedding 模型必须重建索引？线上系统如何平滑迁移？
+    key_points:
+      - {text: "说明不同模型向量空间不兼容，维度相同也不能混用且不会报错", dim: principle}
+      - {text: "说明需要在 chunk 上记录模型名并统一客户端配置", dim: engineering}
+      - {text: "说明影子索引全量重算、迁移期双写、评估、灰度切换、回滚的流程", dim: engineering}
+      - {text: "说明需要重新标定阈值和 Top-K，并结合项目举例", dim: project}
+    reference: |
+      **原因**：向量每一维的含义是各模型训练时自动形成的，不同模型甚至同一模型的不同版本，向量空间都不同。新模型的查询向量和旧模型的文档向量比较毫无意义。维度不同会直接报错；维度相同时不会报错，但检索结果接近随机，最危险。
+      **迁移流程**：
+      1. 新建表或新列，后台用新模型对全部 chunk 全量重算，先估算成本和耗时。
+      2. 迁移期间新增、修改的文档双写新旧两份。
+      3. 在新索引上跑评估集，对比 Recall@K 和答案正确率，重新标定拒答阈值和 Top-K。
+      4. 灰度切换读流量（如 10%→50%→100%），监控线上指标，出问题立即切回。
+      5. 观察期后下线旧索引。
+      **日常保障**：每个 chunk 记录 `embedding_model` 和维度；离线和在线共用同一个 Embedding 客户端；查询时校验模型一致。
+    oral: |
+      因为每个模型都有自己的向量空间，维度一样也不能混用，而且混用了不会报错，结果却接近随机。
+      所以换模型我会走影子迁移：新建一张表用新模型全量重算，迁移期间新文档双写，然后跑评估集、重新标定阈值，再灰度切流量，旧表保留一段时间用于回滚。
+      我们有个客户要求数据不出网，从 API 模型换到私有化开源模型，就是这么迁的，用户完全无感知。
+      平时每个 chunk 都记录模型名，在线查询会校验模型一致。
+  - id: d24-i5
+    kp: d24-k4
+    type: oral
+    difficulty: 4
+    question: 如果让你为一个中文为主、要求私有化部署的企业知识库选择 Embedding 模型，你会怎么做选型和评估？
+    key_points:
+      - {text: "列出语言、领域、输入长度、维度成本、部署方式、许可证等选型维度", dim: concept}
+      - {text: "说明榜单只作初筛，用自己的评估集比较 Recall@K 和答案正确率", dim: principle}
+      - {text: "考虑推理资源、吞吐、延迟、维度与 pgvector 索引上限等工程约束", dim: engineering}
+      - {text: "给出完整评估流程和决策依据，结合项目说明", dim: project}
+    reference: |
+      **1. 明确约束**：中文为主、私有化部署（排除必须调用外部 API 的模型）、可用 GPU 资源、预计 chunk 规模、延迟要求、许可证是否允许商用。
+      **2. 初筛候选**：参考 C-MTEB、MTEB 多语言榜单和模型卡，选 2~3 个满足约束的模型，例如 BGE-M3（1024 维、8192 Token，支持稠密和稀疏）、Qwen3-Embedding 的 0.6B 或 4B（1024 或 2560 维、支持 MRL 和查询指令）。注意按模型卡要求处理查询前缀或指令。
+      **3. 构建评估集**：从业务方收集 100~200 个真实问题，标注标准出处；覆盖术语、型号、长问题、口语化问题等类型。
+      **4. 离线对比**：同一份切片结果分别用候选模型入库，比较 Recall@5/10、MRR，抽样比较最终答案正确率；同时记录单条向量化延迟、GPU 显存占用、全量入库耗时、存储体积。
+      **5. 决策**：效果相近时优先选资源占用小、维度低的模型；维度超过 2000 时考虑 MRL 降维或 halfvec；确定后把模型名、维度、前缀规则写入统一配置。
+      **6. 持续**：记录模型版本，将来升级时走影子迁移。
+    oral: |
+      我会分四步。
+      第一是明确约束：中文为主、必须私有化、GPU 资源多少、能不能商用。第二是参考中文榜单和模型卡初筛两三个候选，比如 BGE-M3 和 Qwen3-Embedding 的小尺寸版本，注意它们对查询前缀或指令的要求。第三是用业务方的一两百个真实问题做评估集，对比 Recall@K 和答案正确率，同时看延迟、显存和存储。最后效果接近时选资源占用更小、维度更低的。
+      榜单只是起点，我们以前就遇到过榜单排名靠前的模型在客户术语上反而更差的情况。
+sources:
+  - {title: "OpenAI API Reference - Embeddings", url: "https://developers.openai.com/api/reference/resources/embeddings"}
+  - {title: "openai-python v3.0.0 Release", url: "https://github.com/openai/openai-python/releases/tag/v3.0.0"}
+  - {title: "Qwen3 Embedding 官方博客", url: "https://qwenlm.github.io/blog/qwen3-embedding/"}
+  - {title: "pgvector README（维度上限、halfvec）", url: "https://github.com/pgvector/pgvector"}

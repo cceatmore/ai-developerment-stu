@@ -1,0 +1,833 @@
+day: 5
+phase: 1
+title: Python 进阶：装饰器、迭代器、生成器与上下文管理器
+goals:
+  - 能把 `@decorator` 还原成「函数替换」，解释 functools.wraps 的作用，读懂 FastAPI 路由注册和重试装饰器
+  - 能区分可迭代对象、迭代器和生成器，解释 for 循环和 yield 的执行过程
+  - 能分析 yield 在 FastAPI 依赖注入和流式输出（StreamingResponse/SSE）中的执行时序
+  - 能用 with 和 contextlib 正确管理数据库连接、文件、锁等资源，并说明异常发生时资源如何释放
+knowledge_points:
+  - id: d05-k1
+    name: 装饰器：原理、wraps 与在 FastAPI/重试中的应用
+    level: P0
+    summary: "@deco 等价于 f = deco(f)：用一个新函数替换原函数；包装时必须用 functools.wraps 保留元信息"
+    why: |
+      AI 后端代码里装饰器无处不在：`@app.get("/chat")` 注册路由、`@retry(...)` 重试模型调用、`@lru_cache` 缓存配置、`@field_validator` 校验字段、`@tool` 注册 Agent 工具。**看不懂装饰器，就看不懂「这个函数为什么会被自动调用」「为什么加了装饰器后 FastAPI 参数全乱了」。**
+    problem: |
+      装饰器解决「在不修改函数本身的前提下，为它统一附加横切逻辑」的问题：日志、计时、重试、缓存、鉴权、注册。它让业务函数保持干净，横切逻辑集中在一处实现、一处修改。
+    principle: |
+      **一、装饰器只是语法糖**
+
+      ```python
+      @timer
+      def search(q): ...
+      ```
+
+      完全等价于：
+
+      ```python
+      def search(q): ...
+      search = timer(search)
+      ```
+
+      装饰器就是一个**接收函数、返回函数（或其他对象）的可调用对象**。它依赖两个前置知识：函数是一等对象、闭包能记住外层变量（Day 03）。
+
+      **二、标准写法：三件套**
+
+      ```python
+      import functools, logging, time
+
+      logger = logging.getLogger(__name__)
+
+      def timer(func):
+          @functools.wraps(func)                 # 保留原函数的元信息
+          def wrapper(*args, **kwargs):          # 接收任意参数，原样透传
+              start = time.perf_counter()
+              try:
+                  return func(*args, **kwargs)
+              finally:
+                  logger.info("%s took %.1fms", func.__name__, (time.perf_counter() - start) * 1000)
+          return wrapper
+      ```
+
+      ```mermaid
+      flowchart LR
+        A["定义时 执行 search = timer(search)"] --> B["名字 search 指向 wrapper"]
+        B --> C["wrapper 通过闭包记住原函数 func"]
+        D["调用时 search(q)"] --> E["实际执行 wrapper(q)"]
+        E --> F["前置逻辑 记录开始时间"]
+        F --> G["调用原函数 func(q)"]
+        G --> H["后置逻辑 记录耗时"]
+        H --> I["返回原函数的结果"]
+      ```
+
+      **三、functools.wraps 为什么必不可少**
+
+      不加 wraps，`search.__name__` 变成 `"wrapper"`，`__doc__` 丢失，日志、监控、文档里全是 wrapper。更严重的是：wraps 会设置 `__wrapped__` 指向原函数，**`inspect.signature()` 会顺着 `__wrapped__` 找到原函数的真实签名**。FastAPI 正是用签名来解析参数的——如果你给路由函数套了一个没加 wraps 的装饰器，FastAPI 看到的签名是 `(*args, **kwargs)`，会把 `args`、`kwargs` 当成**必填的查询参数**，请求直接 422。
+
+      **四、带参数的装饰器：多一层**
+
+      `@retry(times=3)` 先调用 `retry(times=3)` 返回真正的装饰器，再用它装饰函数，所以有三层：
+
+      ```python
+      def retry(times: int = 3, exceptions: tuple[type[BaseException], ...] = (TimeoutError,)):
+          def decorator(func):
+              @functools.wraps(func)
+              def wrapper(*args, **kwargs):
+                  last_exc = None
+                  for attempt in range(1, times + 1):
+                      try:
+                          return func(*args, **kwargs)
+                      except exceptions as e:
+                          last_exc = e
+                          logger.warning("%s attempt %d failed: %r", func.__name__, attempt, e)
+                  raise RuntimeError(f"{func.__name__} failed after {times} attempts") from last_exc
+              return wrapper
+          return decorator
+      ```
+
+      工程上一般直接用成熟库 **tenacity**：`@retry(stop=stop_after_attempt(3), wait=wait_exponential(...), retry=retry_if_exception_type(...))`，退避策略见 Day 20。
+
+      **五、注册型装饰器：FastAPI 的 @app.get**
+
+      `@app.get("/items")` 并不包装函数，而是**把函数登记到路由表，然后原样返回函数**。因此：
+
+      - 装饰器从下往上应用：`@a @b def f` 等价于 `f = a(b(f))`。
+      - 自定义装饰器要放在 `@app.get` **下面**（更靠近函数），FastAPI 注册的才是包装后的函数；放在上面，FastAPI 注册的是原函数，你的装饰器对请求**完全不生效**。
+
+      **六、装饰 async 函数**
+
+      被装饰的是 `async def` 时，wrapper 也必须是 `async def` 并 `await func(...)`；否则 wrapper 返回的是一个未执行的协程对象，计时、重试全部失效（async 原理见 Day 06）。
+
+      **不这样理解会怎样**：会把装饰器当成「魔法」，看不懂执行顺序；加了日志装饰器后接口全部 422 却找不到原因；重试装饰器把参数错误也重试三次，且最后抛出的异常丢了根因。
+    scenarios: |
+      - **路由注册**：`@app.get`、`@router.post` 把函数登记为接口；Agent 框架用 `@tool` 把函数登记为可调用工具。
+      - **LLM 调用重试**：tenacity 的 `@retry` 只对超时和 429 重试，并指数退避。
+      - **缓存**：`@functools.lru_cache` 缓存 `get_settings()`，FastAPI 官方示例中常见。
+      - **埋点**：统一的 `@log_latency` 记录每个服务函数的耗时和异常。
+    code: |
+      ```python
+      import functools
+      import inspect
+
+      def no_wraps(func):
+          def wrapper(*args, **kwargs):
+              return func(*args, **kwargs)
+          return wrapper
+
+      def with_wraps(func):
+          @functools.wraps(func)
+          def wrapper(*args, **kwargs):
+              return func(*args, **kwargs)
+          return wrapper
+
+      @no_wraps
+      def search(q: str, top_k: int = 5) -> list[str]:
+          """检索知识库"""
+          return []
+
+      @with_wraps
+      def search2(q: str, top_k: int = 5) -> list[str]:
+          """检索知识库"""
+          return []
+
+      print(search.__name__, inspect.signature(search))    # wrapper (*args, **kwargs)
+      print(search2.__name__, inspect.signature(search2))  # search2 (q: str, top_k: int = 5) -> list[str]
+      # FastAPI 实测：路由函数套上 no_wraps 后，GET 请求返回 422，提示缺少查询参数 args 和 kwargs
+      ```
+    pitfalls: |
+      - **误区：装饰器会修改原函数。** 它只是让名字指向一个新函数，原函数被闭包保存着。
+      - **误区：wraps 只影响 `__name__`，可有可无。** 它还影响签名解析，FastAPI、pytest、文档工具都依赖它。
+      - **误区：自定义装饰器放在 `@app.get` 上面也行。** 那样 FastAPI 注册的是原函数，装饰器不生效。
+      - **误区：重试所有异常更保险。** 参数错误、鉴权失败重试也不会成功，只会浪费额度和时间。
+      - **坑：用同步 wrapper 装饰 async 函数**，返回的是未 await 的协程。
+    interview_asks:
+      - "装饰器的原理是什么？@decorator 等价于什么代码？"
+      - "functools.wraps 有什么作用？不加会有什么问题？"
+      - "带参数的装饰器为什么要写三层？"
+      - "FastAPI 的 @app.get 是怎么工作的？多个装饰器的执行顺序是怎样的？"
+    project_example: |
+      团队给所有接口加了一个统计耗时的 `@log_latency` 装饰器，没有使用 functools.wraps。上线后所有带参数的 GET 接口都返回 422，错误信息是缺少查询参数 `args` 和 `kwargs`。原因是 FastAPI 通过签名解析参数，看到的是 wrapper 的 `(*args, **kwargs)`。加上 `@functools.wraps(func)` 后恢复正常；同时把装饰器统一放在 `@router.get` 下方，并在 CI 中加了「每个接口 OpenAPI 参数与函数签名一致」的测试。
+
+  - id: d05-k2
+    name: 可迭代对象与迭代器协议
+    level: P1
+    summary: 可迭代对象能产生迭代器，迭代器用 __next__ 逐个产出值、耗尽后抛 StopIteration，且只能消费一次
+    why: |
+      for 循环、推导式、`zip`、`map`、文件读取、数据库游标、HTTP 流式响应，背后都是迭代器协议。**AI 生成代码里「第二次遍历结果为空」「对 map 结果求 len 报错」这类 bug，根源都是不理解迭代器只能消费一次。** 它也是理解生成器的前提。
+    problem: |
+      迭代器协议提供了一种统一、惰性的「逐个取值」方式：不需要一次性把所有数据放进内存，就能遍历列表、文件的每一行、数据库的每一条记录、网络流的每一块数据。所有容器和数据源只要实现这个协议，就能被 for 循环统一使用。
+    principle: |
+      **一、两个概念、两个方法**
+
+      - **可迭代对象（Iterable）**：实现了 `__iter__()`，调用 `iter(obj)` 能返回一个**新的迭代器**。list、tuple、dict、set、str、range 都是。
+      - **迭代器（Iterator）**：实现了 `__next__()`（每次返回下一个值，没有了就抛 `StopIteration`），并且 `__iter__()` 返回**它自己**。
+
+      **二、for 循环的真实过程**
+
+      ```mermaid
+      flowchart TB
+        A["for x in items"] --> B["it = iter(items) 调用 __iter__"]
+        B --> C["x = next(it) 调用 __next__"]
+        C --> D{"抛出 StopIteration 吗"}
+        D -->|"否"| E["执行循环体"]
+        E --> C
+        D -->|"是"| F["循环正常结束 不向外抛异常"]
+      ```
+
+      **三、只能消费一次**
+
+      list 每次 `iter()` 都返回一个新的迭代器，所以可以反复遍历；而迭代器的 `__iter__` 返回自身，**遍历一遍后就耗尽了**，再遍历得到空结果，且不会报错。常见的「一次性」对象：
+
+      - `zip()`、`map()`、`filter()`、`enumerate()` 的返回值；
+      - 生成器（d05-k3）；
+      - 打开的文件对象（按行迭代）；
+      - 数据库游标（如 `sqlite3` 的 `conn.execute()` 返回的 cursor）；
+      - HTTP 流式响应的 `iter_lines()` / `iter_bytes()`。
+
+      迭代器也**没有 `len()`**，不能下标访问。需要多次使用或求长度时，用 `list(it)` 物化一次。
+
+      **四、惰性的价值**
+
+      迭代器只在被要求时才计算下一个值，所以可以表示非常大甚至无限的序列（逐行读取 10GB 日志文件，内存占用只有一行）。`itertools` 提供了大量惰性工具：`islice` 切片、`chain` 拼接、`batched`（3.12+）分批——给 Embedding 接口分批提交时很有用。
+
+      **五、和 JS 对比**
+
+      JS 的 `[Symbol.iterator]()` 和 `next()` 返回 `{value, done}`，与 Python 协议几乎一一对应；区别是 Python 用抛出 `StopIteration` 表示结束。
+
+      **不这样理解会怎样**：会写出「先 `any(...)` 检查一遍游标，再 for 遍历」结果第二次什么都没有的 bug；或者为了求长度把一个巨大的流全部读进内存。
+    scenarios: |
+      - **大文件处理**：`with open(path, encoding="utf-8") as f: for line in f:` 逐行解析日志或 JSONL 语料，不一次读入内存。
+      - **数据库游标**：`for row in conn.execute(sql):` 逐行读取，数据量大时避免 `fetchall()`。
+      - **批量调用**：`for batch in itertools.batched(texts, 64):` 分批调用 Embedding 接口。
+      - **审查 bug**：一个 zip/map/游标对象被遍历两次，第二次为空。
+    pitfalls: |
+      - **误区：所有能 for 的东西都能遍历多次。** 迭代器只能消费一次。
+      - **误区：迭代器耗尽会报错。** for 循环会安静结束，第二次遍历只是得到空结果，非常隐蔽。
+      - **误区：`len(map(...))` 可以用。** 迭代器没有长度，需要先 `list()`。
+      - **混淆：可迭代对象和迭代器。** list 是可迭代对象但不是迭代器，`next([1, 2])` 会抛 TypeError。
+    interview_asks:
+      - "可迭代对象和迭代器有什么区别？for 循环内部是怎么工作的？"
+      - "为什么有些对象只能遍历一次？举几个例子。"
+    project_example: |
+      一个评估脚本先用 `if not any(True for _ in cursor): return` 判断查询结果是否为空，接着 `for row in cursor:` 统计指标，结果统计始终为 0。原因是数据库游标是迭代器，`any` 已经消费了第一行（以及之前的所有行），后面的 for 只能拿到剩下的部分甚至为空。改为 `rows = cursor.fetchall()`（数据量小）或用 `first = next(cursor, None)` 后再 `itertools.chain([first], cursor)` 继续遍历。
+    freshness: |
+      核对于 2026-11：Python 3.12 起 `itertools.batched` 可用于分批。free-threaded 构建（3.13 实验、3.14 起正式支持但可选）的官方文档特别指出：多个线程并发访问同一个迭代器对象通常不是线程安全的，可能出现重复或丢失的元素，应每个线程使用自己的迭代器或加锁。
+    sources:
+      - {title: "Python HOWTO - free threading（Iterators 线程安全说明）", url: "https://docs.python.org/3.15/howto/free-threading-python.html"}
+
+  - id: d05-k3
+    name: 生成器：yield、惰性计算与流式输出
+    level: P0
+    summary: 含 yield 的函数调用后返回生成器，执行到 yield 暂停并交出值，下次 next 从暂停处继续
+    why: |
+      **大模型的流式输出（打字机效果）、FastAPI 的 `yield` 依赖、大文件分块处理，全部建立在生成器之上。** AI 生成的 SSE 接口、`StreamingResponse(gen())`、`def get_db(): ... yield db ... finally: db.close()`，如果你不懂 yield 的暂停与恢复，就看不懂这些代码的执行顺序，也无法判断资源在什么时候被释放。
+    problem: |
+      生成器用普通函数的写法实现迭代器，解决两个问题：一是**惰性**——数据一边产生一边消费，不必全部放进内存，首个结果能立刻返回；二是**可暂停的执行**——函数可以在中间停下、把控制权交给调用方，之后再恢复并执行「收尾代码」，这正是依赖注入和资源管理需要的能力。
+    principle: |
+      **一、调用生成器函数不会执行函数体**
+
+      ```python
+      def numbers():
+          print("开始")
+          yield 1
+          print("继续")
+          yield 2
+          print("结束")
+
+      g = numbers()      # 什么都不打印，只返回一个生成器对象
+      next(g)            # 打印「开始」，返回 1，停在第一个 yield
+      next(g)            # 打印「继续」，返回 2
+      next(g)            # 打印「结束」，函数返回，抛出 StopIteration
+      ```
+
+      生成器对象自动实现了迭代器协议（`__iter__` 返回自身，`__next__` 推进执行），所以可以直接用于 for 循环。它的**局部变量和执行位置被保存在帧对象里**，这就是能「暂停—恢复」的原因。
+
+      **二、生成器的生命周期**
+
+      ```mermaid
+      stateDiagram-v2
+        [*] --> Created: 调用生成器函数
+        Created --> Running: 第一次 next
+        Running --> Suspended: 执行到 yield 交出值
+        Suspended --> Running: 再次 next 或 send
+        Running --> Closed: 函数 return 抛出 StopIteration
+        Running --> Closed: 函数内部抛出异常
+        Suspended --> Closed: close 在 yield 处抛 GeneratorExit
+        Closed --> [*]
+      ```
+
+      重点：**在暂停状态调用 `close()`（或生成器被垃圾回收）时，会在 yield 处抛出 `GeneratorExit`**，所以写在 `try/finally` 里的清理代码会执行。客户端中途断开 SSE 连接时，框架就是通过关闭生成器来触发清理的。
+
+      **三、生成器表达式与内存**
+
+      `sum(len(c) for c in chunks)` 不会创建中间列表，逐个计算；`[...]` 列表推导式会一次性生成整个列表。处理百万级数据时差别巨大。
+
+      **四、yield from**
+
+      `yield from other_gen()` 把另一个生成器产出的值逐个转发出去，用于拼接多段流（例如先输出引用来源，再转发模型的 token 流）。
+
+      **五、在 FastAPI 中的两种用法**
+
+      **用法 1：流式响应。** `StreamingResponse` 接收一个（同步或异步）迭代器，每产出一块就发给客户端：
+
+      ```python
+      def token_stream(question: str):
+          for token in fake_llm(question):          # 模型每生成一个片段
+              yield f"data: {token}\n\n"            # SSE 格式（见 Day 43）
+          yield "data: [DONE]\n\n"
+
+      @app.get("/chat/stream")
+      def chat_stream(q: str):
+          return StreamingResponse(token_stream(q), media_type="text/event-stream")
+      ```
+
+      对同步生成器，Starlette 会放到线程池里迭代，避免阻塞事件循环；调用真实的 LLM 流式 API 通常用异步生成器 `async def ... yield`（见 Day 06、Day 17）。
+
+      **用法 2：带清理的依赖。** `yield` 之前的代码在处理请求前执行，yield 出的值被注入路由函数；yield 之后（通常在 finally 中）的代码在**响应发送之后**执行（这是默认的 `scope="request"`）。FastAPI 内部正是用 `contextlib.contextmanager` / `asynccontextmanager` 把这类依赖包装成上下文管理器（d05-k4）。
+
+      ```mermaid
+      sequenceDiagram
+        participant C as 客户端
+        participant D as get_db 依赖
+        participant R as 路由函数
+        participant S as 流式生成器
+        C->>D: 请求到达
+        D->>D: 打开连接 执行到 yield 暂停
+        D->>R: 注入 db
+        R-->>C: 返回 StreamingResponse
+        loop 逐块发送
+          S-->>C: yield 一块数据
+        end
+        Note over D: 默认 scope=request 响应发送完毕后
+        D->>D: 从 yield 之后继续 finally 关闭连接
+      ```
+
+      **不这样理解会怎样**：会以为调用 `gen()` 就执行了函数；会把大结果先拼成完整字符串再返回，失去流式效果、首字延迟变长；会在依赖的 yield 后写重要逻辑却不知道它在响应之后才执行。
+    scenarios: |
+      - **LLM 流式输出**：生成器逐个产出 token，`StreamingResponse` 以 SSE 推给前端，首字时间从几秒降到几百毫秒。
+      - **数据库会话依赖**：`def get_db(): db = SessionLocal(); try: yield db; finally: db.close()`。
+      - **大文件分块读取**：`def read_chunks(f, size=1 << 20): while (b := f.read(size)): yield b`，用于上传到对象存储或计算哈希。
+      - **数据管道**：读取 → 清洗 → 切片，每一步都是生成器，内存只保存当前处理的一条。
+    code: |
+      ```python
+      from collections.abc import Iterator
+
+      def read_jsonl(path: str) -> Iterator[str]:
+          with open(path, encoding="utf-8") as f:
+              for line in f:                       # 文件本身就是迭代器
+                  line = line.strip()
+                  if line:
+                      yield line
+
+      def with_citations(sources: list[str], tokens: Iterator[str]) -> Iterator[str]:
+          for i, s in enumerate(sources, start=1):
+              yield f"[{i}] {s}\n"
+          yield from tokens                        # 转发另一个生成器
+
+      def fake_llm() -> Iterator[str]:
+          try:
+              for t in ["年假", "为", "5", "天"]:
+                  yield t
+          finally:
+              print("流结束或被关闭，释放资源")
+
+      g = with_citations(["员工手册 p3"], fake_llm())
+      print(next(g), next(g))     # 先输出来源，再输出第一个 token
+      g.close()                   # 提前关闭：GeneratorExit 传入内层，finally 执行
+      ```
+    pitfalls: |
+      - **误区：调用生成器函数会立即执行。** 只返回生成器对象，第一次 next 才开始执行。
+      - **误区：生成器可以遍历多次。** 它是迭代器，耗尽后需要重新调用函数创建新的。
+      - **误区：yield 后面的清理代码一定会执行。** 只有写在 `finally`（或 with）里，并且生成器被关闭或耗尽时才执行。
+      - **误区：FastAPI 依赖 yield 之后的代码在路由返回后立即执行。** 默认 scope 下是在响应发送之后。
+      - **坑：在 yield 依赖中 `except Exception: pass`** 会让 FastAPI 无法感知异常（官方文档专门警告要重新 raise）。
+    interview_asks:
+      - "生成器和普通函数有什么区别？yield 的执行过程是怎样的？"
+      - "生成器表达式和列表推导式有什么区别？什么时候用生成器？"
+      - "大模型流式输出在后端是怎么实现的？生成器起什么作用？"
+      - "FastAPI 中 yield 依赖的执行时序是怎样的？"
+    project_example: |
+      一个知识库问答接口最初用 `answer = "".join(llm_stream(q)); return {"answer": answer}`，等模型完整生成后才返回，用户平均要等 8 秒才看到第一个字。改为生成器逐个 yield token，并用 `StreamingResponse(..., media_type="text/event-stream")` 推送后，首字延迟降到 600ms 左右。同时在生成器的 finally 中记录 token 用量和耗时，即使用户中途关闭页面（生成器被 close），计费日志也不会丢。
+    freshness: |
+      核对于 2026-11（FastAPI 官方文档，并在 FastAPI 0.162.5 上实测）：依赖中 `yield` 之后的退出代码默认（scope="request"）在响应发送之后执行；新版 FastAPI 提供 `Depends(dep, scope="function")`，让退出代码在路由函数返回后、响应发送前执行。实测返回 StreamingResponse 时，默认 scope 下连接在流结束后才关闭，scope="function" 下连接会在流开始前就关闭。scope 参数的具体引入版本以 FastAPI release notes 为准。
+    sources:
+      - {title: "FastAPI - Dependencies with yield", url: "https://fastapi.tiangolo.com/tutorial/dependencies/dependencies-with-yield/"}
+
+  - id: d05-k4
+    name: 上下文管理器：with、__enter__/__exit__ 与 contextlib
+    level: P0
+    summary: with 保证进入时获取资源、离开时（无论是否异常）释放资源；contextlib 用一个 yield 就能写出上下文管理器
+    why: |
+      数据库连接、事务、文件、锁、HTTP 客户端、临时目录——**AI 应用里每一种「借了要还」的资源都应该用 with 管理**。资源泄漏是线上服务慢慢变慢最后挂掉的常见原因：连接池耗尽、文件句柄耗尽、锁没释放导致死锁。FastAPI 的 lifespan、yield 依赖、SQLAlchemy 的 Session 都基于这一机制。
+    problem: |
+      上下文管理器把「获取资源—使用—释放资源」固定成一个结构，让释放逻辑**不依赖于程序员记得写、也不依赖于是否发生异常**。它替代了冗长易错的 try/finally，也让「事务提交或回滚」这样的成对操作变得可靠。
+    principle: |
+      **一、with 语句的协议**
+
+      ```python
+      with EXPR as x:
+          BODY
+      ```
+
+      执行过程：
+
+      1. 计算 `EXPR` 得到上下文管理器对象 `cm`。
+      2. 调用 `cm.__enter__()`，返回值绑定给 `x`（如文件对象、数据库会话）。
+      3. 执行 `BODY`。
+      4. **无论 BODY 正常结束、return、break 还是抛异常**，都调用 `cm.__exit__(exc_type, exc, tb)`；正常结束时三个参数都是 None。
+      5. 如果 `__exit__` 返回**真值**，异常被**吞掉**；返回 None/False，异常继续向外传播。
+
+      ```mermaid
+      sequenceDiagram
+        participant W as with 语句
+        participant M as 上下文管理器
+        participant B as with 代码块
+        W->>M: __enter__
+        M-->>W: 返回资源 绑定到 as 变量
+        W->>B: 执行代码块
+        alt 正常结束
+          B-->>W: 完成
+          W->>M: __exit__ 参数全为 None
+        else 抛出异常
+          B-->>W: 异常
+          W->>M: __exit__ 传入异常类型 实例 traceback
+          M-->>W: 返回真值则吞掉异常 否则继续抛出
+        end
+      ```
+
+      **二、常见的内置上下文管理器**
+
+      - `open(...)`：退出时关闭文件。
+      - `threading.Lock()`：进入时 acquire，退出时 release。
+      - `sqlite3.connect(...)` 作为上下文管理器时**管理的是事务**（成功 commit、异常 rollback），**并不会关闭连接**——这是经典误区。
+      - SQLAlchemy 2.x：`with Session(engine) as session:` 退出时关闭会话；`with session.begin():` 成功提交、异常回滚（见 Day 10）。
+      - `httpx.Client()`：退出时关闭连接池。
+
+      **三、用 contextlib 写上下文管理器**
+
+      不用写类，一个生成器函数加装饰器即可：
+
+      ```python
+      from contextlib import contextmanager
+
+      @contextmanager
+      def timed(name: str):
+          start = time.perf_counter()
+          try:
+              yield                      # yield 之前相当于 __enter__，yield 的值给 as
+          finally:
+              logger.info("%s %.1fms", name, (time.perf_counter() - start) * 1000)   # 相当于 __exit__
+      ```
+
+      原理：`__enter__` 推进生成器到 yield；`__exit__` 时如果没有异常就继续推进生成器，**如果有异常就把异常从 yield 处抛进生成器**。所以清理代码**必须写在 finally 里**，否则异常时不会执行。只能 yield 一次。
+
+      - `contextlib.asynccontextmanager`：异步版本，配合 `async with`。
+      - `contextlib.suppress(FileNotFoundError)`：明确吞掉指定异常。
+      - `contextlib.ExitStack`：动态管理数量不定的多个资源。
+
+      **四、在 FastAPI 中**
+
+      - **lifespan**：应用启动和关闭时的资源（HTTP 客户端连接池、模型加载）用 `@asynccontextmanager` 定义，传给 `FastAPI(lifespan=lifespan)`。**旧写法** `@app.on_event("startup")` 已弃用。
+      - **yield 依赖**：FastAPI 内部把它包装成上下文管理器，异常会被抛进依赖的 yield 处。官方文档强调：在 yield 依赖中 `except` 捕获异常后**要重新 raise**（或抛出 HTTPException），否则 FastAPI 无法感知异常，服务端也没有任何错误日志。
+
+      **不这样理解会怎样**：会以为 `with sqlite3.connect()` 关闭了连接导致连接泄漏；会在 contextmanager 里把清理代码写在 yield 后面而不加 finally，异常时连接永远不释放；会写出 `__exit__` 返回 True 而把所有异常静默吞掉的管理器。
+    scenarios: |
+      - **数据库事务**：`with session.begin(): ...` 写入文档和 chunk 元数据，任一步失败整体回滚。
+      - **应用级资源**：lifespan 中创建 `httpx.AsyncClient` 并在关闭时 `aclose()`，所有请求复用连接池。
+      - **锁**：`with lock:` 保护进程内共享缓存的读写。
+      - **计时与埋点**：`with timed("retrieval"):` 记录检索耗时。
+      - **临时文件**：`with tempfile.TemporaryDirectory() as d:` 解析上传的压缩包，退出时自动删除。
+    code: |
+      ```python
+      import logging
+      import sqlite3
+      import time
+      from contextlib import asynccontextmanager, closing, contextmanager
+
+      import httpx
+      from fastapi import FastAPI
+
+      logger = logging.getLogger(__name__)
+
+      @contextmanager
+      def timed(name: str):
+          start = time.perf_counter()
+          try:
+              yield
+          finally:
+              logger.info("%s took %.1fms", name, (time.perf_counter() - start) * 1000)
+
+      # sqlite3：外层 closing 负责关闭连接，内层 with conn 负责事务
+      with closing(sqlite3.connect(":memory:")) as conn:
+          with conn:
+              conn.execute("CREATE TABLE docs (id TEXT PRIMARY KEY, title TEXT)")
+              conn.execute("INSERT INTO docs VALUES (?, ?)", ("d1", "员工手册"))
+          with timed("query"):
+              print(conn.execute("SELECT title FROM docs").fetchone())
+
+      @asynccontextmanager
+      async def lifespan(app: FastAPI):
+          app.state.http = httpx.AsyncClient(timeout=30.0)   # 启动时创建连接池
+          yield
+          await app.state.http.aclose()                      # 关闭时释放
+
+      app = FastAPI(lifespan=lifespan)
+      ```
+    pitfalls: |
+      - **误区：`with sqlite3.connect(...) as conn` 会关闭连接。** 它只管理事务，关闭需要 `conn.close()` 或 `contextlib.closing`。
+      - **误区：contextmanager 中 yield 后面的代码一定执行。** 发生异常时只有 finally 里的代码会执行。
+      - **误区：`__exit__` 返回 True 更安全。** 会吞掉 with 块内所有异常。
+      - **旧写法：`@app.on_event("startup")`** 已弃用，新代码使用 lifespan。
+      - **坑：在 yield 依赖中捕获异常不重新抛出**，客户端收到 500 但服务端没有任何日志。
+    interview_asks:
+      - "with 语句的执行原理是什么？__exit__ 的返回值有什么作用？"
+      - "contextlib.contextmanager 是怎么把生成器变成上下文管理器的？"
+      - "FastAPI 中如何管理数据库连接和 HTTP 客户端这类资源？"
+    project_example: |
+      一个文档入库服务用 `@contextmanager def get_conn(): conn = pool.getconn(); yield conn; pool.putconn(conn)` 获取 PostgreSQL 连接，没有 try/finally。当某个 PDF 解析抛出异常时，异常从 yield 处抛进生成器，`putconn` 永远不会执行。连续几十个坏文件后连接池耗尽，所有接口卡在获取连接上。改为 `try: yield conn; finally: pool.putconn(conn)` 后问题消失，并补充了「入库过程抛异常后连接数不增长」的测试。
+    freshness: |
+      核对于 2026-11（FastAPI 官方文档）：FastAPI 内部用 `contextlib.contextmanager` / `asynccontextmanager` 实现 yield 依赖；在 yield 依赖中用 except 捕获异常后应重新 raise，否则客户端收到 500 而服务端没有错误信息。应用级启动/关闭资源使用 `FastAPI(lifespan=...)`，`@app.on_event` 为旧写法。
+    sources:
+      - {title: "FastAPI - Dependencies with yield（Context Managers 一节）", url: "https://fastapi.tiangolo.com/tutorial/dependencies/dependencies-with-yield/"}
+
+quiz:
+  - id: d05-q1
+    kp: d05-k1
+    type: single
+    question: |
+      下面两种写法中，`log_latency` 是一个用 functools.wraps 正确实现的耗时日志装饰器。请求 `GET /items` 时，哪种写法会记录耗时日志？
+
+      ```python
+      # 写法 A
+      @log_latency
+      @app.get("/items")
+      def list_items(): ...
+
+      # 写法 B
+      @app.get("/items")
+      @log_latency
+      def list_items(): ...
+      ```
+    options:
+      - "只有写法 A，因为 log_latency 在最外层，最后包装"
+      - "只有写法 B，因为 FastAPI 注册的是 log_latency 包装后的函数"
+      - "两种都会，装饰器顺序不影响结果"
+      - "两种都不会，FastAPI 路由不能与自定义装饰器同时使用"
+    answer: [1]
+    explain: |
+      装饰器从下往上应用。@app.get 是注册型装饰器：把收到的函数登记到路由表并原样返回。写法 B 中先执行 log_latency 得到包装函数，再由 app.get 注册包装函数，所以请求会经过日志逻辑。写法 A 中 app.get 先注册了原函数，外层 log_latency 只改变了模块里 list_items 这个名字的指向，路由表里仍是原函数，日志不会记录。C、D 都是常见误解。
+  - id: d05-q2
+    kp: d05-k3
+    type: multi
+    question: |
+      关于下面的生成器，哪些说法正确？
+
+      ```python
+      def gen():
+          print("A")
+          try:
+              yield 1
+              yield 2
+          finally:
+              print("B")
+      g = gen()
+      ```
+    options:
+      - "执行 `g = gen()` 时会打印 A"
+      - "第一次 `next(g)` 打印 A 并返回 1"
+      - "`list(gen())` 的结果是 [1, 2]，过程中会打印 A 和 B"
+      - "第一次 `next(g)` 后调用 `g.close()`，会打印 B"
+      - "对同一个 g 用 for 遍历两次，两次都能得到 1 和 2"
+    answer: [1, 2, 3]
+    explain: |
+      调用生成器函数只创建生成器对象，不执行函数体，A 错误。第一次 next 才从头执行到第一个 yield，打印 A 并返回 1，B 正确。list 会把生成器耗尽，函数正常结束时执行 finally，C 正确。在暂停状态调用 close 会在 yield 处抛入 GeneratorExit，finally 执行，D 正确。生成器是迭代器，只能消费一次，第二次遍历为空，E 错误。
+  - id: d05-q3
+    kp: d05-k4
+    type: judge
+    question: 在 Python 标准库 sqlite3 中，`with sqlite3.connect("kb.db") as conn:` 代码块结束后，数据库连接会被自动关闭。
+    answer: false
+    explain: |
+      sqlite3 的 Connection 作为上下文管理器时管理的是事务：代码块正常结束时 commit，发生异常时 rollback，但不会关闭连接。需要关闭时应显式调用 conn.close()，或者用 contextlib.closing(sqlite3.connect(...)) 包一层。这是 AI 生成代码中常见的连接泄漏来源。
+  - id: d05-q4
+    kp: d05-k2
+    type: short
+    question: |
+      下面代码第二个 print 输出什么？为什么？如何修改才能让两次都得到正确结果？
+
+      ```python
+      scores = map(float, ["0.9", "0.7", "0.8"])
+      print(max(scores))
+      print(sum(scores))
+      ```
+    key_points:
+      - {text: "说明第一次输出 0.9，第二次输出 0", dim: concept}
+      - {text: "说明 map 返回的是迭代器，max 已经把它消费完", dim: principle}
+      - {text: "说明耗尽的迭代器再次遍历不会报错，只是得到空序列，sum 空序列为 0", dim: principle}
+      - {text: "给出用 list 物化后再多次使用的修改", dim: engineering}
+    reference: |
+      第一个 print 输出 0.9，第二个输出 0。map 在 Python 3 中返回一个惰性的迭代器，而不是列表。max 遍历时把三个元素全部取出，迭代器已经耗尽；sum 再遍历时 next 立刻抛 StopIteration，sum 内部当作空序列处理，返回初始值 0，整个过程不会报错，所以非常隐蔽。修改方法是先物化：`scores = list(map(float, [...]))` 或 `scores = [float(s) for s in ...]`，之后可以反复遍历。类似的一次性对象还有 zip、filter、生成器、文件对象和数据库游标。
+  - id: d05-q5
+    kp: d05-k4
+    type: scenario
+    question: |
+      文档入库服务运行一段时间后所有接口卡死，监控显示数据库连接池耗尽。获取连接的代码如下，调用方写法为 `with get_conn() as conn: parse_and_save(conn, file)`，`parse_and_save` 遇到损坏的 PDF 会抛异常。请分析原因并修复。
+
+      ```python
+      from contextlib import contextmanager
+
+      @contextmanager
+      def get_conn():
+          conn = pool.getconn()
+          yield conn
+          pool.putconn(conn)
+      ```
+    key_points:
+      - {text: "说明 contextmanager 在 with 块抛异常时，会把异常从 yield 处抛进生成器", dim: principle}
+      - {text: "指出 yield 之后的 putconn 没有放在 finally 中，异常时不会执行，连接未归还", dim: concept}
+      - {text: "说明每个损坏文件泄漏一个连接，累积后连接池耗尽导致所有接口阻塞", dim: engineering}
+      - {text: "给出 try yield finally putconn 的修复，并补充异常场景下连接数不增长的测试", dim: engineering}
+    reference: |
+      contextlib.contextmanager 把生成器包装成上下文管理器：__enter__ 推进到 yield 并返回 conn；with 块正常结束时 __exit__ 继续推进生成器，执行 yield 之后的代码；但如果 with 块抛了异常，__exit__ 会调用生成器的 throw，把异常从 yield 那一行抛进生成器。这里 yield 没有被 try/finally 包住，异常直接向外传播，`pool.putconn(conn)` 根本不会执行，连接没有归还给连接池。每遇到一个损坏的 PDF 就泄漏一个连接，累积到连接池上限后，所有需要数据库的请求都卡在获取连接上，表现为接口全部卡死。修复：`conn = pool.getconn(); try: yield conn; finally: pool.putconn(conn)`，必要时在 except 中先 rollback 再 raise。测试：模拟 parse_and_save 抛异常若干次，断言连接池可用连接数不变。
+    followup:
+      question: 如果想在异常时回滚事务、正常时提交，代码应该怎么组织？
+      key_points: ["try 中 yield 后 commit", "except 中 rollback 后重新 raise", "finally 中归还连接"]
+      reference: |
+        写成 `try: yield conn; conn.commit()`、`except Exception: conn.rollback(); raise`、`finally: pool.putconn(conn)` 三段结构。正常结束时提交，异常时回滚并重新抛出让上层感知，无论哪种情况 finally 都会归还连接。
+  - id: d05-q6
+    kp: d05-k1
+    type: code
+    question: |
+      说明下面代码在调用 `ask("hi")` 时的完整执行过程（包括装饰阶段和调用阶段），并指出这个重试装饰器的两个问题。
+
+      ```python
+      import time
+
+      def retry(times=3):
+          def decorator(func):
+              def wrapper(*args, **kwargs):
+                  for i in range(times):
+                      try:
+                          return func(*args, **kwargs)
+                      except Exception:
+                          time.sleep(1)
+                  raise RuntimeError("retry failed")
+              return wrapper
+          return decorator
+
+      @retry(times=2)
+      def ask(q):
+          raise TimeoutError("llm timeout")
+      ```
+    key_points:
+      - {text: "说明装饰阶段先调用 retry(times=2) 得到 decorator，再 decorator(ask) 返回 wrapper，名字 ask 指向 wrapper", dim: principle}
+      - {text: "说明调用阶段 wrapper 两次调用原函数都抛 TimeoutError，每次捕获后 sleep 1 秒，最后抛 RuntimeError", dim: concept}
+      - {text: "指出问题一：未使用 functools.wraps，ask.__name__ 变为 wrapper 且签名丢失", dim: engineering}
+      - {text: "指出问题二：最终 RuntimeError 在 except 块外抛出且没有 from，丢失根因；且对所有 Exception 重试", dim: engineering}
+    reference: |
+      装饰阶段（模块导入时）：`@retry(times=2)` 先执行 retry(2)，返回内层的 decorator（闭包记住 times=2）；再执行 decorator(ask)，返回 wrapper（闭包记住原函数 func），于是模块中的名字 ask 指向 wrapper。调用阶段：`ask("hi")` 实际执行 wrapper("hi")，循环两次：每次调用原函数都抛 TimeoutError，被 except Exception 捕获，sleep 1 秒；循环结束后抛出 RuntimeError("retry failed")，总耗时约 2 秒（最后一次失败后还白白等了 1 秒）。问题一：没有 functools.wraps，ask.__name__ 是 "wrapper"、文档字符串丢失，inspect.signature 得到 (*args, **kwargs)，用在 FastAPI 路由上会导致参数解析错误。问题二：最终抛出的 RuntimeError 没有 `from` 最后一次的异常，而且这行 raise 位于 except 块之外，新异常的 __cause__ 和 __context__ 都是 None，traceback 中完全看不到 TimeoutError 这个直接原因；并且捕获所有 Exception，参数错误、鉴权失败也会被重试。修复：加 @functools.wraps(func)，只捕获可重试的异常类型，记录 last_exc 并 `raise ... from last_exc`，最后一次失败不再 sleep。
+
+code_reading:
+  id: d05-c1
+  kp: [d05-k1, d05-k3, d05-k4, d05-k2]
+  title: 带重试与数据库依赖的流式文档接口
+  scenario: |
+    知识库后台的 `GET /docs/{doc_id}/stream` 接口：通过 yield 依赖获取 SQLite 连接，读取某个文档的所有 chunk，再以 SSE（text/event-stream）格式逐条推送给前端预览。数据库偶尔因写入任务锁表报 `database is locked`，所以开发者给读取函数加了一个自制的重试装饰器。
+  language: python
+  code: |
+    import logging
+    import sqlite3
+    import time
+    from collections.abc import Iterator
+    from typing import Annotated
+
+    from fastapi import Depends, FastAPI
+    from fastapi.responses import StreamingResponse
+
+    logger = logging.getLogger(__name__)
+    app = FastAPI()
+
+
+    def retry(times: int = 3, delay: float = 0.5):
+        def decorator(func):
+            def wrapper(*args, **kwargs):
+                for attempt in range(1, times + 1):
+                    try:
+                        return func(*args, **kwargs)
+                    except sqlite3.OperationalError as e:
+                        logger.warning("%s failed attempt=%d err=%r", func.__name__, attempt, e)
+                        time.sleep(delay)
+                raise RuntimeError(f"{func.__name__} failed after {times} attempts")
+            return wrapper
+        return decorator
+
+
+    def get_db() -> Iterator[sqlite3.Connection]:
+        conn = sqlite3.connect("kb.db", check_same_thread=False)
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+
+    @retry(times=3)
+    def load_chunks(conn: sqlite3.Connection, doc_id: str) -> list[str]:
+        rows = conn.execute("SELECT text FROM chunks WHERE doc_id = ? ORDER BY idx", (doc_id,))
+        return [r[0] for r in rows]
+
+
+    def stream_chunks(chunks: list[str]) -> Iterator[str]:
+        for i, text in enumerate(chunks, start=1):
+            yield f"data: [{i}/{len(chunks)}] {text[:50]}\n\n"
+        yield "data: [DONE]\n\n"
+
+
+    @app.get("/docs/{doc_id}/stream")
+    def stream_doc(doc_id: str, conn: Annotated[sqlite3.Connection, Depends(get_db)]):
+        chunks = load_chunks(conn, doc_id)
+        return StreamingResponse(stream_chunks(chunks), media_type="text/event-stream")
+  walkthrough:
+    function: |
+      根据 doc_id 从 SQLite 读取该文档按顺序排列的所有文本片段，遇到锁表错误最多重试 3 次；然后用生成器把每个片段的前 50 个字符包装成 SSE 事件逐条推送，最后推送 `[DONE]` 结束标记；请求处理完后由 yield 依赖关闭数据库连接。
+    key_functions: |
+      - `retry()`：带参数的装饰器工厂，三层结构；只对 `sqlite3.OperationalError` 重试，每次失败等待 delay 秒。
+      - `get_db()`：yield 依赖；yield 之前打开连接，yield 出的连接被注入路由，finally 中关闭连接。`check_same_thread=False` 是因为同步依赖和同步路由可能在线程池的不同线程中执行。
+      - `load_chunks()`：被 retry 包装；`conn.execute` 返回游标（迭代器），列表推导式把它一次性消费成 list。
+      - `stream_chunks()`：生成器，逐条产出 SSE 格式字符串。
+      - `stream_doc()`：路由函数，组合以上各部分并返回 `StreamingResponse`。
+    params: |
+      路径参数 `doc_id` 由 FastAPI 从 URL 解析；`conn` 通过 `Depends(get_db)` 注入（get_db 执行到 yield 时产出的对象）。`load_chunks(conn, doc_id)` 实际调用的是 wrapper，参数经 `*args, **kwargs` 原样透传给原函数；`times=3` 和 `func` 通过闭包保存。`chunks` 列表作为参数传给生成器函数，生成器对象再传给 StreamingResponse。
+    data_flow: |
+      ```mermaid
+      sequenceDiagram
+        participant C as 前端
+        participant F as FastAPI
+        participant D as get_db
+        participant W as retry 包装的 load_chunks
+        participant G as stream_chunks 生成器
+        C->>F: GET /docs/d1/stream
+        F->>D: 执行到 yield
+        D-->>F: conn
+        F->>W: load_chunks(conn, d1)
+        loop 最多 3 次
+          W->>W: 执行查询 锁表则记录警告并等待
+        end
+        W-->>F: chunks 列表 或 RuntimeError
+        F-->>C: 响应头 text/event-stream
+        loop 每个 chunk
+          G-->>C: data 片段
+        end
+        G-->>C: data DONE
+        Note over D: 默认 scope=request 流发送完后执行 finally 关闭 conn
+      ```
+    failure_points: |
+      - **问题一（值得审查）：`retry` 没有使用 `functools.wraps`。** `load_chunks.__name__` 变成 `wrapper`，签名变成 `(*args, **kwargs)`；目前日志里用的是闭包中的 `func.__name__` 所以还正常，但如果有人把这个装饰器加到路由函数上，FastAPI 会把 args/kwargs 当成必填查询参数，所有请求 422；监控、文档工具看到的也都是 wrapper。
+      - **问题二（值得审查）：重试耗尽后 `raise RuntimeError(...)` 没有 `from` 原异常。** 这行 raise 位于 except 块之外，新异常既没有 `__cause__` 也没有 `__context__`，traceback 里完全看不到最后一次 `OperationalError`，排查时只能看到「failed after 3 attempts」；而且最后一次失败后仍然 sleep，白白增加延迟。
+      - doc_id 不存在时返回空列表，接口仍然 200 并只推送 `[DONE]`，前端无法区分「文档不存在」和「文档为空」。
+      - `RuntimeError` 未被转换为业务异常，客户端收到 500。
+    debugging: |
+      - 用另一个进程对 kb.db 开启写事务不提交（制造锁表），请求接口，观察日志中 3 条 warning 和最终的 RuntimeError traceback，确认看不到原始的 OperationalError 详情。
+      - 打印 `load_chunks.__name__`、`inspect.signature(load_chunks)` 和 `hasattr(load_chunks, "__wrapped__")`，验证元信息丢失。
+      - 在 `get_db` 的 finally 打日志，用 curl `-N` 请求流式接口，观察连接是在流结束后才关闭。
+    change_request: |
+      - 修复问题一和问题二：`wrapper` 上加 `@functools.wraps(func)`；用 `last_exc` 保存最后一次异常，循环外 `raise DocLoadError(...) from last_exc`；最后一次失败不 sleep；生产环境可直接换成 tenacity 并配置指数退避。
+      - 如果需求改成「文档很大，要边查边推，不一次性读入内存」：把生成器改成直接迭代游标（`for (text,) in conn.execute(...)`）。此时**依赖必须保持默认的 scope="request"**，因为流在路由返回之后才被消费；若改为 `Depends(get_db, scope="function")`，连接会在响应发送前关闭，生成器读取时会抛 `sqlite3.ProgrammingError: Cannot operate on a closed database`。同时注意重试装饰器不能简单套在生成器函数上——调用生成器函数只是创建对象，不会执行查询，异常发生在迭代阶段，wrapper 捕获不到。
+  questions:
+    - id: d05-c1-q1
+      kp: d05-k1
+      type: code
+      question: 按时间顺序说明：模块被导入时 `@retry(times=3)` 做了什么；请求到来时调用 `load_chunks(conn, doc_id)` 实际执行的是哪个函数、参数如何传递；如果三次都遇到锁表，最终抛出的异常里能看到什么、看不到什么。
+      key_points:
+        - {text: "说明导入时先执行 retry(times=3) 得到 decorator，再 decorator(load_chunks) 返回 wrapper，名字 load_chunks 指向 wrapper", dim: principle}
+        - {text: "说明调用时执行 wrapper，参数通过 *args **kwargs 透传，times delay func 来自闭包", dim: principle}
+        - {text: "说明三次失败各记录一条 warning 并 sleep，最后抛 RuntimeError，且最后一次失败后也 sleep", dim: concept}
+        - {text: "指出 RuntimeError 在 except 块外抛出且没有 from，traceback 中看不到 OperationalError 根因，应保存 last_exc 并 raise from", dim: engineering}
+      reference: |
+        导入阶段：解释器执行到 `@retry(times=3)` 时先调用 retry(3, 0.5)，返回 decorator，闭包记住 times=3、delay=0.5；然后用 decorator 装饰 load_chunks，decorator 返回 wrapper，闭包记住 func=原 load_chunks。模块里名字 load_chunks 此后指向 wrapper。请求阶段：路由中 `load_chunks(conn, doc_id)` 实际调用 wrapper(conn, doc_id)，两个实参被收集进 args，再通过 `func(*args, **kwargs)` 原样传给原函数。每次原函数抛 sqlite3.OperationalError（database is locked），wrapper 捕获后记录一条带 attempt 序号的 warning 并 sleep 0.5 秒；第三次失败后仍会 sleep，然后退出循环，抛出 RuntimeError("load_chunks failed after 3 attempts")。由于这行 raise 位于 except 块之外，也没有写 from，新异常既没有 __cause__ 也没有 __context__，traceback 中只有 RuntimeError 和 wrapper 的位置，看不到原始的 OperationalError 信息和发生位置，只能靠前面的 warning 日志拼凑。修复是在 except 中 `last_exc = e`，循环后 `raise DocLoadError(...) from last_exc`，并且最后一次失败不再 sleep。
+    - id: d05-c1-q2
+      kp: d05-k3
+      type: code
+      question: |
+        从请求到达到连接关闭，按顺序说明 `get_db`、`load_chunks`、`stream_doc`、`stream_chunks` 以及 `finally: conn.close()` 的执行时机。`stream_chunks(chunks)` 这一行执行时，生成器函数体运行了吗？
+      key_points:
+        - {text: "说明 get_db 先执行到 yield 暂停，conn 被注入路由函数", dim: principle}
+        - {text: "说明 load_chunks 在路由函数中同步执行完毕，返回完整列表", dim: concept}
+        - {text: "说明 stream_chunks(chunks) 只创建生成器对象不执行函数体，StreamingResponse 发送时才逐个 next", dim: principle}
+        - {text: "说明默认 scope 下 get_db 的 finally 在整个流式响应发送完后才执行关闭连接", dim: principle}
+      reference: |
+        请求到达后，FastAPI 先解析 doc_id，然后执行依赖 get_db：打开 SQLite 连接，执行到 yield 时暂停，把 conn 注入路由函数。路由函数 stream_doc 执行 load_chunks（经过 retry 包装），查询并用列表推导式把游标一次性消费成 chunks 列表。接着 `stream_chunks(chunks)` 这一行只是调用生成器函数，返回一个生成器对象，函数体一行都没有执行；这个对象被交给 StreamingResponse，路由函数返回。FastAPI/Starlette 开始发送响应：先发响应头，然后（同步生成器在线程池中）不断对生成器调用 next，每次执行到 yield 就把一条 SSE 文本发给客户端，最后发送 `[DONE]`，生成器结束。整个响应发送完毕后，因为依赖默认 scope 为 request，FastAPI 才继续推进 get_db 的生成器，从 yield 之后执行 finally 中的 conn.close()。本例中数据在路由里已全部读出，所以连接何时关闭不影响结果；如果改为在生成器里直接迭代游标，就必须依赖这个「响应后才关闭」的时序。
+    - id: d05-c1-q3
+      kp: d05-k4
+      type: code
+      question: "`get_db` 为什么要用 `try/finally` 包住 yield？如果写成 `conn = sqlite3.connect(...); yield conn; conn.close()`，在 `load_chunks` 重试三次后抛出 RuntimeError 的情况下会发生什么？另外，把 `get_db` 改成 `with sqlite3.connect(\"kb.db\") as conn: yield conn` 能否保证连接被关闭？"
+      key_points:
+        - {text: "说明 FastAPI 把 yield 依赖包装成上下文管理器，路由中的异常会从 yield 处抛入依赖", dim: principle}
+        - {text: "说明没有 finally 时异常导致 yield 之后的 close 不执行，连接泄漏", dim: concept}
+        - {text: "指出 sqlite3 连接的 with 只管理事务（提交或回滚），不会关闭连接，仍会泄漏", dim: principle}
+        - {text: "给出正确写法：try finally close，或 contextlib.closing 包裹", dim: engineering}
+      reference: |
+        FastAPI 内部用 contextmanager 把 yield 依赖包装成上下文管理器。路由函数里抛出的异常（这里是重试耗尽后的 RuntimeError）会被传回依赖，从 yield 那一行抛进 get_db 的生成器。有 try/finally 时，finally 中的 conn.close() 一定会执行；如果写成 yield 之后直接 conn.close() 而没有 finally，异常从 yield 处抛出后直接向外传播，close 那一行永远不会执行，每次失败的请求都泄漏一个连接。改成 `with sqlite3.connect("kb.db") as conn: yield conn` 也不能解决：sqlite3 的 Connection 作为上下文管理器只负责事务——正常结束 commit、异常时 rollback——并不会关闭连接，所以仍然泄漏。正确写法是保留现在的 try/finally，或者使用 `with contextlib.closing(sqlite3.connect("kb.db", check_same_thread=False)) as conn: yield conn`。
+
+interview:
+  - id: d05-i1
+    kp: d05-k1
+    type: oral
+    difficulty: 1
+    question: 什么是装饰器？它的原理是什么？functools.wraps 有什么用？
+    key_points:
+      - {text: "说明 @deco 等价于 f = deco(f)，装饰器是接收函数返回新函数的可调用对象", dim: concept}
+      - {text: "说明依赖函数是一等对象和闭包，wrapper 通过闭包保存原函数，用 *args **kwargs 透传参数", dim: principle}
+      - {text: "说明 wraps 复制 __name__ __doc__ 等元信息并设置 __wrapped__，使 inspect.signature 能拿到原签名", dim: principle}
+      - {text: "结合 FastAPI 说明不加 wraps 导致参数解析异常（422）的工程影响", dim: project}
+    reference: |
+      装饰器本质上是一个接收函数、返回新函数的可调用对象，`@deco` 写在函数定义上方，等价于定义完后执行 `f = deco(f)`，让名字 f 指向装饰器返回的新函数。它依赖两点：函数是一等对象，可以作为参数和返回值；闭包让内层的 wrapper 记住外层的原函数。典型的 wrapper 用 `*args, **kwargs` 接收任意参数，在调用原函数前后加上日志、计时、重试、鉴权等横切逻辑。带参数的装饰器如 `@retry(times=3)` 需要三层：最外层接收配置并返回真正的装饰器。functools.wraps 会把原函数的 __name__、__qualname__、__doc__、__module__ 等复制到 wrapper 上，并设置 __wrapped__ 指向原函数；inspect.signature 会顺着 __wrapped__ 拿到原函数的真实签名。不加 wraps，日志和监控里函数名都是 wrapper；更严重的是 FastAPI 依靠签名解析参数，看到 (*args, **kwargs) 会把 args 和 kwargs 当成必填查询参数，接口直接返回 422。我们就遇到过统一加耗时装饰器后所有 GET 接口 422 的问题。
+    oral: |
+      装饰器就是一个接收函数、返回新函数的东西，@deco 写在函数上面，等价于 f = deco(f)。里面的 wrapper 靠闭包记住原函数，用 *args、**kwargs 透传参数，在前后加日志、计时、重试这些逻辑。functools.wraps 会把原函数的名字、文档复制过来，还会设置 __wrapped__，让 inspect.signature 能拿到原函数签名。这一点在 FastAPI 里很关键：我们之前给接口加了个没写 wraps 的耗时装饰器，FastAPI 看到的签名变成了 *args、**kwargs，结果所有 GET 接口都返回 422，加上 wraps 就好了。
+  - id: d05-i2
+    kp: d05-k3
+    type: oral
+    difficulty: 2
+    question: 生成器是什么？yield 是怎么工作的？大模型的流式输出在 Python 后端是怎么实现的？
+    key_points:
+      - {text: "说明调用含 yield 的函数返回生成器对象而不执行函数体，next 时运行到 yield 暂停并交出值，帧状态被保存", dim: principle}
+      - {text: "说明生成器是一次性迭代器，惰性计算节省内存，close 时在 yield 处抛 GeneratorExit 触发 finally", dim: principle}
+      - {text: "说明流式输出用生成器或异步生成器逐个 yield 模型片段，交给 StreamingResponse 以 SSE 格式推送", dim: engineering}
+      - {text: "说明流式的价值是降低首字延迟，并在 finally 中记录 token 用量等收尾工作", dim: project}
+    reference: |
+      含有 yield 的函数是生成器函数，调用它不会执行函数体，而是返回一个生成器对象。第一次 next 时从头执行到第一个 yield，把值交给调用方并暂停，局部变量和执行位置保存在帧对象中；再次 next 从暂停处继续，直到下一个 yield；函数结束时抛出 StopIteration。生成器实现了迭代器协议，可以直接用于 for 循环，但只能消费一次。它的价值一是惰性：数据边产生边消费，不需要一次性放进内存；二是可暂停：可以把控制权交给调用方再回来执行收尾代码。在暂停状态调用 close 时，会在 yield 处抛 GeneratorExit，try/finally 里的清理代码会执行。大模型流式输出的实现方式是：调用模型 SDK 的流式接口，得到一个逐块返回的迭代器；后端写一个生成器（高并发场景用 async def 加 yield 的异步生成器），对每个片段 yield 一行 `data: ...\n\n` 格式的 SSE 事件，最后 yield 结束标记；把它交给 FastAPI 的 StreamingResponse，media_type 设为 text/event-stream。这样用户在模型生成第一个 token 后就能看到内容，首字延迟从数秒降到几百毫秒。我们还在生成器的 finally 里记录 token 用量和耗时，即使用户中途断开、生成器被关闭，计费日志也不会丢。
+    oral: |
+      生成器就是带 yield 的函数。调用它不会执行，只是返回一个生成器对象；每次 next 才跑到下一个 yield，把值交出去然后暂停，状态都保存着，下次接着跑。它是一次性的迭代器，好处是惰性，省内存，还能在 finally 里做收尾。流式输出就是用它实现的：调用模型的流式接口，在生成器里每拿到一个片段就 yield 一条 SSE 格式的数据，交给 StreamingResponse 推给前端。我们的知识库问答改成流式后，首字延迟从 8 秒左右降到 600 毫秒左右；我们还在 finally 里记 token 用量，用户中途关页面也不会漏记。
+  - id: d05-i3
+    kp: d05-k4
+    type: oral
+    difficulty: 3
+    question: with 语句的原理是什么？contextlib.contextmanager 是怎么实现的？在 FastAPI 项目中你如何管理数据库连接和 HTTP 客户端？
+    key_points:
+      - {text: "说明 with 调用 __enter__ 获取资源，无论正常还是异常都会调用 __exit__，__exit__ 返回真值会吞掉异常", dim: principle}
+      - {text: "说明 contextmanager 中 __enter__ 推进到 yield，__exit__ 正常时继续推进、异常时把异常从 yield 处抛入，所以清理必须写在 finally", dim: principle}
+      - {text: "说明应用级资源用 lifespan（asynccontextmanager）创建和释放，旧的 on_event 已弃用", dim: engineering}
+      - {text: "说明请求级资源用 yield 依赖并在 finally 关闭，默认 scope 下在响应之后执行，捕获异常要重新 raise", dim: engineering}
+      - {text: "举出缺少 finally 导致连接池耗尽或误以为 sqlite3 的 with 会关闭连接的案例", dim: project}
+    reference: |
+      with 语句先计算表达式得到上下文管理器，调用 __enter__，返回值绑定给 as 后的变量；然后执行代码块；无论代码块正常结束、return 还是抛异常，都会调用 __exit__(exc_type, exc, tb)，正常结束时三个参数为 None。__exit__ 返回真值时异常被吞掉，否则继续传播。它把「获取—使用—释放」固定成结构，释放不依赖于程序员记得写。contextlib.contextmanager 把一个只 yield 一次的生成器包装成上下文管理器：__enter__ 调用 next 推进到 yield，yield 的值作为 as 的结果；__exit__ 时，如果没有异常就再调用 next 让 yield 之后的代码执行，如果有异常就调用生成器的 throw 把异常从 yield 处抛进去。所以清理代码必须写在 finally 中，否则异常时不会执行。FastAPI 项目中我分两类资源：应用级资源如 httpx.AsyncClient 连接池、数据库引擎、加载的模型，用 @asynccontextmanager 定义 lifespan，yield 之前创建，之后关闭，传给 FastAPI(lifespan=...)，不再使用已弃用的 @app.on_event；请求级资源如数据库会话，用 yield 依赖，`session = SessionLocal(); try: yield session; finally: session.close()`。默认 scope 下 finally 在响应发送后执行，流式接口依赖这一点；如果确定响应后不再需要，可以用 Depends(scope="function") 提前释放。依赖里如果 except 捕获异常，一定要重新 raise。踩过的坑：一个获取连接的 contextmanager 没写 finally，损坏文件触发异常后连接没归还，最终连接池耗尽；还有人以为 with sqlite3.connect 会关闭连接，其实它只管事务。
+    oral: |
+      with 会先调 __enter__ 拿到资源，然后执行代码块，不管正常结束还是抛异常，最后都会调 __exit__，如果 __exit__ 返回真值，异常会被吞掉。contextmanager 是用生成器实现的：进入时跑到 yield，退出时没异常就接着跑，有异常就从 yield 那行把异常抛进去，所以清理一定要写在 finally 里。FastAPI 里我分两类：连接池、HTTP 客户端这种应用级的，用 lifespan 创建和关闭；数据库会话这种请求级的，用 yield 依赖加 finally 关闭，默认是响应发完才关，流式接口正好需要这个时序。我们踩过一次坑：获取连接的 contextmanager 没写 finally，坏文件一抛异常连接就没还回去，最后连接池耗尽，所有接口卡死。
+  - id: d05-i4
+    kp: d05-k3
+    type: design
+    difficulty: 4
+    question: 设计一个知识库问答的流式接口：需要从数据库读取会话历史、检索文档、调用大模型流式生成，并在结束后记录 token 用量和耗时。请说明你会如何组合装饰器、生成器和上下文管理器，资源在什么时候获取和释放，用户中途断开时如何保证收尾逻辑执行。
+    key_points:
+      - {text: "说明应用级资源（HTTP 客户端、数据库引擎）放在 lifespan，请求级会话用 yield 依赖并在 finally 释放", dim: engineering}
+      - {text: "说明在流开始前同步完成历史读取和检索，流式生成器只负责调用模型和推送 SSE，避免在流中长时间占用数据库连接", dim: principle}
+      - {text: "说明用异步生成器逐块 yield 并在 try finally 中记录用量，客户端断开时生成器被关闭触发 finally", dim: principle}
+      - {text: "说明重试装饰器只用于建立流之前的调用（如检索、首次请求），使用 wraps 和只重试可恢复异常，流开始后不能简单重试", dim: engineering}
+      - {text: "说明依赖 scope 的选择：流中仍需使用的资源必须保持 request 范围，不需要的可提前释放", dim: project}
+    reference: |
+      我会这样分层。应用级资源：在 lifespan（@asynccontextmanager）中创建 httpx.AsyncClient（或模型 SDK 的异步客户端）和数据库引擎，应用关闭时释放，所有请求复用连接池。请求级资源：数据库会话通过 yield 依赖注入，try/yield/finally 关闭。路由函数内先完成所有「非流式」步骤：读取会话历史、检索并重排文档、组装 Prompt。这些步骤用一个带 functools.wraps 的重试装饰器（或 tenacity）保护，只对超时、限流等可恢复异常重试，失败则抛业务异常，由全局处理器返回 503/504——此时还没开始流式响应，可以返回正常的错误状态码。然后返回 StreamingResponse，传入一个异步生成器：它调用模型的流式接口，每收到一个片段就 yield 一条 SSE 事件，并在本地累计 token 数；整个生成器用 try/finally 包住，finally 中记录 token 用量、耗时、是否中途断开，并写入计费表。用户中途断开时，服务器会关闭这个生成器，GeneratorExit（异步生成器同理）在 yield 处抛出，finally 仍会执行，计费和日志不会丢。流一旦开始，响应头已经发出，就不能再简单重试或改状态码，只能在流中发送一条错误事件后结束。资源时序上要注意：如果计费写库需要在 finally 中使用数据库会话，那么这个会话依赖必须保持默认的 scope="request"，让它在响应结束后才关闭；如果流中不需要数据库，最好在流开始前就把数据读完，或使用 scope="function" 让连接尽早归还，避免慢速的流长时间占用连接池。
+    oral: |
+      我会把它拆成两段。流开始之前，在路由里把历史读取、检索、Prompt 组装都做完，这部分用带 wraps 的重试装饰器保护，只重试超时和限流，失败就直接返回 503 之类的错误，因为这时候还没开始流。然后返回 StreamingResponse，传入一个异步生成器，它调模型流式接口，每个片段 yield 一条 SSE，外面包一层 try/finally，在 finally 里记 token 用量和耗时。用户中途断开时生成器会被关闭，finally 照样执行，计费不会丢。资源上，HTTP 客户端和数据库引擎放 lifespan，数据库会话用 yield 依赖。如果 finally 里还要写库，会话依赖就得保持默认的 request 范围；如果流里不用数据库，我会提前读完，尽早把连接还回去，避免慢流占着连接池。
+
+sources:
+  - {title: "FastAPI - Dependencies with yield", url: "https://fastapi.tiangolo.com/tutorial/dependencies/dependencies-with-yield/"}
+  - {title: "Python HOWTO - free threading", url: "https://docs.python.org/3.15/howto/free-threading-python.html"}

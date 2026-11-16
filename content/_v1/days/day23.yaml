@@ -1,0 +1,708 @@
+day: 23
+phase: 3
+title: 文本切片：Chunk、Chunk Size、Overlap 与切片策略
+goals:
+  - 能解释为什么需要切片，以及为什么不能把整篇文档做成一个向量
+  - 能分析 Chunk Size 过大和过小各自导致的问题，并说明 Overlap 的作用与代价
+  - 能对比固定长度、递归分隔、语义切片、按标题结构四种策略，为不同文档选择合适方案
+  - 能设计切片时需要保留的 metadata（来源、页码、标题路径等），并读懂一段切片代码中的隐患
+knowledge_points:
+  - id: d23-k1
+    name: 为什么需要切片
+    level: P0
+    summary: 一个向量只能代表一个「主题」；切片让每个向量语义集中、可被精准命中、可被精确引用
+    why: |
+      切片是 RAG 里**最影响效果、又最常被随手设置**的环节。很多项目直接用框架默认参数，效果不好时却去换模型、调 Prompt。
+      面试官问「为什么要切片」，是在考你是否理解 Embedding 和检索的工作方式，而不只是背流程。
+    problem: |
+      文档动辄几十页，而 Embedding 模型有输入长度上限，LLM 的上下文也有预算。
+      更根本的是：一篇覆盖十几个主题的文档如果只生成一个向量，这个向量是所有主题的「平均」，和任何一个具体问题都不够接近。
+      切片要解决：**检索粒度、语义集中度、上下文预算、引用精度**四个问题。
+    principle: |
+      **一、四个原因**
+
+      1. **模型输入上限**：Embedding 模型都有最大输入长度（例如 OpenAI 的 Embedding 模型单条输入上限为 8192 Token），超出要么报错，要么被**静默截断**，后半部分内容等于没有入库。
+      2. **语义稀释**：一个向量只能表示一个「平均语义」。一份员工手册包含考勤、请假、报销、福利十几个主题，整篇做一个向量，就像把十几种颜色混在一起，结果是灰色，和「年假几天」这个具体问题的相似度不会高。
+      3. **上下文预算**：即使能检索整篇文档，把整篇放进 Prompt 也又贵又慢，还会引入大量无关内容（Day 21）。
+      4. **引用精度**：切片后可以引用到「第 3 章第 2 节第 15 页」，而不是「整本员工手册」。
+
+      **二、直观理解：一个向量 = 一个话题的坐标**
+
+      ```mermaid
+      flowchart LR
+        subgraph 不切片
+          D["员工手册全文 考勤 请假 报销 福利"] --> V1["一个平均向量 主题模糊"]
+          Q1["问题 年假几天"] -.->|"相似度一般"| V1
+        end
+        subgraph 切片后
+          C1["考勤制度"] --> A["向量 A"]
+          C2["请假制度 年假"] --> B["向量 B"]
+          C3["报销制度"] --> C["向量 C"]
+          Q2["问题 年假几天"] -.->|"相似度高 精准命中"| B
+        end
+      ```
+
+      **三、切片的本质是一个取舍**
+
+      切片要同时满足两个互相矛盾的目标：
+
+      - **语义集中**：每个 chunk 只讲一件事，向量才能精准（倾向切小）。
+      - **上下文完整**：每个 chunk 单独拿出来也能看懂、能回答问题（倾向切大）。
+
+      Chunk Size、Overlap、切片策略、metadata 增强，都是在这两个目标之间找平衡（见本日后续知识点）。
+
+      **四、切片的位置：入库链路的中间**
+
+      切片的输入是解析层输出的结构化块（Day 22：带类型、页码、标题路径），输出是带 metadata 的 chunk 列表，交给向量化（Day 24）。
+
+      - **好的解析是好切片的前提**：如果解析阶段丢了标题和表格结构，切片只能按长度硬切。
+      - **切片规则变化 = 全量重建**：调整 Chunk Size 或策略后，所有文档都要重新切片、重新向量化、重新入库，所以要在上线前用评估集定好参数，并记录每个 chunk 用的切片配置版本。
+
+      **五、什么时候可以不切**
+
+      - FAQ 这类本来就很短、每条一个主题的内容，**一条就是一个 chunk**，强行再切反而破坏问答对。
+      - 很短的公告、通知，整篇就是一个 chunk。
+    scenarios: |
+      - **员工手册、制度汇编**：一份文档覆盖多个主题，必须切片。
+      - **FAQ 知识库**：一问一答作为一个 chunk，不再细切。
+      - **长篇技术文档**：按章节结构切，保证引用到具体小节。
+      - **合同**：按条款切，引用到条款号。
+    pitfalls: |
+      - **误区：模型支持长输入，就可以整篇做一个向量。** 能输入不代表语义不被稀释。
+      - **忽视静默截断**：部分本地 Embedding 模型超长时自动截断不报错，后半部分内容丢失。
+      - **把 FAQ 的问题和答案拆成两个 chunk**：问题命中了，答案却不在同一个 chunk 里。
+      - **上线后随意调整切片参数**：需要全量重建，并且要用评估集验证。
+    interview_asks:
+      - 为什么需要切片？不能整篇文档做一个向量吗？
+      - 切片在 RAG 链路中的位置是什么？它依赖哪些上游信息？
+      - 哪些内容不需要再切片？
+    project_example: |
+      某公司内部助手初版把每份制度文档整篇做一个向量（文档平均 2 万字），使用的本地 Embedding 模型最大输入 512 Token，超出部分被静默截断。
+      结果只有每份文档开头的「总则」被向量化，问具体条款几乎都检索不到。
+      改为按章节加长度切片后，每个 chunk 约 400 字并带章节标题，检索命中率大幅提升，回答也能引用到具体条款和页码。
+  - id: d23-k2
+    name: Chunk Size 与 Overlap 的取舍
+    level: P0
+    summary: 太大语义稀释、浪费上下文；太小断章取义、指代丢失；Overlap 防止边界切断但会带来冗余
+    why: |
+      Chunk Size 和 Overlap 是切片最核心的两个参数，几乎每个 RAG 面试都会问「你们 chunk size 设多少，为什么」。
+      只回答一个数字是不够的，要讲清楚**过大、过小各自的问题，以及如何用评估确定**。
+    problem: |
+      Chunk Size 决定每个向量代表多少内容。过大或过小都会让检索失败，但失败的表现不同，排查方向也不同。
+      Overlap 用来缓解「关键内容恰好被切在边界上」的问题，但设置不当会造成重复召回和存储浪费。
+    principle: |
+      **一、Chunk Size 过大的问题**
+
+      - **语义稀释**：一个 chunk 混了多个主题，向量变「模糊」，和具体问题的相似度下降，**该命中的没命中**。
+      - **挤占上下文**：Top-5 每个 2000 Token，就是 1 万 Token，大部分是无关内容，成本高、延迟高，还会干扰模型。
+      - **引用不精确**：引用到一大段，用户难以核对。
+      - **超过模型输入上限**：被截断或报错。
+
+      **二、Chunk Size 过小的问题**
+
+      - **断章取义**：一个 chunk 只有「符合上述条件的员工，可享受该假期。」——什么条件？什么假期？上下文丢了，**指代词（该、上述、其）失去指向**。
+      - **信息碎片化**：一个完整答案被拆成 5 个 chunk，Top-K 不一定全部召回，模型拿到的是残缺信息。
+      - **相似度噪声变大**：很短的文本向量不稳定，容易和各种问题「看起来相似」。
+      - **数量膨胀**：chunk 数量翻倍，向量存储、索引构建、向量化费用都上升。
+
+      **三、Overlap 的作用与代价**
+
+      Overlap（重叠）指相邻 chunk 之间共享一部分内容。
+
+      ```mermaid
+      flowchart LR
+        subgraph 无重叠
+          A1["块1 ... 年假天数按工龄计算"] --- A2["块2 满一年不满十年的 5 天 ..."]
+        end
+        subgraph 有重叠
+          B1["块1 ... 年假天数按工龄计算 满一年不满十年的 5 天"] --- B2["块2 年假天数按工龄计算 满一年不满十年的 5 天 ..."]
+        end
+      ```
+
+      - **作用**：关键句子正好落在边界时，至少有一个 chunk 能完整包含它，减少「切断」造成的信息丢失。
+      - **代价**：存储和向量化成本增加；相邻 chunk 内容相似，**可能同时进入 Top-K，挤占名额**（检索结果需要去重或合并相邻块）。
+      - **局限**：Overlap 只能缓解边界问题，**解决不了指代丢失**——「该假期」指的是上一节标题，靠重叠几十个字补不回来，需要靠标题路径增强（见本日 metadata 知识点）。
+
+      **四、怎么定参数：从经验起点出发，用评估收敛**
+
+      - **经验起点**：通用文档常从 300~800 Token、重叠 10%~20% 起步；FAQ、短条款更小；技术文档、法律条款可以按结构切，大小随结构浮动。**这只是起点，不是标准答案**。
+      - **按 Token 而不是字符计量**：中文 1 个字和 1 个 Token 不是一一对应的，不同模型的分词器也不同（Day 13）。框架默认往往按字符计长度，需要明确改为按 Token 计算，或者至少知道自己用的是哪种单位。
+      - **用评估集决定**：准备 50~200 个真实问题和标准出处，对比不同 Chunk Size 下的 Recall@K（标准 chunk 是否出现在 Top-K 中）和最终答案正确率（Day 29）。
+      - **与 Top-K、模型上下文一起考虑**：Chunk 小就适当增大 K；Chunk 大就减小 K，总上下文预算保持可控。
+
+      ```mermaid
+      flowchart TD
+        S["选定经验起点 例如 500 Token 重叠 15%"] --> E["在评估集上测 Recall@K 和答案正确率"]
+        E --> J{"问题类型"}
+        J -->|"漏召回 命中的块主题混杂"| SM["减小 Chunk Size 或改按结构切"]
+        J -->|"命中了但缺上下文"| LG["增大 Chunk Size 或加标题前缀 父子块"]
+        J -->|"边界处信息丢失"| OV["适当增加 Overlap"]
+        SM --> E
+        LG --> E
+        OV --> E
+      ```
+    scenarios: |
+      - **制度条款问答**：条款较短且结构清晰，按条款切，单条过长再按长度切。
+      - **技术文档问答**：步骤类内容不能切断，chunk 稍大，并保留章节标题。
+      - **客服 FAQ**：一问一答一个 chunk，不需要 Overlap。
+      - **成本敏感场景**：Overlap 过大导致 chunk 数和向量化费用明显增加，需要权衡。
+    pitfalls: |
+      - **误区：Overlap 越大越好。** 冗余增加、相邻块重复召回挤占 Top-K。
+      - **误区：Overlap 能解决指代问题。** 指代对象常在几百字之外的标题里，要靠标题前缀或父子块。
+      - **字符和 Token 混用**：以为设置了 500 Token，实际是 500 字符。
+      - **只调 Chunk Size 不调 Top-K**：总上下文预算失控或召回不足。
+      - **没有评估就调参**：凭感觉改参数，改完没有对比数据。
+    interview_asks:
+      - 你们的 chunk size 设置多少？为什么？
+      - Chunk 太大和太小分别会出现什么问题？
+      - Overlap 有什么作用？是不是越大越好？
+    project_example: |
+      某 IT 运维知识库最初 chunk size 为 200 字符、无重叠，用户问「数据库主从切换步骤」，只召回了第 3~5 步，前两步在另一个 chunk 中没被召回，模型给出的步骤不完整。
+      团队用 120 个真实问题做评估：200 字符时 Recall@5 偏低；调到约 600 Token、重叠 15%，并在每个 chunk 前加章节标题后，Recall@5 明显提升，完整步骤类问题的正确率也随之提升。
+      同时把 Top-K 从 8 降到 5，总上下文长度基本不变。
+  - id: d23-k3
+    name: 切片策略：固定长度、递归分隔、语义切片、按标题结构
+    level: P0
+    summary: 固定长度最简单但会切断语义；递归分隔是通用默认；按标题结构最适合有结构的文档；语义切片成本最高
+    why: |
+      不同文档的结构差别很大：Markdown 技术文档有清晰标题，合同按条款组织，聊天记录没有结构。用同一种策略切所有文档，效果必然参差不齐。
+      面试中能讲出几种策略的原理和适用场景，并说明「为什么这样选」，是区分「会调框架」和「懂原理」的关键。
+    problem: |
+      切片策略决定**在哪里下刀**。下刀位置不对，会切断句子、拆散表格、把两个主题混在一起。
+      需要根据文档结构、质量要求和成本，在「简单」和「语义完整」之间选择合适的策略，或者组合使用。
+    principle: |
+      **一、固定长度切片（Fixed-size）**
+
+      - **原理**：每 N 个字符或 Token 切一刀，相邻块重叠 M 个。
+      - **优点**：实现最简单，块大小均匀，便于控制成本。
+      - **缺点**：完全不看内容，会把句子、表格、代码从中间切断。
+      - **适用**：没有结构、质量要求不高的文本，或作为其他策略的兜底。
+
+      **二、递归分隔切片（Recursive）**
+
+      - **原理**：给出一个**从大到小**的分隔符列表，例如「段落 → 换行 → 句号 → 逗号 → 空格 → 单字」。先用最大的分隔符切，切出来的块如果还超过上限，再用下一级分隔符继续切，直到满足大小；然后把相邻的小片段合并到接近上限。
+      - **优点**：尽量在自然边界（段落、句子）处切断，是**通用文本的推荐默认策略**。
+      - **注意中文**：LangChain 的 `RecursiveCharacterTextSplitter` 默认分隔符是 `["\n\n", "\n", " ", ""]`，中文没有空格分词，需要加入「。」「！」「？」「；」「，」等中文标点，否则会退化到按单字硬切。
+      - **注意计量单位**：默认 `length_function=len`，按字符计长度；需要按 Token 计时可以用 `from_tiktoken_encoder` 等方式构造。
+
+      **三、按标题 / 文档结构切片（Structure-based）**
+
+      - **原理**：利用文档自身结构——Markdown 的 `#` 标题、docx 的标题样式、HTML 标签、合同的「第 X 条」——先按章节切，**章节过长时再在章节内部用递归分隔切**。
+      - **优点**：每个 chunk 天然属于一个主题，还能得到**标题路径**（如「第三章 假期管理 > 第二节 年假」），用于 metadata 和上下文增强。
+      - **缺点**：依赖解析质量；有的章节很短（只有一行），需要和相邻同级章节合并。
+      - **适用**：Markdown 文档、制度、手册、合同、技术规范等有结构的文档——企业文档大部分属于这一类。
+      - 工具：LangChain 的 `MarkdownHeaderTextSplitter`，docling 的 `HybridChunker`（在结构切片基础上按 Token 上限拆分和合并）。
+
+      **四、语义切片（Semantic）**
+
+      - **原理**：先按句子切开，对每个句子（或相邻几句）做 Embedding，计算相邻句子之间的语义距离；距离突然变大的地方说明「话题变了」，在那里切一刀。
+      - **优点**：不依赖格式，能在没有结构的长文本中找到话题边界。
+      - **缺点**：**入库时就要对每个句子调用 Embedding，成本和耗时显著增加**；阈值需要调；对结构清晰的文档往往不比按标题切更好。
+      - **适用**：会议纪要、访谈稿、长篇无结构文本。
+
+      **五、选型决策**
+
+      ```mermaid
+      flowchart TD
+        D["待切片文档"] --> S{"有可靠的标题或条款结构吗"}
+        S -->|"有"| H["按标题结构切 章节过长再递归切"]
+        S -->|"没有"| U{"是否为一问一答或很短的条目"}
+        U -->|"是"| O["一条一个 chunk"]
+        U -->|"否"| L{"长篇无结构 且预算充足"}
+        L -->|"是"| SEM["语义切片"]
+        L -->|"否"| R["递归分隔切片 加中文标点"]
+        H --> T["表格单独成块 不从中间切断"]
+        R --> T
+        SEM --> T
+      ```
+
+      **实际项目通常是组合策略**：按结构切大块 → 块内递归分隔 → 表格、代码块特殊处理 → 过短的块与同级相邻块合并。
+    scenarios: |
+      - **Markdown 产品文档**：按标题切，块内递归分隔，保留标题路径。
+      - **合同**：按「第 X 条」正则切，每条一个 chunk，过长条款再拆。
+      - **会议纪要、访谈录音转写**：没有结构，可以尝试语义切片或递归分隔。
+      - **混合文档**：表格单独成块，代码块用代码语言的分隔规则（LangChain 提供按编程语言切分的能力）。
+    pitfalls: |
+      - **中文使用默认分隔符**：没有空格可切，最终按单字硬切，句子被切断。
+      - **误区：语义切片一定最好。** 成本高，对有结构的文档未必更好，要用评估集验证。
+      - **按标题切但不处理超长章节**：一个章节几千字，又回到语义稀释的问题。
+      - **按标题切产生大量一两行的小块**：需要合并相邻同级小块。
+      - **旧写法**：LangChain 1.x 起主包已移除文本切分器，`from langchain.text_splitter import ...` 是旧写法，应安装 `langchain-text-splitters` 并从 `langchain_text_splitters` 导入。
+    interview_asks:
+      - 常见的切片策略有哪些？各自适合什么场景？
+      - 中文文档用 RecursiveCharacterTextSplitter 要注意什么？
+      - 语义切片的原理是什么？为什么不总是用它？
+    project_example: |
+      某 SaaS 公司的帮助中心有 1500 篇 Markdown 文档。初版用固定 500 字符切片，很多操作步骤被切成两半。
+      改为「MarkdownHeaderTextSplitter 按二、三级标题切 → 章节超过上限再用加了中文标点的递归分隔切 → 不足 100 字的小节与相邻同级小节合并」，每个 chunk 都带「文档标题 > 二级标题 > 三级标题」路径。
+      评估集上 Recall@5 提升明显，而且引用可以直接跳转到对应小节的锚点。团队也试过语义切片，在这批结构化文档上没有明显收益，入库成本却高了很多，最终没有采用。
+    code: |
+      ```python
+      # pip install langchain-text-splitters
+      from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
+
+      md = open("handbook.md", encoding="utf-8").read()
+
+      # 1) 先按标题结构切，标题进入 metadata
+      header_splitter = MarkdownHeaderTextSplitter(
+          headers_to_split_on=[("#", "h1"), ("##", "h2"), ("###", "h3")],
+      )
+      sections = header_splitter.split_text(md)          # list[Document]，metadata 含 h1/h2/h3
+
+      # 2) 章节过长时再递归切；加入中文标点，避免按单字硬切
+      splitter = RecursiveCharacterTextSplitter(
+          separators=["\n\n", "\n", "。", "！", "？", "；", "，", " ", ""],
+          chunk_size=500,        # 默认按字符数计算（length_function=len）
+          chunk_overlap=75,
+      )
+      chunks = splitter.split_documents(sections)          # 用 split_documents 才能保留每节的 metadata
+      ```
+    freshness: |
+      核对于 2026-11：
+      - **包名**：文本切分器在独立包 `langchain-text-splitters`（PyPI 当前 1.1.3，2026-10-02），导入路径 `from langchain_text_splitters import RecursiveCharacterTextSplitter`。
+      - **旧写法**：`from langchain.text_splitter import ...`。LangChain 1.x 已把文本切分器从 `langchain` 主包命名空间移除，旧路径只在 `langchain-classic` 中为兼容保留，新项目不要使用。
+      - `RecursiveCharacterTextSplitter` 默认分隔符为 `["\n\n", "\n", " ", ""]`，官方文档建议对中文等无空格语言加入全角标点；`MarkdownHeaderTextSplitter` 默认会从内容中去掉标题行（`strip_headers=True`），切完后应使用 `split_documents` 以保留各节 metadata。
+      - **语义切片**：`SemanticChunker` 目前仍在 `langchain_experimental.text_splitter`（langchain-experimental 0.4.2）。2026-03 曾有 PR 尝试把它迁入 `langchain-text-splitters`，但该 PR 已关闭、主包当前导出列表中没有它；以官方文档为准。
+      - docling 的原生切片器 `HybridChunker`（`from docling.chunking import HybridChunker`）在按文档结构切的基础上，按分词器 Token 上限拆分超长块、合并同标题下的过小块。
+    sources:
+      - {title: "langchain-text-splitters（PyPI）", url: "https://pypi.org/project/langchain-text-splitters/"}
+      - {title: "LangChain Docs - Splitting recursively", url: "https://docs.langchain.com/oss/python/integrations/splitters/recursive_text_splitter"}
+      - {title: "LangChain Docs - Split markdown", url: "https://docs.langchain.com/oss/python/integrations/splitters/markdown_header_metadata_splitter"}
+      - {title: "LangChain v1 PR - remove text splitters from langchain v1 namespace", url: "https://github.com/langchain-ai/langchain/pull/33297"}
+      - {title: "LangChain PR #35668（SemanticChunker 迁移尝试，已关闭）", url: "https://github.com/langchain-ai/langchain/pull/35668"}
+      - {title: "Docling - Chunking", url: "https://docling-project.github.io/docling/concepts/chunking/"}
+  - id: d23-k4
+    name: 切片 metadata 保留与上下文增强
+    level: P1
+    summary: 每个 chunk 都要带上来源、页码、标题路径、版本、权限；标题前缀和父子块用来弥补切片丢失的上下文
+    why: |
+      没有 metadata 的 chunk 无法引用出处、无法按权限和版本过滤、无法增量更新——这些都是企业项目的硬需求。
+      metadata 一旦在入库时漏掉，只能全量重建，所以必须在切片阶段就设计好。
+    problem: |
+      切片把文档拆碎了：chunk 不知道自己来自哪份文档、哪一页、哪一章，也不知道「该假期」指的是什么。
+      需要在切片时把这些信息「随身携带」，并在必要时把上下文补回 chunk 文本中。
+    principle: |
+      **一、每个 chunk 应携带的 metadata**
+
+      | 字段 | 用途 |
+      |---|---|
+      | `doc_id`、`source`（文件名或 URL） | 引用出处、按文档删除或更新 |
+      | `page` / `page_start`、`page_end` | 引用到页，跨页块要记录起止页 |
+      | `heading_path` | 引用到章节；作为上下文前缀；按章节过滤 |
+      | `chunk_index`、`char_start`、`char_end` | 还原原文位置、取相邻块 |
+      | `block_type` | 区分正文、表格、代码，检索和展示时区别对待 |
+      | `doc_version`、`effective_date`、`status` | 版本过滤，避免引用旧制度（Day 21） |
+      | `acl` / `dept_id` / `tenant_id` | 权限过滤 |
+      | `content_hash`、`chunker_version` | 增量更新判断、切片配置追溯 |
+
+      ```mermaid
+      erDiagram
+        DOCUMENT ||--o{ CHUNK : contains
+        DOCUMENT {
+          string doc_id
+          string source
+          string version
+          string status
+          string acl
+        }
+        CHUNK {
+          string chunk_id
+          string doc_id
+          int chunk_index
+          int page_start
+          int page_end
+          string heading_path
+          string block_type
+          string content_hash
+          string text
+        }
+      ```
+
+      **二、chunk_id 要稳定**
+
+      增量更新时需要判断「这个 chunk 变了没有」。chunk_id 推荐由 `doc_id + 内容哈希`（如 SHA-256）生成：内容不变，id 不变，就不需要重新向量化。
+
+      - 不要用 Python 内置 `hash()`：字符串哈希在每个进程中都会随机加盐，重启后结果不同。
+      - 只用 `chunk_index` 做 id 也不稳：文档开头插入一段，后面所有块的序号都会变。
+
+      **三、上下文增强：把丢失的上下文补回来**
+
+      1. **标题路径前缀**：向量化时用「员工手册 > 第三章 假期管理 > 年假\n正文」代替纯正文。这样「该假期」所在的 chunk 也带上了「年假」这个关键词，**检索命中率通常明显提升**。展示给用户时可以只显示正文。
+      2. **父子块（Small-to-Big）**：用小块（如 200 Token）做检索，命中后把它所属的大块（整节，如 1000 Token）交给 LLM。兼顾「小块检索精准」和「大块上下文完整」。
+      3. **相邻块扩展**：命中第 i 块时，同时取第 i-1、i+1 块，依赖 `chunk_index`。
+      4. **LLM 生成上下文摘要**：入库时让 LLM 为每个 chunk 生成一句「本段在全文中的位置和主题」再拼到前面，效果好但入库成本高。
+
+      **四、注意事项**
+
+      - 前缀会占用 Chunk Size 预算，计算长度时要算进去。
+      - 跨页 chunk 只记录起始页会导致引用页码错误，要记录起止页。
+      - metadata 字段要和在线检索的过滤条件口径一致（Day 21 的契约）。
+    scenarios: |
+      - **引用出处**：回答中展示「《员工手册》第三章 第 15~16 页」，点击跳转原文。
+      - **权限过滤**：按 `dept_id` 过滤后再检索。
+      - **增量更新**：文档修改后对比 `content_hash`，只重新向量化变化的块。
+      - **父子块检索**：小块检索、大块送入 LLM，用于操作手册等步骤性内容。
+    pitfalls: |
+      - **只存文本不存 metadata**：上线后要加引用和权限过滤，只能全量重建。
+      - **用内置 hash() 生成 id**：每次重启 id 都变，增量更新全部失效。
+      - **跨页 chunk 只记第一页**：引用页码错误，用户核对时找不到。
+      - **标题前缀不计入长度**：实际 chunk 超过模型输入上限。
+      - **metadata 口径与检索过滤不一致**：过滤条件永远匹配不上。
+    interview_asks:
+      - 你们的 chunk 上保存了哪些 metadata？分别有什么用？
+      - 什么是父子块（Small-to-Big）检索？解决什么问题？
+      - 文档更新后，你们怎么做增量入库？
+    project_example: |
+      在一个制度问答项目中，用户问「年假可以跨年使用吗」，命中的 chunk 只有「该假期原则上应在当年度内休完，确因工作需要……」，向量相似度不高、排在第 7 位，没有进入 Top-5。
+      改造：向量化时在 chunk 前加标题路径「员工手册 > 第三章 假期管理 > 年休假」，该 chunk 升到第 1 位；同时记录 `page_start/page_end` 解决了跨页引用错误；chunk_id 改为 `doc_id + SHA-256(内容)`，制度修订时只有变化的十几个 chunk 需要重新向量化。
+quiz:
+  - id: d23-q1
+    kp: d23-k2
+    type: single
+    question: 把 Chunk Size 从 400 Token 调到 3000 Token，最主要的负面影响是什么？
+    options:
+      - 超过 pgvector 的存储上限，无法写入
+      - 一个块混合多个主题，向量语义被稀释，具体问题的命中率下降，同时挤占 Prompt 预算
+      - Embedding 模型会自动截断超长部分，所以没有任何影响
+      - 只是增加存储成本，不影响检索效果
+    answer: [1]
+    explain: |
+      大块的向量是多个主题的「平均」，和具体问题的相似度下降；Top-K 个大块还会占用大量上下文，增加成本和干扰。
+      A：pgvector 存储的是向量，维度与文本长度无关；C：截断恰恰是问题，被截掉的内容等于没有入库；D：存储成本不是主要问题，检索效果才是。
+  - id: d23-q2
+    kp: d23-k3
+    type: multi
+    question: 关于 LangChain 的 RecursiveCharacterTextSplitter，以下哪些说法是正确的？
+    options:
+      - 按分隔符列表从大到小尝试，块仍然超过上限时使用下一级分隔符继续切
+      - 默认分隔符对中文不友好，通常需要加入「。」「！」「？」等中文标点
+      - chunk_size 默认按 Token 数计算
+      - chunk_overlap 让相邻块共享一部分内容，用于缓解边界切断
+      - 它会计算句子之间的语义相似度来决定切分点
+    answer: [0, 1, 3]
+    explain: |
+      A、B、D 正确。C 错误：默认 `length_function=len`，按字符数计算，需要按 Token 计算时要显式指定（例如用 `from_tiktoken_encoder` 构造）。
+      E 错误：按语义相似度找切分点是语义切片（SemanticChunker）的做法，递归分隔只看分隔符和长度，不调用 Embedding。
+  - id: d23-q3
+    kp: d23-k2
+    type: judge
+    question: Overlap 越大，信息丢失越少，所以在成本允许的情况下应该尽量把 Overlap 设大，比如设为 Chunk Size 的 50%。
+    answer: false
+    explain: |
+      错误。Overlap 过大会让相邻 chunk 内容高度相似，检索时可能同时进入 Top-K，挤占名额、降低结果多样性；chunk 数量和向量化、存储成本也显著增加。
+      而且 Overlap 只能缓解边界切断，解决不了「该假期」这类指代丢失，后者要靠标题前缀或父子块。一般从 10%~20% 起步，用评估集确定。
+  - id: d23-q4
+    kp: d23-k2
+    type: scenario
+    question: 用户问「年假可以跨年使用吗」，系统检索到的最相关 chunk 是「该假期原则上应在当年度内休完，确因工作需要可顺延至次年第一季度。」但它只排在第 7 位，没进入 Top-5。请分析原因并给出改进方案。
+    key_points:
+      - {text: "指出 chunk 太小或缺少上下文，「该假期」的指代对象丢失，向量中没有「年假」语义", dim: principle}
+      - {text: "提出向量化时加标题路径前缀，把章节标题补进 chunk 文本", dim: engineering}
+      - {text: "提出父子块或相邻块扩展，小块检索大块送入模型", dim: engineering}
+      - {text: "指出单纯增大 Overlap 难以解决指代问题，并用评估集验证改进效果", dim: project}
+    reference: |
+      **原因**：chunk 本身没有出现「年假」这个词，「该假期」指的是所在章节标题「年休假」。切片后标题和正文分离，chunk 的向量里缺少「年假」语义，因此与问题的相似度不够高，被其他提到「年假」但不回答跨年问题的 chunk 挤到后面。
+      **改进**：
+      1. **标题路径前缀**：向量化时使用「员工手册 > 第三章 假期管理 > 年休假\n该假期原则上……」，让 chunk 带上主题词。这是成本最低、通常收益最大的改法。
+      2. **按结构切片**：按小节切，让同一小节的内容尽量在一个 chunk 内。
+      3. **父子块**：用小块检索，命中后把整节交给模型，保证上下文完整。
+      4. Overlap 只能补边界附近几十个字，标题可能在几百字之外，单纯加大 Overlap 解决不了。
+      5. 把这类「指代型」问题加入评估集，对比改造前后的 Recall@5。
+  - id: d23-q5
+    kp: d23-k1
+    type: short
+    question: 有同事说「我们用的 Embedding 模型支持 8192 Token 输入，大部分文档都不超过这个长度，所以每篇文档直接做一个向量就行，不用切片」。请反驳这个观点。
+    key_points:
+      - {text: "指出一个向量是全文的平均语义，多主题文档会被稀释，具体问题命中率低", dim: principle}
+      - {text: "指出检索到整篇文档后放入 Prompt 成本高、干扰多", dim: engineering}
+      - {text: "指出整篇做向量无法精确引用到章节和页码", dim: concept}
+      - {text: "指出可以不切的例外，如 FAQ、短通知等单主题短文本", dim: concept}
+    reference: |
+      「能输入」不等于「表示得好」：
+      1. **语义稀释**：一篇制度文档包含考勤、请假、报销等多个主题，整篇的向量是这些主题的平均，和「年假几天」这样的具体问题相似度不会高，很容易被别的文档挤下去。
+      2. **上下文浪费**：检索命中后要把整篇几千 Token 放进 Prompt，Top-5 就是几万 Token，成本高、延迟高，大部分内容和问题无关，还会干扰模型。
+      3. **引用粒度太粗**：只能告诉用户「答案在员工手册里」，无法定位到章节和页码。
+      4. **更新粒度太粗**：改一个字也要整篇重新向量化。
+      例外情况：FAQ、短通知这类本身就短、只有一个主题的内容，可以一条一个向量。
+  - id: d23-q6
+    kp: d23-k3
+    type: design
+    question: 知识库包含三类内容：带标题样式的员工手册（docx）、客服 FAQ（Excel，一行一问一答）、产品参数表（PDF 中的大表格）。请为每类内容设计切片策略，并说明理由。
+    key_points:
+      - {text: "员工手册按标题结构切，章节过长再递归分隔，保留标题路径", dim: engineering}
+      - {text: "FAQ 一问一答作为一个 chunk，不再切分也不需要 Overlap", dim: principle}
+      - {text: "参数表作为表格块处理，按行分组并重复表头，不从中间切断", dim: engineering}
+      - {text: "说明统一的 metadata 设计与用评估集验证策略", dim: project}
+    reference: |
+      **员工手册（docx）**：利用标题样式按章节切，得到「手册 > 章 > 节」标题路径；单节超过上限时在节内用加了中文标点的递归分隔切（例如 500 Token、重叠 15%）；不足 100 字的小节与相邻同级小节合并；向量化时加标题路径前缀。理由：结构清晰，按结构切语义最完整，引用可以到节。
+      **FAQ（Excel）**：一行就是一个 chunk，文本为「问：……\n答：……」，问题和答案必须在一起。不需要 Overlap，也不需要再切。理由：本身就是单主题短文本，拆开会导致问题命中但答案不在同一 chunk。
+      **参数表（PDF 表格）**：解析阶段识别表格结构，表格作为独立块；小表整体一个 chunk（Markdown 表格）；大表按若干行分组，每组重复表头和表名，或者逐行转成「型号 X：额定功率 5kW」这样的文本。同时把产品型号写入 metadata 便于过滤。理由：避免数字与表头脱节。
+      **通用**：所有 chunk 都带 `doc_id`、`source`、页码或行号、`block_type`、`version`、`acl`；三类策略分别在评估集上验证 Recall@K。
+  - id: d23-q7
+    kp: d23-k4
+    type: short
+    question: 请列出你会为每个 chunk 保存的 metadata（至少 5 个），说明每个字段的用途，并说明 chunk_id 应该如何生成。
+    key_points:
+      - {text: "列出来源、页码、标题路径用于引用和上下文", dim: concept}
+      - {text: "列出版本、生效状态、权限字段用于过滤", dim: engineering}
+      - {text: "列出 chunk_index、content_hash 等用于相邻块扩展和增量更新", dim: engineering}
+      - {text: "chunk_id 用 doc_id 加内容哈希生成，不用内置 hash 或纯序号", dim: principle}
+    reference: |
+      - `doc_id`、`source`：引用出处，按文档删除或更新。
+      - `page_start`、`page_end`：引用到页，跨页块记录起止页。
+      - `heading_path`：引用到章节，向量化时做前缀补充上下文，也可以按章节过滤。
+      - `chunk_index`：取相邻块、还原顺序。
+      - `block_type`：区分正文、表格、代码。
+      - `doc_version`、`status`、`effective_date`：只检索有效版本。
+      - `acl` / `dept_id`：权限过滤。
+      - `content_hash`、`chunker_version`、`embedding_model`：增量更新判断和追溯。
+      **chunk_id**：用 `doc_id + SHA-256(chunk 文本)` 生成，内容不变 id 就不变，增量更新时只处理变化的块。不要用 Python 内置 `hash()`（每个进程随机加盐，重启后不同），也不要只用序号（前面插入内容后，后面所有序号都变）。
+code_reading:
+  id: d23-c1
+  kp: [d23-k3, d23-k4]
+  title: 按标题分组的切片器
+  scenario: 离线入库流水线中的切片模块。解析层输出带页码和标题路径的 Block 列表，chunk_document() 按标题分组后用递归分隔切片，生成带 metadata 的 Chunk，交给批量向量化任务；chunk_id 用于增量更新时判断哪些块需要重新向量化。
+  language: python
+  code: |
+    import hashlib
+    import logging
+    from dataclasses import dataclass, field
+
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+    logger = logging.getLogger(__name__)
+    SEPARATORS = ["\n\n", "\n", "。", "！", "？", "；", "，", " ", ""]
+
+
+    @dataclass
+    class Block:
+        text: str
+        page: int
+        heading_path: list[str]
+        block_type: str = "paragraph"   # paragraph | table | title
+
+
+    @dataclass
+    class Chunk:
+        chunk_id: str
+        doc_id: str
+        text: str
+        metadata: dict = field(default_factory=dict)
+
+
+    def build_splitter(chunk_size: int = 500, overlap: int = 75) -> RecursiveCharacterTextSplitter:
+        return RecursiveCharacterTextSplitter(
+            separators=SEPARATORS, chunk_size=chunk_size, chunk_overlap=overlap, keep_separator="end"
+        )
+
+
+    def chunk_document(doc_id: str, source: str, blocks: list[Block],
+                       splitter: RecursiveCharacterTextSplitter) -> list[Chunk]:
+        sections: dict[tuple[str, ...], list[Block]] = {}
+        for b in blocks:
+            sections.setdefault(tuple(b.heading_path), []).append(b)
+
+        chunks: list[Chunk] = []
+        for path, items in sections.items():
+            body = "\n\n".join(b.text for b in items if b.block_type != "title")
+            for piece in splitter.split_text(body):
+                chunks.append(Chunk(
+                    chunk_id=f"{doc_id}-{hash(piece)}",
+                    doc_id=doc_id,
+                    text=" > ".join(path) + "\n" + piece,
+                    metadata={
+                        "source": source,
+                        "page": items[0].page,
+                        "heading_path": list(path),
+                        "chunk_index": len(chunks),
+                    },
+                ))
+        logger.info("doc=%s sections=%d chunks=%d", doc_id, len(sections), len(chunks))
+        return chunks
+  walkthrough:
+    function: |
+      把一份文档的 Block 列表按标题路径分组，每组（一个小节）内的正文拼起来，用加了中文标点的递归分隔切成若干片段，再给每个片段加上标题路径前缀和 metadata，生成 Chunk 列表。
+    key_functions: |
+      - `build_splitter()`：创建递归分隔切片器，分隔符从段落到单字逐级变细，`keep_separator="end"` 让句号等标点留在句末。
+      - `chunk_document()`：按 `heading_path` 分组 → 拼接小节正文（跳过标题块，因为标题会作为前缀加回去）→ 切片 → 生成 id、拼前缀、写 metadata。
+      - `Block` / `Chunk`：解析层输出和切片层输出的数据结构。
+    params: |
+      - `chunk_size=500`、`overlap=75`：按字符计（`length_function` 默认为 `len`），不是 Token。
+      - `splitter` 由调用方创建后传入，便于在不同文档类型间复用或替换配置。
+      - `doc_id`、`source` 来自文档记录，写入每个 chunk。
+    data_flow: |
+      ```mermaid
+      flowchart LR
+        B["Block 列表 含页码和标题路径"] --> G["按 heading_path 分组为小节"]
+        G --> J["小节内正文拼接 跳过标题块"]
+        J --> S["递归分隔切成片段"]
+        S --> P["加标题路径前缀"]
+        P --> M["生成 chunk_id 和 metadata"]
+        M --> C["Chunk 列表 交给向量化"]
+      ```
+      数据从「解析块」变成「小节文本」再变成「带前缀的片段」，页码信息在分组拼接这一步被压缩成了一个值。
+    failure_points: |
+      - **chunk_id 不稳定（值得审查）**：使用 Python 内置 `hash(piece)`，字符串哈希每个进程随机加盐，任务重启或换一台 Worker 后 id 全变，增量更新会把所有 chunk 都当成新块，旧块无法被正确删除，库里出现大量重复。代码里已经 import 了 `hashlib` 却没用。
+      - **页码错误（值得审查）**：`"page": items[0].page` 让整个小节的所有 chunk 都使用小节第一块的页码，一个跨 3 页的小节，后两页的内容引用的都是第一页。
+      - **表格被当作普通文本切**：`block_type == "table"` 的块和正文拼在一起，可能从表格中间切断。
+      - **前缀占用长度**：标题路径前缀在切片之后才加上，实际 chunk 长度会超过 `chunk_size`。
+      - **同名标题路径合并**：文档中不相邻的两处如果标题路径完全相同，会被合并到同一组。
+    debugging: |
+      - 同一份文档连续运行两次（两个独立进程），比较 chunk_id 集合是否一致，即可复现 id 不稳定。
+      - 选一个跨页的小节，打印每个 chunk 的文本和 `page`，与原 PDF 对照。
+      - 统计 chunk 长度分布（含前缀），检查是否有超长块。
+      - 对包含表格的文档打印切片结果，检查表格是否被切断。
+    change_request: |
+      - **修复 id**：改为 `hashlib.sha256((doc_id + piece).encode("utf-8")).hexdigest()`，必要时加上 `chunker_version`。
+      - **修复页码**：拼接时记录每个 Block 在 body 中的字符偏移区间，切片后用片段的起止位置反查 `page_start`、`page_end`（LangChain 的 `create_documents` 配合 `add_start_index=True` 可以拿到起始偏移）。
+      - **表格单独处理**：`block_type == "table"` 的块不参与拼接，单独成块或按行分组并重复表头。
+      - **要求按 Token 计长度**：用 `RecursiveCharacterTextSplitter.from_tiktoken_encoder(...)` 构造或自定义 `length_function`，并把前缀长度计入预算。
+  questions:
+    - id: d23-c1-q1
+      kp: d23-k4
+      type: code
+      question: 增量更新的逻辑是「新 chunk_id 不在库中就向量化并写入；库中有但新结果里没有的 chunk_id 就删除」。在这段代码下，同一份未修改的文档被另一个 Worker 进程重新处理，会发生什么？如何修复？
+      key_points:
+        - {text: "指出内置 hash 对字符串随机加盐，不同进程结果不同", dim: principle}
+        - {text: "推导出所有 chunk_id 都变化，全部被当作新增，旧的全部被删除再重写", dim: concept}
+        - {text: "指出由此带来的重复向量化成本，以及写入和删除之间出现重复或缺失的风险", dim: engineering}
+        - {text: "修复：用 hashlib 的 SHA-256 基于 doc_id 和内容生成稳定 id", dim: engineering}
+      reference: |
+        Python 对 `str` 的内置 `hash()` 在每个进程启动时使用随机种子（除非固定 `PYTHONHASHSEED`），所以同一段文本在不同进程中得到的哈希值不同。
+        结果：文档内容没变，但新 Worker 生成的 chunk_id 全部不同 → 增量逻辑认为所有 chunk 都是新的，全部重新向量化（白花钱）；旧的 chunk_id 都「消失」了，于是全部删除。如果写入和删除不在一个事务里，中间会出现重复数据或短暂缺失；如果删除步骤失败，库里会残留大量重复 chunk，检索结果出现重复。
+        修复：`chunk_id = hashlib.sha256(f"{doc_id}:{piece}".encode("utf-8")).hexdigest()`，内容不变 id 就不变；切片配置变化时把 `chunker_version` 也拼进去，确保配置变更触发重建。
+    - id: d23-c1-q2
+      kp: d23-k4
+      type: code
+      question: 某小节从第 12 页延续到第 14 页，被切成 4 个 chunk。用户的问题命中了第 4 个 chunk（内容实际在第 14 页），回答中的引用会显示第几页？为什么？如何修改？
+      key_points:
+        - {text: "指出所有 chunk 都使用 items[0].page，即第 12 页", dim: concept}
+        - {text: "解释原因：拼接小节正文时丢失了每个 Block 的页码边界", dim: principle}
+        - {text: "提出记录每个 Block 在拼接文本中的偏移区间，按片段起止位置反查页码", dim: engineering}
+        - {text: "提出 metadata 改为 page_start 和 page_end 两个字段", dim: engineering}
+      reference: |
+        会显示第 12 页。`metadata["page"]` 统一取 `items[0].page`，也就是该小节第一个 Block 的页码，后面所有 chunk 都复用这个值。
+        根本原因是：把小节内所有 Block 拼接成一个 `body` 字符串时，每个 Block 的页码边界信息丢失了，切片器只看到一整段文本。
+        修改：拼接时记录每个 Block 在 `body` 中的起止字符位置和页码；切片时拿到每个片段在 `body` 中的起始偏移（例如用 `create_documents` 加 `add_start_index=True`，或自行查找），结合片段长度得到结束位置，再反查覆盖的 Block，得到 `page_start` 和 `page_end`。引用时显示「第 13~14 页」这样的范围。
+    - id: d23-c1-q3
+      kp: d23-k3
+      type: code
+      question: 说明 `RecursiveCharacterTextSplitter` 在这段代码中如何处理一段 1200 字、没有空行但有多个句号的中文小节。如果把 SEPARATORS 换成默认值，结果会有什么不同？
+      key_points:
+        - {text: "先尝试段落分隔符和换行，无法切分时降级到句号等中文标点", dim: principle}
+        - {text: "在句末切开后合并相邻句子，使每块接近 500 字符，相邻块约 75 字符重叠", dim: concept}
+        - {text: "默认分隔符没有中文标点，没有空格时会退化到按单字切，句子被从中间切断", dim: principle}
+        - {text: "keep_separator 为 end 时句号保留在句末，块边界更自然", dim: concept}
+      reference: |
+        处理过程：切片器先用 `\n\n` 切，没有空行，整段仍超过 500；再用 `\n` 切，没有换行，仍超长；然后用「。」切，把文本拆成一个个句子（`keep_separator="end"` 让句号留在句末）。之后把相邻句子依次合并，长度接近 500 字符就形成一个块，下一个块从前一个块末尾约 75 字符处的句子开始，形成重叠。单个句子如果超过 500，会继续用「！」「？」「；」「，」等更细的分隔符切。最终得到约 3 个块，每块都在句子边界结束。
+        换成默认分隔符 `["\n\n", "\n", " ", ""]`：中文没有空格，前三级都无法切分，只能用 `""` 逐字切分再合并，块在第 500 个字符处硬切，句子从中间断开，这正是官方文档提醒中文要加入全角标点的原因。
+interview:
+  - id: d23-i1
+    kp: d23-k1
+    type: oral
+    difficulty: 1
+    question: RAG 中为什么需要对文档做切片？
+    key_points:
+      - {text: "说明 Embedding 模型有输入上限，超长会报错或被静默截断", dim: concept}
+      - {text: "说明一个向量是平均语义，多主题文档会被稀释", dim: principle}
+      - {text: "说明上下文预算和引用精度的需求", dim: engineering}
+      - {text: "结合项目说明切片带来的效果变化", dim: project}
+    reference: |
+      切片主要有四个原因：
+      1. **输入上限**：Embedding 模型有最大输入长度，超出要么报错，要么被静默截断，后半部分内容相当于没入库。
+      2. **语义集中**：一个向量只能表示一个平均语义。多主题的长文档整篇做一个向量，语义被稀释，和具体问题的相似度不高；切成单主题的小块，问题才能精准命中。
+      3. **上下文预算**：检索结果要放进 Prompt，块越小，同样的预算能放进越多真正相关的内容。
+      4. **引用和更新粒度**：切片后可以引用到具体章节和页码，文档局部修改时也只需重新处理变化的块。
+      切片的核心矛盾是「语义集中」和「上下文完整」，所以 Chunk Size、Overlap、策略和 metadata 增强都需要配合调整。
+    oral: |
+      我理解切片主要是因为「一个向量只能代表一个主题」。
+      整篇文档做一个向量，等于把考勤、请假、报销的语义混在一起取平均，问具体问题时反而匹配不上。另外 Embedding 模型有输入上限，超长会被截断；放进 Prompt 也有预算；切片后还能引用到具体页码。
+      我们之前有个项目整篇文档做向量，结果模型只看到了开头的总则，切片后命中率提升非常明显。
+  - id: d23-i2
+    kp: d23-k2
+    type: oral
+    difficulty: 2
+    question: Chunk Size 过大和过小分别会有什么问题？Overlap 的作用是什么？你们是如何确定这些参数的？
+    key_points:
+      - {text: "过大：语义稀释、挤占上下文、引用不精确、可能超出模型上限", dim: principle}
+      - {text: "过小：断章取义、指代丢失、信息碎片化、数量膨胀", dim: principle}
+      - {text: "Overlap 缓解边界切断，但带来冗余和重复召回，不能解决指代问题", dim: concept}
+      - {text: "用评估集对比 Recall@K 和答案正确率确定参数，并联动调整 Top-K", dim: project}
+    reference: |
+      **过大**：一个块混合多个主题，向量被稀释，该命中的没命中；Top-K 个大块占用大量上下文，成本和延迟上升，无关内容还会干扰模型；引用到一大段，用户难核对；还可能超过模型输入上限被截断。
+      **过小**：一个块只有半句话，上下文丢失，「该」「上述」这类指代失去指向；一个完整答案被拆成多块，Top-K 不一定全召回；短文本向量不稳定；块数量膨胀，存储和向量化成本上升。
+      **Overlap**：相邻块共享一部分内容，关键句落在边界时至少一个块能完整包含它。代价是冗余增加，相邻块可能同时进入 Top-K 挤占名额。它解决不了指代问题，后者要用标题前缀或父子块。
+      **确定方法**：从经验起点出发（例如 300~800 Token、重叠 10%~20%），用 50~200 个真实问题的评估集，对比不同参数下的 Recall@K 和答案正确率；根据失败类型调整：主题混杂就调小，缺上下文就调大或加标题前缀，边界丢失就加 Overlap；同时联动调整 Top-K，控制总上下文。注意参数要按 Token 计，而不是字符。
+    oral: |
+      过大的问题是语义被稀释，该命中的命不中，而且占上下文；过小的问题是断章取义，比如只剩「该假期可以顺延」，模型不知道是什么假期。
+      Overlap 是为了防止关键句被切在边界上，但它会带来冗余和相邻块重复召回，而且解决不了指代问题，那个要靠标题前缀。
+      参数我们是用评估集定的：从 500 Token、重叠 15% 起步，看 Recall@5 和答案正确率，按失败类型调。运维知识库项目里我们从 200 字符调到 600 Token 加标题前缀，步骤类问题的完整率明显提升。
+  - id: d23-i3
+    kp: d23-k3
+    type: oral
+    difficulty: 2
+    question: 常见的切片策略有哪些？请说明各自原理和适用场景，并说明你会怎么选。
+    key_points:
+      - {text: "说明固定长度、递归分隔、按标题结构、语义切片四种策略的原理", dim: concept}
+      - {text: "指出递归分隔对中文要加标点、语义切片成本高需评估", dim: principle}
+      - {text: "给出按文档结构选择策略、表格特殊处理、小块合并的组合方案", dim: engineering}
+      - {text: "结合项目说明选型理由和评估结果", dim: project}
+    reference: |
+      - **固定长度**：每 N 个字符或 Token 切一刀，简单均匀，但会切断句子和表格，适合无结构文本或兜底。
+      - **递归分隔**：按「段落 → 换行 → 句号 → 逗号 → 字」从大到小尝试，尽量在自然边界切，再合并到接近上限，是通用文本的默认选择；中文要加入全角标点，否则会退化成按字硬切。
+      - **按标题结构**：利用 Markdown 标题、docx 标题样式、合同条款号先按章节切，章节过长再递归切，能得到标题路径用于引用和上下文增强，适合企业中大部分有结构的文档。
+      - **语义切片**：对句子做 Embedding，在相邻句语义距离突变处切，适合会议纪要等无结构长文本；入库成本高，对结构化文档未必更好。
+      **选择方式**：有可靠结构优先按结构切；短条目一条一块；长篇无结构文本用递归分隔，预算充足再试语义切片；表格和代码特殊处理；过短的块与相邻同级块合并。最终用评估集比较。
+    oral: |
+      我一般讲四种：固定长度最简单，但会切断句子；递归分隔按段落、句子、逗号逐级尝试，是通用默认，中文要记得加全角标点；按标题结构切最适合企业文档，还能拿到标题路径；语义切片是按句子向量的距离突变来切，适合会议纪要这种无结构文本，但入库成本高。
+      实际项目我会组合使用：先按标题切，章节过长再递归切，表格单独处理，太短的小节合并。
+      我们帮助中心项目也试过语义切片，在结构化文档上没有明显收益，成本却高很多，最后没用。
+  - id: d23-i4
+    kp: d23-k4
+    type: oral
+    difficulty: 3
+    question: 切片时你们会保留哪些 metadata？如何解决切片后上下文丢失的问题？
+    key_points:
+      - {text: "列出来源、页码起止、标题路径、版本状态、权限、内容哈希等字段及用途", dim: concept}
+      - {text: "说明 chunk_id 用内容哈希生成以支持增量更新", dim: engineering}
+      - {text: "说明标题路径前缀、父子块、相邻块扩展等上下文增强方法及代价", dim: principle}
+      - {text: "结合项目说明某种增强方法带来的效果", dim: project}
+    reference: |
+      **metadata**：`doc_id` 和 `source` 用于引用和按文档更新；`page_start`、`page_end` 用于引用到页；`heading_path` 用于引用到章节和做前缀；`chunk_index` 用于取相邻块；`block_type` 区分正文和表格；`doc_version`、`status` 用于只检索有效版本；`acl` 或 `dept_id` 用于权限过滤；`content_hash`、`chunker_version`、`embedding_model` 用于增量更新和追溯。chunk_id 用 `doc_id + SHA-256(内容)`，内容不变 id 不变。
+      **上下文增强**：
+      1. **标题路径前缀**：向量化时在正文前加「文档 > 章 > 节」，成本最低，能补回主题词，解决「该假期」类指代问题。
+      2. **父子块**：小块检索、命中后返回所属的大块给 LLM，兼顾检索精度和上下文完整，代价是存储两层数据。
+      3. **相邻块扩展**：命中第 i 块时带上前后块。
+      4. **LLM 生成块摘要前缀**：效果好但入库成本高，适合高价值文档。
+      注意前缀会占用长度预算，metadata 口径要和在线过滤一致。
+    oral: |
+      metadata 我会分三类：引用类，有来源、起止页码、标题路径；过滤类，有版本状态、部门权限；运维类，有内容哈希、切片配置版本、Embedding 模型名，chunk_id 用内容哈希生成，方便增量更新。
+      上下文丢失我主要用两招：一是向量化时加标题路径前缀，成本最低；二是父子块，小块检索、大块给模型。
+      我们制度问答项目里有个「该假期可以跨年」的块原来排第 7，加了标题前缀以后排到了第 1。
+  - id: d23-i5
+    kp: d23-k2
+    type: oral
+    difficulty: 4
+    question: 如果让你系统性地优化一个已上线 RAG 系统的切片方案，你会怎么做？需要考虑哪些工程成本和风险？
+    key_points:
+      - {text: "先建立评估集和基线，按入库、检索、生成分类失败案例", dim: project}
+      - {text: "设计对照实验：不同策略、Chunk Size、Overlap、前缀，测 Recall@K 和答案正确率", dim: principle}
+      - {text: "考虑全量重建的成本与时间，用新表或新索引影子构建后切换，支持回滚", dim: engineering}
+      - {text: "记录 chunker_version，线上监控和 bad case 回流", dim: engineering}
+    reference: |
+      **1. 建立基线**：从线上日志和业务方收集 100~200 个真实问题，标注标准答案和标准出处（chunk 或页码），测出当前的 Recall@K 和答案正确率；把失败案例分类：没入库（解析问题）、没召回（切片或检索问题）、召回了答错（生成问题）。
+      **2. 对照实验**：只针对切片问题，设计几组配置：按结构切 vs 递归切、不同 Chunk Size（如 300/600/1000 Token）、不同 Overlap、是否加标题前缀、是否用父子块。离线对同一批文档跑出多套索引，在评估集上比较指标，同时记录 chunk 数量、向量化成本、平均上下文长度。
+      **3. 上线方式**：切片变化意味着全量重新切片和向量化，要估算费用和耗时。用新表或新索引在后台「影子构建」，构建完成后用评估集验证，再通过配置开关切换读流量，保留旧索引一段时间以便回滚。
+      **4. 持续运营**：每个 chunk 记录 `chunker_version`；线上记录每次检索结果，用户点踩的案例进入 bad case 池并加入评估集；定期回归。
+      **风险**：重建期间新旧数据混用、成本超预算、只看平均指标忽略某类文档变差，需要按文档类型分组看指标。
+    oral: |
+      我会按「先度量、再实验、后切换」三步走。
+      先用 100 多个真实问题建评估集，测出当前 Recall@K 和正确率，并把失败分成没入库、没召回、答错三类，只有没召回才是切片要解决的。
+      然后离线做对照实验：按结构切还是递归切、几种 Chunk Size、要不要标题前缀和父子块，同时看效果和成本。
+      上线时因为要全量重建，我会用新表影子构建，验证通过再切流量，旧索引保留用于回滚，每个 chunk 都记录切片配置版本。
+      之后把用户点踩的案例持续加进评估集回归。
+sources:
+  - {title: "langchain-text-splitters（PyPI）", url: "https://pypi.org/project/langchain-text-splitters/"}
+  - {title: "LangChain Docs - Text splitter integrations", url: "https://docs.langchain.com/oss/python/integrations/splitters"}
+  - {title: "LangChain v1 migration guide", url: "https://docs.langchain.com/oss/python/migrate/langchain-v1"}
+  - {title: "Docling - Chunking", url: "https://docling-project.github.io/docling/concepts/chunking/"}

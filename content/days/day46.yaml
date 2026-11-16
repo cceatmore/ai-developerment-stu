@@ -1,0 +1,1010 @@
+day: 46
+phase: 5
+title: 鉴权与多租户：JWT 与刷新令牌、RBAC 与资源级授权、租户隔离、审计日志
+goals:
+  - 能写出一份完整的 JWT 校验清单，说清双令牌、轮换与重用检测怎么解决「JWT 无法吊销」
+  - 能区分 401 / 403 / 404，并把「功能级权限 + 对象级权限」都落到后端，而不是只靠前端隐藏按钮
+  - 能设计一个多租户 AI 平台的隔离方案：租户上下文从哪来、数据库 RLS 怎么兜底、缓存/向量/队列/配额怎么隔离
+  - 能说清审计日志和应用日志、Trace 的区别，并为 Agent 工具调用设计审计字段
+minutes: 75
+resources:
+  - title: "FastAPI 官方中文文档：OAuth2 实现密码哈希与 Bearer JWT 令牌验证"
+    url: "https://fastapi.tiangolo.com/zh/tutorial/security/oauth2-jwt/"
+    kind: doc
+    lang: zh
+    minutes: 25
+    note: "重点看「安装 PyJWT」「密码哈希 pwdlib」「处理 JWT 令牌」三节，对照 k1 的代码：jwt.decode 里固定 algorithms、捕获 InvalidTokenError、用 DUMMY_HASH 防时序攻击"
+  - title: "OWASP Multi-Tenant Security Cheat Sheet"
+    url: "https://cheatsheetseries.owasp.org/cheatsheets/Multi_Tenant_Security_Cheat_Sheet.html"
+    kind: doc
+    lang: en
+    minutes: 25
+    note: "看 Tenant Context、Database Isolation（RLS 与 SET LOCAL 的连接池陷阱）、Caching、Logging 四节，对应 k3 与 k4；末尾的测试清单可以直接改成你项目的跨租户回归用例"
+  - title: "OWASP API Security Top 10 2023：API1 Broken Object Level Authorization"
+    url: "https://github.com/OWASP/API-Security/blob/master/editions/2023/en/0xa1-broken-object-level-authorization.md"
+    kind: doc
+    lang: en
+    minutes: 10
+    note: "看 Example Attack Scenarios 和 How To Prevent 两节，注意它强调「只比对 JWT 里的用户 ID 不够」，对应 k2 的对象级授权"
+knowledge_points:
+  - id: d46-k1
+    name: JWT、OAuth2/OIDC 与刷新令牌
+    level: P0
+    summary: JWT 是签名不是加密；服务端固定算法并校验 exp/iss/aud；短 access 加可轮换的 refresh，弥补 JWT 难以吊销
+    analogy: |
+      **像你写过的 axios 拦截器「无感刷新」。** 请求返回 401 → 用 refresh token 换一个新 access token → 重放原请求；多个请求同时 401 时用一个 Promise 锁住，只刷新一次。
+
+      **不一样的地方：**
+      - 前端只负责「**带上、刷新、重放**」；服务端负责「**验签、判过期、轮换、重用检测、吊销**」，安全性全在后端。
+      - 前端的「只刷新一次」是体验优化；服务端的**轮换 + 重用检测**是安全机制：旧 refresh 被再次使用，说明可能被盗，要作废整组会话。
+      - 前端把 token 放在哪（localStorage 还是 HttpOnly Cookie）直接决定 XSS 能不能偷走它，这是你转后端后要做的设计决策，而不只是实现。
+    why: |
+      AI 平台的每个入口都要先回答「**你是谁**」：聊天接口、SSE 流、文件上传、Agent 工具调用、MCP server。
+      JWT 是最常见的答案，但也是面试高频追问点：**能不能吊销、放哪里、过期了怎么办、和 OAuth2/OIDC 什么关系**。答不清这些，面试官会认为你只会调库。
+    problem: |
+      解决「**无状态服务如何低成本地识别用户**」：服务端不用每次查 Session 表，只要验签就知道用户是谁，多副本水平扩展很方便。
+      同时要处理它的代价：**签发后难以撤回**。员工离职、改密码、token 泄露时，必须有机制让它尽快失效。
+    principle: |
+      **一、JWT 的结构：签名不等于加密**
+
+      `header.payload.signature`，三段都是 Base64URL 编码。
+      - **任何人都能解码 payload**，签名只保证「没被篡改」。所以 payload 里**不放手机号、身份证、权限明细等敏感信息**。
+      - 常用声明：`sub` 用户 ID、`iss` 签发方、`aud` 受众（给哪个 API 用）、`exp` 过期、`iat` 签发时间、`jti` 唯一 ID。
+      - 多租户系统常加 `tid`（租户 ID），但**租户成员关系仍要在服务端确认**（见 k3）。
+
+      **二、校验清单：每一步都不能省**
+
+      ```mermaid
+      flowchart TD
+        A["请求携带 Bearer token"] --> B{"算法在服务端白名单内"}
+        B -- "否" --> X["401 并带 WWW-Authenticate"]
+        B -- "是" --> C{"签名正确"}
+        C -- "否" --> X
+        C -- "是" --> D{"exp nbf 有效 允许少量时钟偏差"}
+        D -- "否" --> X
+        D -- "是" --> E{"iss 和 aud 是我方"}
+        E -- "否" --> X
+        E -- "是" --> F{"用户未禁用 token_version 匹配"}
+        F -- "否" --> X
+        F -- "是" --> G["得到可信身份 进入授权判断"]
+      ```
+
+      - **算法写死在服务端**：`jwt.decode(token, key, algorithms=["RS256"])`。绝不能读 token header 里的 `alg` 来决定用什么算法验签，否则攻击者可以改成 `none` 或做算法混淆。
+      - **必需声明**：PyJWT 用 `options={"require": ["exp", "sub", "iss"]}` 强制存在，再传 `issuer=`、`audience=` 校验值；`leeway` 只给几秒到一两分钟。
+      - **HS256 vs RS256**：HS256 用同一个密钥签和验，适合单体；RS256/ES256 私钥签、公钥验，适合「一个 IdP 发、多个服务验」。公钥通过 **JWKS** 发布，按 header 的 `kid` 选钥，PyJWT 的 `PyJWKClient` 会自动缓存和刷新。
+
+      **三、双令牌：短 access + 长 refresh**
+
+      ```mermaid
+      sequenceDiagram
+        participant U as 浏览器
+        participant A as 认证服务
+        participant R as 业务 API
+        U->>A: 登录成功
+        A-->>U: access 15 分钟 加 refresh 放 HttpOnly Cookie
+        U->>R: 带 access 调用
+        R-->>U: 200
+        U->>R: access 过期后调用
+        R-->>U: 401
+        U->>A: 用 refresh 换新
+        A->>A: 旧 refresh 作废 签发新 refresh
+        A-->>U: 新 access 和新 refresh
+        Note over A: 已作废的 refresh 再次出现 说明可能被盗 作废整组会话
+      ```
+
+      - **access token** 短（几分钟到十几分钟），无状态验签，泄露的窗口小。
+      - **refresh token** 长，**服务端存储状态**（哈希后存库，带 family_id），每次使用都**轮换**。
+      - RFC 9700（OAuth 2.0 安全最佳实践，2025 年 1 月）要求：**公开客户端（浏览器、App）的 refresh token 必须做发送方绑定（DPoP / mTLS）或轮换**；已作废的 refresh 被再次使用时，要吊销该授权下的活跃 token。
+
+      **四、吊销的三种手段（按成本从低到高）**
+
+      | 手段 | 做法 | 适合 |
+      |---|---|---|
+      | 缩短寿命 | access 15 分钟，自然过期 | 默认 |
+      | token_version | 用户表存版本号，改密码或禁用时加 1，token 里带版本，不匹配即拒绝 | 改密码、离职「所有设备下线」 |
+      | jti 黑名单 | Redis 存被吊销的 jti，TTL 等于剩余寿命 | 单个 token 泄露 |
+
+      token_version 需要查一次用户状态，可以放 Redis 缓存，用户被禁用时主动删缓存。
+
+      **五、OAuth2 / OIDC 在企业里的位置**
+
+      - **OAuth2 解决授权**：让客户端拿到 access token 去调 API。**OIDC 在 OAuth2 上加了身份层**：多发一个 **ID Token**，告诉客户端「谁登录了」。
+      - **ID Token 是给客户端看的，不能拿去调 API**；API 只接受 `aud` 是自己的 access token。
+      - 企业 SSO 用**授权码流 + PKCE**。RFC 9700 规定 **密码模式（ROPC）不得使用**，隐式模式因易泄露也不应再用。FastAPI 教程里的 password flow 适合「自家前端登录自家后端」的入门场景，对接企业 IdP 时换成 OIDC。
+      - **MCP 也走这一套**：2026-07-28 版规范里，HTTP 传输的 MCP server 是 OAuth 资源服务器，**必须校验 token 的受众是自己**，客户端要用 PKCE 和 Resource Indicators。
+
+      **六、token 放哪里**
+
+      | 位置 | XSS 能否偷走 | CSRF 风险 | 说明 |
+      |---|---|---|---|
+      | localStorage | 能 | 无 | 最简单，但一次 XSS 就全丢 |
+      | 内存变量 | 较难 | 无 | 刷新页面就没了，要配合 refresh |
+      | HttpOnly Cookie | 不能 | 有，需 SameSite 和 CSRF token | refresh token 的推荐位置 |
+      | BFF 持有 | 浏览器拿不到 | 按 Cookie 处理 | Node 中间层保管 token，浏览器只有会话 Cookie |
+
+      你做过 Node 中间层，**BFF 模式**就是你的天然优势：token 不进浏览器，前端只和 BFF 打交道。
+    scenarios: |
+      - **企业知识库登录**：对接公司 OIDC（飞书、企业微信、Keycloak 等），后端只验 access token 的签名、iss、aud。
+      - **员工离职**：HR 系统回调禁用账号，token_version 加 1，所有设备下次请求即 401。
+      - **SSE 流式接口**：EventSource 不能自定义请求头，常见做法是用 fetch 读流并带 Authorization，或走 Cookie 会话；不要把长期 token 拼在 URL 上（会进访问日志）。
+      - **MCP server 对外开放**：校验 audience，拒绝发给别的服务的 token，防止「拿 A 服务的 token 调 B 服务」。
+    code: |
+      ```python
+      from datetime import datetime, timedelta, timezone
+      import jwt
+      from jwt.exceptions import InvalidTokenError
+      from fastapi import Depends, HTTPException, status
+      from fastapi.security import OAuth2PasswordBearer
+
+      ISSUER = "https://auth.example.com"
+      AUDIENCE = "kb-api"
+      ALGORITHMS = ["HS256"]  # 服务端白名单，绝不读 token 头里的 alg
+      oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
+
+      def create_access_token(user_id: str, tenant_id: str, ver: int) -> str:
+          now = datetime.now(timezone.utc)
+          payload = {
+              "sub": user_id, "tid": tenant_id, "ver": ver,
+              "iss": ISSUER, "aud": AUDIENCE,
+              "iat": now, "exp": now + timedelta(minutes=15),
+          }
+          return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
+
+      async def get_current_user(token: str = Depends(oauth2_scheme)):
+          unauthorized = HTTPException(
+              status_code=status.HTTP_401_UNAUTHORIZED,
+              detail="Could not validate credentials",
+              headers={"WWW-Authenticate": "Bearer"},
+          )
+          try:
+              claims = jwt.decode(
+                  token, SECRET_KEY, algorithms=ALGORITHMS,
+                  issuer=ISSUER, audience=AUDIENCE, leeway=30,
+                  options={"require": ["exp", "sub", "iss", "aud"]},
+              )
+          except InvalidTokenError:
+              raise unauthorized
+          user = await load_user_cached(claims["sub"])
+          if user is None or user.disabled or user.token_version != claims["ver"]:
+              raise unauthorized
+          return user
+      ```
+    pitfalls: |
+      - **把 payload 当加密**：在 JWT 里放手机号、权限列表，任何人 Base64 解码即可看到。
+      - **从 header 读 alg**：`algorithms=[header["alg"]]` 等于让攻击者选算法。
+      - **关闭过期校验或不校验 aud**：拿测试环境或别的服务签发的 token 也能通过。
+      - **refresh 不轮换、不存状态**：refresh 泄露后可以无限续期，且无法发现被盗。
+      - **轮换不做宽限期**：多个标签页同时刷新，第二个请求被判为「重用」把用户踢下线。可以让同一旧 token 在几秒内重复请求时返回同一组新 token。
+      - **用 ID Token 调 API**：ID Token 的 aud 是客户端，不是你的 API。
+      - **token 拼在 URL 查询参数**：会进入 nginx 访问日志、浏览器历史和 Referer。
+    interview_asks:
+      - question: "JWT 被盗了怎么办？你们怎么做到改密码后所有设备下线？"
+        answer: "访问令牌时间短，并维护一个能失效的会话或令牌版本。改密码时增加版本或废止刷新令牌，旧的刷新不能再换新访问令牌。只靠 JWT 自己过期，做不到立刻全设备下线。"
+      - question: "access token 和 refresh token 为什么要分开？refresh token 放哪里？"
+        answer: "访问令牌经常带在请求里，时间短，泄露了窗口小。刷新令牌只用来换新的访问令牌，时间长，所以要更少暴露。Web 放在 HttpOnly、Secure 的 Cookie 里，不要放进前端能读的 localStorage。"
+      - question: "OAuth2 和 OIDC 有什么区别？ID Token 能不能用来调后端接口？"
+        answer: "OAuth2 解决授权，让应用拿到访问资源的权限。OIDC 在上面加了登录身份，用 ID Token 说明用户是谁。调你的后端接口要用访问令牌，不用 ID Token。"
+      - question: "HS256 和 RS256 怎么选？多个微服务怎么验同一个 IdP 签发的 token？"
+        answer: "HS256 是共享密钥，每个验签的服务都要拿到密钥，泄露面大。RS256 是私钥签发、公钥验证，服务只存公钥。多个服务向 IdP 拉公钥验同一个令牌，不要各自再签一遍。"
+    project_example: |
+      **p2 智慧园区运营工作台（Vue3）登录链路：**
+      - 浏览器只和 Node BFF 通信，BFF 持有 access 和 refresh，浏览器只拿 HttpOnly、SameSite=Lax 的会话 Cookie；
+      - access 15 分钟，refresh 每次使用都轮换，库里存哈希和 family_id；检测到重用就作废整组；
+      - 账号禁用或改密码时 token_version 加 1 并删除 Redis 用户缓存，下一次请求就返回 401；
+      - 前端拦截器只做「single-flight 刷新 + 重放」，不做任何权限判断。
+      面试时可以这样讲：「前端那层我以前就写过，这次我补齐的是服务端那一半：验签清单、轮换和吊销。」
+    freshness: |
+      2026-11 核实：
+      - FastAPI 官方教程（含中文版）已改用 **PyJWT + pwdlib[argon2]**，旧版教程用的 python-jose 和 passlib 不再推荐；passlib 只在需要兼容老哈希时使用。
+      - **RFC 9700**（2025-01）：密码模式不得使用；公开客户端的 refresh token 必须发送方绑定或轮换。
+      - **OAuth 2.1 仍是 Internet-Draft**（截至 2026-10 为 draft-ietf-oauth-v2-1-17），还不是 RFC。
+      - JWT 最佳实践的更新版 **draft-ietf-oauth-rfc8725bis** 已于 2026-08 获 IESG 批准、进入 RFC 编辑队列，将取代 RFC 8725，正式编号以发布为准。
+      - MCP 规范 2026-07-28 版：HTTP 传输的授权基于 OAuth 2.1，MCP server 必须校验 token 受众。
+    sources:
+      - title: "FastAPI 中文文档：OAuth2 与 JWT"
+        url: "https://fastapi.tiangolo.com/zh/tutorial/security/oauth2-jwt/"
+      - title: "PyJWT Usage Examples"
+        url: "https://pyjwt.readthedocs.io/en/stable/usage.html"
+      - title: "RFC 9700 Best Current Practice for OAuth 2.0 Security"
+        url: "https://datatracker.ietf.org/doc/rfc9700/"
+      - title: "draft-ietf-oauth-v2-1 The OAuth 2.1 Authorization Framework"
+        url: "https://datatracker.ietf.org/doc/draft-ietf-oauth-v2-1/"
+      - title: "draft-ietf-oauth-rfc8725bis JWT Best Current Practices"
+        url: "https://datatracker.ietf.org/doc/draft-ietf-oauth-rfc8725bis/"
+      - title: "OpenID Connect Core 1.0"
+        url: "https://openid.net/specs/openid-connect-core-1_0.html"
+      - title: "MCP Specification 2026-07-28 Authorization"
+        url: "https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization"
+
+  - id: d46-k2
+    name: RBAC 与资源级授权（BOLA / BFLA）
+    level: P0
+    summary: 认证回答「你是谁」，RBAC 回答「能做哪类操作」，对象级授权回答「能不能动这一条」；三层都必须在服务端执行
+    analogy: |
+      **像你在前端写的 `v-permission` 指令和路由守卫。** 后端返回权限码列表 `["kb:read", "kb:delete"]`，前端据此隐藏按钮、拦截路由。
+
+      **不一样的地方：**
+      - 前端隐藏按钮只是**体验**，攻击者直接用 curl 调接口就绕过了。**后端每个接口都要再校验一次**，前端那份权限码只是后端的「副本」。
+      - 前端的权限粒度通常到「按钮」为止；后端还要管到「**这一条数据是不是你的**」，即对象级授权。按钮你能看见，不代表这条知识库你能删。
+      - 前端判断失败就是不显示；后端判断失败要选对状态码（401 / 403 / 404），并写审计日志。
+    why: |
+      OWASP API Security Top 10（2023）里**第 1 名是 BOLA（对象级授权缺失）**，第 5 名是 BFLA（功能级授权缺失）。它们几乎不需要技术含量：把 URL 里的 ID 改一下就能看到别人的对话。
+      AI 平台的风险更大：**检索、缓存、Agent 工具**都可能绕开你在接口层写的权限判断，把别人的数据「合法地」带出来。
+    problem: |
+      解决「**已登录用户能做什么、能动哪些数据**」的问题。
+      认证只能证明身份；授权要把「角色 → 权限 → 资源归属」落到每一次读写上，并且在 RAG 检索、Agent 代用户调用工具时**不丢失用户身份**。
+    principle: |
+      **一、三层判断，顺序固定**
+
+      ```mermaid
+      flowchart TD
+        A["请求到达"] --> B{"认证 token 有效"}
+        B -- "否" --> C["401 未认证"]
+        B -- "是" --> D{"功能级 有没有 kb:delete 权限码"}
+        D -- "否" --> E["403 无权限"]
+        D -- "是" --> F{"对象级 这条记录属于本租户且你有权访问"}
+        F -- "否" --> G["404 不存在或无权访问 统一返回"]
+        F -- "是" --> H["执行操作 并写审计"]
+      ```
+
+      | 状态码 | 含义 | 场景 |
+      |---|---|---|
+      | 401 | 没认证或认证失败 | 无 token、过期、验签失败，要带 `WWW-Authenticate` |
+      | 403 | 身份明确但没这类权限 | 普通员工调管理接口 |
+      | 404 | 对象不存在**或**你无权知道它存在 | 访问别人的会话 ID，统一 404 防止探测 |
+
+      **二、RBAC 数据模型**
+
+      ```mermaid
+      erDiagram
+        TENANT ||--o{ USER : has
+        USER ||--o{ USER_ROLE : assigned
+        ROLE ||--o{ USER_ROLE : grants
+        ROLE ||--o{ ROLE_PERMISSION : contains
+        PERMISSION ||--o{ ROLE_PERMISSION : included
+        TENANT ||--o{ KNOWLEDGE_BASE : owns
+        KNOWLEDGE_BASE ||--o{ KB_MEMBER : shares
+        USER ||--o{ KB_MEMBER : joins
+      ```
+
+      - 代码里**判断权限码，不判断角色名**：写 `require("kb:delete")`，而不是 `if role == "admin"`。新增角色时不用改代码。
+      - **默认拒绝**：没有显式授权就是没有。
+      - RBAC 管「类」，ACL/归属管「条」。知识库共享给某几个人，用 `KB_MEMBER` 这类关系表，或升级到 ABAC（按部门、密级等属性判断）。
+
+      **三、对象级授权：写进查询条件**
+
+      - 错误写法：`doc = db.get(Document, doc_id)` 后再判断，很容易漏判；
+      - 正确写法：`WHERE id = :id AND tenant_id = :tid AND (owner_id = :uid OR kb_id IN 可访问集合)`，查不到就 404。
+      - **只比对 JWT 里的用户 ID 不够**（OWASP 原话）：你要比对的是「这个对象和这个用户的关系」。
+      - **BOPLA（属性级）**：返回值不要把 `owner_phone`、`internal_note` 原样吐出；更新接口用白名单 schema，防止用户顺手提交 `role=admin`（批量赋值）。
+
+      **四、AI 场景特有的越权点**
+
+      | 位置 | 风险 | 做法 |
+      |---|---|---|
+      | RAG 检索 | 先检索 TopK 再过滤，可能把别人的片段带进上下文 | **检索时**就带 ACL 过滤条件（见 Day 30） |
+      | 答案缓存 | key 只用问题文本，A 部门的答案给了 B 部门 | key 包含租户、权限范围、知识库版本 |
+      | Agent 工具 | 工具用全权限服务账号，模型被诱导就能越权 | 工具调用**携带用户身份**，工具内再授权 |
+      | 高风险动作 | 删除、派单、发邮件直接执行 | 人工审批（见 Day 37）、最小权限（见 Day 45） |
+      | 批量导出 | 导出接口忘了套对象级过滤 | 和列表接口复用同一个查询构造函数 |
+
+      **五、Agent 代用户执行：防「混淆代理人」**
+
+      模型本身不是安全边界。Agent 调工具时，**应该以「用户」的身份去调**，而不是以「Agent 服务」的身份。
+      - 做法一：把用户的 access token（或通过令牌交换得到的、范围更小的 token）传给工具服务，工具服务按用户权限判断；
+      - 做法二：工具服务只信任网关注入的、已验证的用户上下文，并对每次调用做对象级校验；
+      - MCP server 要校验 token 受众，**不要把收到的 token 原样转发给下游服务**（规范明确禁止 token passthrough）。
+    scenarios: |
+      - **会话接口**：`GET /conversations/{id}` 查询条件带 `user_id` 和 `tenant_id`，查不到统一 404。
+      - **知识库共享**：只读成员能问答，编辑成员能上传，管理员能删除；前端按权限码渲染按钮，后端同一份权限码校验。
+      - **园区工单 Agent**：员工只能查自己园区的工单，派单需要 `workorder:dispatch` 权限且要人工确认。
+      - **管理后台导出**：导出与列表共用查询构造函数，避免导出接口漏掉过滤。
+    code: |
+      ```python
+      from fastapi import Depends, HTTPException
+      from sqlalchemy import select, or_
+
+      def require(perm: str):
+          async def checker(user=Depends(get_current_user)):
+              if perm not in user.permissions:  # 权限码，不是角色名
+                  raise HTTPException(403, "forbidden")
+              return user
+          return checker
+
+      def visible_kb_ids(user):
+          return select(KbMember.kb_id).where(KbMember.user_id == user.id)
+
+      @app.delete("/kbs/{kb_id}/docs/{doc_id}")
+      async def delete_doc(kb_id: str, doc_id: str,
+                           user=Depends(require("doc:delete")), db=Depends(get_db)):
+          stmt = select(Document).where(
+              Document.id == doc_id,
+              Document.kb_id == kb_id,
+              Document.tenant_id == user.tenant_id,
+              or_(Document.owner_id == user.id, Document.kb_id.in_(visible_kb_ids(user))),
+          )
+          doc = (await db.execute(stmt)).scalar_one_or_none()
+          if doc is None:
+              raise HTTPException(404, "not found")  # 不区分不存在和无权访问
+          await soft_delete(db, doc, actor=user)       # 同事务写审计，见 k4
+          return {"ok": True}
+      ```
+    pitfalls: |
+      - **只在前端控制权限**：接口裸奔，改一下请求就能调。
+      - **以为 UUID 不可猜就安全**：ID 会出现在分享链接、日志、前端缓存里，对象级校验一个都不能少。
+      - **判断角色名**：`if role == "admin"` 散落各处，新增「知识库管理员」时到处漏改。
+      - **先查后判**：`db.get` 拿到对象再判断归属，后来者加接口时忘了判断。
+      - **检索后过滤**：TopK 里大部分是无权文档，过滤后答案质量下降，还可能在日志、缓存里留下越权片段。
+      - **Agent 工具用超级账号**：一旦提示词注入成功，模型就拥有了全部权限。
+    interview_asks:
+      - question: "401、403、404 分别什么时候用？访问别人的对话为什么返回 404？"
+        answer: "401 没登录，403 登录了但明确告诉他没权限，404 资源不存在。访问别人的对话用 404，是为了不让他靠 403 探测出这条对话存在。不要用 403 泄露有无。"
+      - question: "前端已经做了按钮级权限，后端为什么还要做？对象级授权你怎么实现？"
+        answer: "前端隐藏按钮只是体验，请求可以伪造。后端每一条都要查这个用户能不能动这个对象。对象级就是查资源的拥有者、租户和角色，不通过就 404 或 403。"
+      - question: "RAG 系统里权限过滤放在检索前还是检索后？为什么？"
+        answer: "放在检索条件里，查询时就带上允许的文档范围。事后过滤会占满名额，也可能把标题写进日志。模型不应该看到无权片段。"
+      - question: "Agent 代用户调用工具时，权限怎么传递？模型能不能作为权限判断的一环？"
+        answer: "工具用当前用户的身份去调用下游，身份由代码从登录态带上。模型只提出要调什么。它说自己有权限也不算数。下游再验一次，不信任调用方口头说的角色。"
+    project_example: |
+      **p1 企业知识库 + p2 园区 Agent 的权限设计：**
+      - p1：文档入库时写入 `tenant_id`、`kb_id`、`acl_groups`，检索 SQL 直接带这些过滤条件，答案缓存 key 包含权限范围哈希；
+      - p2：工单 MCP server 不信任 Agent 传来的「用户 ID 参数」，只信任 token 里经过验证的身份；`dispatch_work_order` 需要 `workorder:dispatch` 权限并进入人工审批；
+      - 工作台前端用后端返回的权限码渲染菜单和按钮，但每个接口都有同一份后端校验；
+      - 写一组越权回归测试：用户 A 的 token 访问用户 B 的会话、文档、工单，全部应返回 404。
+    freshness: |
+      2026-11 核实：OWASP API Security Top 10 的最新版仍是 **2023 版**，API1 为 BOLA、API3 为 BOPLA（属性级）、API5 为 BFLA（功能级）。MCP 2026-07-28 版规范要求 server 校验 token 受众，并禁止把客户端 token 透传给下游 API。
+    sources:
+      - title: "OWASP API Security Project"
+        url: "https://owasp.org/projects/api-security-project"
+      - title: "OWASP API1:2023 Broken Object Level Authorization"
+        url: "https://github.com/OWASP/API-Security/blob/master/editions/2023/en/0xa1-broken-object-level-authorization.md"
+      - title: "MCP Specification 2026-07-28 Authorization"
+        url: "https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization"
+
+  - id: d46-k3
+    name: 租户隔离：隔离模型、租户上下文与数据库 RLS
+    level: P0
+    summary: 租户上下文只来自已验证身份；共享库用应用过滤加 RLS 双保险；缓存、向量、对象存储、队列、配额都要带租户
+    analogy: |
+      **像你做体育 SaaS 时的多租户前端：** 按子域名或登录信息确定当前租户，Pinia 里存 `currentTenant`，每个请求头带 `X-Tenant-Id`。
+
+      **不一样的地方：**
+      - 前端传来的 `X-Tenant-Id` **只能当「选择器」**（用户属于多个租户时选哪个），后端必须用 token 里的身份去确认「你确实是这个租户的成员」，不能直接拿来当查询条件。
+      - 前端切换租户只是换个变量；后端的租户边界要贯穿**数据库、缓存、向量库、对象存储、队列、日志、模型配额**，任何一处漏了就是跨租户泄露。
+      - 前端出错是显示错了；后端出错是 A 公司的合同出现在 B 公司的答案里，属于安全事故。
+    why: |
+      企业 AI 平台天然多租户：一个平台服务多个公司、多个园区、多个事业部。
+      跨租户泄露是 B 端客户**最不能接受**的事故，也是面试「设计一个多租户知识库」时面试官一定会深挖的点：你只说「加个 tenant_id」是不够的。
+    problem: |
+      解决「**共享基础设施时，如何保证一个租户永远看不到、也影响不到另一个租户**」。
+      包括两类问题：**数据隔离**（看不到）和**资源隔离**（大租户的批量入库不能把小租户的问答拖慢，即「吵闹邻居」）。
+    principle: |
+      **一、三种隔离模型**
+
+      | 模型 | 做法 | 优点 | 代价 |
+      |---|---|---|---|
+      | silo 独立 | 每租户独立库或独立集群 | 隔离最强，可单独加密、单独删除 | 成本高，运维量随租户数增长 |
+      | pool 共享 | 共享表，每行带 `tenant_id` | 成本最低，易扩展 | 全靠代码和 RLS 保证隔离 |
+      | bridge 混合 | 如每租户一个 schema，或大客户独立、小客户共享 | 按客户等级灵活选择 | 两套运维流程 |
+
+      常见答案：**默认 pool，付费大客户或强合规客户升级为 silo**。向量库同理：小租户共享集合加过滤，大租户独立索引。
+
+      **二、租户上下文：在最早的地方建立，一路传下去**
+
+      ```mermaid
+      flowchart LR
+        A["请求 带 token 和可选 X-Tenant-Id"] --> B["认证 得到 user_id"]
+        B --> C{"该用户是此租户成员"}
+        C -- "否" --> D["403 并写审计"]
+        C -- "是" --> E["建立租户上下文 contextvars"]
+        E --> F["数据库 事务内 set_config"]
+        E --> G["缓存 key 前缀 tenant"]
+        E --> H["向量检索 过滤 tenant_id"]
+        E --> I["对象存储 tenant 路径前缀"]
+        E --> J["队列消息 携带 tenant 和 user"]
+        E --> K["LLM 网关 按租户计量和限额"]
+      ```
+
+      - 上下文缺失时 **fail closed**：宁可报错，也不要回退成「查全部」。
+      - 异步任务（入库 Worker、定时任务）没有 HTTP 请求，消息里要带 `tenant_id` 和发起人，Worker **重新建立并校验**上下文。
+
+      **三、数据库层：应用过滤 + RLS 兜底**
+
+      - 应用层：所有查询都加 `tenant_id` 条件；SQLAlchemy 可以用 `do_orm_execute` + `with_loader_criteria` 自动加，但**原生 SQL 和批量操作会绕过它**，只能算一层防护。
+      - 数据库层：PostgreSQL **行级安全（RLS）**，数据库自己强制过滤：
+
+      ```sql
+      ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+      CREATE POLICY tenant_isolation ON documents
+        USING (tenant_id = current_setting('app.current_tenant', true)::uuid)
+        WITH CHECK (tenant_id = current_setting('app.current_tenant', true)::uuid);
+      ```
+
+      RLS 的关键细节：
+      - 开启 RLS 但**没有任何策略**时，普通角色**默认看不到任何行**（默认拒绝）；
+      - **表的属主默认绕过 RLS**，除非 `FORCE ROW LEVEL SECURITY`；超级用户和带 `BYPASSRLS` 的角色**始终绕过**。所以应用要用一个**普通角色**连接，迁移用属主角色；
+      - `USING` 管读和删改哪些行可见，`WITH CHECK` 管写入的新行是否合法；
+      - **设置租户必须是事务级**：`SET LOCAL` 或 `set_config('app.current_tenant', :tid, true)`。用会话级 `SET`，连接归还连接池后，下一个请求可能带着上一个租户的设置。
+
+      **四、AI 平台特有的隔离面**
+
+      | 位置 | 做法 |
+      |---|---|
+      | 向量检索 | 检索时带 `tenant_id` 过滤；pgvector 与业务表同库，可以直接受 RLS 保护 |
+      | 缓存 | key 以 `t:{tenant_id}:` 开头，问答缓存再加权限范围和知识库版本 |
+      | 对象存储 | 路径 `tenant/{tid}/...`，下载用短期签名 URL，签发前校验归属 |
+      | 队列与 Worker | 消息带租户，Worker 重新 set_config，不信任消息里的「已校验」字段 |
+      | 模型配额 | 网关按租户统计 Token 和并发，超限 429，防止吵闹邻居（见 Day 47） |
+      | Agent 记忆 | 按租户 + 用户分区，删除用户时同步删除长期记忆 |
+      | Text2SQL | 模型生成的 SQL 不可信，用只读角色执行，RLS 保证它查不出别的租户 |
+
+      **五、用测试证明隔离**
+
+      至少准备两个租户的数据，用 A 的身份把每个接口、每个工具、每个导出都打一遍，断言拿不到 B 的任何数据；再检查请求角色在 `pg_roles` 里 `rolsuper` 和 `rolbypassrls` 都是 false。
+    scenarios: |
+      - **多园区运营 Agent**：园区就是租户，管理员可能管多个园区，请求里带选择器，后端校验成员关系。
+      - **知识库 SaaS**：中小客户共享库 + RLS；金融客户要求独立密钥和可单独销毁数据，升级为独立库。
+      - **批量入库**：大租户一次上传几千份文档，入库队列按租户做公平调度，不影响其他租户的问答延迟。
+      - **Text2SQL 报表**：生成的 SQL 在只读角色 + RLS 下执行，即使模型写了 `SELECT * FROM alarms` 也只返回本园区数据。
+    code: |
+      ```python
+      from sqlalchemy import text
+
+      async def tenant_session(tenant_id: str):
+          async with SessionLocal() as session:
+              async with session.begin():
+                  # 第三个参数 true 表示仅本事务有效，连接归还连接池后不会残留
+                  await session.execute(
+                      text("SELECT set_config('app.current_tenant', :tid, true)"),
+                      {"tid": tenant_id},
+                  )
+                  yield session
+
+      async def get_db(ctx=Depends(get_tenant_context)):
+          if ctx.tenant_id is None:
+              raise HTTPException(403, "tenant context required")  # fail closed
+          async for s in tenant_session(ctx.tenant_id):
+              yield s
+      ```
+    pitfalls: |
+      - **直接信任请求头里的租户 ID**：改一下请求头就进入了别的租户。
+      - **应用用表属主或超级用户连接**：RLS 写了等于没写，测试也发现不了，因为开发时数据都是自己的。
+      - **用会话级 SET**：连接池复用导致租户设置「串号」，问题只在并发时偶发。
+      - **只隔离了数据库**：Redis 缓存、向量库、对象存储、日志检索界面里漏了租户条件。
+      - **Worker 丢了上下文**：后台任务用全权限连接处理所有租户，一个 bug 就写错租户。
+      - **没做吵闹邻居控制**：一个租户的批量任务打满模型配额，全平台 429。
+    interview_asks:
+      - question: "多租户隔离有哪几种模型？你会怎么选？"
+        answer: "共享表加租户字段、每租户一个 Schema、或每租户一套库。多数中小规模用共享表加行级隔离，成本低。合规要求强、客户要独立时再拆库。先选共享表，把租户条件做死。"
+      - question: "租户 ID 从哪里来？前端传的能不能信？"
+        answer: "从登录令牌里的租户来，不从请求体、查询参数或模型参数来。前端传来的只能忽略。否则换一个 id 就能读到别的租户。"
+      - question: "PostgreSQL RLS 怎么用？连接池环境下有什么坑？"
+        answer: "RLS 在表上强制每次查询带租户条件，就算代码忘了也能挡住。连接池会复用连接，必须在每次取用连接时设置当前租户，归还时清掉。设在会话上又忘了清，下一个请求会沿用上一个租户。"
+      - question: "除了数据库，AI 平台还有哪些地方要做租户隔离？"
+        answer: "对象存储路径、向量检索、缓存 key、队列消息、日志和评测样本。任何一处只按文档 id 存，都可能串租户。模型提示里也不能混进别的租户的切片。"
+    project_example: |
+      **p2 园区 Agent 的多园区隔离：**
+      - 园区即租户，token 里只有 `sub`，用户和园区的成员关系在服务端查（缓存到 Redis）；
+      - 告警、设备、工单表都开启 RLS，应用用普通角色 `app_rw` 连接，Text2SQL 子 Agent 用只读角色 `app_ro`；
+      - 每个事务开头 `set_config('app.current_tenant', tid, true)`，上下文缺失直接 403；
+      - 入库和统计 Worker 从消息里取租户，重新建立上下文；
+      - CI 里有一组「双租户回归测试」，覆盖接口、MCP 工具和导出。
+      这个设计可以直接回答「模型生成的 SQL 你怎么保证安全」：**不靠模型自觉，靠数据库强制**。
+    freshness: |
+      2026-11 核实：PostgreSQL 18 文档仍规定表属主默认绕过 RLS（需 FORCE），超级用户和 BYPASSRLS 角色始终绕过，未定义策略时默认拒绝。OWASP 多租户安全速查表建议用 SET LOCAL 或 set_config(..., true) 设置事务级租户上下文，并警告会话级 SET 会在连接池中串租户。
+    sources:
+      - title: "PostgreSQL Documentation: Row Security Policies"
+        url: "https://www.postgresql.org/docs/current/ddl-rowsecurity.html"
+      - title: "OWASP Multi-Tenant Security Cheat Sheet"
+        url: "https://cheatsheetseries.owasp.org/cheatsheets/Multi_Tenant_Security_Cheat_Sheet.html"
+      - title: "AWS Multi-tenant architectures on AWS"
+        url: "https://docs.aws.amazon.com/solutions/multi-tenant-architectures-on-aws/"
+
+  - id: d46-k4
+    name: 审计日志：谁在什么时候对什么做了什么
+    level: P1
+    summary: 审计日志在服务端产生、不可采样、只追加不可改、按租户隔离查询；Agent 工具调用与审批必须进审计
+    analogy: |
+      **像前端的操作埋点上报**：用户点了什么、什么时候点的，上报到日志平台。
+
+      **不一样的地方：**
+      - 埋点在客户端产生，可以丢、可以采样；审计必须在**服务端**产生，**一条都不能丢**，最好和业务操作同事务写入。
+      - 埋点用于分析行为；审计用于**追责和合规**，要能回答「谁删了这份合同」，所以只能追加，任何人（包括管理员）都不能改。
+      - 埋点数据可以给产品看全量；审计数据要按租户隔离，租户管理员只能看自己租户的。
+    why: |
+      企业客户采购 AI 平台时，安全问卷几乎必问「**有没有操作审计**」。Agent 会代用户执行动作，出了问题必须能还原「谁发起、模型调了什么工具、谁审批、结果如何」。
+    problem: |
+      解决「**事后能否还原并证明发生了什么**」。应用日志会轮转、Trace 会采样，都不适合当证据；审计日志要在完整性、不可篡改和隔离上单独设计。
+    principle: |
+      **一、记录哪些事件**
+
+      - 认证：登录成功或失败、刷新令牌重用告警、登出；
+      - 授权变更：角色分配、知识库共享、权限码变更；
+      - 敏感数据操作：文档上传、删除、导出、批量下载；
+      - **Agent 动作**：工具名、参数摘要、发起用户、是否需要审批、审批人、执行结果；
+      - 平台运维人员对租户数据的任何访问。
+
+      **二、每条记录的字段**
+
+      `who`（用户 ID、租户 ID、客户端 IP）、`what`（动作）、`resource`（类型和 ID）、`when`（服务端时间）、`result`（成功、拒绝、失败原因）、`trace_id`（关联 Day 43 的 Trace）、`reason`（审批意见或工单号）。
+      租户 ID 必须来自**已验证的上下文**，不能来自请求参数。
+
+      **三、和应用日志、Trace 的区别**
+
+      | | 应用日志 | Trace | 审计日志 |
+      |---|---|---|---|
+      | 目的 | 排查问题 | 定位慢和错 | 追责、合规 |
+      | 能否采样或丢失 | 可以 | 常采样 | **不可以** |
+      | 能否修改 | 无所谓 | 无所谓 | **只追加** |
+      | 谁能看 | 开发 | 开发 | 按租户授权，平台审计员单独角色 |
+
+      **四、怎么写才不丢**
+
+      - 关键操作**同事务**写审计表：业务成功审计必然存在；
+      - 或用 **outbox**：同事务写 outbox，再异步投递到审计存储；
+      - 存储层禁止 UPDATE 和 DELETE（数据库权限或对象存储的 WORM 保留策略），高要求时加哈希链防篡改；
+      - **不记录**密码、token、完整身份证号；prompt 和回答是否入审计按客户合规要求决定，默认只存摘要或哈希。
+    scenarios: |
+      - **合同被误删**：审计能查到删除人、时间、来源 IP、关联 Trace，并据此从软删除中恢复。
+      - **Agent 派错工单**：审计记录工具调用参数摘要、发起人和审批人，能区分是模型错了还是审批人没仔细看。
+      - **客户安全审查**：导出某租户近 90 天的权限变更记录。
+    pitfalls: |
+      - **把审计写进普通应用日志**：日志轮转后证据没了，也无法按租户授权查看。
+      - **异步写审计且不做重试**：业务成功、审计丢失，恰好出事的那次查不到。
+      - **审计里记录完整 token 或用户隐私原文**：审计库本身变成新的泄露源。
+      - **租户管理员能看平台全部审计**：审计查询接口同样要做租户隔离。
+    interview_asks:
+      - question: "审计日志和普通日志、链路追踪有什么区别？"
+        answer: "普通日志用来排错，可以采样。链路追踪看一次请求的耗时。审计日志记录谁在什么时候对哪个对象做了什么，要完整、不可随手改，用来追责。三者 id 可以互相关联，但不能互相替代。"
+      - question: "Agent 代用户执行了一个动作，事后怎么还原整个过程？"
+        answer: "审计记下用户、时间、工具、参数和结果。Trace 记下模型为什么这么选。两边用同一个请求 id。不能只有模型的自然语言，没有「到底调用了哪个接口」。"
+    project_example: |
+      **p2 园区 Agent 的工单审计：**每次 `dispatch_work_order` 调用都在同一事务里写 `audit_events`：发起用户、园区、工具名、参数摘要、审批人、审批结果、trace_id。
+      工作台提供「审计」页面，园区管理员只能查本园区；平台审计员是单独角色，不能修改任何记录。
+      面试时可以把这条和 Day 37 的人工审批、Day 43 的 Trace 串起来讲：**审批负责事前拦截，审计负责事后追溯，Trace 负责定位细节**。
+    freshness: |
+      2026-11 核实：OWASP 多租户安全速查表建议审计日志携带已验证的租户上下文、采用只追加或 WORM 存储，并区分租户管理员与平台审计员的查看权限。
+    sources:
+      - title: "OWASP Multi-Tenant Security Cheat Sheet"
+        url: "https://cheatsheetseries.owasp.org/cheatsheets/Multi_Tenant_Security_Cheat_Sheet.html"
+
+test:
+  - id: d46-t1
+    kp: d46-k1
+    type: single
+    question: 前端同事说：「JWT 是签过名的，所以把员工手机号放进 payload 很安全。」最准确的回应是：
+    options:
+      - "签名只防篡改不防查看，payload 任何人都能 Base64URL 解码"
+      - "确实安全，没有签名密钥就无法解码 payload"
+      - "改用 RS256 后 payload 就会被公钥加密，因此安全"
+      - "只要全站 HTTPS，payload 在任何地方都不会被看到"
+    answer: [0]
+    explain: |
+      JWT 的 payload 只是 Base64URL 编码，签名保证的是「内容没被改过」，不是「别人看不到」。
+      RS256 也只是签名算法，不加密；HTTPS 只保护传输过程，token 仍会出现在浏览器存储、日志、调试工具里。需要加密要用 JWE，但更好的做法是根本不放敏感信息。
+  - id: d46-t2
+    kp: d46-k1
+    type: multi
+    question: 后端用 PyJWT 校验 access token，下列哪些做法是**正确**的？
+    options:
+      - "从 token header 读取 alg，再传给 jwt.decode 的 algorithms 参数"
+      - "在服务端写死 algorithms 白名单，例如只允许 RS256"
+      - "传入 issuer 和 audience，并用 options 的 require 强制 exp、sub 存在"
+      - "为了兼容各服务器的时钟偏差，把 leeway 设为 1 天"
+      - "验签通过后再检查用户是否被禁用、token_version 是否匹配"
+    answer: [1, 2, 4]
+    explain: |
+      算法必须由服务端决定，读 header 的 alg 会让攻击者选择算法；issuer、audience 和必需声明能挡住别的系统或测试环境签发的 token；验签只证明 token 没被改，用户状态要另外查。
+      leeway 只用于抵消几秒到一两分钟的时钟偏差，设成 1 天等于让过期 token 多活一天。
+  - id: d46-t3
+    kp: d46-k1
+    type: judge
+    question: 做了 refresh token 轮换后，如果一个已经作废的 refresh token 又被拿来刷新，最稳妥的处理是只拒绝这一次请求，同一用户的其他会话保持不变。
+    answer: false
+    explain: |
+      已作废的 refresh 再次出现，说明它很可能被盗：要么攻击者在用，要么合法用户在用而攻击者已经拿到了新的。服务端无法分辨谁是谁，所以应该作废这一整组（同一 family）的令牌，强制重新登录。RFC 9700 也要求在这种情况下吊销该授权的活跃 token。
+  - id: d46-t4
+    kp: d46-k1
+    type: single
+    question: 下面这段鉴权依赖，**最严重**的安全问题是：
+    code: |
+      async def get_current_user(token: str = Depends(oauth2_scheme)):
+          header = jwt.get_unverified_header(token)
+          claims = jwt.decode(
+              token, PUBLIC_KEY,
+              algorithms=[header["alg"]],
+              options={"verify_exp": False},
+          )
+          return await db.get(User, claims["sub"])
+    options:
+      - "没有使用 async 版本的 jwt 库，会阻塞事件循环"
+      - "返回 User 对象太重，应该只返回用户 ID"
+      - "算法由 token 自己决定且关闭了过期校验，伪造和过期 token 都可能通过"
+      - "没有捕获异常，验签失败时会返回 500 而不是 401"
+    answer: [2]
+    explain: |
+      algorithms 取自 token header，攻击者可以选择算法做混淆攻击；verify_exp 为 False 让过期 token 永久有效；同时也没校验 iss、aud 和用户状态。这些是安全漏洞。
+      没捕获 InvalidTokenError 导致返回 500 确实是问题，但属于错误处理不规范，严重程度低于前者；jwt.decode 是纯 CPU 计算，不涉及 I/O 阻塞。
+  - id: d46-t5
+    kp: d46-k1
+    type: single
+    question: 企业 SSO（OIDC 授权码流）登录后，前端同时拿到了 ID Token 和 Access Token。调用你们的知识库问答 API 时，正确做法是：
+    options:
+      - "带 ID Token，因为它包含用户姓名和邮箱，后端可以少查一次库"
+      - "带 Access Token，API 校验签名并确认 aud 是本 API"
+      - "两个都可以带，只要签名是同一个 IdP 签的就行"
+      - "带 ID Token，后端只验签名，不需要关心 aud"
+    answer: [1]
+    explain: |
+      ID Token 是 OIDC 发给客户端的身份凭证，它的 aud 是客户端应用；Access Token 才是给资源服务器（你的 API）用的。API 只接受 aud 是自己的 access token，否则任何拿到同一 IdP 签发的 token 的系统都能调你的接口。
+  - id: d46-t6
+    kp: d46-k2
+    type: single
+    question: 管理后台已经用 v-permission 指令把「删除知识库」按钮对普通员工隐藏了。关于后端删除接口，正确的说法是：
+    options:
+      - "前端已经隐藏，后端只要校验 token 有效即可"
+      - "后端只需校验请求的 Referer 来自管理后台"
+      - "后端检查角色名是否等于 admin，管理员才能删"
+      - "后端校验 kb:delete 权限码，并确认该知识库属于本租户且用户有权管理"
+    answer: [3]
+    explain: |
+      前端隐藏只是体验，接口可以被直接调用，所以后端要做功能级校验（权限码）和对象级校验（这一条是否属于你）。
+      Referer 可以伪造；判断角色名会让新增角色时到处改代码，也不包含对象级判断；只校验 token 有效等于所有登录用户都能删。
+  - id: d46-t7
+    kp: d46-k2
+    type: multi
+    question: 在一个企业知识库 + Agent 平台里，下列哪些是**容易绕开接口层权限判断**的越权点？
+    options:
+      - "向量检索先取 TopK 再按权限过滤，无权片段可能已进入日志或上下文"
+      - "答案缓存的 key 只用问题文本，不含租户和权限范围"
+      - "Agent 的工单工具使用拥有所有园区权限的服务账号执行"
+      - "登录接口使用 pwdlib 的 Argon2 做密码哈希"
+      - "导出接口单独写了一套查询，没有复用列表接口的对象级过滤"
+    answer: [0, 1, 2, 4]
+    explain: |
+      检索、缓存、Agent 工具、导出都是「数据不经过你写的那个接口判断」就能流出的路径，是 AI 平台越权的高发点。
+      Argon2 密码哈希是正确做法，与越权无关。
+  - id: d46-t8
+    kp: d46-k2
+    type: judge
+    question: 只要把会话 ID、文档 ID 都换成随机 UUID，攻击者猜不到，就可以省掉对象级授权校验。
+    answer: false
+    explain: |
+      UUID 只是让「遍历」变难，并不能阻止「拿到」：ID 会出现在分享链接、浏览器历史、日志、截图和前端缓存里。OWASP 把 BOLA 列为 API 安全第一名，防御方式是每次访问都校验对象与用户的关系，而不是依赖 ID 难猜。
+  - id: d46-t9
+    kp: d46-k2
+    type: single
+    question: 用户 A 持有效 token 请求 `GET /api/conversations/{id}`，这个 ID 属于用户 B。推荐返回：
+    options:
+      - "401，因为 A 对这条会话没有认证"
+      - "403，并在响应里提示该会话属于其他用户"
+      - "404，与「会话不存在」返回同样的结果"
+      - "200 但返回空内容，避免前端报错"
+    answer: [2]
+    explain: |
+      A 的身份是有效的，所以不是 401。返回 403 会泄露「这个 ID 存在」，攻击者可以借此探测；统一返回 404 让「不存在」和「无权访问」无法区分。返回 200 空内容会让前端和监控都误以为正常。
+  - id: d46-t10
+    kp: d46-k3
+    type: single
+    question: 服务使用 PostgreSQL RLS 做租户隔离，每个请求开始时执行 `SET app.current_tenant = 'A'`（会话级），连接来自连接池。偶发的问题最可能是：
+    options:
+      - "RLS 不支持自定义参数，策略根本不会生效"
+      - "连接归还池后设置仍在，下一个请求若没设置成功就会沿用上个租户"
+      - "会话级 SET 会让该连接自动获得 BYPASSRLS 权限"
+      - "每次 SET 都会让查询计划失效，导致性能问题"
+    answer: [1]
+    explain: |
+      会话级 SET 的作用范围是整个连接，连接池复用连接时，设置会残留到下一个请求。只要某个请求的设置步骤被跳过或失败，就会以上一个租户的身份查询。应改为事务级的 SET LOCAL 或 set_config(..., true)，并在上下文缺失时直接拒绝。
+  - id: d46-t11
+    kp: d46-k3
+    type: single
+    question: 下面的迁移脚本和应用配置上线后，测试发现租户 B 依然能查到租户 A 的文档。最可能的原因是：
+    code: |
+      -- 迁移脚本，由 kb_owner 角色执行，documents 表属主是 kb_owner
+      ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+      CREATE POLICY tenant_isolation ON documents
+        USING (tenant_id = current_setting('app.current_tenant', true)::uuid);
+
+      # 应用配置
+      DATABASE_URL = "postgresql+asyncpg://kb_owner:***@db/kb"
+    options:
+      - "应用使用表属主连接，属主默认绕过 RLS，策略没有生效"
+      - "策略缺少 WITH CHECK 子句，所以读取也不受限制"
+      - "current_setting 第二个参数为 true 会让策略被忽略"
+      - "asyncpg 驱动不支持行级安全，需要换成 psycopg"
+    answer: [0]
+    explain: |
+      PostgreSQL 中表的属主默认不受 RLS 约束（除非 FORCE ROW LEVEL SECURITY），超级用户和 BYPASSRLS 角色也始终绕过。应用应使用一个普通角色连接，属主角色只用于迁移。
+      WITH CHECK 约束的是写入的新行，不影响读取；current_setting 的第二个参数表示参数不存在时返回 NULL 而不报错；RLS 是数据库行为，与驱动无关。
+  - id: d46-t12
+    kp: d46-k3
+    type: multi
+    question: 一个共享部署（pool 模型）的多租户 RAG 平台，下列哪些地方**需要显式带上租户维度**？
+    options:
+      - "Redis 中的检索结果缓存和答案缓存的 key"
+      - "向量检索的过滤条件"
+      - "对象存储中原始文件的路径和签名 URL 的签发校验"
+      - "入库队列的消息体，以及 Worker 处理时的数据库上下文"
+      - "LLM 网关的 Token 计量和限额"
+    answer: [0, 1, 2, 3, 4]
+    explain: |
+      pool 模型下所有基础设施都是共享的，租户边界要贯穿每一层：缓存 key 防串答案，向量过滤防检索越界，存储路径和签名 URL 防直接下载，队列消息和 Worker 上下文防后台任务写错租户，网关计量和限额防吵闹邻居。漏掉任何一处都可能造成泄露或相互影响。
+  - id: d46-t13
+    kp: d46-k3
+    type: judge
+    question: 用户已经通过登录认证，因此请求头里的 X-Tenant-Id 可以直接作为数据库查询的租户条件。
+    answer: false
+    explain: |
+      认证只证明「你是谁」，不证明「你属于这个租户」。客户端传来的租户 ID 只能作为选择器，后端必须用已验证的用户身份确认成员关系，再建立租户上下文；否则改一下请求头就能进入别的租户。
+  - id: d46-t14
+    kp: d46-k3
+    type: single
+    question: 你的知识库 SaaS 默认采用共享库加 RLS。一家银行客户要求：数据使用独立加密密钥、合同终止时可单独彻底销毁、性能不受其他客户影响。较合理的做法是：
+    options:
+      - "继续共享库，在 RLS 策略里给银行加一条更严格的规则"
+      - "共享库不变，只把银行的 Redis 缓存独立出来"
+      - "让银行自己在前端做数据加密，后端仍按普通租户处理"
+      - "为该客户升级为独立库或独立集群，其余客户继续共享"
+    answer: [3]
+    explain: |
+      独立密钥、可单独销毁、资源不受影响，这三条都是 silo 模型的优势，共享库靠策略无法做到物理层面的销毁和资源隔离。按客户等级混合使用（bridge）是常见方案。只独立缓存或前端加密都没有解决核心诉求。
+  - id: d46-t15
+    kp: d46-k4
+    type: single
+    question: 团队想省事：「我们已经有 OpenTelemetry Trace，采样率 10%，就拿它当审计日志吧。」主要问题是：
+    options:
+      - "Trace 不能记录用户 ID，无法关联操作人"
+      - "Trace 的存储成本比审计日志高得多"
+      - "Trace 会采样和过期，审计要求每条都在、不可篡改且按租户授权查看"
+      - "Trace 只能记录 HTTP 请求，无法记录数据库操作"
+    answer: [2]
+    explain: |
+      审计的核心要求是完整、不可篡改、可按租户授权查询。10% 采样意味着 90% 的操作没有记录，Trace 后端通常也允许清理和修改。Trace 可以记录用户 ID 和数据库 span，所以其他选项的理由不成立。两者应通过 trace_id 关联，而不是相互替代。
+  - id: d46-t16
+    kp: d46-k4
+    type: judge
+    question: 为了事后追查方便，审计日志应该完整记录用户的 access token 和发给 Agent 的全部原始 prompt。
+    answer: false
+    explain: |
+      token 一旦进入审计库，审计库就成了新的泄露源，访问审计的人可以冒充用户。prompt 里可能有个人信息或机密，默认应只存摘要或哈希，是否保存原文按客户合规要求决定。审计要记录的是谁、做了什么、对什么、结果如何。
+  - id: d46-t17
+    kp: d46-k4
+    type: multi
+    question: 园区 Agent 调用 `dispatch_work_order` 工具派发工单，审计记录中**应当包含**哪些信息？
+    options:
+      - "发起用户 ID 和已验证的租户（园区）ID"
+      - "工具名与参数摘要"
+      - "审批人、审批结果和审批时间"
+      - "调用时使用的 access token 原文"
+      - "关联的 trace_id，用于跳转查看模型推理过程"
+    answer: [0, 1, 2, 4]
+    explain: |
+      审计要能回答「谁发起、做了什么、谁批准、结果如何」，并能关联到 Trace 看细节。access token 原文不应写入任何日志，泄露后可被直接冒用。
+  - id: d46-t18
+    kp: d46-k4
+    type: single
+    question: 文档删除接口先提交业务事务，再异步发送一条审计消息。某次删除成功但审计消息因网络问题丢失。最合理的改进是：
+    options:
+      - "前端收到删除成功后，再调用一次审计接口补记"
+      - "审计或 outbox 记录与业务同事务写入，再异步投递"
+      - "改成写本地日志文件，再由日志采集器统一收集"
+      - "把消息队列的发送重试次数提高到 10 次以上"
+    answer: [1]
+    explain: |
+      同事务写入保证「业务成功则审计记录必然存在」，outbox 再负责可靠投递到审计存储。前端补记可以被绕过；本地日志会轮转、可能丢；业务提交后才发消息，进程在两步之间崩溃时重试次数再多也没用。
+
+exam:
+  - id: d46-e1
+    kp: d46-k1
+    type: single
+    question: 服务端实现了严格的 refresh 轮换和重用检测。上线后用户反馈：同时开着三个标签页，经常被突然踢下线。最合理的修复是：
+    options:
+      - "关闭重用检测，只保留轮换"
+      - "把 access token 有效期改成 7 天，减少刷新次数"
+      - "把 refresh token 改存 localStorage，方便各标签页共享"
+      - "前端跨标签页只刷新一次，服务端允许旧 token 在数秒内重复换得同一组新 token"
+    answer: [3]
+    explain: |
+      多个标签页几乎同时用同一个旧 refresh 刷新，第一个成功后旧 token 作废，后面的被判为「重用」，触发整组吊销。前端用 BroadcastChannel 或锁做 single-flight，服务端给一个很短的宽限期，就能兼顾安全和体验。
+      关闭重用检测丢掉了发现盗用的能力；延长 access 扩大了泄露窗口；放 localStorage 会被 XSS 读取。
+  - id: d46-e2
+    kp: d46-k2
+    type: single
+    question: 园区 Agent 通过 MCP 调用工单服务。目前工单服务只校验「请求来自 Agent 服务」，Agent 服务使用一个能操作所有园区的服务账号。安全评审最关心的风险和修复是：
+    options:
+      - "混淆代理人：工具应携带用户身份，工单服务按用户权限再授权"
+      - "服务账号密码可能泄露，应改为每月自动轮换一次密码"
+      - "MCP 协议本身不安全，应改回普通 HTTP 接口并加签名"
+      - "Agent 调用可能过于频繁，应给服务账号单独加限流"
+    answer: [0]
+    explain: |
+      模型可能被提示词注入诱导，此时 Agent 会用全权限服务账号做用户本没权限的事，这就是混淆代理人。修复的关键是让下游按「真实用户」授权。轮换密码、限流都不能解决权限放大；MCP 本身支持 OAuth 授权，换协议不解决问题。
+  - id: d46-e3
+    kp: d46-k3
+    type: single
+    question: 园区 Agent 的 Text2SQL 子任务会让模型生成 SQL 并执行。当前做法是在系统提示词里写「只能查询本园区数据」。最可靠的加固方式是：
+    options:
+      - "在提示词里把这条规则重复三遍并加粗"
+      - "用正则检查 SQL 里是否包含 park_id 条件"
+      - "用只读的普通角色执行，事务内设置租户上下文，由 RLS 强制过滤"
+      - "让另一个模型审查生成的 SQL 是否越权"
+    answer: [2]
+    explain: |
+      模型生成的 SQL 是不可信输入，提示词和模型审查都只是概率性防护；正则很容易被子查询、别名、注释绕过。只读角色限制了能做什么，RLS 让数据库本身只返回本租户的行，即使 SQL 写成 SELECT * 也越不了界。正则校验和模型审查可以作为额外防线。
+  - id: d46-e4
+    kp: d46-k4
+    type: single
+    question: 多租户平台的「审计查询」页面，以下权限设计最合理的是：
+    options:
+      - "所有租户管理员都能查看全平台审计，方便协同排查"
+      - "租户管理员只能查本租户审计，平台审计员是独立角色且只读"
+      - "审计只允许数据库管理员直接查表，不提供页面"
+      - "平台运维人员可以查看和修正审计记录中的错误"
+    answer: [1]
+    explain: |
+      审计数据本身也是敏感数据，同样需要租户隔离；平台审计员与租户管理员职责分离，且任何人都不能修改审计。只能直接查表会让审计依赖少数人的数据库权限，也无法做细粒度授权和留痕。
+  - id: d46-e5
+    kp: d46-k1
+    type: multi
+    question: 按 MCP 2026-07-28 版规范，你要把一个工单 MCP server 通过 HTTP 对外提供，并启用授权。下列哪些说法正确？
+    options:
+      - "MCP server 作为 OAuth 资源服务器，必须校验 token 的受众是自己"
+      - "客户端需要使用 PKCE"
+      - "server 需要提供受保护资源元数据，告诉客户端去哪个授权服务器"
+      - "server 可以把收到的用户 token 原样转发给下游工单系统，省去二次签发"
+      - "使用 STDIO 传输的本地 server 也必须走同一套 OAuth 流程"
+    answer: [0, 1, 2]
+    explain: |
+      规范要求 HTTP 传输的 MCP server 校验受众、提供受保护资源元数据（RFC 9728），客户端使用 PKCE 和 Resource Indicators。
+      规范明确禁止 token 透传给下游，否则受众校验形同虚设；STDIO 传输不适用这套流程，应从环境中获取凭据。
+  - id: d46-e6
+    kp: d46-k3
+    type: multi
+    question: 为了证明「租户隔离有效」，下列哪些测试或检查是**有价值**的？
+    options:
+      - "准备两个租户的数据，用 A 的身份调用每个接口、工具和导出，断言拿不到 B 的数据"
+      - "检查应用连接数据库所用角色的 rolsuper 和 rolbypassrls 都为 false"
+      - "模拟租户上下文缺失，断言请求被拒绝而不是返回全部数据"
+      - "只用一个租户的数据跑完全部功能测试，确认没有报错"
+      - "在连接池复用场景下连续交替请求两个租户，检查结果没有串号"
+    answer: [0, 1, 2, 4]
+    explain: |
+      跨租户访问、角色权限、上下文缺失时 fail closed、连接池交替请求，都是隔离失效的真实路径。只用一个租户的数据测试，永远发现不了跨租户问题，因为所有数据本来就是「自己的」。
+  - id: d46-e7
+    kp: d46-k3
+    type: judge
+    question: 对一张表执行了 ENABLE ROW LEVEL SECURITY 但还没有创建任何策略，此时普通角色查询该表会返回全部行。
+    answer: false
+    explain: |
+      PostgreSQL 的规则是：开启 RLS 后若没有任何策略，采用默认拒绝，普通角色看不到也改不了任何行。表属主、超级用户和 BYPASSRLS 角色例外。
+  - id: d46-e8
+    kp: d46-k1
+    type: judge
+    question: 截至 2026 年，OAuth 2.1 已经发布为正式 RFC，所以密码模式在协议层面已被正式移除。
+    answer: false
+    explain: |
+      截至 2026-10，OAuth 2.1 仍是 Internet-Draft（draft-ietf-oauth-v2-1-17），还不是 RFC。不过已经发布的 RFC 9700 安全最佳实践明确规定密码模式不得使用，所以实践中同样不该再用它。
+  - id: d46-e9
+    kp: d46-k2
+    type: case
+    question: |
+      你负责一个多租户企业知识库平台。渗透测试报告指出两个问题：
+      1. `GET /api/conversations/{id}` 只校验 token 有效，把 ID 换成别人的就能看到对话；
+      2. `GET /api/kbs/{kb_id}/export` 由另一位同事实现，同样没有校验知识库归属。
+      开发同事建议：「在前端把会话 ID 和知识库 ID 改成加密字符串，攻击者就改不了了。」
+      作为后端负责人，最合理的整改方案是：
+    options:
+      - "后端把归属写进查询并共用构造函数，统一 404，补越权回归测试"
+      - "采纳建议，前端加密 ID，后端解密后照常按 ID 查询"
+      - "给这两个接口加更严格的限流，让攻击者难以批量遍历"
+      - "把两个接口改为仅管理员可调用，普通员工无法访问"
+    answer: [0]
+    explain: |
+      问题根源是后端缺少对象级授权：查询时没有限定「属于本租户且本用户有权访问」。把条件写进查询、多个接口共用同一个构造函数可以避免再次遗漏，统一 404 防止探测，回归测试让问题不再复发。
+      前端加密 ID 只是换了个形式的「不可猜」，拿到别人的加密 ID 照样能访问；限流只增加遍历成本；改成仅管理员可用则破坏了正常功能，管理员之间仍可能跨租户访问。
+
+interview:
+  - id: d46-i1
+    kp: d46-k1
+    type: scenario
+    difficulty: 2
+    question: 你们的 AI 平台用 JWT 做鉴权。安全团队提出三个要求：员工离职后立即失效；用户改密码后其他设备全部下线；尽量不要每个请求都查数据库。你怎么设计？
+    key_points:
+      - {text: "说明 JWT 无状态导致难以吊销，所以采用短 access 加服务端有状态的 refresh", dim: concept}
+      - {text: "给出 token_version 方案：用户表存版本号，离职或改密码时加 1，token 携带版本并在校验时比对", dim: principle}
+      - {text: "用 Redis 缓存用户状态与版本，禁用时主动删除缓存，兼顾实时性和数据库压力", dim: engineering}
+      - {text: "refresh 每次轮换并做重用检测，离职时直接作废该用户全部 refresh family", dim: principle}
+      - {text: "结合项目说明前端拦截器 single-flight 刷新、BFF 持有 token 的落地方式", dim: project}
+    reference: |
+      **结论：** 短寿命 access token + 服务端可控的 refresh token + token_version，再用 Redis 缓存用户状态，三个要求都能满足。
+
+      **1. 为什么不能只靠 JWT 本身：** JWT 签发后在过期前一直有效，服务端无法「收回」。所以 access token 只给 15 分钟左右，真正可控的状态放在 refresh 和用户版本号上。
+
+      **2. 离职立即失效、改密码全部下线：** 用户表加 `token_version`，签发 access 时把版本写进 claims。离职或改密码时版本加 1，同时作废该用户所有 refresh family。校验时比对版本，不一致直接 401。这样不用等 access 过期。
+
+      **3. 不想每次查库：** 用户状态和版本缓存在 Redis，TTL 几分钟；禁用或改密码时**主动删除缓存**，下一次请求回源拿到新版本。单个 token 泄露的场景再配合 jti 黑名单，TTL 设为剩余寿命。
+
+      **4. refresh 的安全：** refresh 存哈希和 family_id，每次使用都轮换；已作废的 refresh 再次出现就吊销整组。多标签页并发刷新时，前端做 single-flight，服务端给几秒宽限期，避免误杀。
+
+      **5. 存放位置：** refresh 放 HttpOnly + SameSite Cookie，或者由 Node BFF 持有，浏览器只拿会话 Cookie。
+    oral: |
+      我的方案是短 access、可控 refresh、加一个 token_version。
+      JWT 本身签出去就收不回，所以 access 只给 15 分钟；用户表存版本号，离职或改密码时加一，同时作废他所有 refresh，校验时版本对不上就 401，不用等过期。为了不每次查库，用户状态缓存在 Redis，禁用时主动删缓存。
+      在园区工作台项目里，我用 Node BFF 持有 token，浏览器只拿 HttpOnly 的会话 Cookie；前端拦截器只负责 single-flight 刷新和重放，服务端做轮换和重用检测，多标签页并发刷新给了几秒宽限期，避免把正常用户踢下线。
+  - id: d46-i2
+    kp: d46-k2
+    type: scenario
+    difficulty: 3
+    question: 渗透测试报告了两个问题：一是把会话 ID 改成别人的就能看到对话；二是普通员工对园区 Agent 说「帮我把 3 号楼所有未完成工单都关掉」，Agent 真的用服务账号把别的部门的工单关了。你怎么修复，又怎么保证以后不再出现？
+    key_points:
+      - {text: "第一个是 BOLA：对象级授权缺失，要把归属条件写进查询，查不到统一 404", dim: principle}
+      - {text: "第二个是混淆代理人：Agent 用全权限服务账号执行，模型不是安全边界", dim: concept}
+      - {text: "修复：工具调用携带用户身份或缩小范围的 token，工具服务按用户权限和园区归属再授权，批量关闭这类高风险动作走人工审批", dim: engineering}
+      - {text: "防复发：共用查询构造函数、越权回归测试进 CI、审计记录工具调用与审批人", dim: engineering}
+      - {text: "结合 p2 项目说明 MCP server 校验 token 受众、不透传 token", dim: project}
+    reference: |
+      **结论：** 两个问题本质相同，**后端没有按「真实用户」做对象级授权**。一个发生在普通接口，一个发生在 Agent 工具调用。
+
+      **问题一：BOLA。**
+      - 立即修：查询条件改为 `id = :id AND tenant_id = :tid AND user_id = :uid`，查不到返回 404，不区分「不存在」和「无权访问」；
+      - 排查同类：全局搜索按 ID 直接取对象的写法（`db.get`、`filter_by(id=...)`），列表、详情、导出、删除都过一遍。
+
+      **问题二：混淆代理人。**
+      - 根因：工单服务只认「请求来自 Agent」，Agent 拥有所有园区权限。模型听了用户的话，用自己的大权限去执行，相当于把权限借给了用户；
+      - 修复：Agent 调工具时**携带用户身份**（用户 token 或令牌交换得到的、范围更小的 token），工单 MCP server 校验受众，再按用户的权限码和园区归属判断；
+      - 批量关闭、派单这类高风险动作，进入人工审批（Day 37），审批卡片展示将要影响的工单列表；
+      - 工具参数里的「用户 ID」「园区 ID」一律不信任，以 token 里的身份为准。
+
+      **防复发：**
+      - 对象级过滤收敛到一个查询构造函数，新接口复用它；
+      - CI 加双租户、双用户越权回归测试，覆盖 HTTP 接口和 MCP 工具；
+      - 审计记录每次工具调用的发起人、参数摘要、审批人和 trace_id，出事能还原。
+    oral: |
+      我认为这两个问题是同一个根因：后端没有按真实用户做对象级授权。
+      第一个是 BOLA，我会把用户和租户条件直接写进查询，查不到一律 404，再全局排查按 ID 直接取对象的代码。第二个是混淆代理人，Agent 用全权限账号执行，模型被一句话就带偏了。修法是工具调用携带用户身份，工单服务按用户权限和园区归属再判断，批量关闭走人工审批。
+      在园区 Agent 项目里，我的工单 MCP server 只信任 token 里的身份，不信任模型传的用户 ID 参数，也不把 token 透传给下游；CI 里有一组双用户越权测试，覆盖接口和工具，审计里能查到每次派单是谁发起、谁批准的。
+  - id: d46-i3
+    kp: d46-k3
+    type: design
+    difficulty: 4
+    question: 请你设计一个多租户「企业知识库 + Agent」平台的鉴权与隔离方案。要求：对接客户自己的 SSO；租户内有管理员、编辑、普通成员；知识库可以共享给指定人员；大客户要求数据物理隔离；要能应对 Agent 调用工具和后台批量入库。
+    key_points:
+      - {text: "认证：OIDC 授权码 + PKCE 对接客户 IdP，API 只接受 aud 为本平台的 access token，按租户配置 issuer 和 JWKS", dim: concept}
+      - {text: "授权：RBAC 权限码管功能，知识库成员表或 ABAC 管对象，检索阶段带 ACL 过滤", dim: principle}
+      - {text: "隔离：默认 pool 加 RLS 并使用事务级 set_config，大客户 silo，缓存、向量、对象存储、队列、配额全部带租户", dim: principle}
+      - {text: "Agent 与 Worker：工具调用携带用户身份并二次授权，高风险动作审批；Worker 从消息重建租户上下文", dim: engineering}
+      - {text: "验证与运营：双租户回归测试、角色 BYPASSRLS 检查、审计日志按租户隔离且只追加", dim: engineering}
+      - {text: "能结合 p1 与 p2 说明具体落地和取舍", dim: project}
+    reference: |
+      **结论：** 认证交给客户 IdP，授权分功能级和对象级两层，隔离默认共享库加 RLS、大客户独立库，再把租户维度贯穿到缓存、向量、存储、队列和模型配额，最后用测试和审计证明它有效。
+
+      **1. 认证**
+      - 每个租户配置自己的 OIDC issuer 和 JWKS 地址，登录走授权码 + PKCE；
+      - 平台签发（或直接校验）aud 为本平台的 access token，固定算法白名单、校验 iss/aud/exp；
+      - Node BFF 持有 token，浏览器只拿 HttpOnly 会话 Cookie。
+
+      **2. 授权**
+      - 功能级：角色 → 权限码，代码里只判断权限码，默认拒绝；
+      - 对象级：知识库成员表（读、写、管理），文档继承知识库权限；查询条件里写归属，查不到 404；
+      - RAG：入库时写 `tenant_id`、`kb_id`、`acl`，**检索时**就过滤；答案缓存 key 含权限范围哈希和知识库版本。
+
+      **3. 隔离**
+      - 中小租户 pool：业务表和 pgvector 向量表都开启 RLS，应用用普通角色连接，每个事务 `set_config('app.current_tenant', tid, true)`，上下文缺失 fail closed；
+      - 大客户 silo：独立数据库和独立密钥，路由层按租户选择连接；
+      - 其他层：Redis key 前缀、对象存储路径前缀与短期签名 URL、队列消息带租户、LLM 网关按租户计量限额，入库队列按租户公平调度。
+
+      **4. Agent 与后台任务**
+      - Agent 调 MCP 工具携带用户身份，MCP server 校验受众、按用户权限和归属再授权，不透传 token；
+      - 删除、派单、批量操作进人工审批；
+      - Worker 从消息里取租户和发起人，重新建立上下文，不用全权限连接。
+
+      **5. 证明它有效**
+      - CI 双租户回归：每个接口、工具、导出都用 A 的身份尝试访问 B；
+      - 启动检查连接角色 rolsuper、rolbypassrls 为 false；
+      - 审计日志同事务写入、只追加、按租户隔离查询，平台审计员独立角色。
+
+      **取舍：** pool 成本低但隔离依赖代码和 RLS 的正确性，所以测试必须到位；silo 隔离强但运维成本随客户数增长，只给有明确合规要求的客户。
+    oral: |
+      我会分四层回答：认证、授权、隔离、验证。
+      认证交给客户自己的 IdP，走 OIDC 授权码加 PKCE，平台 API 只认 aud 是自己的 access token。授权分两层，权限码管功能，知识库成员表管对象，RAG 在检索时就带 ACL 过滤。隔离默认共享库加 RLS，应用用普通角色，每个事务设置租户上下文，大客户单独建库；缓存、向量、对象存储、队列、模型配额都带租户维度。
+      在知识库和园区 Agent 这两个项目里，我还处理了两个容易漏的地方：Agent 调工具时携带用户身份并在工具内二次授权，Worker 从消息里重建租户上下文。最后靠双租户回归测试和审计日志证明隔离真的有效，而不是只停留在设计上。

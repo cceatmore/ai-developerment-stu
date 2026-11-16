@@ -1,0 +1,778 @@
+day: 36
+phase: 4
+title: LangGraph 进阶：Checkpoint、持久化与人工确认
+goals:
+  - 能解释 Checkpointer 在每个 super-step 保存状态快照的机制，以及 thread_id 的作用
+  - 能根据场景选择 InMemorySaver / SqliteSaver / PostgresSaver，并说清 durability 模式的取舍
+  - 能用 interrupt + Command(resume=...) 设计人工审批流程，并指出「节点从头重跑」带来的幂等性问题
+  - 能用 get_state_history / update_state 做断点恢复与时间旅行调试
+knowledge_points:
+  - id: d36-k1
+    name: Checkpointer 原理：super-step 快照与 thread_id
+    level: P0
+    summary: 每个 super-step 结束存一份状态快照，按 thread_id 归档；有了它图才能暂停、恢复、回放
+    why: |
+      Day 35 里的 LangGraph 图跑完就结束，状态只活在内存里。真实业务中 Agent 经常要**跨请求**工作：多轮对话、等人审批、进程重启后继续。
+      面试官问「你们的 Agent 怎么做多轮记忆 / 怎么做人工审批 / 服务挂了怎么办」，答案几乎都绕不开 Checkpointer。
+    problem: |
+      - **状态丢失**：没有持久化，一次 HTTP 请求结束，图的状态就没了，下一轮对话要从头开始。
+      - **无法暂停**：人工审批可能等几小时，不可能让一个 Python 调用一直阻塞。
+      - **失败重跑成本高**：第 5 步失败，前 4 步（可能包含昂贵的 LLM 调用）全部重来。
+      Checkpointer 把「图执行到哪了、状态是什么」存下来，让图变成**可中断、可恢复**的长流程。
+    principle: |
+      **一、super-step 是什么**
+
+      LangGraph 底层是 Pregel 式的「按步推进」模型（Day 35 讲过 State / Node / Edge）。**一个 super-step = 图的一次「滴答」**：本步所有被调度的节点执行（可能并行），然后统一把它们的输出合并进 State。
+
+      对顺序图 `START -> A -> B -> END`，会有输入步、A 步、B 步三个 super-step，**每个 super-step 结束都会写一个 checkpoint**。
+
+      ```mermaid
+      flowchart LR
+        I["输入 step -1"] --> C0["checkpoint 0"]
+        C0 --> A["节点 A 执行"] --> C1["checkpoint 1"]
+        C1 --> B["节点 B 执行"] --> C2["checkpoint 2"]
+        C2 --> E["END"]
+        C1 -.->|"parent_config 指向上一个"| C0
+        C2 -.->|"parent_config 指向上一个"| C1
+      ```
+
+      **二、checkpoint 里存了什么**
+
+      官方用 `StateSnapshot` 表示一个快照，关键字段：
+      - `values`：当前 State 的值（比如 messages 列表）。
+      - `next`：下一步要执行哪些节点。为空说明图已跑完。
+      - `config`：包含 `thread_id`、`checkpoint_ns`、`checkpoint_id`。
+      - `metadata`：`source`（input / loop / update）、`step`（第几个 super-step）、`writes`（本步节点输出）。
+      - `parent_config`：上一个 checkpoint，所以历史是一条**链**。
+      - `tasks`：待执行任务，包括挂起的 interrupt 信息。
+
+      **三、thread_id 是「游标」**
+
+      - `config={"configurable": {"thread_id": "t-1"}}` 告诉 Checkpointer 读写哪条线程。
+      - **同一个 thread_id**：加载这条线程最新的 checkpoint，在其基础上继续。
+      - **新的 thread_id**：空状态，全新开始。
+      - 类比前端：thread_id 像 sessionId，checkpoint 像每次 `setState` 后存到 localStorage 的快照，而且每次都保留历史版本。
+
+      **四、调用方式决定行为**（官方表格的人话版）
+
+      | 目的 | 调用 |
+      |---|---|
+      | 提交新输入 | `graph.invoke(input, config)` |
+      | 出错后继续 | `graph.invoke(None, config)`，加载最新 checkpoint 重试未完成的工作 |
+      | 回答 interrupt | `graph.invoke(Command(resume=答案), config)` |
+      | 回放历史 | `graph.invoke(None, 历史快照.config)` |
+
+      **注意**：复用 thread_id 本身不等于「恢复执行」；输入是什么（新输入 / None / Command）才决定是开新一轮还是接着跑。
+
+      **五、pending writes：并行节点的容错**
+
+      一个 super-step 里 A、B 并行，A 成功、B 失败。LangGraph 会先把 A 的输出作为 task 级写入（`checkpoint_writes` 表）落库，恢复时**不重跑 A**，只重跑 B。完整快照在 super-step 全部完成后才提交。
+
+      **六、不这样做会怎样**
+
+      - 自己把 messages 存 Redis 也能做多轮对话，但只存了「对话」，没存「执行位置」，无法在图中间暂停、无法回放某一步。
+      - 不理解 super-step 边界，就会误以为可以从「节点执行到一半」恢复——实际上**只能从 super-step 边界恢复**，节点会从头重跑。
+    scenarios: |
+      - **多轮对话记忆**：客服 Agent 用 `thread_id = 会话ID`，每轮只传新消息，历史由 checkpoint 自动带上。
+      - **长流程审批**：合同审核 Agent 在「发送给客户」前暂停，第二天主管审批后用同一 thread_id 继续。
+      - **故障恢复**：批量处理任务进程被 K8s 重启，用 `invoke(None, config)` 从最近 checkpoint 继续，不重复调用前面的 LLM。
+      - **线上排障**：用 `get_state_history` 查看用户投诉的那次对话每一步的 State。
+    code: |
+      ```python
+      from typing import Annotated, TypedDict
+      import operator
+
+      from langgraph.checkpoint.memory import InMemorySaver
+      from langgraph.graph import END, START, StateGraph
+
+
+      class State(TypedDict):
+          steps: Annotated[list[str], operator.add]  # reducer：追加而不是覆盖
+
+
+      def a(state: State) -> dict:
+          return {"steps": ["A"]}
+
+
+      def b(state: State) -> dict:
+          return {"steps": ["B"]}
+
+
+      builder = StateGraph(State)
+      builder.add_node("a", a)
+      builder.add_node("b", b)
+      builder.add_edge(START, "a")
+      builder.add_edge("a", "b")
+      builder.add_edge("b", END)
+      graph = builder.compile(checkpointer=InMemorySaver())
+
+      config = {"configurable": {"thread_id": "demo-1"}}
+      graph.invoke({"steps": []}, config)
+
+      snap = graph.get_state(config)
+      print(snap.values, snap.next)          # {'steps': ['A', 'B']} ()
+      for s in graph.get_state_history(config):  # 最新的在前
+          print(s.metadata["step"], s.values)
+      ```
+    pitfalls: |
+      - **误区：checkpoint 只在图结束时保存。** 默认是每个 super-step 都保存；只有 `durability="exit"` 才是结束时保存。
+      - **误区：能从节点中间恢复。** 只能从 super-step 边界恢复，节点会**从头**再执行，节点内的副作用会重复。
+      - **thread_id 设计错误**：用 `user_id` 当 thread_id，同一用户并发的两个任务互相覆盖状态；应该用「会话 ID / 业务单号」。
+      - **把 recursion_limit 放进 configurable**：它是 config 顶层键，放错位置不生效（Day 37 展开）。
+      - **混淆 Checkpointer 与 Store**：Checkpointer 是「单线程内」的执行状态；跨线程的长期记忆（用户偏好）用 Store，两者不是一回事。
+    interview_asks:
+      - LangGraph 的 checkpoint 是什么时候保存的？保存了哪些内容？
+      - thread_id 有什么用？如果两个请求用了同一个 thread_id 会发生什么？
+      - 图在第三个节点失败了，恢复时前两个节点会重新执行吗？
+    project_example: |
+      在一个「采购申请助手」项目中，图包含：解析申请 → 查预算 → 生成审批单 → 等待审批 → 下单。我们用 `thread_id = "purchase-" + 申请单号`，而不是用户 ID，因为一个人可能同时有多张申请单。
+      上线后某次数据库抖动导致「下单」节点失败，运维直接调用 `graph.invoke(None, config)`，图从「下单」所在的 super-step 重试，前面的 LLM 解析和预算查询都没重跑，节省了 Token，也避免了重复生成审批单。
+    freshness: |
+      核对于 2026-11：langgraph 1.2.20，依赖 langgraph-checkpoint 4.x。官方文档明确「checkpoint 在每个 super-step 边界保存」「thread_id 是持久化游标」。内存实现当前名称为 `InMemorySaver`（`from langgraph.checkpoint.memory import InMemorySaver`），部分旧教程写作 `MemorySaver`，以当前文档为准。
+    sources:
+      - {title: "LangGraph Docs - Checkpointers", url: "https://docs.langchain.com/oss/python/langgraph/checkpointers"}
+      - {title: "LangGraph Reference - Checkpointing", url: "https://reference.langchain.com/python/langgraph/checkpoints"}
+
+  - id: d36-k2
+    name: 持久化选型：内存、SQLite 与 Postgres Checkpointer
+    level: P1
+    summary: 开发用 InMemorySaver，生产用 PostgresSaver；setup 建表、durability 控制写盘时机
+    why: |
+      很多 Demo 用 `InMemorySaver` 跑通就上线，结果服务一重启所有对话和审批全部丢失，或者多实例部署时请求打到另一台机器上找不到状态。
+      面试中「你们 checkpoint 存哪」是区分 Demo 和生产经验的常见问题。
+    problem: |
+      - 内存存储：进程重启即丢、多副本之间不共享。
+      - 需要一个**持久、可多实例共享、可查询历史**的存储，同时在性能和可靠性之间可配置。
+      - 长对话的 checkpoint 会不断膨胀，需要考虑存储增长。
+    principle: |
+      **一、官方提供的实现**
+
+      | Saver | 包 | 适用 |
+      |---|---|---|
+      | `InMemorySaver` | `langgraph-checkpoint`（随 langgraph 安装） | 调试、单测 |
+      | `SqliteSaver` / `AsyncSqliteSaver` | `langgraph-checkpoint-sqlite` | 本地实验、小工具 |
+      | `PostgresSaver` / `AsyncPostgresSaver` | `langgraph-checkpoint-postgres` | 生产 |
+      | `MongoDBSaver` 等 | 对应扩展包 | 生产（按技术栈选） |
+
+      所有实现都遵守 `BaseCheckpointSaver` 接口：`put`（存快照）、`put_writes`（存 task 级写入）、`get_tuple`（取快照）、`list`（列历史）。异步执行（`ainvoke`/`astream`）时要用异步版本的 Saver。
+
+      **二、Postgres 的关键细节**
+
+      - **首次使用必须调用 `.setup()`** 建表（checkpoints、checkpoint_writes 等）。
+      - 手动创建 psycopg 连接时，官方要求 `autocommit=True` 和 `row_factory=dict_row`，否则建表可能不提交、读取时报 `TypeError`。
+      - 一行 checkpoint 存的是**序列化后的全部 State 通道值**，所以 State 里不要塞大文件、大对象。
+
+      **三、durability 模式：什么时候写盘**
+
+      - `"exit"`：图结束（成功、失败、interrupt）时才写。最快，但中途崩溃无法恢复。
+      - `"async"`：下一步执行时异步写。性能好，崩溃时有小概率丢最后一个 checkpoint。
+      - `"sync"`：写完再执行下一步。最可靠，有额外延迟。
+      调用时传入：`graph.invoke(input, config, durability="sync")`。涉及资金、审批的流程建议 `sync`。
+
+      **四、存储增长**
+
+      默认每个 super-step 写入所有通道的完整值，多轮对话 messages 越来越长，存储随之线性甚至更快增长。官方提供 `DeltaChannel` 只存增量；工程上还要配合**定期清理已结束线程**。
+
+      **五、不这样做会怎样**：用内存 Saver 上生产 = 重启丢审批单；用 Postgres 但不 `setup()` = 第一次调用直接报表不存在。
+    scenarios: |
+      - **本地开发与单测**：InMemorySaver，测试之间互不影响。
+      - **内部小工具**：单机部署的脚本型 Agent 用 SqliteSaver，文件即数据库。
+      - **生产服务**：FastAPI 多副本 + AsyncPostgresSaver，复用已有的 PostgreSQL（Day 10、Day 25 用过的同一套库），审批流程用 `durability="sync"`。
+    code: |
+      ```python
+      import os
+
+      from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+      DB_URI = os.environ["PG_DSN"]  # 例如 postgresql://user:pass@host:5432/db
+
+
+      async def build_graph(builder):
+          # from_conn_string 是异步上下文管理器，应用生命周期内保持打开
+          async with AsyncPostgresSaver.from_conn_string(DB_URI) as saver:
+              await saver.setup()  # 首次运行建表，可重复调用
+              graph = builder.compile(checkpointer=saver)
+              config = {"configurable": {"thread_id": "order-1001"}}
+              await graph.ainvoke({"messages": []}, config, durability="sync")
+      ```
+    pitfalls: |
+      - **InMemorySaver 上生产**：重启丢失、多副本不共享，负载均衡后状态「时有时无」。
+      - **忘记 setup()**：首次调用报表不存在；手动建连接时忘记 `autocommit=True` 导致表没真正创建。
+      - **同步 Saver 配异步图**：`ainvoke` 时要用 `AsyncPostgresSaver`，否则报错或阻塞事件循环（Day 06 讲过不能在事件循环里做阻塞 IO）。
+      - **把 checkpoint 当业务数据库**：checkpoint 是执行状态，结构随框架版本变化；审批结果、订单状态仍要写进自己的业务表。
+      - **State 里放大对象**：每步都全量序列化，存储和延迟一起爆炸。
+    interview_asks:
+      - 生产环境 checkpoint 你们存在哪里？为什么不用内存？
+      - durability 的三种模式有什么区别？审批流程你会选哪个？
+    project_example: |
+      某合同审核 Agent 初版用 InMemorySaver，部署两个副本后，主管点「批准」的请求经常打到另一个副本，报「找不到线程状态」。
+      改为 AsyncPostgresSaver，复用业务 PostgreSQL，加一张自己的 `review_tasks` 表记录 thread_id、合同号、状态，用于后台列表展示和超时清理；checkpoint 表只给 LangGraph 用，审批结果另写业务表做审计。
+    freshness: |
+      核对于 2026-11：包名 `langgraph-checkpoint-postgres`，类名 `PostgresSaver` / `AsyncPostgresSaver`，首次使用需 `.setup()`；手动连接需 `autocommit=True`、`row_factory=dict_row`（官方 README）。durability 三种模式 `exit` / `async` / `sync` 来自官方 Checkpointers 文档。langgraph 1.2.18 起 DeltaChannel 默认每 100 次更新做一次全量快照。
+    sources:
+      - {title: "LangGraph Docs - Checkpointers（durability 与存储优化）", url: "https://docs.langchain.com/oss/python/langgraph/checkpointers"}
+      - {title: "GitHub - langgraph checkpoint-postgres", url: "https://github.com/langchain-ai/langgraph/tree/main/libs/checkpoint-postgres"}
+
+  - id: d36-k3
+    name: interrupt 人工确认与 Command(resume) 恢复
+    level: P0
+    summary: interrupt 抛出可恢复异常暂停图，Command(resume) 的值成为 interrupt 返回值，节点从头重跑
+    why: |
+      Agent 一旦能退款、发邮件、改数据库，就必须有「人在回路」（human-in-the-loop）：关键动作前让人确认。
+      这是 Agent 落地企业的硬性要求，也是 Day 40 安全话题的基础。面试必问「怎么做人工审批」，而且会追问「恢复后节点怎么执行」。
+    problem: |
+      - 人工审批的等待时间不可控（几秒到几天），不能阻塞线程等待。
+      - 审批人可能要**修改**参数（改金额、改收件人）后再执行，而不只是「是/否」。
+      - 恢复时必须回到准确的位置，并拿到人的答复继续往下走。
+    principle: |
+      **一、基本用法：三个前提**
+
+      1. 编译时配置 **Checkpointer**（生产用持久化的）。
+      2. 调用时传 **thread_id**。
+      3. 在节点里调用 `interrupt(payload)`，payload 必须可 JSON 序列化。
+
+      **二、执行过程**
+
+      ```mermaid
+      sequenceDiagram
+        participant U as 前端或审批人
+        participant API as 后端服务
+        participant G as LangGraph 图
+        participant CP as Checkpointer
+        API->>G: invoke 输入 + thread_id
+        G->>G: 执行到节点内 interrupt
+        G->>CP: 保存当前状态和挂起信息
+        G-->>API: 返回结果含 __interrupt__
+        API-->>U: 展示待审批内容
+        U->>API: 批准并修改金额
+        API->>G: invoke Command resume + 同一 thread_id
+        G->>CP: 读取最新 checkpoint
+        G->>G: 该节点从头重跑 interrupt 直接返回人的答复
+        G-->>API: 继续执行到结束
+      ```
+
+      **三、内部机制（面试关键）**
+
+      - 节点内第一次执行到 `interrupt()` 时，它会**抛出一个特殊异常**（`GraphInterrupt`），中止当前节点，LangGraph 把状态和 payload 存进 checkpoint。
+      - 调用方用 `invoke` 时，payload 出现在返回值的 `__interrupt__` 字段；用新的 `stream_events(..., version="v3")` 时出现在 `stream.interrupts`。
+      - 恢复：`graph.invoke(Command(resume=value), config)`。**被中断的节点从头重新执行**，执行到 `interrupt()` 时不再抛异常，而是**直接返回 resume 的值**。
+      - 一个节点有多个 `interrupt()` 时，按**调用顺序**（索引）匹配 resume 值。
+
+      **四、由此推出的四条铁律**（官方文档明确列出）
+
+      1. **不要用裸 try/except 包住 interrupt**：会把 `GraphInterrupt` 吞掉，图根本不会暂停。
+      2. **interrupt 之前的副作用必须幂等**：节点会重跑，interrupt 之前的「创建工单」「发通知」会执行两次。做法：把副作用放到 interrupt 之后，或拆到单独节点，或用 upsert / 幂等键。
+      3. **不要条件性地跳过或重排 interrupt**：匹配靠顺序，重跑时顺序变了就对不上。
+      4. **payload 只放简单可序列化的数据**，不要放函数、类实例。
+
+      **五、审批的三种常见答复**
+
+      - 批准：`Command(resume={"action": "approve"})`
+      - 修改后批准：`{"action": "edit", "amount": 80}`，节点里用修改后的值继续
+      - 拒绝：`{"action": "reject", "reason": "..."}`，路由到拒绝分支
+
+      `interrupt` 还支持 `response_schema` 参数（Pydantic 模型等），可校验恢复值并让前端渲染表单。LangChain 的 `create_agent` 另有 `HumanInTheLoopMiddleware`，对指定工具调用自动做 approve / edit / reject（Day 40 详述）。
+
+      **六、和静态断点的区别**
+
+      编译时的 `interrupt_before` / `interrupt_after` 是**静态断点**，在节点前后固定停下，主要用于调试；`interrupt()` 是**动态的**，可以写在任何位置、按条件触发（例如金额大于 1000 才审批），生产审批流程用它。
+
+      **七、不这样做会怎样**：自己写「把状态存库 + 轮询审批表 + 手动恢复」能做，但要自己处理执行位置、并发、重放，工作量和 bug 都远多于用框架原语。
+    scenarios: |
+      - **退款审批**：金额超过阈值时 interrupt，客服主管在后台批准或改金额。
+      - **发送前确认**：营销 Agent 生成邮件后暂停，运营确认文案和收件人再发。
+      - **补充信息**：Agent 发现缺少必要参数（例如发票抬头），interrupt 询问用户，而不是瞎猜。
+      - **SQL 执行确认**：数据分析 Agent 生成 DELETE / UPDATE 语句时暂停，让人确认。
+    code: |
+      ```python
+      from typing import TypedDict
+
+      from langgraph.checkpoint.memory import InMemorySaver
+      from langgraph.graph import END, START, StateGraph
+      from langgraph.types import Command, interrupt
+
+
+      class State(TypedDict, total=False):
+          amount: float
+          decision: dict
+
+
+      def approve(state: State) -> dict:
+          # interrupt 之前不要放非幂等副作用：恢复时本节点会从头重跑
+          decision = interrupt({"question": "是否批准退款", "amount": state["amount"]})
+          return {"decision": decision}
+
+
+      builder = StateGraph(State)
+      builder.add_node("approve", approve)
+      builder.add_edge(START, "approve")
+      builder.add_edge("approve", END)
+      graph = builder.compile(checkpointer=InMemorySaver())
+
+      config = {"configurable": {"thread_id": "refund-9001"}}
+      first = graph.invoke({"amount": 120.0}, config)
+      print(first["__interrupt__"][0].value)  # 交给前端展示
+
+      final = graph.invoke(Command(resume={"action": "edit", "amount": 80.0}), config)
+      print(final["decision"])
+      ```
+    pitfalls: |
+      - **用 `except Exception` 包住 interrupt**：GraphInterrupt 被吞，图不会暂停，后面按「默认值」继续跑。
+      - **interrupt 前做非幂等操作**：恢复时重复创建工单、重复扣库存、重复发消息。
+      - **恢复时换了 thread_id**：等于开了一条新线程，状态为空，审批「消失」。
+      - **用 `Command(update=...)` 作为输入继续多轮对话**：官方说明作为 invoke 输入只应使用 `Command(resume=...)`，继续对话应传普通输入字典。
+      - **把审批结果只存在 checkpoint**：审计要求谁在何时批准了什么，应写入业务审计表。
+      - **以为 resume 后从 interrupt 那一行继续**：实际是节点从头重跑，interrupt 之前的代码会再执行一次。
+    interview_asks:
+      - LangGraph 的 interrupt 是怎么实现暂停和恢复的？恢复后节点从哪里开始执行？
+      - 为什么 interrupt 之前的代码要求幂等？举个出问题的例子。
+      - 审批人想修改 Agent 提议的参数再执行，你怎么设计？
+    project_example: |
+      在一个「工单退款 Agent」里，最初把「创建退款工单」写在 interrupt 之前，主管批准后发现每张退款都有两张工单。原因是恢复时审批节点从头重跑。
+      修复方案：把节点拆成「prepare（生成退款建议）」→「review（只做 interrupt）」→「execute（调用退款接口，带幂等键 = thread_id）」三个节点。review 返回 `{"action": "approve" | "edit" | "reject"}`，用条件边路由；execute 节点配置重试策略，退款接口靠幂等键保证重试不重复扣款。
+    freshness: |
+      核对于 2026-11（langgraph 1.2.20）：`from langgraph.types import interrupt, Command`；`interrupt(value, *, response_schema=None)`；恢复用 `Command(resume=...)`；`invoke` 返回值中的 `__interrupt__` 仍可用，官方现推荐 `graph.stream_events(..., version="v3")` 读取 `stream.interrupts`。1.2.20 新增「每个 interrupt 独立 id」和「strict resume 模式（拒绝过期的恢复答复）」，具体参数以官方文档为准。旧写法：早期教程用 `NodeInterrupt` 异常或只用 `interrupt_before` 静态断点实现审批，当前推荐 `interrupt()`。
+    sources:
+      - {title: "LangGraph Docs - Interrupts", url: "https://docs.langchain.com/oss/python/langgraph/interrupts"}
+      - {title: "LangGraph Reference - interrupt", url: "https://reference.langchain.com/python/langgraph/types/interrupt"}
+      - {title: "GitHub - langgraph releases", url: "https://github.com/langchain-ai/langgraph/releases"}
+
+  - id: d36-k4
+    name: 断点恢复与时间旅行
+    level: P1
+    summary: get_state_history 查历史，传旧 checkpoint_id 回放，update_state 改状态后分叉重跑
+    why: |
+      Agent 出错时，最难的是「复现」：LLM 输出有随机性，同样的输入不一定再出一样的错。
+      有了 checkpoint 历史，就能看到出错那次每一步的真实 State，还能从中间某步改数据重跑，这是调试和线上纠错的利器。
+    problem: |
+      - 线上用户反馈「Agent 给了错误答案」，需要看到当时每一步的状态和工具结果。
+      - Agent 在某步做了错误决策（选错工具），希望修正状态后从那一步继续，而不是整单重来。
+      - 进程崩溃后需要从最近的位置继续。
+    principle: |
+      **一、三类操作**
+
+      - **查看**：`graph.get_state(config)` 看最新快照；`graph.get_state_history(config)` 返回该线程全部快照，**最新的在前**。每个快照有自己的 `checkpoint_id`。
+      - **回放（Replay）**：`graph.invoke(None, 某个历史快照.config)`。该 checkpoint 之前的节点**不重跑**（结果已保存），之后的节点**全部重新执行**，包括 LLM 调用、API 请求和 interrupt。
+      - **分叉（Fork）**：`graph.update_state(历史config, 新值, as_node=...)` 会**新建**一个 checkpoint（不修改原快照），再从它继续执行，形成一条新分支。更新会经过 reducer：带 `operator.add` 的字段是追加而不是覆盖。
+
+      ```mermaid
+      flowchart LR
+        C1["checkpoint 1 计划"] --> C2["checkpoint 2 选错工具"] --> C3["checkpoint 3 错误答案"]
+        C1 --> F2["update_state 新建 checkpoint 2b 修正工具参数"]
+        F2 --> F3["checkpoint 3b 正确答案"]
+      ```
+
+      **二、出错后继续 vs 回放**
+
+      - 出错后继续：`invoke(None, config)`，**不带** checkpoint_id，加载最新快照，重试未完成的任务（配合 pending writes，同一 super-step 已成功的节点不重跑）。
+      - 回放：**带**历史 checkpoint_id，从过去某点重新执行后续所有节点。
+
+      **三、注意副作用**
+
+      回放会重新执行外部调用。如果后续节点会发邮件、扣款，回放就会**再发一次**。所以「时间旅行」主要用于调试环境，或者后续节点本身是幂等的。
+
+      **四、不这样做会怎样**：只能看日志猜，或者让用户重新提问来复现，往往复现不出来。
+    scenarios: |
+      - **客诉排查**：根据会话 ID 拉 `get_state_history`，定位是检索结果错了还是模型推理错了。
+      - **人工纠偏**：运营发现 Agent 把「北京」识别成「南京」，用 `update_state` 修正字段后继续执行。
+      - **评估与对比**：从同一个 checkpoint 分叉，换不同 Prompt 跑后续步骤，对比效果。
+      - **崩溃恢复**：Worker 重启后扫描未完成线程，逐个 `invoke(None, config)`。
+    pitfalls: |
+      - **把回放当恢复**：带 checkpoint_id 是回放，会重跑后续所有节点；单纯出错后继续不要带 checkpoint_id。
+      - **以为 update_state 会修改历史**：它新建 checkpoint，原历史不变，这正是可审计的基础。
+      - **忽略 reducer**：对 messages 这类追加字段 update_state，会追加而不是替换，需要用对应的删除或覆盖方式。
+      - **在生产环境随意回放有副作用的图**：重复发通知、重复扣款。
+      - **崩溃发生在第一个 checkpoint 落盘之前**：此时线程和「从未调用过」无法区分，官方建议在业务库先写一条受理记录（outbox）。
+    interview_asks:
+      - 如何复现一次线上 Agent 的错误决策？
+      - 回放和 update_state 分叉有什么区别？回放时要注意什么？
+    project_example: |
+      某数据分析 Agent 偶发把「上月」解析成错误日期范围。我们在后台做了一个「执行轨迹」页面：输入会话 ID，调用 `get_state_history` 按 step 展示每个快照的 values 和 metadata.writes。
+      定位到「解析时间」节点的输出错误后，运营可以在页面上修正日期字段，后端调用 `update_state(..., as_node="parse_time")` 分叉，再 `invoke(None, 新config)` 重新生成报表。由于报表生成节点只是查询和渲染，没有外部副作用，所以允许分叉重跑。
+    freshness: |
+      核对于 2026-11：`get_state_history` 返回顺序为最新在前；`update_state` 新建 checkpoint 且经过 reducer；回放会重新触发 LLM 调用、API 请求和 interrupt（官方 Checkpointers 文档 Replay / Update state 章节）。
+    sources:
+      - {title: "LangGraph Docs - Checkpointers（Replay / Update state）", url: "https://docs.langchain.com/oss/python/langgraph/checkpointers"}
+
+quiz:
+  - id: d36-q1
+    kp: d36-k1
+    type: single
+    question: 一个顺序图 START -> A -> B -> END 编译时配置了 Checkpointer（默认 durability）。关于 checkpoint 的保存时机，下列说法正确的是？
+    options:
+      - "只在图执行结束时保存一次最终状态"
+      - "在每个 super-step 结束时都保存一个快照，A、B 执行后各有一个"
+      - "只在调用 interrupt 时保存"
+      - "每个节点内部每执行一行代码保存一次，所以可以从节点中间恢复"
+    answer: [1]
+    explain: |
+      LangGraph 在每个 super-step 边界保存 checkpoint，顺序图的输入、A、B 各对应一个 super-step。只在结束时保存是 durability="exit" 的行为，不是默认。interrupt 会触发保存，但不是唯一时机。checkpoint 粒度是 super-step，不能从节点中间恢复，恢复时节点从头执行。
+  - id: d36-q2
+    kp: d36-k3
+    type: judge
+    question: 被 interrupt 暂停的节点在 Command(resume=...) 恢复后，会从 interrupt() 那一行之后继续执行，interrupt 之前的代码不会再执行。
+    answer: false
+    explain: |
+      恢复时被中断的节点从头重新执行，执行到 interrupt() 时不再抛异常，而是直接返回 resume 的值。因此 interrupt 之前的代码会再跑一次，其中的副作用（创建工单、发通知）必须幂等，或者移到 interrupt 之后、拆成单独节点。
+  - id: d36-q3
+    kp: d36-k2
+    type: multi
+    question: 下列哪些做法会导致生产环境中「审批完成后找不到线程状态」或状态丢失？（多选）
+    options:
+      - "多副本部署时使用 InMemorySaver"
+      - "恢复时使用了与暂停时不同的 thread_id"
+      - "使用 PostgresSaver 并在首次部署时调用 setup()"
+      - "durability 设为 exit，且进程在 interrupt 之前崩溃"
+    answer: [0, 1, 3]
+    explain: |
+      InMemorySaver 进程内存储，多副本不共享，请求打到另一台就找不到状态。换 thread_id 等于开新线程，状态为空。exit 模式只在执行退出时写盘，中途崩溃没有任何 checkpoint。PostgresSaver 加 setup() 是正确做法，不会导致丢失。
+  - id: d36-q4
+    kp: d36-k3
+    type: short
+    question: |
+      有同事写了 `try: decision = interrupt(payload) except Exception: decision = {"approved": False}`，说是「防止审批出错」。这段代码实际运行会发生什么？为什么？
+    key_points:
+      - {text: "指出 interrupt 通过抛出特殊异常 GraphInterrupt 实现暂停", dim: principle}
+      - {text: "指出 except Exception 会捕获该异常，导致图不会暂停", dim: principle}
+      - {text: "指出结果是所有请求都按默认值 approved=False 继续执行，相当于全部自动拒绝且无人审批", dim: engineering}
+      - {text: "给出修复：去掉 try/except，或只捕获具体异常类型且不包住 interrupt", dim: engineering}
+    reference: |
+      interrupt() 第一次执行时会抛出 GraphInterrupt 这个特殊异常，LangGraph 在图的执行层捕获它、保存 checkpoint 并把 payload 返回给调用方，这就是「暂停」。
+      同事的 `except Exception` 在节点内部先把这个异常捕获了，LangGraph 根本收不到，所以图不会暂停，decision 被赋值为 {"approved": False}，接着走拒绝分支。表现是：前端永远收不到待审批项，所有退款都被自动拒绝，而且日志里可能还有一条「审批失败」的异常记录误导排查。
+      修复：去掉包住 interrupt 的 try/except；如果节点里还有其他可能出错的代码，单独对那段代码捕获具体异常（如 httpx.HTTPError），不要把 interrupt 包进去。官方文档明确把「不要用裸 try/except 包住 interrupt」列为规则。
+  - id: d36-q5
+    kp: d36-k3
+    type: scenario
+    question: 退款审批节点的代码顺序是：调用 CRM 接口创建退款工单 → interrupt 等待主管审批 → 返回审批结果。上线后发现每笔退款都有两张工单。请分析原因并给出至少两种修复方案。
+    key_points:
+      - {text: "指出恢复时被中断节点会从头重跑，创建工单的调用执行了两次", dim: principle}
+      - {text: "方案一：把创建工单移到 interrupt 之后或拆成单独节点", dim: engineering}
+      - {text: "方案二：创建工单使用幂等键（如 thread_id 或订单号）或 upsert，重复调用不产生新记录", dim: engineering}
+      - {text: "提到 execute 节点重试时同样需要幂等，不只是 interrupt 前", dim: engineering}
+    reference: |
+      原因：LangGraph 恢复时，被 interrupt 中断的节点从头重新执行。第一次执行时创建了工单然后在 interrupt 处暂停；主管批准后 Command(resume) 恢复，节点重跑，又调用了一次创建工单接口，interrupt 这次直接返回审批结果。所以每笔退款两张工单。
+      修复方案：
+      1. **调整顺序 / 拆节点**：prepare 节点生成退款建议 → review 节点只做 interrupt → execute 节点创建工单并退款。review 节点重跑时没有副作用。
+      2. **幂等化**：创建工单接口传幂等键（例如 `refund-{订单号}` 或 thread_id），CRM 侧遇到相同键返回已有工单；或者在本地先查是否已存在再创建（upsert）。
+      3. 即使拆了节点，execute 节点配置了重试策略后也可能重复执行，所以外部写操作最好都带幂等键。这是「副作用放在 interrupt 后 + 外部调用幂等」双保险。
+    followup:
+      question: 如果 CRM 接口不支持幂等键，你还能怎么保证不重复创建？
+      key_points: [在自己的业务库记录 thread_id 与工单号的映射, 创建前先查映射表, 用数据库唯一约束防并发重复]
+      reference: 在业务库建一张映射表（thread_id 唯一约束 → 工单号）。创建前先查，存在就复用；不存在则调用 CRM 后插入映射。并发情况下靠唯一约束兜底，插入冲突时回查已有记录。这本质上是在自己这一侧实现幂等。
+  - id: d36-q6
+    kp: d36-k4
+    type: short
+    question: 请区分 `graph.invoke(None, config)`（config 不含 checkpoint_id）与 `graph.invoke(None, history_snapshot.config)`（含历史 checkpoint_id）的行为差异，并说明后者在生产环境的风险。
+    key_points:
+      - {text: "前者加载最新 checkpoint，继续或重试未完成的工作", dim: concept}
+      - {text: "后者从历史 checkpoint 回放，之后的节点全部重新执行", dim: principle}
+      - {text: "指出回放会重新触发 LLM 调用、外部 API 与 interrupt，带来重复副作用和成本", dim: engineering}
+    reference: |
+      `invoke(None, config)` 不带 checkpoint_id：加载该线程**最新**的 checkpoint，如果上次执行失败或中断，就重试未完成的任务。同一个 super-step 里已经成功的节点因为有 pending writes，不会重跑。这是「出错后继续」。
+      `invoke(None, 历史config)` 带 checkpoint_id：这是**回放**。该 checkpoint 之前的节点结果直接使用，之后的节点全部重新执行，包括 LLM 调用（产生新的 Token 成本和不同输出）、外部 API（可能重复发邮件、扣款）以及 interrupt（会再次要求审批）。
+      所以生产环境回放有风险：一是重复副作用，二是成本，三是结果不一定和原来一致。通常只在调试环境或后续节点幂等时使用；需要修正时更推荐 update_state 分叉并明确评估后续节点的副作用。
+  - id: d36-q7
+    kp: d36-k1
+    type: design
+    question: 你要为一个 SaaS 客服 Agent 设计 thread_id 规则。同一个用户可以同时开多个会话，会话之间不能串数据，同时需要支持「会话结束 30 天后清理状态」。请给出设计并说明理由。
+    key_points:
+      - {text: "thread_id 使用会话级唯一 ID 而不是 user_id，避免并发会话互相覆盖", dim: engineering}
+      - {text: "thread_id 带租户维度或在业务表中关联租户与用户，防止跨租户访问", dim: engineering}
+      - {text: "恢复或读取状态前校验当前用户是否拥有该 thread_id，不能只信任前端传入", dim: engineering}
+      - {text: "在业务表记录 thread_id、创建时间、结束时间，定时任务按策略清理 checkpoint", dim: project}
+    reference: |
+      设计：`thread_id = "{tenant_id}:{conversation_id}"`，conversation_id 是创建会话时后端生成的 UUID。
+      理由与配套：
+      1. **会话粒度**：用 user_id 做 thread_id，同一用户两个会话会读写同一条线程，消息互相混入。用会话 ID 才能隔离。
+      2. **租户隔离**：thread_id 里带租户前缀，同时在业务表 `conversations(id, tenant_id, user_id, thread_id, status, closed_at)` 中保存归属关系。
+      3. **鉴权**：前端只能传 conversation_id，后端查业务表确认属于当前登录用户和租户后，再拼出 thread_id 调用图。不能让前端直接指定 thread_id，否则可以读别人的对话状态（越权）。
+      4. **清理**：会话关闭时记录 closed_at，定时任务查出超过 30 天的会话，调用 checkpointer 的删除线程能力（或直接按 thread_id 清理 checkpoint 表），再标记业务表。
+  - id: d36-q8
+    kp: d36-k2
+    type: single
+    question: 一个处理资金退款的 LangGraph 流程要求「任何一步完成后进程崩溃，都能从该步之后恢复」，并且可以接受少量延迟。应选择哪种 durability 模式？
+    options:
+      - "exit：只在执行退出时写入，性能最好"
+      - "async：下一步执行时异步写入"
+      - "sync：写入完成后才开始下一步"
+      - "不需要配置，任何模式都能保证每步可恢复"
+    answer: [2]
+    explain: |
+      sync 在下一步开始前同步提交 checkpoint，保证每一步完成后都已持久化，适合资金类流程，代价是额外延迟。async 有小概率在崩溃时丢失最后一个 checkpoint。exit 中途崩溃完全无法恢复。不同模式的可靠性不同，不能说任何模式都一样。
+
+code_reading:
+  id: d36-c1
+  kp: [d36-k1, d36-k3]
+  title: 带 PostgresSaver 和 interrupt 的退款审批图
+  scenario: 电商客服后台调用这段代码：客服 Agent 判断需要退款时调用 start_refund，主管在审批页面点击「批准 / 拒绝」时调用 resume_refund。状态存在 PostgreSQL，服务多副本部署。
+  language: python
+  code: |
+    import logging
+    import os
+    from typing import TypedDict
+
+    import httpx
+    from langgraph.checkpoint.postgres import PostgresSaver
+    from langgraph.graph import END, START, StateGraph
+    from langgraph.types import Command, interrupt
+
+    logger = logging.getLogger("refund_graph")
+    CRM_API = os.environ["CRM_API_URL"]
+
+
+    class RefundState(TypedDict, total=False):
+        order_id: str
+        amount: float
+        ticket_id: str
+        decision: dict
+        result: str
+
+
+    def review(state: RefundState) -> dict:
+        resp = httpx.post(f"{CRM_API}/tickets", json={"order_id": state["order_id"]}, timeout=5)
+        resp.raise_for_status()
+        ticket_id = resp.json()["ticket_id"]
+        try:
+            decision = interrupt({
+                "ticket_id": ticket_id,
+                "order_id": state["order_id"],
+                "amount": state["amount"],
+            })
+        except Exception:
+            logger.exception("review failed, default reject")
+            decision = {"approved": False}
+        return {"ticket_id": ticket_id, "decision": decision}
+
+
+    def execute(state: RefundState) -> dict:
+        amount = state["decision"].get("amount", state["amount"])
+        resp = httpx.post(
+            f"{CRM_API}/refunds",
+            json={"ticket_id": state["ticket_id"], "amount": amount},
+            headers={"Idempotency-Key": state["ticket_id"]},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return {"result": "refunded"}
+
+
+    def reject(state: RefundState) -> dict:
+        return {"result": "rejected"}
+
+
+    def route(state: RefundState) -> str:
+        return "execute" if state["decision"].get("approved") else "reject"
+
+
+    def build_graph(saver: PostgresSaver):
+        g = StateGraph(RefundState)
+        g.add_node("review", review)
+        g.add_node("execute", execute)
+        g.add_node("reject", reject)
+        g.add_edge(START, "review")
+        g.add_conditional_edges("review", route, ["execute", "reject"])
+        g.add_edge("execute", END)
+        g.add_edge("reject", END)
+        return g.compile(checkpointer=saver)
+
+
+    def start_refund(graph, order_id: str, amount: float):
+        config = {"configurable": {"thread_id": f"refund-{order_id}"}}
+        out = graph.invoke({"order_id": order_id, "amount": amount}, config)
+        return out.get("__interrupt__")
+
+
+    def resume_refund(graph, order_id: str, approved: bool, amount: float | None = None):
+        config = {"configurable": {"thread_id": f"refund-{order_id}"}}
+        answer = {"approved": approved}
+        if amount is not None:
+            answer["amount"] = amount
+        return graph.invoke(Command(resume=answer), config)
+  walkthrough:
+    function: |
+      实现一个「退款需主管审批」的 LangGraph 流程：review 节点创建 CRM 工单并通过 interrupt 暂停等待审批；主管答复后按 approved 路由到 execute（调用退款接口）或 reject。状态通过 PostgresSaver 持久化，thread_id 用订单号拼接，多副本都能恢复。
+    key_functions: |
+      - `review`：创建工单 + interrupt 暂停，恢复后返回审批结果。**本段代码的两个问题都在这里。**
+      - `execute`：用审批结果中的金额（允许主管修改）调用退款接口，带 `Idempotency-Key` 防重复扣款。
+      - `route`：条件边函数，根据 decision.approved 决定下一个节点。
+      - `build_graph`：组装图并用 PostgresSaver 编译。
+      - `start_refund` / `resume_refund`：对外入口，分别负责首次执行和用 `Command(resume=...)` 恢复。
+    params: |
+      - `order_id`、`amount` 作为初始输入写入 State。
+      - thread_id 由 `refund-{order_id}` 生成，两次调用必须一致，否则恢复会落到空线程。
+      - 主管的答复 `{"approved": bool, "amount": 可选}` 通过 `Command(resume=answer)` 传入，成为 review 节点里 `interrupt()` 的返回值，再以 `decision` 写入 State。
+    data_flow: |
+      ```mermaid
+      flowchart TD
+        S["start_refund 输入订单与金额"] --> R1["review 第一次执行 创建工单"]
+        R1 --> I["interrupt 抛出 GraphInterrupt"]
+        I --> CP[("PostgreSQL checkpoint")]
+        CP --> UI["审批页面展示 __interrupt__"]
+        UI --> RS["resume_refund 传入 Command resume"]
+        RS --> R2["review 从头重跑 再次创建工单"]
+        R2 --> D{"approved"}
+        D -->|"是"| EX["execute 调用退款接口"]
+        D -->|"否"| RJ["reject"]
+      ```
+    failure_points: |
+      - **问题一：interrupt 被 `except Exception` 包住。** interrupt 靠抛 GraphInterrupt 暂停，这里被捕获后图不会暂停，decision 直接变成 `{"approved": False}`，所有退款被自动拒绝，日志里还会出现一条误导性的 「review failed」。
+      - **问题二：interrupt 之前有非幂等副作用。** 即使修好问题一，恢复时 review 从头重跑，会再次 POST `/tickets`，每笔退款两张工单，而且第二张工单号与 interrupt payload 里展示给主管的不一致。
+      - CRM 接口超时（5 秒）或返回 5xx，`raise_for_status` 抛异常，节点失败；没有配置 retry_policy。
+      - 主管修改金额没有上限校验，可以改成大于原订单金额。
+    debugging: |
+      - 现象「审批页面从来没有待办」：先看 `start_refund` 返回值是否有 `__interrupt__`，再搜日志里的 「review failed, default reject」，即可定位问题一。
+      - 现象「工单重复」：在 CRM 侧按 order_id 查工单数量；用 `graph.get_state_history(config)` 查看 review 节点的 writes，对比 ticket_id 与审批时展示的 ticket_id。
+      - 本地复现：用 InMemorySaver 替换 PostgresSaver，mock httpx（如 respx），断言 `/tickets` 被调用次数。
+    change_request: |
+      如果需求改成「金额小于 100 元自动通过，不需要审批」：在 review 里先判断金额，小于阈值直接返回 `{"decision": {"approved": True}}`，不调用 interrupt。注意这个判断必须是确定性的（每次重跑结果相同），否则会违反「不要条件性跳过 interrupt」的规则。同时应把创建工单移到 execute 节点，并给 execute 加 `retry_policy=RetryPolicy(max_attempts=3)`，对主管修改的金额加「不得超过原金额」的校验。
+  questions:
+    - id: d36-c1-q1
+      kp: d36-k3
+      type: code
+      question: 按执行顺序说明：调用 start_refund 后，review 节点内部发生了什么？最终 start_refund 返回了什么？为什么审批页面看不到待办？
+      key_points:
+        - {text: "说明先调用 CRM 创建工单，再执行 interrupt", dim: principle}
+        - {text: "说明 interrupt 抛出 GraphInterrupt 被 except Exception 捕获", dim: principle}
+        - {text: "说明 decision 变为 approved False，路由到 reject，图直接执行完毕", dim: engineering}
+        - {text: "说明返回值中没有 __interrupt__，所以 start_refund 返回 None，审批页无待办", dim: engineering}
+      reference: |
+        1. start_refund 用 `refund-{order_id}` 作为 thread_id 调用 invoke，图从 START 进入 review。
+        2. review 先 POST `/tickets` 创建工单，拿到 ticket_id。
+        3. 执行 `interrupt(...)`，它第一次执行会抛出 GraphInterrupt。
+        4. 这个异常被 `except Exception` 捕获，记录一条 「review failed, default reject」 日志，decision 被赋值为 `{"approved": False}`。
+        5. review 正常返回，route 返回 "reject"，图走 reject 节点并结束，result 为 rejected。
+        6. invoke 的返回值是最终 State，没有 `__interrupt__` 键，`out.get("__interrupt__")` 返回 None。
+        所以审批页面永远没有待办，所有退款被自动拒绝。修复是去掉包住 interrupt 的 try/except。
+    - id: d36-c1-q2
+      kp: d36-k1
+      type: code
+      question: 假设已去掉 try/except。主管批准后调用 resume_refund，请说明 LangGraph 如何找到并恢复这次执行，review 节点会再执行哪些代码，以及会带来什么业务问题、怎么改。
+      key_points:
+        - {text: "说明通过相同 thread_id 从 PostgreSQL 加载最新 checkpoint 及挂起的 interrupt", dim: principle}
+        - {text: "说明 review 节点从头重跑，再次调用创建工单接口", dim: principle}
+        - {text: "指出产生重复工单，且新 ticket_id 与审批时展示的不一致，execute 用的是第二张", dim: engineering}
+        - {text: "给出修复：创建工单移到 execute 或单独节点，或使用幂等键", dim: engineering}
+      reference: |
+        resume_refund 用同样的 `refund-{order_id}` 拼出 thread_id，PostgresSaver 按 thread_id 读出该线程最新的 checkpoint，其中记录了 review 节点处于中断状态。任何副本都能读到，因为状态在 PostgreSQL 里。
+        LangGraph 重新执行 review 节点**从第一行开始**：再次 POST `/tickets`，得到一个新的 ticket_id；执行到 interrupt 时不再抛异常，而是直接返回 `{"approved": True, ...}`。节点返回新的 ticket_id 和 decision，进入 execute。
+        业务问题：CRM 里有两张工单；主管审批时看到的是第一张工单号，实际退款挂在第二张上，对账混乱。
+        修复：review 只做 interrupt；工单创建移到 execute（或单独 create_ticket 节点放在 review 之后），并使用 `refund-{order_id}` 作为幂等键，这样 execute 被重试时也不会重复创建。
+    - id: d36-c1-q3
+      kp: d36-k3
+      type: code
+      question: execute 节点的 Idempotency-Key 使用了 state["ticket_id"]。结合本段代码现有的问题，这个幂等键能否防止重复退款？如果主管连续点了两次「批准」按钮，会发生什么？
+      key_points:
+        - {text: "指出在工单重复创建的情况下 ticket_id 本身不稳定，幂等键的前提被破坏", dim: engineering}
+        - {text: "分析第二次 resume 时线程已执行结束，没有挂起的 interrupt，恢复不会再触发 execute 或行为需按框架返回判断", dim: principle}
+        - {text: "建议幂等键使用稳定的业务标识（如订单号）并在接口层做重复点击防护", dim: engineering}
+      reference: |
+        幂等键的前提是「同一笔业务每次都用同一个键」。本段代码里 ticket_id 会因为 review 重跑而变化，所以如果 execute 前的流程被再次触发，拿到的是新的 ticket_id，幂等键失效，可能重复退款。更稳妥的是用订单号这种稳定标识，例如 `refund-{order_id}`。
+        主管连点两次：第一次 resume 后图执行到 END，线程没有挂起的 interrupt。第二次用同一 thread_id 传 Command(resume=...)，此时没有待恢复的中断，不会再进入 execute（具体是忽略还是报错，以当前版本行为为准，1.2.20 还新增了拒绝过期答复的 strict resume 模式）。但不能把防重复完全寄托在框架上：接口层应先查业务表的审批状态（已审批则直接返回），前端按钮也要防重复提交，退款接口再用稳定幂等键兜底。
+
+interview:
+  - id: d36-i1
+    kp: d36-k1
+    type: oral
+    difficulty: 1
+    question: LangGraph 的 Checkpointer 是什么？它解决了什么问题？
+    key_points:
+      - {text: "说明 checkpointer 在每个 super-step 保存状态快照", dim: concept}
+      - {text: "说明快照按 thread_id 组织，同一 thread_id 可继续执行", dim: concept}
+      - {text: "列出它支撑的能力：多轮记忆、人工审批、故障恢复、时间旅行", dim: principle}
+      - {text: "结合项目说明 thread_id 的取值或存储选型", dim: project}
+    reference: |
+      Checkpointer 是 LangGraph 的持久化层。图编译时传入 checkpointer 后，每个 super-step（图的一次推进，本步所有节点执行完并合并状态）结束时会保存一个 StateSnapshot，包含当前 State 值、下一步要执行的节点、元数据和父快照指针。这些快照按 thread_id 分组，thread_id 就像会话的游标。
+      它解决几个问题：第一，多轮对话不用自己拼历史，同一 thread_id 再次调用会自动加载状态；第二，人工审批可以用 interrupt 暂停，状态落库后等几小时再恢复；第三，节点失败可以从最近 checkpoint 继续，不必重跑前面昂贵的 LLM 调用；第四，可以查看历史、回放和分叉，方便排查。
+      项目里我们用会话 ID 而不是用户 ID 做 thread_id，生产用 PostgresSaver。
+    oral: |
+      Checkpointer 是 LangGraph 的持久化机制。我理解它就是在图每推进一步，也就是每个 super-step 结束时，把整个 State 拍一张快照存下来，并且按 thread_id 归档。
+      有了它，图就从「一次性函数调用」变成「可以暂停和恢复的长流程」：多轮对话只要复用 thread_id，历史自动带上；需要人工审批时可以 interrupt 暂停，第二天再恢复；某个节点挂了，可以从最近的快照继续，不重复调用前面的大模型。
+      在我们的采购助手里，thread_id 用的是申请单号，存储用 PostgreSQL，这样多副本都能恢复同一个流程。
+  - id: d36-i2
+    kp: d36-k3
+    type: oral
+    difficulty: 2
+    question: 用 LangGraph 实现「关键操作前人工确认」，你会怎么做？恢复时有什么需要注意的？
+    key_points:
+      - {text: "说明 interrupt 加 checkpointer 加 thread_id 三要素", dim: concept}
+      - {text: "说明恢复用 Command(resume) 且 resume 值成为 interrupt 返回值", dim: principle}
+      - {text: "指出恢复时节点从头重跑，interrupt 前副作用必须幂等", dim: principle}
+      - {text: "提到不能用 try/except 包住 interrupt、支持 approve/edit/reject 三类答复", dim: engineering}
+      - {text: "结合项目说明审批结果落业务表或拆节点的做法", dim: project}
+    reference: |
+      实现：编译时配置持久化 checkpointer（生产用 PostgresSaver），调用时带 thread_id；在需要确认的节点里调用 `interrupt(payload)`，payload 放待确认的动作和参数。interrupt 第一次执行会抛出 GraphInterrupt，LangGraph 保存状态并把 payload 通过返回值的 `__interrupt__` 交给调用方，前端展示给审批人。审批人提交后，后端用相同 thread_id 调用 `graph.invoke(Command(resume=答复), config)`，答复成为 interrupt 的返回值。
+      注意事项：
+      1. 恢复时被中断的节点从头重跑，所以 interrupt 前不能有非幂等副作用，推荐「准备 → 审批 → 执行」拆成三个节点。
+      2. 不要用 try/except 包住 interrupt，否则异常被吞，图不会暂停。
+      3. 多个 interrupt 按顺序匹配，不能条件性跳过或重排。
+      4. 答复设计成 approve / edit / reject，edit 允许修改参数，但要在执行节点再做校验（比如金额上限）。
+      5. 审批人、时间、结果写业务审计表，不只存在 checkpoint 里。
+    oral: |
+      我会用 interrupt 加持久化 checkpointer 来做。在需要确认的节点里调用 interrupt，把要执行的动作和参数作为 payload 抛出去，图会暂停并保存状态，前端拿到 __interrupt__ 展示给审批人；审批完成后，用同一个 thread_id 传 Command(resume=答复) 恢复，答复就成了 interrupt 的返回值。
+      最需要注意的是恢复时节点会从头重跑。我们之前把创建工单写在 interrupt 前面，结果每笔都建了两张工单。后来拆成准备、审批、执行三个节点，执行节点再用幂等键。另外不能用 try/except 包住 interrupt，否则图根本不会停。答复我们支持批准、修改后批准、拒绝三种，审批记录另外写审计表。
+  - id: d36-i3
+    kp: d36-k2
+    type: oral
+    difficulty: 3
+    question: 你们的 Agent 服务多副本部署，checkpoint 怎么存？如何保证可靠性和控制存储成本？
+    key_points:
+      - {text: "说明多副本必须用共享持久化存储，如 PostgresSaver，内存不可用", dim: engineering}
+      - {text: "说明 setup 建表、异步图用 AsyncPostgresSaver、连接参数要求", dim: principle}
+      - {text: "说明 durability 模式取舍，关键流程用 sync", dim: principle}
+      - {text: "说明存储增长问题及清理策略或 DeltaChannel、State 不放大对象", dim: engineering}
+      - {text: "结合项目说明业务表与 checkpoint 表的分工", dim: project}
+    reference: |
+      多副本部署时请求可能落在任意实例，checkpoint 必须放在共享存储里。我们用 `AsyncPostgresSaver`（包 langgraph-checkpoint-postgres），因为 FastAPI 是异步的，同步 Saver 会阻塞事件循环。首次部署时调用 `setup()` 建表；如果自己管理 psycopg 连接池，按官方要求设置 `autocommit=True` 和 `row_factory=dict_row`。
+      可靠性：涉及退款、审批的流程调用时传 `durability="sync"`，每步提交后再执行下一步；普通问答用默认的 async 换性能。崩溃发生在第一个 checkpoint 之前时线程不可见，所以入口先在业务表写一条受理记录。
+      存储成本：默认每个 super-step 全量写入所有通道，长对话 messages 会让存储快速增长。措施包括：State 只放必要字段，大文件存对象存储只放引用；对追加型通道考虑 DeltaChannel；业务表记录线程的结束时间，定时清理过期线程；对历史 messages 做摘要压缩（Day 13 讲过上下文管理）。
+      分工：checkpoint 表只给框架用；审批结果、订单状态写业务表，便于查询和审计，也避免框架升级导致表结构变化影响业务。
+    oral: |
+      多副本下 checkpoint 必须放共享存储，我们用的是 AsyncPostgresSaver，复用业务的 PostgreSQL，部署时跑一次 setup 建表。可靠性方面，退款和审批流程用 durability 等于 sync，保证每一步都落盘再往下走；普通问答用默认的 async。
+      存储成本是上线后才发现的问题：每一步都全量存 State，长对话涨得很快。我们做了三件事：State 里只放必要字段，文件只存引用；会话结束 30 天后定时清理线程；长对话做摘要。另外审批结果单独写业务表做审计，checkpoint 表只当框架的执行状态用。
+  - id: d36-i4
+    kp: d36-k4
+    type: oral
+    difficulty: 3
+    question: 线上用户投诉 Agent 做了错误决策，你如何利用 LangGraph 的持久化能力排查并纠正？
+    key_points:
+      - {text: "通过业务 ID 找到 thread_id，用 get_state_history 查看每步快照", dim: engineering}
+      - {text: "根据 metadata.writes 和 values 定位出错节点是检索、推理还是工具", dim: principle}
+      - {text: "使用 update_state 分叉修正后继续，并说明其新建 checkpoint 不改历史", dim: principle}
+      - {text: "指出回放或分叉会重新执行后续节点，需评估副作用与成本", dim: engineering}
+      - {text: "提到把问题样本加入评估集做回归", dim: project}
+    reference: |
+      排查：先用投诉单里的会话 ID 查业务表得到 thread_id，调用 `graph.get_state_history(config)` 拿到这条线程的所有快照（最新在前）。逐个看 metadata.step、metadata.writes（这一步哪个节点写了什么）和 values，定位错误从哪一步开始：是检索回来的资料不对，还是模型选错了工具、填错了参数，或者是工具返回异常被当成了正常结果。
+      纠正：如果是某个字段被解析错，用 `graph.update_state(那一步的config, 修正值, as_node="对应节点")`，它会新建一个 checkpoint 作为分支，原历史保留，可用于审计；再用 `invoke(None, 新config)` 继续执行。
+      注意：回放和分叉都会重新执行之后的节点，包括 LLM 和外部 API。如果后面有发邮件、扣款等副作用，要先确认幂等性，或者只在测试环境分叉复现。
+      收尾：把这次的输入和期望输出加入评估集，修改 Prompt 或工具描述后跑回归，防止同类问题再出现（Day 48 会讲评估体系）。
+    oral: |
+      我会先用投诉里的会话 ID 找到 thread_id，调用 get_state_history 把这条线程每一步的快照拉出来，看每一步是哪个节点写了什么，定位到底是检索错了、模型选错工具了，还是工具报错被当成正常结果了。
+      定位后如果只是某个字段错了，就用 update_state 在那一步分叉，它会新建 checkpoint，不改原来的历史，然后从新分支继续执行。但要注意分叉后后续节点都会重跑，有发通知、扣款这种副作用的，要先确认幂等，或者只在测试环境复现。最后把这个案例加进评估集做回归。
+  - id: d36-i5
+    kp: d36-k3
+    type: design
+    difficulty: 4
+    question: 设计一个「合同审批 Agent」：Agent 起草合同 → 法务审批（可能修改条款）→ 金额超过 50 万还需财务审批 → 发送给客户。要求支持多副本部署、审批可以等几天、进程重启不丢、不重复发送。请说明图结构、持久化、interrupt 设计和防重复措施。
+    key_points:
+      - {text: "图结构拆分起草、法务审批、财务审批、发送节点，用条件边按金额路由", dim: engineering}
+      - {text: "使用 PostgresSaver 或 AsyncPostgresSaver 共享持久化，关键步骤 durability 用 sync", dim: engineering}
+      - {text: "审批节点只做 interrupt，payload 可序列化，支持 approve edit reject，按顺序不条件跳过", dim: principle}
+      - {text: "发送节点放在审批之后并使用幂等键与业务状态检查防重复发送", dim: engineering}
+      - {text: "thread_id 用合同号，恢复前校验审批人权限，审批记录写业务审计表", dim: project}
+    reference: |
+      **图结构**：draft（LLM 起草）→ legal_review（interrupt）→ 条件边：法务拒绝 → revise 或 END；批准且金额大于 50 万 → finance_review（interrupt）；否则 → send。finance_review 批准 → send → END。法务的 edit 答复会把修改后的条款写回 State，send 使用最新条款。金额判断写在条件边里，是确定性的，不在审批节点里条件性跳过 interrupt。
+      **持久化**：AsyncPostgresSaver，部署时 setup；thread_id = `contract-{合同号}`；调用 legal_review 前后和 send 前使用 `durability="sync"`。等待几天没有问题，因为暂停时没有任何进程在阻塞，只是数据库里一条挂起的 checkpoint。业务表 `contract_flows` 记录合同号、thread_id、当前阶段、待审批人，供审批列表页查询。
+      **interrupt 设计**：每个审批节点只做 interrupt 和简单的结果整理，payload 是合同摘要、条款 diff、金额等纯 JSON。审批接口收到答复时先校验当前登录人是否是该阶段的审批人、该合同是否处于该阶段，再调用 `Command(resume=...)`。使用 `response_schema` 校验答复结构。
+      **防重复**：send 节点放在所有审批之后；调用邮件 / 电子签服务时用 `send-{合同号}-{版本号}` 作为幂等键；发送前检查业务表状态，已发送则直接返回；send 节点设置 RetryPolicy，重试依赖幂等键保证不重复。审批接口对同一阶段的重复提交直接返回已处理。
+      **可观测**：每次审批、恢复、发送都写审计日志；后台提供 get_state_history 轨迹查看。
+    oral: |
+      我会把图拆成起草、法务审批、财务审批、发送四个节点。金额是否超过 50 万用条件边判断，不在审批节点里条件性地跳过 interrupt。审批节点只做 interrupt，payload 是合同摘要和条款修改对比，答复支持批准、修改、拒绝。
+      持久化用 AsyncPostgresSaver，thread_id 用合同号，关键步骤用 sync 模式落盘，所以等几天、进程重启都没关系，暂停期间不占任何进程。审批接口在恢复前先校验审批人身份和合同所处阶段，审批记录写业务审计表。
+      防重复发送是重点：发送节点放在最后，用合同号加版本号作为幂等键，发送前再查一次业务状态，重试也不会发两次。
+
+sources:
+  - {title: "LangGraph Docs - Checkpointers", url: "https://docs.langchain.com/oss/python/langgraph/checkpointers"}
+  - {title: "LangGraph Docs - Interrupts", url: "https://docs.langchain.com/oss/python/langgraph/interrupts"}
+  - {title: "LangGraph Reference - Checkpointing", url: "https://reference.langchain.com/python/langgraph/checkpoints"}
+  - {title: "GitHub - langgraph checkpoint-postgres", url: "https://github.com/langchain-ai/langgraph/tree/main/libs/checkpoint-postgres"}
+  - {title: "PyPI - langgraph", url: "https://pypi.org/project/langgraph/"}

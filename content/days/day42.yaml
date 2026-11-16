@@ -1,0 +1,931 @@
+day: 42
+phase: 5
+title: LLM-as-Judge 与轨迹评测
+goals:
+  - 能写出一个可复核的评审 rubric：单一维度、二元或少档位、先理由后结论、结构化输出
+  - 能说出评审的主要偏差，并用人工标注样本和 Cohen's κ 校准评审是否可信
+  - 能区分 pass@k 与 pass^k，并根据业务场景选择合适的可靠性指标
+  - 能为一个会调用工具的 Agent 设计结果、工具调用、轨迹三个层次的评测
+minutes: 60
+resources:
+  - title: "Hello-Agents 第十二章 智能体性能评估"
+    url: "https://github.com/datawhalechina/hello-agents/blob/main/docs/chapter12/%E7%AC%AC%E5%8D%81%E4%BA%8C%E7%AB%A0%20%E6%99%BA%E8%83%BD%E4%BD%93%E6%80%A7%E8%83%BD%E8%AF%84%E4%BC%B0.md"
+    kind: repo
+    lang: zh
+    minutes: 30
+    note: "看 12.2 BFCL 中 AST 匹配评估工具调用的部分（对应 k4），再看 12.4 中 LLM Judge 与 Win Rate 两节（对应 k1 的单点评分与成对比较）"
+  - title: "李宏毅 2025 秋 第 4 讲：評估生成式人工智慧能力時可能遇到的各種坑"
+    url: "https://www.youtube.com/watch?v=dWQVY_h0YXU"
+    kind: video
+    lang: zh
+    minutes: 20
+    note: "看后半段「用语言模型来评估」和评估偏见的例子（会偏袒自己、告诉它答案改过就多给分），对应 k2"
+  - title: "LangSmith：How to evaluate your agent with trajectory evaluations"
+    url: "https://docs.langchain.com/langsmith/trajectory-evals"
+    kind: doc
+    lang: en
+    minutes: 15
+    note: "看 strict / unordered / subset / superset 四种轨迹匹配模式的表格和示例，对应 k4"
+  - title: "τ-bench 论文（Sierra）"
+    url: "https://arxiv.org/abs/2406.12045"
+    kind: article
+    lang: en
+    minutes: 15
+    note: "只看摘要和 pass^k 指标定义那一段，理解为什么 Agent 要看多次运行的一致性，对应 k3"
+knowledge_points:
+  - id: d42-k1
+    name: LLM-as-Judge 与 rubric 设计
+    level: P0
+    summary: 用另一个模型按评分规则判定开放式回答；一个评审只判一个维度，先写理由再给结论，输出结构化结果
+    analogy: |
+      像团队的 **Code Review Checklist**：每一条都是可以明确回答「是 / 否」的检查项，Reviewer 照着清单逐项打勾并写评论。
+      **不一样的地方**：这里的 Reviewer 是一个模型，它会有偏差、会被措辞影响、换个版本标准就变了，所以评审本身也要被评测（见 k2）。
+    why: |
+      开放式回答（摘要、客服回复、报告）没有唯一正确答案，规则判不了，人工判又太贵。LLM-as-Judge 是目前最主流的折中方案，Langfuse、LangSmith、DeepEval、RAGAS 都内置。
+      面试时说「我们用 LLM 打分」不加分，说清楚 **rubric 怎么写、怎么保证可信** 才加分。
+    problem: |
+      解决「开放式输出谁来打分、怎么规模化打分」的问题。
+      随手写一句「请评价这个回答好不好」，评审会给出含糊、不稳定、无法复核的分数，团队据此优化等于在噪声上调参。
+    principle: |
+      **一、什么时候该用评审**
+
+      先问自己：**能不能用规则判？** JSON 是否合法、引用 ID 是否存在、是否拒答，都应该用代码判（见 Day 41）。
+      只有「是否覆盖要点」「是否有依据」「语气是否合适」这类主观维度，才交给评审。
+
+      **二、三种评审形式**
+
+      | 形式 | 做法 | 适合 |
+      |---|---|---|
+      | **基于参考** | 给评审参考答案或关键事实点，判断回答是否覆盖、是否矛盾 | 有标注的离线评测，**最稳定，优先用** |
+      | **单点判定** | 只给问题和回答，按 rubric 判 pass / fail 或打档 | 线上无参考答案的监控 |
+      | **成对比较** | 给 A、B 两个回答，选更好的 | 比较两个版本，绝对标准难写时（Hello-Agents 里叫 Win Rate） |
+
+      **三、rubric 怎么写**
+
+      1. **一个评审只判一个维度**：正确性、有依据、语气分开判，不要合成一个总分。
+      2. **二元或少档位**：pass / fail，或 correct / partially_correct / incorrect（Langfuse 支持数值、类别、布尔三种分数类型）。
+      3. **写清标准和边界示例**：例如「漏掉一个关键要点算 fail；措辞不同但意思一致算 pass」。
+      4. **先理由后结论**：让评审先写出依据，再给结论。结论更稳定，人工复核分歧样本时也能看到它为什么这么判。
+      5. **给足上下文**：判「有没有依据」必须给检索片段；判「是否正确」要给参考要点。
+      6. **允许「无法判断」**：信息不足时不要逼它二选一，单独统计。
+      7. **工程配置**：评审模型单独配置、固定版本、温度设低、结构化输出（JSON + Pydantic 校验）。
+
+      ```mermaid
+      flowchart LR
+        Q["问题"] --> J["评审模型 固定版本 低温度"]
+        A["被测回答"] --> J
+        R["参考要点或检索片段"] --> J
+        RB["rubric 单一维度 含边界示例"] --> J
+        J --> O["JSON 理由 加 结论"]
+        O --> V{"解析成功"}
+        V -->|"是"| S["记录分数与理由"]
+        V -->|"否"| E["记为 error 计入失败"]
+      ```
+
+      **四、一个常被忽略的细节**
+
+      评审解析失败、超时、报错时，**不能默认判通过，也不能直接跳过**。要记成 error 并计入分母，否则评审越不稳定，通过率反而越高（Day 44 的 CI 门禁会再讲）。
+    scenarios: |
+      - 知识库问答：基于关键事实点判正确性，基于检索片段判「回答中每个说法是否有依据」。
+      - 两版 Prompt 对比：用成对比较，交换顺序评两次，只统计两次一致的结论。
+      - 线上监控：对 5% 的真实对话用单点评审判「是否答非所问」，低分进人工复核队列。
+    code: |
+      一个基于参考要点的二元评审（使用 OpenAI 兼容接口，评审模型与被测模型分开配置）：
+
+      ```python
+      import os
+
+      from openai import OpenAI
+      from pydantic import BaseModel, ValidationError
+
+      judge_client = OpenAI(base_url=os.environ.get("JUDGE_BASE_URL"), api_key=os.environ["JUDGE_API_KEY"])
+      JUDGE_MODEL = os.environ["JUDGE_MODEL"]  # 与被测系统不同系列，并固定版本
+
+      RUBRIC = """你是严格的评审，只判断「回答是否覆盖全部参考要点且没有与之矛盾」。
+      - 措辞不同但意思一致：算覆盖
+      - 漏掉任意一个要点，或与要点矛盾：fail
+      - 信息不足无法判断：unknown
+      先写 reasoning，再给 verdict。只输出 JSON：{"reasoning": "...", "verdict": "pass|fail|unknown"}"""
+
+
+      class Verdict(BaseModel):
+          reasoning: str
+          verdict: str
+
+
+      def judge(question: str, answer: str, points: list[str]) -> str:
+          resp = judge_client.chat.completions.create(
+              model=JUDGE_MODEL,
+              temperature=0,
+              response_format={"type": "json_object"},
+              messages=[
+                  {"role": "system", "content": RUBRIC},
+                  {"role": "user", "content": f"问题：{question}\n参考要点：{points}\n待评回答：{answer}"},
+              ],
+          )
+          try:
+              v = Verdict.model_validate_json(resp.choices[0].message.content or "")
+          except ValidationError:
+              return "error"  # 计入失败，不能默认通过
+          return v.verdict if v.verdict in ("pass", "fail", "unknown") else "error"
+      ```
+    pitfalls: |
+      - **误区：一个评审同时判正确性、语气、格式并给总分。** 无法知道哪个维度出问题，分数也不稳定。
+      - **误区：只要分数，不要理由。** 分歧样本无法复核，rubric 也无从改进。
+      - **误区：评审和被测用同一个模型、同一个配置变量。** 升级被测模型时评审标准也跟着变了，新旧分数不可比。
+      - **误区：解析失败时返回通过。** 评审越出错通过率越高，CI 会放过真实退化。
+      - **误区：规则能判的也交给评审。** 又贵又不稳定。
+    interview_asks:
+      - question: "你们的评审 Prompt 是怎么写的？为什么这么写？"
+        answer: "给它明确的通过条件、失败条件和必须引用的证据，要求先写理由再给结论。不说「请客观打分」。条件和业务规则一致，并用人工标过的题校准过。"
+      - question: "单点打分、成对比较、基于参考，分别什么时候用？"
+        answer: "有标准答案或明确规则，用基于参考的判定。两个版本哪个更好，用成对比较，比绝对分稳。没有参考的开放聊天才勉强单点，而且等级要少。"
+      - question: "评审输出格式解析失败了怎么处理？"
+        answer: "算作这次评审失败，重试一次，仍失败就进人工，不要当成答案通过。评审自己的格式也要用结构化输出。失败率要监控。"
+    project_example: |
+      **p1 企业知识库**：为回答设计两个独立评审。
+      「正确性评审」输入问题、关键事实点和回答，输出 pass / fail / unknown；「有依据评审」输入回答和本次检索片段，要求逐句说明依据来自哪个片段，任何一句找不到依据就 fail。
+      两个评审都用与生成模型不同系列的模型，温度 0，结果连同理由写入 `eval/results.jsonl`，CI 中解析失败的样本计为 error 并单独报警。
+    freshness: |
+      核对于 2026-11：Langfuse 的 LLM-as-a-Judge 评审可作用于 Observations（线上）或 Experiments（离线数据集），分数支持数值、类别、布尔三种类型，旧的 trace 级评审已标记弃用；LangSmith 的成对评测提供 `randomize_order` 参数用于缓解位置偏差（默认关闭）。具体参数以官方文档为准。
+    sources:
+      - {title: "Langfuse - LLM-as-a-Judge", url: "https://langfuse.com/docs/evaluation/evaluation-methods/llm-as-a-judge"}
+      - {title: "LangSmith - How to run a pairwise evaluation", url: "https://docs.langchain.com/langsmith/evaluate-pairwise"}
+  - id: d42-k2
+    name: 评审偏差与人工一致性校准
+    level: P0
+    summary: 评审有位置、长度、风格、自我偏好等偏差；启用前用人工标注样本校准，看一致率也要看 Cohen's κ
+    analogy: |
+      像给新入职的 Code Reviewer 做 **「带教对齐」**：先让他和资深同事各自评同一批 PR，对比分歧，统一标准后才让他独立审。
+      **不一样的地方**：人会随经验变好，模型评审换个版本标准就可能整体漂移，所以评审模型或 rubric 一改就要**重新校准**。
+    why: |
+      「让 AI 给 AI 打分靠谱吗？」是面试官和老板最常见的质疑。
+      回答「我们校准过，评审和人工在 100 条样本上的 κ 是多少」，比「GPT 很强所以可信」有说服力得多。
+    problem: |
+      解决「评审分数能不能信」的问题。
+      不校准时可能出现：评审偏爱长回答，团队越优化回答越啰嗦；评审偏爱自家模型，选型结论被扭曲；评审几乎全判通过，一致率看着 90%，其实一个错误都抓不住。
+    principle: |
+      **一、已知偏差**
+
+      | 偏差 | 表现 | 缓解 |
+      |---|---|---|
+      | 位置偏差 | 成对比较时偏向放在前面或后面的回答 | 交换顺序各评一次，不一致记平局 |
+      | 长度偏差 | 偏向更长、看起来更详细的回答 | rubric 写明「简洁准确优先」，用参考要点约束 |
+      | 风格偏差 | 偏向 Markdown 排版、列表更多的回答 | 判定前统一格式，或 rubric 明确不看排版 |
+      | 自我偏好 | 偏向自己或同系列模型生成的回答 | 评审与被测用不同厂商或系列 |
+      | 暗示偏差 | 告诉它「这个答案修改过」或「来自权威网站」就给高分 | 评审输入里不放来源、版本等无关信息 |
+
+      证据：
+      - Zheng 等人 2023 年的 MT-Bench 研究系统讨论了位置、长度、自我增强偏差，同时发现强模型评审与人类的一致率**超过 80%，与人类彼此之间的一致率相当**。所以结论是「可用，但要处理偏差」。
+      - 后续研究发现自我偏好与「文本对评审来说是否熟悉（困惑度低）」有关，不只是「认出了自己」。
+      - 李宏毅在评估讲次中举例：同一个答案，告诉模型「这是修改过的版本」，分数就凭空变高。
+      - 2026 年的大规模研究还发现：不同评审的位置偏差差异可达两个数量级，而**风格偏差**（偏爱 Markdown）在一些设置下比位置偏差更突出。偏差大小因模型和任务而异，**必须在自己的数据上测**。
+
+      **二、校准流程**
+
+      ```mermaid
+      sequenceDiagram
+        participant H as 人工标注者
+        participant J as 评审模型
+        participant A as 一致性分析
+        H->>A: 100 条样本的人工判定 含通过与不通过
+        J->>A: 同样 100 条的评审判定
+        A->>A: 计算一致率 Cohen κ 失败样本识别率
+        A-->>J: 未达标 修改 rubric 补边界示例
+        A-->>H: 分歧样本复核 可能是人工标错
+        J->>A: 在另一批留出样本上重新验证
+        A-->>J: 达标后启用 每季度抽检
+      ```
+
+      **三、只看一致率为什么不够**
+
+      假设 100 条里人工判 90 条通过、10 条不通过；一个「永远判通过」的评审，一致率也有 **90%**，但它**一个错误都抓不住**。
+      所以要同时看：
+      - **Cohen's κ**：扣除「碰巧一致」后的一致程度，0 表示和瞎猜一样，1 表示完全一致。2026 年一项覆盖 21 个评审模型的研究指出，只报原始一致率会**系统性高估**评审能力。
+      - **失败样本识别率**：人工判 fail 的样本里，评审也判 fail 的比例。评测的价值就在于抓住失败。
+
+      **四、校准的工程细节**
+
+      - 校准样本要**同时有通过和不通过**，并覆盖边界情况（部分正确、措辞不同）。
+      - 用来改 rubric 的分歧样本，**不能**再用来验收最终一致率，要留一批没看过的样本验证，否则就是对校准集过拟合。
+      - 分歧时也要复核人工标注，有时是人标错了。
+      - 评审模型、rubric、被测任务类型变化时**重新校准**；平时每季度抽检。
+    scenarios: |
+      - 启用评审前：业务专家标注 100 条（约 30 条不通过），评审 κ 不达标就补充「部分正确」的判定示例。
+      - 选型对比：被测有 A、B 两家模型，评审选第三家模型，避免自我偏好影响选型结论。
+      - 线上抽检：每月随机抽 30 条评审结果人工复核，发现一致性下降就重新校准。
+    code: |
+      计算一致率和 Cohen's κ（二元判定）：
+
+      ```python
+      def agreement(human: list[bool], judge: list[bool]) -> float:
+          return sum(h == j for h, j in zip(human, judge)) / len(human)
+
+
+      def cohen_kappa(human: list[bool], judge: list[bool]) -> float:
+          n = len(human)
+          po = agreement(human, judge)
+          ph, pj = sum(human) / n, sum(judge) / n
+          pe = ph * pj + (1 - ph) * (1 - pj)  # 碰巧一致的概率
+          return 0.0 if pe == 1 else (po - pe) / (1 - pe)
+
+
+      def fail_recall(human: list[bool], judge: list[bool]) -> float:
+          fails = [j for h, j in zip(human, judge) if not h]
+          return sum(not j for j in fails) / len(fails) if fails else 1.0
+      ```
+    pitfalls: |
+      - **误区：评审模型越强就越不需要校准。** 强模型同样有位置、风格偏差，且偏差大小因任务而异。
+      - **误区：一致率 90% 就够了。** 类别不平衡时，永远判通过也能拿 90%，要看 κ 和失败样本识别率。
+      - **误区：用改 rubric 时看过的样本来验收。** 对校准集过拟合，换一批样本一致率就掉。
+      - **误区：校准一次永久有效。** 评审模型、rubric 或任务一变就要重来。
+      - **误区：分歧一律以人工为准。** 人工也会标错，分歧样本要双向复核。
+    interview_asks:
+      - question: "LLM-as-Judge 有哪些偏差？你怎么缓解？"
+        answer: "偏爱更长的、位置靠前的、和自己风格像的答案。缓解方法是固定长度要求、交换前后顺序、用细则而不是印象，并用人工样本测偏差。"
+      - question: "你怎么证明评审模型的打分是可信的？"
+        answer: "拿一批人标好的题，算评审和人的一致率，特别看它会不会把坏答案放行。一致率够，并且漏放可接受，才拿它做门禁。否则只做初筛。"
+      - question: "一致率 90% 的评审一定可靠吗？"
+        answer: "不一定。如果坏答案只占 10%，它全判成好也能有高一致率。要看它在「应该失败」的题上的表现，不能只看总一致率。"
+    project_example: |
+      **p1 企业知识库**：请两位 HR 同事标注 100 条「正确性」样本，其中约三成是不通过或部分正确。
+      第一版 rubric 的失败样本识别率偏低，分析分歧发现评审把「漏掉一个条件的回答」判成了通过，于是在 rubric 里补充两条边界示例；再在另一批 50 条未参与修改的样本上验证，κ 和失败识别率都达标后才接入 CI（具体数值用你的校准结果填写）。
+    freshness: |
+      核对于 2026-11：Zheng 等人 2023（arXiv 2306.05685）给出强评审与人类一致率超过 80% 的结论；2024 年 arXiv 2410.21819 将自我偏好与低困惑度联系起来；2026 年 arXiv 2606.19544 对 21 个评审的大规模评估指出原始一致率高估评审能力、应报告 Cohen's κ，并观察到位置偏差在不同评审间差异很大；2026 年 arXiv 2604.23178 报告风格偏差（偏爱 Markdown）在其设置中较突出。偏差数值依赖具体模型与任务，不要直接套用。
+    sources:
+      - {title: "Zheng et al. 2023 - Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena", url: "https://arxiv.org/abs/2306.05685"}
+      - {title: "Self-Preference Bias in LLM-as-a-Judge (2024)", url: "https://arxiv.org/abs/2410.21819"}
+      - {title: "Reliability without Validity: Large-Scale Evaluation of LLM-as-a-Judge (2026)", url: "https://arxiv.org/html/2606.19544"}
+      - {title: "Judging the Judges: Bias Mitigation Strategies in LLM-as-a-Judge Pipelines (2026)", url: "https://arxiv.org/html/2604.23178"}
+  - id: d42-k3
+    name: pass@k 与 pass^k：多次运行与可靠性
+    level: P1
+    summary: pass@k 问「k 次里至少成功一次」，衡量能力上限；pass^k 问「k 次全部成功」，衡量可靠性
+    analogy: |
+      像前端 CI 里的 **flaky test（不稳定用例）**：跑一次过了不代表稳定，连续跑 10 次都过才算可靠。
+      **不一样的地方**：前端 flaky test 是 bug 要修掉；Agent 的随机性是固有的，只能用指标量化它、用设计降低它。
+    why: |
+      Agent 单次运行成功率看着不错，上线后业务方却说「时好时坏不敢用」，根源是**一致性**没有被度量。
+      面试中提到 pass^k，能体现你理解「能做到」和「每次都能做到」是两回事。
+    problem: |
+      解决「只跑一次评测，看不出 Agent 稳不稳定」的问题。
+      同一个任务，Agent 可能这次成功、下次失败；只看单次成功率，会高估面向客户场景的可靠性，也会低估有验证器可重试场景的潜力。
+    principle: |
+      **一、两个指标的定义**
+
+      - **pass@k**：同一任务独立运行 k 次，**至少一次成功**的概率。来自代码生成评测（有单元测试可以判断哪次对），衡量「多试几次能不能做出来」。
+      - **pass^k**（读作 pass hat k）：同一任务独立运行 k 次，**全部成功**的概率。由 τ-bench 提出，衡量「每次都能做对」的可靠性。
+      - k = 1 时两者相等，都等于平均单次成功率。
+
+      **二、直觉**
+
+      假设某任务单次成功率 0.8，且每次独立：
+      - pass@3 ≈ 1 − 0.2³ = **0.992**
+      - pass^3 ≈ 0.8³ = **0.512**
+
+      同一个 Agent，按「能力上限」看接近满分，按「每次都对」看只有一半。
+
+      τ-bench 的实测：当时表现最好的函数调用 Agent 在零售场景平均成功率超过 60%，但 **pass^8 跌到 25% 以下**。
+
+      **三、怎么算**
+
+      每个任务跑 n 次（n ≥ k），成功 c 次，按任务取平均：
+      - pass@k = 1 − C(n−c, k) / C(n, k)
+      - pass^k = C(c, k) / C(n, k)
+
+      ```mermaid
+      flowchart LR
+        T["同一任务"] --> R["独立运行 n 次"]
+        R --> C["成功 c 次"]
+        C --> A["pass@k 至少一次成功 能力上限"]
+        C --> B["pass^k 全部成功 可靠性"]
+        A --> U1["有验证器可重试 如跑单测"]
+        B --> U2["面向客户每次都要对 如派单退款"]
+      ```
+
+      **四、选哪个**
+
+      | 场景 | 指标 | 原因 |
+      |---|---|---|
+      | Coding Agent 有单测可验证，允许重试 | pass@k | 失败了可以自动重来，只要有一次过就行 |
+      | 客服、退款、派单，用户每次都要对 | pass^k | 用户不会给你重试机会 |
+      | 日常版本对比 | pass@1 | 成本最低，作为主指标 |
+
+      **五、成本控制**
+
+      多次运行成本是 n 倍，不必全量都跑：挑**关键任务子集**（如 20 条高风险任务）跑 3~5 次即可。
+      提升 pass^k 的常见办法：降低温度、把确定性步骤交给代码、补充澄清环节、减少模糊指令。
+    scenarios: |
+      - 选型：两个模型 pass@1 相近，但 pass^5 一个 0.6 一个 0.3，面向客户的场景选前者。
+      - Coding Agent：pass@1 只有 50%，但 pass@3 达到 85%，于是设计「跑测试失败就重试，最多 3 次」的循环。
+      - 版本发布：关键任务子集的 pass^3 设为发布门槛之一。
+    code: |
+      无偏估计（每个任务跑 n 次，成功 c 次）：
+
+      ```python
+      from math import comb
+
+
+      def pass_at_k(n: int, c: int, k: int) -> float:
+          return 1 - comb(n - c, k) / comb(n, k)
+
+
+      def pass_hat_k(n: int, c: int, k: int) -> float:
+          return comb(c, k) / comb(n, k)
+
+
+      # 每个任务的 (n, c)，结果按任务取平均
+      runs = [(5, 5), (5, 3), (5, 1)]
+      print(sum(pass_at_k(n, c, 3) for n, c in runs) / len(runs))
+      print(sum(pass_hat_k(n, c, 3) for n, c in runs) / len(runs))
+      ```
+    pitfalls: |
+      - **误区：pass@k 高就说明 Agent 可以无人值守。** 它只说明「多试能做出来」，前提是有可靠的验证器挑出正确那次。
+      - **误区：每个任务跑一次再乘以 k。** 两个指标都要求同一任务真实运行多次。
+      - **误区：所有评测都跑 k 次。** 成本翻倍，挑关键子集即可。
+      - **混淆：pass^k 和单次成功率的 k 次方。** 只有在每次独立、成功率相同时才近似相等，实际要用多次运行结果估计。
+    interview_asks:
+      - question: "pass@k 和 pass^k 有什么区别？分别适合什么场景？"
+        answer: "pass@k 是 k 次里有一次对就算过，适合可以重试或有人挑选的编程题。pass^k 是 k 次都要对，适合用户只看一次、必须稳定的 Agent。对外承诺稳定性用后者。"
+      - question: "Agent 评测平均成功率很高，为什么上线后还是不稳定？"
+        answer: "平均分把多次运行抹平了。用户遇到的是单次。要看同一题重复跑是否都过，以及最差的那一类题。只报平均成功率会掩盖偶发的工具乱调用。"
+      - question: "怎么提升 Agent 的一致性？"
+        answer: "把容易飘的步骤改成代码或固定流程，减少不必要的工具，温度调低，加上校验和最大步数。再用 pass^k 看是不是真的更稳，而不是平均分更高。"
+    project_example: |
+      **p3 前端 Coding Agent**：选 20 个「新增或修改 Vue 组件」的任务，每个跑 5 次，成功标准是 vitest 和 eslint 全部通过。
+      同时报告 pass@1、pass@3 和 pass^3：pass@3 说明「生成-测试-修复循环最多重试 3 次」能覆盖多少任务（为 Day 47 的循环设计提供依据）；pass^3 说明不重试时的稳定性。数字用你自己的运行结果填写。
+    freshness: |
+      核对于 2026-11：pass^k 由 τ-bench（Yao 等，arXiv 2406.12045，ICLR 2025）提出，论文给出 pass^k 与 pass@k 的无偏估计公式；Sierra 后续发布了 τ²/τ³-bench，原仓库提示旧任务已过时，以新版本为准。
+    sources:
+      - {title: "τ-bench 论文 arXiv 2406.12045", url: "https://arxiv.org/abs/2406.12045"}
+      - {title: "Sierra - τ-Bench: Benchmarking AI agents for the real-world", url: "https://sierra.ai/blog/benchmarking-ai-agents"}
+      - {title: "sierra-research/tau-bench 仓库", url: "https://github.com/sierra-research/tau-bench"}
+  - id: d42-k4
+    name: 工具调用正确率与轨迹评测
+    level: P0
+    summary: Agent 评测分三层：最终结果对不对、每次工具调用对不对、整条轨迹是否合规高效
+    analogy: |
+      像前端 E2E 测试的两种断言：**断言最终页面状态**（下单后订单列表出现新订单），以及**断言接口调用序列**（必须先调 `/auth` 再调 `/order`，用 Mock Service Worker 记录请求）。
+      **不一样的地方**：Agent 达成同一目标可以有多条合理路径，路径断言写得太死会误杀正确行为。
+    why: |
+      Agent 的价值在于「替用户办成事」，只看最后一句回复看不出它有没有调错接口、有没有越权、有没有绕远路。
+      招聘 JD 中「Agent 评测」「工具调用准确率」越来越常见，面试官常问「你怎么评测一个 Agent」。
+    problem: |
+      解决「Agent 回复看起来对，但过程有问题」以及「过程不同但结果正确被误判」两类问题。
+      例如：退款最终状态正确，但没有经过用户确认；或者 Agent 多查了一次设备详情，被严格的轨迹比对判为失败。
+    principle: |
+      **一、三层评测**
+
+      ```mermaid
+      flowchart TB
+        A["Agent 评测"] --> L1["结果层 最终状态与回复"]
+        A --> L2["工具调用层 选得对 参数对"]
+        A --> L3["轨迹层 顺序约束 效率 安全"]
+        L1 --> M1["比对业务数据最终状态 回复含必要信息"]
+        L2 --> M2["工具选择正确率 参数结构匹配 不该调用时没调用"]
+        L3 --> M3["关键顺序 如先审批后派单 步数 重复调用 越权调用"]
+      ```
+
+      **二、结果层：先看事情办没办成**
+
+      τ-bench 的做法：任务结束后**比对数据库最终状态**与期望状态，再检查回复里是否包含必要信息。好处是不关心路径，Agent 换种问法、换个顺序都能被正确判定。
+      但论文也提醒：结果正确是**必要不充分**条件，例如没有得到用户明确确认就退款，最终状态一样却违反了规则。所以还需要轨迹层的约束。
+
+      **三、工具调用层**
+
+      - **工具选择**：该调用的调了没有？不该调用的（闲聊、越权请求）是不是没调？BFCL 专门有 irrelevance 类别测「不该调用」。
+      - **参数正确**：用**结构匹配**比较函数名和参数键值，忽略参数顺序和引号、空格等格式差异（Hello-Agents 第十二章用 BFCL 的 AST 匹配讲了这个方法）。
+      - 再配合 Schema 校验检查类型、必填、枚举值。
+
+      **四、轨迹层**
+
+      LangChain 的 `agentevals` 提供四种轨迹匹配模式：
+
+      | 模式 | 含义 | 适合 |
+      |---|---|---|
+      | strict | 消息和工具调用顺序完全一致 | 顺序本身就是规则，如先查政策再授权 |
+      | unordered | 工具调用相同，顺序不限 | 几个查询谁先谁后无所谓 |
+      | subset | 只能调用参考里出现的工具，不能多 | 防止越界调用 |
+      | superset | 至少调用参考里的工具，允许额外调用 | 确认关键动作做了 |
+
+      另外可以用 LLM 评审判断整条轨迹是否合理高效（需要校准，见 k2）。
+
+      **五、效率与安全也是指标**
+
+      步数、重复调用次数、Token、耗时；以及**越权调用次数**（审批前是否调用了写操作、是否调用了与任务无关的高风险工具）。安全约束应设为硬门槛。
+
+      **实用建议**：以结果层为主判定，轨迹层只校验**真正重要的约束**，不要用 strict 模式去比对所有步骤。
+    scenarios: |
+      - 退款客服 Agent：结果层比对订单状态；轨迹层要求「确认身份」在「发起退款」之前。
+      - 运维 Agent：工具调用层统计参数正确率，重点看时间范围和资源 ID；安全层统计是否出现删除类调用。
+      - 报表 Agent：用 unordered 模式确认它查了需要的三个数据源，顺序不限。
+    code: |
+      一个不依赖框架的最小轨迹检查：关键工具必须出现，写操作必须在审批之后。
+
+      ```python
+      from dataclasses import dataclass
+
+
+      @dataclass
+      class Call:
+          name: str
+          args: dict
+
+
+      def check_trajectory(calls: list[Call], required: set[str]) -> dict:
+          names = [c.name for c in calls]
+          approved_at = names.index("request_approval") if "request_approval" in names else None
+          writes = [i for i, n in enumerate(names) if n in {"create_work_order", "dispatch_order"}]
+          return {
+              "has_required": required.issubset(names),
+              "write_before_approval": any(approved_at is None or i < approved_at for i in writes),
+              "steps": len(calls),
+              "repeated_calls": len(names) - len({(c.name, str(sorted(c.args.items()))) for c in calls}),
+          }
+      ```
+
+      用 `agentevals` 做轨迹匹配（模式名以官方文档为准）：
+
+      ```python
+      from agentevals.trajectory.match import create_trajectory_match_evaluator
+
+      evaluator = create_trajectory_match_evaluator(trajectory_match_mode="superset")
+      result = evaluator(outputs=agent_messages, reference_outputs=reference_messages)
+      ```
+    pitfalls: |
+      - **误区：只看最终回复文本。** 回复说「已为您派单」，实际可能根本没调用派单工具。
+      - **误区：轨迹一律 strict 匹配。** 合理的替代路径会被误判失败，团队被迫在 Prompt 里写死步骤。
+      - **误区：只看结果不看过程。** 结果正确但跳过了确认或审批，属于严重违规。
+      - **误区：用字符串比较工具调用。** 参数顺序、引号不同就判错。
+      - **误区：不测「不该调用工具」的样本。** Agent 对闲聊或越权请求也乱调工具时测不出来。
+    interview_asks:
+      - question: "你怎么评测一个 Agent？只看最后的回答可以吗？"
+        answer: "不够。还要看它有没有调对工具、参数对不对、有没有多余的危险调用、步数是否可接受。最后回答对了但途中调错库，也不能算通过。"
+      - question: "工具调用的参数正确率怎么判定？"
+        answer: "和标注的调用比：工具名对不对，关键参数对不对。id 这类字段要精确匹配。多出来的危险调用算失败。不要只看最终自然语言像不像。"
+      - question: "轨迹评测用严格匹配有什么问题？"
+        answer: "同样正确的路径可能工具顺序不同，严格全串匹配会误伤。对必须调用的关键步骤做匹配，允许无关的只读步骤有差异。危险调用则一票否决。"
+    project_example: |
+      **p2 智慧园区运营 Agent（任务评测模块）**：评测集 40 条任务，每条包含用户请求、期望的工单表最终状态、必须调用的工具、禁止的行为。
+      判定：结果层比对工单表（类型、园区编号、设备、优先级）；工具层统计 `query_alarms` 参数正确率；轨迹层只校验两条约束：「派单前必须经过人工审批中断」和「不得调用与请求无关的写工具」。
+      另选 15 条高频任务各跑 3 次报告 pass^3。评测脚本输出每类指标的通过率和违规样本清单。
+    freshness: |
+      核对于 2026-11：LangChain 开源包 `agentevals` 提供 `create_trajectory_match_evaluator`（Python）/ `createTrajectoryMatchEvaluator`（TypeScript），`trajectory_match_mode` 支持 strict、unordered、subset、superset 四种模式，也支持 LLM-as-judge 轨迹评审；Hello-Agents 第十二章用 BFCL 的 AST 匹配评估工具调用，类别含 simple、multiple、parallel、irrelevance。
+    sources:
+      - {title: "LangSmith - Trajectory evaluations (agentevals)", url: "https://docs.langchain.com/langsmith/trajectory-evals"}
+      - {title: "Hello-Agents 第十二章 智能体性能评估", url: "https://github.com/datawhalechina/hello-agents/blob/main/docs/chapter12/%E7%AC%AC%E5%8D%81%E4%BA%8C%E7%AB%A0%20%E6%99%BA%E8%83%BD%E4%BD%93%E6%80%A7%E8%83%BD%E8%AF%84%E4%BC%B0.md"}
+      - {title: "τ-bench 论文 arXiv 2406.12045", url: "https://arxiv.org/abs/2406.12045"}
+test:
+  - id: d42-t1
+    kp: d42-k1
+    type: single
+    question: 业务专家为每条样本写了 3 条「必须提到的关键事实点」。要判断回答是否正确，最稳定的评审形式是？
+    options:
+      - "单点打分：只给问题和回答，让评审给出 1~10 分"
+      - "成对比较：把新旧两版回答放在一起，选出更好的"
+      - "基于参考：给评审关键事实点，逐条判断是否覆盖"
+      - "自我评估：让被测模型在回答末尾给自己打一个分"
+    answer: [2]
+    explain: |
+      有标注的关键事实点时，基于参考的评审只需判断「有没有覆盖、有没有矛盾」，标准明确、一致性最高，是离线评测的首选。
+      无参考的 1~10 分噪声大；成对比较只能说明相对好坏，不能判断是否正确；被测模型自评存在明显的自我偏好。
+  - id: d42-t2
+    kp: d42-k1
+    type: single
+    question: 下面四种评审 Prompt 写法，哪一种最可能得到稳定、可复核的结果？
+    options:
+      - "只判「是否覆盖全部参考要点」，先写理由再输出 pass 或 fail"
+      - "综合考虑准确性、语气、格式和长度，给出 1~10 的总分"
+      - "请你像一位资深专家一样，严格评价这个回答的整体质量"
+      - "只输出一个分数数字，不要输出理由，以节省 Token 成本"
+    answer: [0]
+    explain: |
+      单一维度加二元结论，标准清晰；先写理由再下结论能提高稳定性，也方便人工复核分歧样本。
+      多维度合成总分无法定位问题；「像专家一样严格」没有可执行的标准；不输出理由会让评审结果无法复核。
+  - id: d42-t3
+    kp: d42-k1
+    type: single
+    question: 下面的评审函数用于 CI 回归评测。对评测结论影响最严重的问题是什么？
+    code: |
+      import json
+      import os
+      from openai import OpenAI
+
+      client = OpenAI()
+      MODEL = os.environ["APP_MODEL"]  # 被测系统也读取这个变量
+
+      def judge(question: str, answer: str, points: list[str]) -> bool:
+          resp = client.chat.completions.create(
+              model=MODEL,
+              messages=[{"role": "user", "content": f"问题：{question}\n回答：{answer}\n要点：{points}\n回答好吗？"}],
+          )
+          try:
+              return json.loads(resp.choices[0].message.content)["pass"]
+          except Exception:
+              return True
+    lang: python
+    options:
+      - "没有设置 max_tokens，评审输出可能过长而浪费 Token"
+      - "使用了同步客户端，几百条样本的评测会跑得比较慢"
+      - "在 f-string 里直接拼接列表，送给评审的格式不美观"
+      - "解析失败时默认判通过，且评审与被测共用同一模型"
+    answer: [3]
+    explain: |
+      解析失败返回 True，评审越不稳定通过率越高，会掩盖真实退化；评审与被测共用 APP_MODEL，存在自我偏好，而且升级被测模型时评审标准同时改变，新旧分数不可比。另外 Prompt 没有 rubric、没有要求 JSON 格式。
+      max_tokens、同步调用、列表格式都只是次要问题，不会扭曲评测结论。
+  - id: d42-t4
+    kp: d42-k1
+    type: single
+    question: 什么情况下应优先使用「成对比较」而不是单点评分？
+    options:
+      - "需要知道每条回答是否绝对达标，用于上线门禁判断"
+      - "比较两个版本谁更好，而绝对评分标准很难写清楚时"
+      - "检查 JSON 输出是否符合 Schema 这类确定性要求时"
+      - "系统只有一个版本，需要监控线上每条回答的质量时"
+    answer: [1]
+    explain: |
+      成对比较回答「A 和 B 哪个更好」，在摘要、文案这类绝对分数难定义的任务上，相对判断比绝对打分更容易、更一致，适合版本对比。
+      上线门禁需要绝对标准；Schema 检查应该用代码；只有一个版本时没有比较对象。
+  - id: d42-t5
+    kp: d42-k1
+    type: multi
+    question: 以下哪些做法有助于提高 LLM 评审的稳定性和可复核性？
+    options:
+      - "要求输出结构化 JSON，包含理由和结论两个字段"
+      - "评审模型单独配置、固定版本，并把温度设低"
+      - "允许评审在信息不足时输出「无法判断」"
+      - "让评审一次判断五个维度，只输出一个总分"
+    answer: [0, 1, 2]
+    explain: |
+      结构化输出便于解析和复核；独立配置、固定版本、低温度减少评审自身的波动；允许「无法判断」避免强迫二选一造成误判。
+      多维度合成一个总分会丢失信息，也更不稳定，应拆成多个单维度评审。
+  - id: d42-t6
+    kp: d42-k2
+    type: single
+    question: 关于 Zheng 等人 2023 年 MT-Bench 研究对 LLM-as-Judge 的结论，哪一项准确？
+    options:
+      - "LLM 评审与人类判断几乎不一致，不能用于任何评测"
+      - "强模型评审与人类一致率超 80%，接近人类之间的一致水平"
+      - "LLM 评审没有任何系统性偏差，可以完全替代人工评审"
+      - "只有成对比较存在偏差，单点评分的方式没有任何偏差"
+    answer: [1]
+    explain: |
+      该研究发现 GPT-4 这类强评审与人类偏好的一致率超过 80%，与人类彼此之间的一致率相当，同时也系统讨论了位置、长度、自我增强等偏差及缓解方法。
+      结论是「可用但要处理偏差」，既不是不能用，也不是没有偏差。
+  - id: d42-t7
+    kp: d42-k2
+    type: single
+    question: 下面代码模拟了一次评审校准，输出是什么？说明了什么？
+    code: |
+      human = [True] * 90 + [False] * 10   # 人工：90 条通过，10 条不通过
+      judge = [True] * 100                  # 评审：全部判通过
+
+      agree = sum(h == j for h, j in zip(human, judge)) / len(human)
+      p_h, p_j = sum(human) / 100, sum(judge) / 100
+      p_e = p_h * p_j + (1 - p_h) * (1 - p_j)
+      kappa = (agree - p_e) / (1 - p_e)
+      print(agree, round(kappa, 2))
+    lang: python
+    options:
+      - "0.9 0.0，一致率看着高，但评审完全没有区分能力"
+      - "0.9 0.9，评审与人工高度一致，可以直接投入使用"
+      - "0.1 0.0，评审与人工的判断几乎完全相反"
+      - "0.9 1.0，评审完美复现了人工的全部判断"
+    answer: [0]
+    explain: |
+      一致率 = 90/100 = 0.9；碰巧一致概率 p_e = 0.9×1 + 0.1×0 = 0.9，κ = (0.9−0.9)/(1−0.9) = 0。
+      这个评审一个失败样本都没抓住，却有 90% 一致率。类别不平衡时必须看 κ 和失败样本识别率，不能只看一致率。
+  - id: d42-t8
+    kp: d42-k2
+    type: single
+    question: 成对比较时，你发现评审明显偏向放在前面的回答。最直接有效的缓解办法是？
+    options:
+      - "换一个参数量更大的评审模型，偏差自然就会消失"
+      - "把两个回答拼成一段文本，让评审自己分辨谁更好"
+      - "只比较长度相近的回答，长度差距大的样本直接丢弃"
+      - "交换顺序各评一次，两次结论不一致就记为平局"
+    answer: [3]
+    explain: |
+      交换顺序各评一次是处理位置偏差的标准做法，只统计两次一致的结论，不一致视为平局，LangSmith 的成对评测也提供了随机化顺序的选项。
+      更大的模型也可能有位置偏差；拼成一段会让判断更混乱；丢弃样本会让评测集失去代表性。
+  - id: d42-t9
+    kp: d42-k2
+    type: single
+    question: 被测系统使用模型 X，评审也使用模型 X。最主要的风险是什么？
+    options:
+      - "评审调用会和被测调用争抢同一个账号的限流配额"
+      - "评审偏好自己熟悉的表达且与被测共享盲区，错误易被放过"
+      - "同一个模型无法稳定输出 JSON，评审结果无法解析"
+      - "评审会倾向于把所有回答都判为不通过，导致分数偏低"
+    answer: [1]
+    explain: |
+      同一模型做评审存在自我偏好（研究显示与文本对评审更「熟悉」有关），而且被测模型理解错的地方评审往往也理解错，错误难以被发现。应换用不同厂商或系列的评审模型。
+      配额争抢是工程问题但不扭曲结论；JSON 输出与是否同一模型无关；自我偏好倾向是打高分而不是低分。
+  - id: d42-t10
+    kp: d42-k2
+    type: judge
+    question: 人工标注 100 条后，评审与人工的一致率达到 92%，说明评审已经可靠，之后无需再做检查。
+    answer: false
+    explain: |
+      一致率在类别不平衡时会高估评审能力，需要同时看 Cohen's κ 和失败样本识别率；用来改 rubric 的样本也不能直接用来验收。
+      此外评审模型、rubric 或任务变化后都需要重新校准，平时也要定期抽检。
+  - id: d42-t11
+    kp: d42-k2
+    type: multi
+    question: 以下哪些属于 LLM 评审常见的偏差？
+    options:
+      - "偏向放在某个固定位置的回答"
+      - "偏向更长或排版更花哨的回答"
+      - "偏向自己或同系列模型生成的回答"
+      - "给了参考要点后，更看重回答是否覆盖要点"
+    answer: [0, 1, 2]
+    explain: |
+      位置偏差、长度与风格偏差、自我偏好都是已被研究证实的评审偏差，需要通过交换顺序、rubric 约束和换用不同系列模型来缓解。
+      给了参考要点后关注要点覆盖，是基于参考评审的设计目标，不是偏差。
+  - id: d42-t12
+    kp: d42-k3
+    type: single
+    question: 下面代码的输出是什么？
+    code: |
+      from math import comb
+
+      def pass_at_k(n: int, c: int, k: int) -> float:
+          return 1 - comb(n - c, k) / comb(n, k)
+
+      def pass_hat_k(n: int, c: int, k: int) -> float:
+          return comb(c, k) / comb(n, k)
+
+      print(pass_at_k(5, 3, 2), pass_hat_k(5, 3, 2))
+    lang: python
+    options:
+      - "0.9 0.3"
+      - "0.3 0.9"
+      - "0.6 0.6"
+      - "0.9 0.6"
+    answer: [0]
+    explain: |
+      n=5、c=3、k=2：C(5,2)=10，C(2,2)=1，所以 pass@2 = 1 − 1/10 = 0.9；C(3,2)=3，所以 pass^2 = 3/10 = 0.3。
+      同一组运行结果，「至少一次成功」接近满分，「两次都成功」只有 0.3，这正是能力上限和可靠性的差别。
+  - id: d42-t13
+    kp: d42-k3
+    type: single
+    question: 银行客服 Agent 处理同一类退款请求，业务方要求「每个客户来问都要办对」。哪个指标最能反映这个要求？
+    options:
+      - "pass@k，k 次里只要有一次成功就说明能力具备"
+      - "单次运行成功率，把评测集跑一遍就足以说明问题"
+      - "pass^k，要求同一任务独立运行 k 次全部成功"
+      - "评审平均分，因为它能反映回答整体的友好程度"
+    answer: [2]
+    explain: |
+      面向客户的场景没有「重试挑最好的一次」的机会，每次都要对，所以要看 pass^k 这种一致性指标，τ-bench 正是为此提出它。
+      pass@k 衡量的是多试能否做出来；单次成功率看不出波动；评审平均分与任务是否办成无直接关系。
+  - id: d42-t14
+    kp: d42-k3
+    type: judge
+    question: 对于有单元测试可以自动判断对错、允许多次尝试的 Coding Agent 任务，pass@k 比 pass^k 更能反映「允许重试时能否完成任务」。
+    answer: true
+    explain: |
+      有可靠验证器（单元测试）时，系统可以自动重试并挑出通过的那一次，只要 k 次里有一次成功就够了，这正是 pass@k 的含义。
+      pass^k 衡量每次都成功的一致性，更适合没有重试机会的面向用户场景。
+  - id: d42-t15
+    kp: d42-k3
+    type: multi
+    question: 关于 pass@k 与 pass^k，以下哪些说法正确？
+    options:
+      - "k=1 时两者相等，都等于平均单次成功率"
+      - "k 增大时，pass@k 不会下降，pass^k 不会上升"
+      - "τ-bench 中强模型的 pass^8 远低于 pass^1"
+      - "pass^k 只需要每个任务运行 1 次就能计算"
+    answer: [0, 1, 2]
+    explain: |
+      k=1 时「至少一次」和「全部」是同一件事；k 越大，至少一次成功越容易、全部成功越难；τ-bench 中最好的 Agent 平均成功率超过 60%，pass^8 却低于 25%。
+      两个指标都需要同一任务真实运行多次（n ≥ k）才能估计。
+  - id: d42-t16
+    kp: d42-k4
+    type: single
+    question: 评测一个会调用工具修改业务数据的 Agent（如退款、派单），哪种判定最能直接反映「任务是否真的完成」？
+    options:
+      - "比较回复文本与参考回复在字面上的相似程度"
+      - "比对执行结束后的业务数据状态是否符合期望"
+      - "统计 Agent 在整个任务中一共调用了多少次工具"
+      - "让评审模型判断回复语气是否足够专业友好"
+    answer: [1]
+    explain: |
+      τ-bench 的做法是在任务结束后比对数据库最终状态与期望状态，它不关心路径和措辞，直接回答「事情办成没有」。
+      回复文本可能说「已办理」但实际没调用工具；调用次数是效率指标；语气与任务完成无关。
+  - id: d42-t17
+    kp: d42-k4
+    type: multi
+    question: 判定一次工具调用的参数是否正确时，为什么推荐比较函数名与参数键值的「结构匹配」，而不是直接比较调用字符串？
+    options:
+      - "参数顺序不同但含义相同的调用应当判为正确"
+      - "引号、空格等格式差异不应该影响判定结果"
+      - "可以准确发现参数名写错、值类型错误等问题"
+      - "可以直接判断工具执行后业务结果是否正确"
+    answer: [0, 1, 2]
+    explain: |
+      工具调用本质是结构化数据，结构匹配忽略顺序与格式差异，同时能精确发现参数名、类型、取值错误，BFCL 用 AST 匹配正是这个原因。
+      参数结构正确不代表执行结果正确（例如单位不同、数据已变化），业务结果需要结果层评测来确认。
+  - id: d42-t18
+    kp: d42-k4
+    type: judge
+    question: 轨迹评测应该一律使用严格匹配（工具调用顺序必须与参考轨迹完全一致），这样最能保证 Agent 行为正确。
+    answer: false
+    explain: |
+      Agent 达成同一目标常有多条合理路径，严格匹配会把多查一次、换个顺序的正确行为判为失败，逼着团队在 Prompt 里写死步骤。
+      更好的做法是以结果层为主，轨迹层只校验真正重要的约束（如先审批后派单），并按需选择 unordered、subset、superset 模式。
+  - id: d42-t19
+    kp: d42-k4
+    type: single
+    question: 你想确认 Agent「至少调用了参考轨迹里的关键工具」，同时允许它额外多查几次。在 agentevals 的轨迹匹配模式中应该选择哪个？
+    options:
+      - "strict：消息和工具调用的顺序必须完全一致"
+      - "unordered：工具调用集合相同，但顺序不限"
+      - "subset：只能调用参考轨迹中出现过的工具"
+      - "superset：至少包含参考中的工具，允许额外调用"
+    answer: [3]
+    explain: |
+      superset 要求实际轨迹包含参考轨迹中的全部工具调用，并允许额外调用，正好对应「关键动作必须做、多查几次无妨」。
+      strict 要求顺序完全一致；unordered 要求集合相同，不允许多；subset 恰好相反，只限制不能超出参考范围。
+exam:
+  - id: d42-e1
+    kp: d42-k1
+    type: single
+    question: 你要评测知识库回答「是否忠实于本次检索到的资料」。下面哪种评审设计最合理？
+    options:
+      - "只给评审问题和回答，让它凭自身知识判断回答是否正确"
+      - "给评审参考答案，判断回答与参考答案的措辞是否一致"
+      - "给评审检索片段，拆出回答中的说法逐条核对有无依据"
+      - "让被测模型在回答末尾自述一句「以上内容均有依据」"
+    answer: [2]
+    explain: |
+      忠实度的定义是「回答中的说法能否被检索资料支持」，评审必须拿到检索片段并逐条核对，RAGAS 的 Faithfulness 也是按「被支持的说法数 / 全部说法数」计算。
+      凭常识判断衡量的是正确性而非忠实度；措辞一致不等于有依据；模型自述没有任何约束力。
+  - id: d42-e2
+    kp: d42-k2
+    type: single
+    question: 评审与人工在 100 条校准样本上有 18 条不一致，其中 12 条都是「回答部分正确」的情况。最合理的下一步是？
+    options:
+      - "在 rubric 中明确「部分正确」的判定标准并补边界示例，再换一批样本验证"
+      - "换一个更贵的评审模型，不修改 rubric，直接在原样本上重跑"
+      - "把这 12 条从校准集中删掉，一致率就能达到上线标准"
+      - "改为让评审打 1~10 分，部分正确的回答就能给中间分"
+    answer: [0]
+    explain: |
+      分歧集中在「部分正确」，说明 rubric 对边界情况没有写清楚，应补充判定规则和示例，并在没参与修改的样本上验证，避免对校准集过拟合。
+      换模型不解决标准不清的问题；删除分歧样本是掩盖问题；改成 1~10 分只会让边界更模糊。
+  - id: d42-e3
+    kp: d42-k3
+    type: single
+    question: Coding Agent 在 20 个任务上各跑 5 次，结果为 pass@1 = 55%、pass@5 = 90%、pass^5 = 20%。哪种解读最合理？
+    options:
+      - "pass@5 很高，说明 Agent 已足够稳定，可以无人值守直接合并 PR"
+      - "pass^5 只有 20%，说明 Agent 基本没有能力，应该放弃这个方案"
+      - "多数任务能力具备但不稳定，适合配合测试验证和重试，不宜无人值守"
+      - "三个数字互相矛盾，说明评测脚本的统计逻辑一定存在 bug"
+    answer: [2]
+    explain: |
+      pass@5 高说明多数任务多试几次能做出来；pass^5 低说明每次都成功的概率很低。结合起来：应设计「跑测试、失败重试」的循环，并保留人工审查，而不是无人值守合并。
+      这三个数字完全可能同时出现，并不矛盾；仅凭 pass^5 低就放弃也忽略了重试能带来的提升。
+  - id: d42-e4
+    kp: d42-k4
+    type: single
+    question: 退款 Agent 的评测只比对「最终数据库状态」。上线后发现它会在用户没有确认的情况下直接退款，但最终状态和期望一致。这说明什么？
+    options:
+      - "最终状态评测是错误的方法，应该全部改成人工评测"
+      - "数据库状态比对的实现有 bug，没有读取到正确数据"
+      - "只看结果不看过程，需要补充确认步骤的轨迹约束"
+      - "模型能力不足，换一个更强的模型就能自然解决"
+    answer: [2]
+    explain: |
+      τ-bench 论文也指出最终状态正确是必要但不充分的：没有得到用户明确确认就退款，状态一样却违反规则。需要在轨迹层增加「确认在退款之前」的约束检查，并设为硬门槛。
+      结果层评测本身没错，只是不完整；这不是比对实现的 bug；换模型不能替代规则校验。
+  - id: d42-e5
+    kp: d42-k2
+    type: multi
+    question: 关于评审校准流程，哪些做法是正确的？
+    options:
+      - "校准样本同时包含通过与不通过，并覆盖边界情况"
+      - "除一致率外，还要看 Cohen's κ 或失败样本识别率"
+      - "评审模型或 rubric 改动之后，需要重新进行校准"
+      - "用来修改 rubric 的分歧样本，也用来验收最终一致率"
+    answer: [0, 1, 2]
+    explain: |
+      样本要有正负两类和边界情况才能检验区分能力；κ 和失败识别率弥补了一致率在类别不平衡时的高估；评审配置变化后标准可能漂移，必须重新校准。
+      用改 rubric 时看过的样本验收，等于在训练集上测试，会高估评审能力，应使用留出样本。
+  - id: d42-e6
+    kp: d42-k4
+    type: multi
+    question: 为智慧园区运营 Agent（查告警、创建工单、派单需审批）设计评测指标，哪些是合理的？
+    options:
+      - "工具选择正确率：该调用的调用了，不该调用的没调用"
+      - "参数正确率：园区编号、时间范围等参数是否正确"
+      - "越权调用次数：审批之前是否调用了派单等写操作"
+      - "工具描述字数：描述写得越长说明工具设计得越好"
+    answer: [0, 1, 2]
+    explain: |
+      工具选择、参数正确、审批前是否越权分别对应工具调用层和轨迹安全层的核心指标，越权调用应设为硬门槛。
+      工具描述字数与 Agent 是否正确完成任务没有直接关系，不是评测指标。
+  - id: d42-e7
+    kp: d42-k1
+    type: judge
+    question: 让评审模型先写出判断理由、再给出结论，通常比只输出结论更稳定，也便于人工复核分歧样本。
+    answer: true
+    explain: |
+      先理由后结论让评审在下结论前逐条对照标准，结论更稳定；理由被保存下来后，校准时可以看到评审为什么判错，从而有针对性地修改 rubric。
+      这也是 Langfuse 等平台的评审默认同时返回分数和理由的原因。
+  - id: d42-e8
+    kp: d42-k3
+    type: judge
+    question: pass@k 的计算方式是：每个任务只运行一次，得到成功率后再乘以 k。
+    answer: false
+    explain: |
+      pass@k 是同一任务独立运行多次后「至少一次成功」的概率，需要每个任务真实运行 n 次（n ≥ k），统计成功次数 c，再用 1 − C(n−c,k)/C(n,k) 估计并按任务平均。
+      成功率乘以 k 甚至可能超过 1，没有统计意义。
+  - id: d42-e9
+    kp: d42-k4
+    type: case
+    question: |
+      p2 园区 Agent 的任务评测集有 40 条「查询告警并派单」任务。当前判定方式是：用 strict 模式把 Agent 的工具调用序列和人工写的参考轨迹逐步比对，完全一致才算通过，通过率只有 35%。
+      你抽看失败样本发现，大多数是 Agent 多查了一次设备详情，或者先查设备再查告警，最终创建的工单内容完全正确，而且都经过了审批。最合理的改进是？
+    options:
+      - "保持 strict，在 Prompt 中规定每一步的固定调用顺序"
+      - "以工单最终状态判定为主，轨迹只校验审批等关键约束"
+      - "改用 LLM 评审给整条轨迹打 1~10 分，取平均作为通过率"
+      - "删除这些失败样本，只保留与参考轨迹一致的样本"
+    answer: [1]
+    explain: |
+      失败样本都是合理的替代路径，问题出在判定方式过严。应以结果层（工单最终状态）为主判定，轨迹层只保留「派单前必须审批」「不得调用无关写工具」这类真正重要的约束，必要时用 superset 或 unordered 模式。
+      在 Prompt 里写死顺序会降低 Agent 灵活性；1~10 分评审噪声大且需校准；删除样本是掩盖问题。
+interview:
+  - id: d42-i1
+    kp: d42-k2
+    type: scenario
+    difficulty: 2
+    question: 老板质疑：「你们的评测是让 AI 给 AI 打分，这靠谱吗？」你怎么回答，并拿出证据？
+    key_points:
+      - {text: "承认评审有位置、长度、风格、自我偏好等偏差，说明对应缓解措施", dim: principle}
+      - {text: "说明用人工标注样本校准，看一致率、Cohen κ 和失败样本识别率", dim: engineering}
+      - {text: "说明评审只用于主观维度，规则能判的用代码判，评审模型与被测分离并固定版本", dim: engineering}
+      - {text: "引用研究或项目数据：强评审与人类一致率可达人类之间水平，但需要自己的数据验证", dim: concept}
+      - {text: "说明定期抽检和配置变化时重新校准", dim: project}
+    reference: |
+      我会先承认它不是天然可靠，然后拿出我们怎么让它变得可信的证据。
+      第一，评审的使用范围是受限的：格式、引用、是否拒答这些能用代码判的，全部用规则判；只有「是否覆盖关键要点」「是否有依据」这类主观维度才用评审，而且是基于参考要点的二元判定，不让它自由打分。
+      第二，已知偏差都有对应处理：成对比较时交换顺序评两次；rubric 写明简洁准确优先、不看排版；评审模型和被测模型来自不同厂商并固定版本、温度为 0。
+      第三，也是最关键的证据：我们请业务同事人工标注了 100 条样本，其中约三成是不通过，计算评审和人工的一致率、Cohen's κ 和失败样本识别率。只看一致率会高估，所以我们重点看 κ 和「人工判错的样本评审能抓住多少」。第一版 rubric 不达标，补了边界示例后在另一批样本上验证达标才启用。
+      第四，持续监控：每季度抽检，评审模型或 rubric 一改就重新校准。学术上 MT-Bench 研究也显示强评审与人类的一致率可达到人类彼此之间的水平，但我们只相信在自己数据上测出来的数字。
+    oral: |
+      我会直接说：它不是天然靠谱，但我们做了校准，有数据。首先评审只管主观维度，能用代码判的格式、引用、拒答都用规则判；评审也只做基于关键要点的二元判断，不让它自由打分。
+      其次它的偏差我们都有处理，比如交换顺序评两次、评审和被测用不同厂商的模型、固定版本。
+      最关键的是我们请业务同事标了 100 条，算了评审和人工的一致率和 κ，还专门看人工判错的样本评审能抓住多少。第一版不达标，补了边界示例、换一批样本验证通过才上线，之后每季度抽检。
+  - id: d42-i2
+    kp: d42-k4
+    type: design
+    difficulty: 3
+    question: 请为一个智慧园区运营 Agent 设计任务评测方案。它可以查询设备与告警、做只读数据分析、创建工单，派单前必须经过人工审批。
+    key_points:
+      - {text: "评测样本结构：用户请求、期望最终状态、必须调用的工具、禁止行为、分组标签", dim: engineering}
+      - {text: "结果层：比对工单表最终状态与回复中的必要信息", dim: principle}
+      - {text: "工具调用层：工具选择正确率、参数结构匹配、不该调用时没调用", dim: principle}
+      - {text: "轨迹层：只校验关键约束（审批前不派单、不越权写），统计步数与重复调用", dim: engineering}
+      - {text: "可靠性：关键任务跑多次报告 pass^k，并在 CI 中设门槛", dim: project}
+    reference: |
+      我会分「样本 → 判定 → 指标 → 流程」来设计。
+      样本：40~60 条任务，每条包含用户请求（含多轮）、期望的工单表最终状态（类型、园区编号、设备、优先级）、必须调用的工具、禁止行为（如审批前派单、调用与请求无关的写工具），以及分组标签：纯查询、数据分析、建单、派单、闲聊和越权请求（应不调用工具或拒绝）。
+      判定分三层：结果层在沙箱数据库里执行，结束后比对工单表状态，并检查回复是否告知工单号等必要信息；工具调用层用结构匹配比较函数名和参数键值，统计工具选择正确率、参数正确率，越权请求样本检查是否没有调用工具；轨迹层只校验关键约束——派单前必须出现人工审批中断、不得出现无关写操作——同时统计步数和重复调用作为效率指标。
+      可靠性：挑 15 条高频关键任务各跑 3 次，报告 pass^3，因为运营人员不会接受时好时坏。
+      流程：评测脚本按分组输出结果层通过率、参数正确率、越权次数、pass^3；越权次数必须为 0、关键分组不允许下降，作为 CI 门禁；失败样本连同 Trace 链接输出，便于错误分析。
+    oral: |
+      我会按三层来评。第一层看结果，在沙箱数据库里跑完任务，比对工单表最终状态对不对，回复里有没有告诉用户工单号。第二层看工具调用，用结构匹配比函数名和参数，统计工具选得对不对、园区编号这些参数对不对，还要有越权和闲聊样本，确认它这时候不乱调工具。
+      第三层看轨迹，但我只校验关键约束，比如派单前必须经过人工审批，不用严格比对每一步，否则多查一次也会被判错。
+      另外挑十几条高频任务各跑三次算 pass^3，看稳不稳定。越权次数必须为零，作为 CI 的硬门槛。
+  - id: d42-i3
+    kp: d42-k3
+    type: scenario
+    difficulty: 4
+    question: 你的 Agent 在评测集上平均成功率 85%，但上线后业务方说「时好时坏，不敢用」。你怎么分析，又怎么改进？
+    key_points:
+      - {text: "指出单次成功率掩盖了一致性问题，应对关键任务多次运行计算 pass^k", dim: principle}
+      - {text: "分析不一致来源：模糊指令、温度与采样、确定性步骤交给模型、工具返回不稳定", dim: principle}
+      - {text: "改进：确定性步骤交给代码、降低温度、补澄清环节、结构化输出与参数校验", dim: engineering}
+      - {text: "检查评测集与线上分布差异，把线上失败样本补回评测集", dim: engineering}
+      - {text: "把 pass^k 纳入发布门槛并持续监控", dim: project}
+    reference: |
+      「时好时坏」说明问题在一致性，而评测只看了单次成功率。
+      分析第一步：挑出业务方最常用的 15~20 类任务，每条跑 5 次，计算 pass^1 和 pass^5。如果 pass^1 有 85% 而 pass^5 只有 40% 左右，就证实了不稳定。再按任务看：哪些任务 5 次里成功次数在 2~4 次之间，这些就是不稳定任务。
+      第二步找原因：读这些任务成功和失败的 Trace 对比，常见原因有：用户指令模糊，模型每次理解不同；温度偏高；本应由代码完成的确定性步骤（如名称转编号、时间换算）交给了模型；工具在不同时刻返回不同数据；上下文太长导致关键信息有时被忽略。
+      第三步改进：确定性步骤改成代码或专门工具；温度调低并使用结构化输出与参数校验；对模糊请求加澄清环节；关键约束用代码强制，而不是依赖 Prompt。
+      第四步检查评测本身：评测集是否和线上分布一致，线上「不敢用」的具体案例要补回评测集。
+      最后把关键任务的 pass^3 纳入发布门槛，并在线上按任务类型监控成功率波动。
+    oral: |
+      时好时坏说明问题在一致性，而 85% 只是单次成功率。我会先挑业务最常用的十几类任务，每条跑五次，算 pass^5。如果单次 85%、五次全对只有四成，就证实了不稳定，而且能找出哪些任务成功次数在中间摇摆。
+      然后对比这些任务成功和失败的 Trace，常见原因是指令模糊、温度高，或者把名称转编号这种确定性的事交给了模型。
+      改进上，确定性的步骤交给代码，温度调低、参数做校验，模糊的请求先让 Agent 追问澄清。最后把关键任务的 pass^3 放进发布门槛，线上也按任务类型盯成功率波动。
+sources:
+  - {title: "Zheng et al. 2023 - Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena", url: "https://arxiv.org/abs/2306.05685"}
+  - {title: "τ-bench 论文 arXiv 2406.12045", url: "https://arxiv.org/abs/2406.12045"}
+  - {title: "LangSmith - Trajectory evaluations", url: "https://docs.langchain.com/langsmith/trajectory-evals"}
+  - {title: "LangSmith - Evaluation concepts", url: "https://docs.langchain.com/langsmith/evaluation-concepts"}
+  - {title: "Langfuse - LLM-as-a-Judge", url: "https://langfuse.com/docs/evaluation/evaluation-methods/llm-as-a-judge"}
+  - {title: "RAGAS - Faithfulness 指标定义", url: "https://docs.ragas.io/en/latest/concepts/metrics/available_metrics/faithfulness/"}

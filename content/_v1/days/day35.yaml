@@ -1,0 +1,779 @@
+day: 35
+phase: 4
+title: LangGraph：State、Node、Edge 与 Graph
+goals:
+  - 能解释 LangGraph 为什么用「图 + 共享状态」来编排 Agent，以及它和 LangChain、create_agent 的关系
+  - 能讲清 State 的 reducer 机制：节点返回部分更新、默认覆盖、operator.add 追加、add_messages 按 id 合并
+  - 能用 StateGraph、普通边、条件边、START / END 搭出一个带循环的 Agent 图，并说清 compile 做了什么
+  - 能读懂一个手写的 LangGraph 工具调用图，找出缺少终止条件和工具异常未处理的问题
+knowledge_points:
+  - id: d35-k1
+    name: LangGraph 的定位：从链到图
+    level: P1
+    summary: LangGraph 是有状态的图运行时，用节点和边表达分支与循环，用共享 State 传递数据；create_agent 就运行在它之上
+    why: |
+      Day 34 的 LCEL 只能表达「从左到右」的流水线。Agent 天然需要**循环**（模型 → 工具 → 模型）、**分支**（有没有工具调用）、**状态**（消息历史、计数器）和**中断恢复**（人工确认）。
+      LangGraph 是目前 Python 生态里编排这类流程最主流的选择，Agent 岗位 JD 中出现频率很高。
+    problem: |
+      用 LCEL 或手写 while 循环实现复杂 Agent 时：
+      - 分支和循环写在 if/while 里，流程图只存在于开发者脑子里；
+      - 状态散落在局部变量中，进程重启就丢；
+      - 想在某一步暂停等人工确认、之后从断点继续，几乎要重写整个流程。
+      LangGraph 把流程显式建模为图，把状态集中管理，并内建持久化和中断能力（Day 36）。
+    principle: |
+      **一、三个核心概念**
+
+      | 概念 | 是什么 | 类比 |
+      |---|---|---|
+      | **State** | 所有节点共享的数据结构（通常是 TypedDict） | 前端的全局 Store |
+      | **Node** | 一个函数：读取 State，返回要更新的部分 | Redux 的 reducer 加副作用 |
+      | **Edge** | 决定下一个执行哪个节点（固定或条件） | 路由规则 |
+
+      **二、与 LangChain 的关系**
+
+      ```mermaid
+      flowchart TD
+        A["create_agent：高层 Agent 工厂"] --> B["编译后的 LangGraph 图"]
+        C["你手写的 StateGraph"] --> B
+        B --> D["LangGraph 运行时：执行、状态合并、checkpoint、中断"]
+        E["节点内部可以用 LangChain 的模型、LCEL 链、工具"] --> C
+      ```
+
+      - LangGraph v1 官方定位：**稳定的 Agent 运行时**，核心图 API 和执行模型在 v1 中保持不变。
+      - LangChain 的 `create_agent` 返回的就是一个 LangGraph 图（节点 model、tools）。
+      - LangGraph **不依赖** LangChain 的 Agent 抽象，节点里可以直接调用任何 SDK；但通常会用 langchain-core 的消息类型。
+
+      **三、什么时候用 LangGraph**
+
+      - 标准 ReAct 工具 Agent：先用 create_agent；
+      - 需要自定义分支、多阶段流程、人工审批、子图、多 Agent：直接写 StateGraph；
+      - 简单确定的流水线：LCEL 或普通代码就够了。
+
+      **四、v1 的变化（迁移时要注意）**
+
+      `langgraph.prebuilt.create_react_agent` 已弃用，改用 `langchain.agents.create_agent`；`MessageGraph` 移除，改用带 messages 键的 StateGraph；`ToolNode`、`tools_condition` 仍保留在 `langgraph.prebuilt` 中。StateGraph、checkpointer、`interrupt()`、`Command`、`Send` 保持兼容。
+    scenarios: |
+      - **售后审批流**：识别意图 → 查订单 → 金额小于阈值自动退款，否则进入人工审批节点 → 通知用户。
+      - **研究助手**：规划节点生成子任务，用 Send 并行分发给多个检索节点，再由汇总节点合成报告。
+      - **客服 Agent**：model 与 tools 两个节点循环，加一个「转人工」节点作为兜底出口。
+    pitfalls: |
+      - **误区：LangGraph 是 LangChain 的升级版，要替换掉 LangChain。** 两者分层协作：LangGraph 管编排，LangChain 提供模型、工具等组件。
+      - **误区：用了 LangGraph 就是多 Agent。** 单 Agent 也常用 LangGraph；多 Agent 只是图的一种形态（Day 39）。
+      - **照搬旧教程**：用 `MessageGraph` 或 `create_react_agent` 写新代码，属于旧写法。
+    interview_asks:
+      - 为什么用 LangGraph 而不是 LangChain 的链？
+      - LangGraph 和 LangChain 是什么关系？
+    project_example: |
+      售后系统最初用 LCEL 加 if/else 实现退款流程，后来要加「大额退款人工审批、审批后继续执行」，发现进程重启后审批中的单子全部丢失。
+      改用 LangGraph 后，把流程拆成 classify、check_order、auto_refund、human_review、notify 五个节点，用条件边按金额分流，审批节点用中断等待人工（Day 36 的 checkpoint）。流程图可以直接从代码导出给产品评审，状态也可以持久化。
+    freshness: |
+      核对于 2026-11：langgraph 1.2.20（PyPI）。LangGraph v1 发布说明：核心图原语（state、nodes、edges）与执行模型不变；`create_react_agent` 弃用改用 `langchain.agents.create_agent`。v1 迁移指南：移除 `MessageGraph`，`ToolNode` 仍可用（官方 PR 已取消其弃用）。旧写法：`MessageGraph`、`from langgraph.prebuilt import create_react_agent`。
+    sources:
+      - {title: "LangGraph Docs - What's new in LangGraph v1", url: "https://docs.langchain.com/oss/python/releases/langgraph-v1"}
+      - {title: "LangGraph v1 migration guide", url: "https://docs.langchain.com/oss/python/migrate/langgraph-v1"}
+
+  - id: d35-k2
+    name: State 与 reducer
+    level: P0
+    summary: State 是所有节点共享的数据；节点只返回部分更新，由每个键的 reducer 决定是覆盖还是合并，messages 用 add_messages 追加并按 id 更新
+    why: |
+      LangGraph 里 80% 的「奇怪 bug」都和 State 合并有关：消息历史突然只剩一条、并行节点报 InvalidUpdateError、计数器不清零。
+      理解 reducer 就能解释这些现象，这也是面试官深挖 LangGraph 时最爱问的点。
+    problem: |
+      多个节点要读写同一份数据，必须回答：
+      - 节点要返回完整状态，还是只返回改了的部分？
+      - 两个节点在同一步都更新同一个键，听谁的？
+      - 消息历史应该被覆盖还是追加？想修改某条历史消息怎么办？
+      reducer 就是对这些问题的统一规则。
+    principle: |
+      **一、State 的定义**
+
+      最常见的是 TypedDict：
+
+      ```python
+      import operator
+      from typing import Annotated
+
+      from langchain.messages import AnyMessage
+      from langgraph.graph.message import add_messages
+      from typing_extensions import TypedDict
+
+      class State(TypedDict):
+          messages: Annotated[list[AnyMessage], add_messages]   # 用 add_messages 合并
+          logs: Annotated[list[str], operator.add]              # 列表拼接
+          step_count: int                                       # 没有 reducer：覆盖
+      ```
+
+      官方文档的说法：State 由 **channels（通道）** 组成，每个键就是一个通道，每个通道定义「更新如何合并进来」。
+
+      **二、节点返回部分更新**
+
+      节点函数接收当前 State，返回一个**只包含要更新的键**的字典。LangGraph 对每个键调用 reducer：
+
+      `新值 = reducer(当前值, 节点返回的值)`
+
+      | reducer | 行为 | 例子：当前 [a]，节点返回 [b] |
+      |---|---|---|
+      | 无（默认） | 覆盖 | 结果 [b] |
+      | `operator.add` | 拼接 | 结果 [a, b] |
+      | `add_messages` | 追加新消息；**id 相同的替换**；自动把 dict 转成消息对象 | 结果 [a, b] |
+
+      ```mermaid
+      flowchart LR
+        S["当前 State：messages 为 Human 消息"] --> N["model 节点"]
+        N --> U["返回部分更新：messages 为一条 AI 回复"]
+        U --> R{"messages 键的 reducer"}
+        R -- "add_messages" --> OK["结果：Human 消息加 AI 回复"]
+        R -- "没有 reducer" --> BAD["结果：只剩 AI 回复，历史丢失"]
+      ```
+
+      **三、为什么 messages 要用 add_messages 而不是 operator.add**
+
+      官方文档说明：`operator.add` 只能追加，**不能按 id 更新已有消息**（例如人工审核时修改模型的工具调用参数）。`add_messages` 还会把 `{"role": "user", "content": "..."}` 这种字典转成消息对象。`MessagesState` 是内置的、只有一个 messages 键（使用 add_messages）的 State，可以继承后加字段。
+
+      **四、并行节点写同一个键**
+
+      两个节点在同一个 super-step 中并行执行，都更新一个**没有 reducer** 的键时，LangGraph 会抛出 `InvalidUpdateError`（提示每步只能接收一个值，需要用 Annotated 声明 reducer）。有 reducer 的键则会依次合并。
+
+      **五、不这样做会怎样**
+
+      - messages 不加 reducer：每次 model 节点返回新回复，就把整个历史覆盖掉，模型「失忆」。
+      - 想清空一个带 reducer 的列表时返回空列表：`operator.add` 会把空列表拼上去，**什么都没清掉**。官方提供 `Overwrite` 用于绕过 reducer 直接替换（以官方文档为准）。
+    scenarios: |
+      - 对话 Agent：`messages` 用 add_messages；
+      - 多个检索节点并行写入结果：`documents: Annotated[list, operator.add]`；
+      - 计数器、当前阶段、路由标记：不加 reducer，直接覆盖；
+      - 人工审核修改工具调用参数：返回同 id 的新 AIMessage，add_messages 会替换旧消息。
+    pitfalls: |
+      - **误区：节点要返回完整 State。** 只返回改动的键即可，返回完整 State 可能导致带 reducer 的列表被重复追加。
+      - **误区：在节点里直接修改 state 字典就能生效。** 应该通过返回值更新，原地修改不会经过 reducer，也不会被 checkpoint 正确记录。
+      - **messages 忘写 Annotated**：历史被覆盖，是最常见的新手 bug。
+      - **用 Pydantic 当 create_agent 的状态**：create_agent 只支持 TypedDict 状态；StateGraph 本身支持多种 schema，但团队内建议统一。
+    interview_asks:
+      - LangGraph 的 State 是怎么在节点之间传递和更新的？
+      - 什么是 reducer？add_messages 和 operator.add 有什么区别？
+      - 两个并行节点同时更新同一个字段会怎样？
+    project_example: |
+      研究助手里三个检索节点并行写 `documents` 字段，第一版没有声明 reducer，运行时报 InvalidUpdateError。改为 `Annotated[list[Doc], operator.add]` 后正常合并。
+      后来又发现重试时 documents 越积越多，原因是重试前返回空列表想「清空」，但 operator.add 不会清空。最终改为单独的 `retry_round` 字段区分轮次，汇总节点只取当前轮的文档。
+    freshness: |
+      核对于 2026-11（langgraph 1.2.20）：Graph API 文档说明「节点返回部分更新，按每个通道的 reducer 合并；默认 reducer 覆盖」「Plain operator.add only appends, so it cannot update an existing message in place」「MessagesState 是只有 messages 键并使用 add_messages 的预置状态」，导入路径 `from langgraph.graph.message import add_messages`。本地实测：无 reducer 时历史被覆盖；两个并行节点写同一无 reducer 键抛 InvalidUpdateError；add_messages 对同 id 消息做替换、把 dict 转为 HumanMessage。
+    sources:
+      - {title: "LangGraph Docs - Graph API（State、Reducers）", url: "https://docs.langchain.com/oss/python/langgraph/graph-api"}
+
+  - id: d35-k3
+    name: Node、Edge 与条件路由
+    level: P0
+    summary: 节点是读 State 写部分更新的函数；普通边固定下一步，条件边由路由函数按 State 决定下一步，START 和 END 标记入口与出口，回指的边形成循环
+    why: |
+      会画图才能用 LangGraph。把 Day 32 的 ReAct 循环翻译成「model 节点 + tools 节点 + 条件边 + 回边」，是 LangGraph 最基础也最常考的建模能力。
+    problem: |
+      Agent 流程需要表达三种控制流：
+      - 顺序：A 做完做 B；
+      - 分支：根据结果去 B 或 C，或者结束；
+      - 循环：B 做完回到 A。
+      需要一种既能运行、又能可视化的声明方式。
+    principle: |
+      **一、节点（Node）**
+
+      - 普通 Python 函数（同步或异步），参数是当前 State，返回要更新的键；
+      - 也可以接收运行时上下文（`runtime: Runtime[ContextSchema]`）拿到数据库连接、模型名等不放进 State 的依赖；
+      - `builder.add_node("model", call_model)` 注册，名字用于边和日志。
+
+      **二、边（Edge）**
+
+      | 类型 | 写法 | 作用 |
+      |---|---|---|
+      | 入口 | `add_edge(START, "model")` | START 是虚拟起点，把输入交给第一个节点 |
+      | 普通边 | `add_edge("tools", "model")` | 固定下一步；指回前面的节点就形成循环 |
+      | 条件边 | `add_conditional_edges("model", route, ["tools", END])` | 执行完 model 后调用 route(state)，按返回值决定下一步 |
+      | 出口 | 路由到 `END` | 结束本次运行 |
+
+      路由函数可以返回节点名、`END`、节点名列表（扇出并行），或 `Send` 对象（见 d35-k5）。第三个参数（path map）声明可能的目标，便于校验和画图。
+
+      **三、把 ReAct 画成图**
+
+      ```mermaid
+      stateDiagram-v2
+        state "model：调用 LLM" as model
+        state "tools：执行工具调用" as tools
+        [*] --> model: START
+        model --> tools: 最后一条 AI 消息有 tool_calls
+        model --> [*]: 没有 tool_calls，到 END
+        tools --> model: 普通边，形成循环
+      ```
+
+      这和 create_agent 内部的主干结构一致。`langgraph.prebuilt` 里的 `ToolNode` 和 `tools_condition` 就是现成的 tools 节点和路由函数。
+
+      **四、官方的两条重要约束**
+
+      - **同一个节点不要同时用普通边和动态路由**（条件边或 Command），否则两条路径都会执行。
+      - 路由函数应该是**纯函数**：只根据 State 判断，不做副作用。
+
+      **五、不这样做会怎样**
+
+      - 条件边没有到 END 的出口：图永远不会正常结束，只能等递归上限报错；
+      - 路由函数里调模型、写库：每次重放或调试都会重复产生副作用，且难以测试。
+    scenarios: |
+      - 意图路由：`add_conditional_edges(START, classify_route, ["faq", "order", "human"])`，从入口直接分流。
+      - 质量把关：生成节点后接条件边，评估不通过回到生成节点，最多重试 N 次。
+      - 兜底出口：路由函数在 State 中的步数超限时返回 "handoff" 节点，转人工。
+    code: |
+      ```python
+      from typing import Literal
+
+      from langgraph.graph import END, START, StateGraph, MessagesState
+
+      def route(state: MessagesState) -> Literal["tools", "__end__"]:
+          last = state["messages"][-1]
+          return "tools" if getattr(last, "tool_calls", None) else END
+
+      builder = StateGraph(MessagesState)
+      builder.add_node("model", call_model)      # call_model / run_tools 为自定义节点函数
+      builder.add_node("tools", run_tools)
+      builder.add_edge(START, "model")
+      builder.add_conditional_edges("model", route, ["tools", END])
+      builder.add_edge("tools", "model")
+      graph = builder.compile()
+      ```
+    pitfalls: |
+      - **误区：END 是一个要自己实现的节点。** START 和 END 都是虚拟节点常量（END 的值是字符串 `__end__`）。
+      - **混用普通边和条件边**：同一节点既 add_edge 又 add_conditional_edges，两条路都会走。
+      - **路由函数返回了未声明的节点名**：运行时报错，或者画出的图和实际不一致。
+      - **循环里没有退出条件**：只依赖模型「不再调用工具」来结束，风险见代码阅读。
+    interview_asks:
+      - 用 LangGraph 怎么实现一个 ReAct Agent？画一下图。
+      - 普通边和条件边有什么区别？循环是怎么形成的？
+    project_example: |
+      客服图最初只有 model 和 tools 两个节点。上线后加了第三个节点 handoff（转人工）：路由函数检查 `state["tool_rounds"] >= 5` 或模型输出了「转人工」标记，就路由到 handoff，由它写工单并给用户固定话术，然后到 END。
+      这样「什么时候结束」从隐式依赖模型，变成了图上看得见的出口。
+    sources:
+      - {title: "LangGraph Docs - Graph API（Nodes、Edges）", url: "https://docs.langchain.com/oss/python/langgraph/graph-api"}
+      - {title: "LangGraph Reference - tools_condition", url: "https://reference.langchain.com/python/langgraph.prebuilt/tool_node/tools_condition"}
+
+  - id: d35-k4
+    name: 编译与执行：compile、super-step 与递归上限
+    level: P1
+    summary: compile 校验图结构并挂载 checkpointer 等运行选项；执行按 super-step 推进，同一步的节点并行，步数超过 recursion_limit 抛 GraphRecursionError
+    why: |
+      理解执行模型，才能解释「为什么两个节点同时执行」「为什么报 GraphRecursionError」「为什么旧教程说默认 25 步，现在却跑了几千步都不停」。
+    problem: |
+      图定义好之后，运行时要决定：哪些节点可以一起跑、状态什么时候合并、什么时候保存检查点、跑多少步算异常。
+    principle: |
+      **一、compile 做了什么**
+
+      官方文档：必须先 compile 才能 invoke 或 stream。compile 会**检查图结构**（例如孤立节点），也是挂载运行时选项的地方：checkpointer（持久化，Day 36）、断点、缓存等。编译后的图实现了 Runnable 接口，可以 `invoke`、`stream`、`batch`，以及 `ainvoke`、`astream`。
+
+      **二、super-step 执行模型**
+
+      ```mermaid
+      sequenceDiagram
+        participant R as 运行时
+        participant A as 本步待执行节点
+        participant S as State
+        R->>A: 第 1 步：执行所有被触发的节点（可并行）
+        A-->>R: 各自返回部分更新
+        R->>S: 按 reducer 合并更新，可在此保存 checkpoint
+        R->>R: 根据边计算下一步要触发的节点
+        R->>A: 第 2 步：执行新触发的节点
+        Note over R: 直到没有节点被触发或到达 END，或步数超过 recursion_limit
+      ```
+
+      - 同一 super-step 中被触发的多个节点**并行执行**，结束后统一合并状态（所以才有 d35-k2 的并行写冲突）。
+      - checkpoint 在 super-step 边界保存，而不是节点函数中途（Day 36 详讲）。
+
+      **三、recursion_limit（递归上限）**
+
+      - 含义：一次运行最多执行多少个 super-step，超过抛 `GraphRecursionError`。
+      - 设置方式：`graph.invoke(inputs, config={"recursion_limit": 20})`，是 config 的**顶层键**，放进 `configurable` 里不生效。
+      - **默认值变化**（Python 版）：1.0.6 之前为 25；1.0.6~1.1.3 为 10000；1.1.4 起为 10007（可用环境变量 `LANGGRAPH_DEFAULT_RECURSION_LIMIT` 覆盖）。
+      - 工程含义：现在的默认值**几乎等于不设限**，Agent 的步数控制必须自己做（State 计数器、调用次数中间件、显式 recursion_limit），Day 37 系统展开。
+
+      **四、运行方式**
+
+      - `invoke`：返回最终 State；
+      - `stream(inputs, stream_mode="updates")`：每个节点完成时返回它的更新，适合展示进度；`stream_mode="values"` 返回每步后的完整 State；
+      - `graph.get_graph().draw_mermaid()`：导出 mermaid 流程图，方便评审。
+    scenarios: |
+      - 线上 Agent：`invoke(..., config={"recursion_limit": 30})` 作为最后一道防线，并捕获 GraphRecursionError 返回兜底话术。
+      - 前端展示「正在查询订单…」：用 stream 的 updates 模式按节点推送进度。
+      - 设计评审：把 draw_mermaid 的输出贴进文档。
+    pitfalls: |
+      - **误区：LangGraph 默认会在 25 步时停止。** 这是 1.0.6 之前（以及 LangGraph JS）的默认值，当前 Python 版默认 10007。
+      - **把 recursion_limit 放进 configurable**：不会生效。
+      - **误区：recursion_limit 等于工具调用次数。** 它数的是 super-step，一轮「model + tools」就是 2 步。
+      - **忘记 compile**：StateGraph 构建器本身不能 invoke。
+    interview_asks:
+      - LangGraph 的图是怎么执行的？什么是 super-step？
+      - 遇到 GraphRecursionError 是什么原因？怎么处理？
+    project_example: |
+      团队按旧教程认为「LangGraph 默认 25 步会自动停」，没有做步数控制。升级到 1.x 后，一个工具持续返回错误时，Agent 在 model 和 tools 之间跑了上千步，单次会话花费异常，最后被网关超时切断。
+      修复：State 中加 tool_rounds 计数、路由函数超限转人工；invoke 显式传 recursion_limit=30 并捕获 GraphRecursionError；同时对工具错误做重试上限。
+    freshness: |
+      核对于 2026-11：Graph API 文档写明「必须 compile 后才能 invoke 或 stream」「recursion_limit 是 config 顶层键，不在 configurable 下」「1.1.4 起默认 10,007 super-steps；1.0.6~1.1.3 为 10,000」。langgraph 1.0.6 发布说明包含「change default recursion limit」，此前默认值为 25（langgraph 仓库 PR #7355 说明 10000 改为 10007 的原因；docs 仓库 issue #7034 指出 LangGraph JS 仍为 25）。本地 langgraph 1.2.20 实测 `DEFAULT_RECURSION_LIMIT == 10007`，显式传 recursion_limit=12 时死循环图抛出 GraphRecursionError。
+    sources:
+      - {title: "LangGraph Docs - Graph API（Compiling、Recursion limit）", url: "https://docs.langchain.com/oss/python/langgraph/graph-api"}
+      - {title: "langgraph 1.0.6 release notes", url: "https://github.com/langchain-ai/langgraph/releases/tag/1.0.6"}
+      - {title: "langgraph PR #7355 - recursion limit default 10007", url: "https://github.com/langchain-ai/langgraph/pull/7355"}
+
+  - id: d35-k5
+    name: Command 与 Send
+    level: P2
+    summary: Command 让节点在一次返回中同时更新状态并指定下一跳；Send 让条件边在运行时按数据动态扇出多个并行任务
+    why: |
+      阅读较复杂的 LangGraph 代码（多 Agent 交接、map-reduce、人工审批恢复）时一定会遇到这两个原语，知道它们解决什么问题即可。
+    problem: |
+      普通模式下「更新状态」由节点做、「选下一步」由边做，两者分离。有时下一步取决于节点刚做完的工作（如 Agent 交接），拆开写很别扭；
+      另外有些任务的并行数量只有运行时才知道（如每个子问题一个检索任务），静态边无法表达。
+    principle: |
+      **Command**（`from langgraph.types import Command`）：
+
+      - 节点返回 `Command(update={...}, goto="next_node")`，同时更新和路由；
+      - 返回类型标注 `Command[Literal["next_node"]]`，帮助 LangGraph 画出动态边；
+      - `Command(resume=...)` 作为 invoke 输入，用于中断后恢复（Day 36）；
+      - 官方提醒：只做路由时优先用条件边；**不要在同一节点同时用 Command 路由和普通边**。
+
+      **Send**（`from langgraph.types import Send`）：
+
+      - 条件边的路由函数返回 `[Send("worker", {"subject": s}) for s in subjects]`；
+      - 每个 Send 以自己的输入调用一次目标节点，并行执行；
+      - 结果写入带 reducer（如 operator.add）的键自动汇总。
+
+      ```mermaid
+      flowchart LR
+        P["planner：生成子问题列表"] --> F{"路由函数返回多个 Send"}
+        F --> W1["worker：子问题 1"]
+        F --> W2["worker：子问题 2"]
+        F --> W3["worker：子问题 3"]
+        W1 --> M["results 键用 operator.add 汇总"]
+        W2 --> M
+        W3 --> M
+        M --> S["synthesize：汇总回答"]
+      ```
+    scenarios: |
+      - 多 Agent 交接：客服 Agent 判断需要退款专员时返回 `Command(goto="refund_agent", update={...})`（Day 39）。
+      - 调研报告：Send 把每个章节分发给写作节点并行生成。
+      - 人工审批恢复：`graph.invoke(Command(resume="approve"), config)`。
+    pitfalls: |
+      - **误区：Command 可以代替所有条件边。** 只路由时条件边更清晰。
+      - **用 Command(update=...) 作为输入继续对话**：官方说明这会从最新 checkpoint 恢复而不是从 START 开始，新一轮对话应传普通字典。
+      - **Send 的目标节点写共享键却没有 reducer**：并行写冲突报错。
+    interview_asks:
+      - LangGraph 的 Command 和 Send 分别用来做什么？
+      - 怎么用 LangGraph 实现 map-reduce？
+    project_example: |
+      竞品调研 Agent 中，planner 节点输出 6 个竞品名称，路由函数返回 6 个 Send 并行调用 research 节点，每个节点把结果追加到 `findings: Annotated[list, operator.add]`，最后 synthesize 节点汇总。并行后总耗时从约 90 秒降到 25 秒左右。
+    freshness: |
+      核对于 2026-11（langgraph 1.2.20）：Graph API 文档中 `Send`、`Command` 均从 `langgraph.types` 导入；`Command` 支持 `update`、`goto`、`graph`（如 `Command.PARENT`）、`resume`；文档提醒 `Command(resume=...)` 是唯一推荐作为 invoke 输入的 Command 形式。本地实测 Send 扇出与 Command 循环路由均按预期运行。
+    sources:
+      - {title: "LangGraph Docs - Graph API（Send、Command）", url: "https://docs.langchain.com/oss/python/langgraph/graph-api"}
+
+quiz:
+  - id: d35-q1
+    kp: d35-k2
+    type: single
+    question: |
+      State 定义为 `class State(TypedDict): messages: list`（没有 Annotated reducer）。model 节点返回 `{"messages": [ai_reply]}`。执行后 messages 会是什么？
+    options:
+      - "原有历史消息加上 ai_reply"
+      - "只剩 ai_reply，原有历史被覆盖"
+      - "LangGraph 报错，要求必须声明 reducer"
+      - "原有历史不变，ai_reply 被丢弃"
+    answer: [1]
+    explain: |
+      没有声明 reducer 的键使用默认 reducer，即「用新值覆盖旧值」，所以历史被替换为只含 ai_reply 的列表，这是最常见的「Agent 失忆」原因。A 是使用 add_messages 或 operator.add 才有的结果；C 只会在同一步多个节点并行写同一无 reducer 键时发生（InvalidUpdateError）；D 不符合任何合并规则。
+  - id: d35-q2
+    kp: d35-k4
+    type: judge
+    question: 在当前版本的 LangGraph（Python 1.2.x）中，如果不设置 recursion_limit，图默认最多执行 25 个 super-step 就会抛出 GraphRecursionError，所以 Agent 不会长时间死循环。
+    answer: false
+    explain: |
+      25 是 1.0.6 之前的默认值（LangGraph JS 至今也是 25）。Python 版从 1.0.6 起改为 10000，1.1.4 起为 10007，几乎等于不设限。依赖默认值会让死循环的 Agent 运行很久、消耗大量 Token。应在 State 中计数并在路由中设置出口，同时在 config 顶层显式设置 recursion_limit。
+  - id: d35-q3
+    kp: d35-k3
+    type: multi
+    question: 关于 LangGraph 的边，以下哪些说法正确？
+    options:
+      - "add_edge(\"tools\", \"model\") 指回前面的节点，就能形成 model 与 tools 之间的循环"
+      - "条件边的路由函数可以返回节点名、END、节点名列表或 Send 对象"
+      - "同一个节点同时添加普通边和条件边，LangGraph 会自动只走条件边"
+      - "START 和 END 是虚拟节点，用来标记入口和出口"
+    answer: [0, 1, 3]
+    explain: |
+      A、B、D 都是 Graph API 文档描述的行为。C 错误：官方明确提醒同一节点不要同时使用静态边和动态路由（条件边或 Command），否则两条路径都会执行，可能导致重复执行或状态异常。
+  - id: d35-q4
+    kp: d35-k2
+    type: short
+    question: 请解释 LangGraph 中 reducer 的作用，并比较「不声明 reducer」「operator.add」「add_messages」三种方式在消息历史场景下的区别。
+    key_points:
+      - {text: "说明节点只返回部分更新，reducer 决定新值如何与当前值合并", dim: concept}
+      - {text: "不声明 reducer 时默认覆盖，消息历史会被新返回的列表替换", dim: principle}
+      - {text: "operator.add 只做列表拼接，无法按 id 更新已有消息", dim: principle}
+      - {text: "add_messages 追加新消息、按 id 替换已有消息，并把 dict 转为消息对象", dim: principle}
+      - {text: "说明并行节点写同一无 reducer 键会报 InvalidUpdateError", dim: engineering}
+    reference: |
+      **reducer 的作用**：节点只返回要更新的键，LangGraph 对每个键调用该键的 reducer：`新值 = reducer(当前值, 更新值)`。它定义了「怎么合并」。
+
+      **三种方式**：
+      - **不声明**：默认 reducer 是覆盖。model 节点返回 `[ai_reply]`，历史就只剩这一条，模型下一轮看不到之前的对话和工具结果。
+      - **operator.add**：列表拼接，历史能保留；但如果想修改某条已存在的消息（例如人工审核改了工具调用参数），只会再追加一条，旧消息还在。
+      - **add_messages**：追加新消息；遇到 id 相同的消息会**替换**；还会把 `{"role": "user", ...}` 这样的字典转换成消息对象。这是消息历史的标准选择，`MessagesState` 内置的就是它。
+
+      另外，同一 super-step 中两个并行节点写同一个**没有 reducer** 的键时，LangGraph 抛 InvalidUpdateError，需要声明 reducer 才能合并。
+  - id: d35-q5
+    kp: d35-k3
+    type: scenario
+    question: |
+      你用 LangGraph 写了客服 Agent：model 节点、tools 节点，`add_conditional_edges("model", route, ["tools", END])`，`add_edge("tools", "model")`。
+      上线后发现：当物流接口持续返回「暂无轨迹」时，有的会话持续几分钟才被网关超时切断，账单异常；还有一次物流接口抛异常，用户直接看到 500 错误。
+      请分析两个问题的原因，并给出图结构和节点层面的修改方案。
+    key_points:
+      - {text: "指出循环只靠模型不再调用工具结束，没有步数出口，默认 recursion_limit 为 10007 几乎不限制", dim: principle}
+      - {text: "提出 State 中增加工具轮次计数，路由函数超限时转到 handoff 节点或 END", dim: engineering}
+      - {text: "提出 invoke 时在 config 顶层设置 recursion_limit 并捕获 GraphRecursionError 作为最后防线", dim: engineering}
+      - {text: "指出 tools 节点中工具异常未捕获会让整个图运行失败", dim: principle}
+      - {text: "提出在 tools 节点内捕获异常并转为 ToolMessage 回传，或配置 ToolNode 的 handle_tool_errors", dim: engineering}
+    reference: |
+      **问题一：长时间循环。**
+      图中唯一的出口是「model 没有返回 tool_calls」。物流接口一直返回暂无轨迹时，模型可能不断换参数重试，model ↔ tools 无限循环。LangGraph Python 当前默认 recursion_limit 是 10007，几乎不会触发。
+      修改：
+      - State 增加 `tool_rounds: int`，tools 节点每次返回 `tool_rounds + 1`；
+      - 路由函数先检查 `tool_rounds >= 5`，超限路由到新增的 `handoff` 节点（生成转人工话术、记录工单），再到 END；
+      - `invoke(..., config={"recursion_limit": 30})` 放在 config 顶层，捕获 GraphRecursionError 返回兜底话术；
+      - 外层再加整体超时。
+
+      **问题二：500 错误。**
+      tools 节点直接调用工具，异常没有被捕获，会从节点冒泡到 `graph.invoke`，整个运行失败。如果用的是 ToolNode，当前默认也只处理参数错误，执行异常会重新抛出。
+      修改：在 tools 节点里逐个调用 try/except，把异常转成 `ToolMessage(content="物流系统暂时不可用", tool_call_id=...)` 回传，让模型告知用户；临时故障先有限次重试；程序 bug 记录告警。使用 ToolNode 时可配置 `handle_tool_errors`。
+    followup:
+      question: 为什么不能只调小 recursion_limit 来解决问题一？
+      key_points: [超限是抛异常而不是优雅结束, 步数计的是 super-step 不是业务轮次, 应在图中设计可见的业务出口]
+      reference: recursion_limit 超限时抛 GraphRecursionError，是异常路径而不是业务出口，用户体验差；它数的是 super-step，不直接对应工具轮次；更好的做法是在 State 中计数、由路由函数走到 handoff 节点优雅结束，recursion_limit 只作为最后防线。
+  - id: d35-q6
+    kp: d35-k3
+    type: design
+    question: |
+      请用 LangGraph 设计一个「售后退款」流程图：先分类用户意图；如果是退款，查询订单；金额不超过 200 元自动退款，超过 200 元进入人工审批；审批通过或自动退款后通知用户；非退款意图交给通用客服 Agent。
+      请说明 State 字段及 reducer、节点、边（含条件边）的设计。
+    key_points:
+      - {text: "State 包含 messages 使用 add_messages，以及 intent、order、amount、approval 等覆盖型字段", dim: concept}
+      - {text: "节点划分合理：classify、check_order、auto_refund、human_review、notify、general_agent", dim: engineering}
+      - {text: "START 后接 classify，用条件边按 intent 分流到 check_order 或 general_agent", dim: principle}
+      - {text: "check_order 后用条件边按金额分流到 auto_refund 或 human_review", dim: principle}
+      - {text: "提到人工审批需要中断和 checkpoint 持久化，退款节点需要幂等", dim: engineering}
+    reference: |
+      **State**：
+      - `messages: Annotated[list[AnyMessage], add_messages]`：对话历史；
+      - `intent: str`、`order: dict | None`、`amount: float`、`approval: str | None`、`refund_id: str | None`：覆盖型字段，不需要 reducer。
+
+      **节点**：
+      - `classify`：调用模型做意图分类，写 intent；
+      - `check_order`：按订单号查询订单（订单归属用当前用户校验），写 order 和 amount；
+      - `auto_refund`：调用退款接口（以订单号作为幂等键），写 refund_id；
+      - `human_review`：暂停等待人工审批（Day 36 的 interrupt + checkpointer），恢复后写 approval；
+      - `notify`：根据结果给用户发消息；
+      - `general_agent`：通用客服 Agent，可以是 create_agent 生成的子图。
+
+      **边**：
+      - `START → classify`；
+      - `classify` 条件边：intent 为 refund → `check_order`，否则 → `general_agent`；
+      - `check_order` 条件边：订单不存在 → `notify`（告知原因）；amount ≤ 200 → `auto_refund`；否则 → `human_review`；
+      - `human_review` 条件边：通过 → `auto_refund`，拒绝 → `notify`；
+      - `auto_refund → notify`、`notify → END`、`general_agent → END`。
+
+      **工程要点**：人工审批必须配置 checkpointer 才能跨请求恢复；退款接口幂等，防止恢复或重试时重复退款；用 `draw_mermaid` 导出流程图给业务评审。
+    followup:
+      question: 为什么金额判断用条件边，而不是让模型决定是否需要人工审批？
+      key_points: [金额阈值是确定性业务规则, 用代码判断可测试可审计, 避免模型被诱导绕过审批]
+      reference: 200 元阈值是明确的业务规则，用路由函数判断 100% 准确、可单测、可审计；交给模型判断既不稳定，也可能被用户话术诱导跳过审批，属于不该交给模型的决策。
+code_reading:
+  id: d35-c1
+  kp: [d35-k2, d35-k3, d35-k4]
+  title: 手写 LangGraph 工具调用图
+  scenario: |
+    电商客服的 Agent 服务：FastAPI 接口收到用户消息后调用 `answer()`，内部用一个手写的 StateGraph 实现「模型决策 → 执行工具 → 再决策」的循环。没有使用 create_agent，因为后续要在图上加入转人工和审批节点。
+  language: python
+  code: |
+    import json
+    import logging
+    import os
+    from typing import Annotated, Literal
+
+    from langchain.chat_models import init_chat_model
+    from langchain.messages import AnyMessage, SystemMessage, ToolMessage
+    from langchain.tools import tool
+    from langgraph.graph import END, START, StateGraph
+    from langgraph.graph.message import add_messages
+    from typing_extensions import TypedDict
+
+    logger = logging.getLogger("support_graph")
+
+    class State(TypedDict):
+        messages: Annotated[list[AnyMessage], add_messages]
+        user_id: str
+        tool_rounds: int
+
+    @tool
+    def get_order(order_id: str) -> dict:
+        """按订单号查询订单状态和物流单号。订单号为 SO 加 8 位数字。"""
+        ...  # 调用订单服务，省略实现
+
+    @tool
+    def get_logistics(tracking_no: str) -> dict:
+        """按物流单号查询最新物流轨迹，物流单号来自 get_order 的结果。"""
+        ...  # 调用物流服务，省略实现
+
+    TOOLS = {t.name: t for t in (get_order, get_logistics)}
+    model = init_chat_model(os.environ["CHAT_MODEL"], timeout=30).bind_tools(list(TOOLS.values()))
+    SYSTEM = SystemMessage("你是电商客服，只能依据工具结果回答，不确定时请用户联系人工。")
+
+    def call_model(state: State) -> dict:
+        reply = model.invoke([SYSTEM, *state["messages"]])
+        return {"messages": [reply]}
+
+    def run_tools(state: State) -> dict:
+        results = []
+        for call in state["messages"][-1].tool_calls:
+            output = TOOLS[call["name"]].invoke(call["args"])
+            logger.info("user=%s tool=%s", state["user_id"], call["name"])
+            results.append(ToolMessage(content=json.dumps(output, ensure_ascii=False), tool_call_id=call["id"]))
+        return {"messages": results, "tool_rounds": state["tool_rounds"] + 1}
+
+    def route(state: State) -> Literal["tools", "__end__"]:
+        return "tools" if state["messages"][-1].tool_calls else END
+
+    graph = (
+        StateGraph(State)
+        .add_node("model", call_model)
+        .add_node("tools", run_tools)
+        .add_edge(START, "model")
+        .add_conditional_edges("model", route, ["tools", END])
+        .add_edge("tools", "model")
+        .compile()
+    )
+
+    def answer(user_id: str, text: str) -> str:
+        result = graph.invoke({"messages": [{"role": "user", "content": text}], "user_id": user_id, "tool_rounds": 0})
+        return result["messages"][-1].content
+  walkthrough:
+    function: |
+      用 LangGraph 手写一个 ReAct 工具 Agent：model 节点调用绑定了工具的模型；如果模型返回工具调用，路由到 tools 节点执行并把结果作为 ToolMessage 追加到消息历史，再回到 model 节点；模型不再调用工具时结束，`answer` 返回最后一条消息的内容。
+    key_functions: |
+      - `State`：messages 用 add_messages 合并；user_id 和 tool_rounds 是覆盖型字段。
+      - `call_model`：把系统提示和历史消息发给模型，返回只含新回复的部分更新。
+      - `run_tools`：遍历最后一条 AI 消息的 tool_calls，按名查表执行，构造带 tool_call_id 的 ToolMessage，并把 tool_rounds 加 1。
+      - `route`：条件边路由函数，有 tool_calls 去 tools，否则到 END。
+      - `graph`：START → model →（条件）tools 或 END，tools → model 形成循环；`compile()` 生成可执行的图。
+      - `answer`：构造初始 State 并 invoke，取最终回复。
+    params: |
+      `answer` 传入的初始 State 中，messages 是字典形式的用户消息，add_messages 会把它转成 HumanMessage。
+      model 节点通过 `bind_tools` 让模型知道有哪些工具；模型返回的 `tool_calls` 是 `{"name", "args", "id"}` 字典列表，`args` 已经是解析好的 dict，直接传给 `tool.invoke`。
+      ToolMessage 的 `tool_call_id` 必须等于对应调用的 id，模型才能把结果和调用对上。user_id 只写进了 State 和日志，**没有传给任何工具**。
+    data_flow: |
+      ```mermaid
+      stateDiagram-v2
+        state "model：call_model" as model
+        state "tools：run_tools" as tools
+        [*] --> model: START，messages 为用户消息
+        model --> tools: route 发现 tool_calls
+        tools --> model: 追加 ToolMessage，tool_rounds 加 1
+        model --> [*]: route 返回 END
+      ```
+      State 的变化：初始 [Human] → model 后 [Human, AI(tool_calls)] → tools 后 [Human, AI, Tool] → model 后 [Human, AI, Tool, AI(最终回答)]。每一步节点只返回新增的消息，由 add_messages 追加。
+    failure_points: |
+      - **没有终止条件**：`tool_rounds` 被计数但 `route` 从未检查它；唯一出口是模型不再调用工具。工具一直返回不理想的结果时会在 model 和 tools 之间反复循环，而当前 LangGraph 默认 recursion_limit 为 10007，`answer` 也没有传 recursion_limit，几乎不会被截停。
+      - **工具异常直接抛出**：`TOOLS[call["name"]]` 遇到模型编造的工具名会 KeyError；`get_order` / `get_logistics` 内部的网络错误、超时也会从 run_tools 冒泡到 `graph.invoke`，整个请求失败，用户看到 500。
+      - 一轮多个 tool_calls 时，前面的工具成功、后面的失败，前面的结果也随异常一起丢失。
+      - **越权风险**：user_id 没有传给工具，get_order 无法校验订单归属，用户可以查询任意订单号（Day 40）。
+      - `json.dumps(output)` 遇到 datetime、Decimal 等类型会报 TypeError；结果也没有截断。
+      - 做得好的地方：messages 正确使用了 add_messages；ToolMessage 带上了 tool_call_id；模型设置了 30 秒超时。
+    debugging: |
+      - 用 `graph.stream(inputs, stream_mode="updates")` 逐节点打印更新，观察每一轮 model 请求了什么工具、tools 返回了什么。
+      - 用返回固定 tool_calls 的假模型（如 langchain_core 的 GenericFakeChatModel 子类）复现死循环，并传 `config={"recursion_limit": 12}` 验证会抛 GraphRecursionError。
+      - 让 get_logistics 的 mock 抛 TimeoutError，确认异常是否让整个 invoke 失败。
+      - `print(graph.get_graph().draw_mermaid())` 检查图结构是否与设计一致。
+    change_request: |
+      如果需求改成「最多 4 轮工具调用，超出转人工」：新增 `handoff` 节点（生成转人工话术并记录工单），`route` 先判断 `state["tool_rounds"] >= 4` 返回 "handoff"，路由目标列表加入 "handoff"，并 `add_edge("handoff", END)`；`answer` 中传 `config={"recursion_limit": 20}` 并捕获 GraphRecursionError 作为最后防线。
+      如果要求「工具失败不中断对话」：在 run_tools 中对每个调用 try/except，未知工具和异常都生成内容为错误说明的 ToolMessage（仍使用原 tool_call_id），或改用 `ToolNode` 并配置 `handle_tool_errors`。
+  questions:
+    - id: d35-c1-q1
+      kp: d35-k2
+      type: code
+      question: 用户发送「SO12345678 到哪了」，模型先调用 get_order，再调用 get_logistics，最后给出回答。请按 super-step 顺序说明每一步执行了哪个节点、State 中 messages 和 tool_rounds 如何变化，以及 add_messages 起了什么作用。
+      key_points:
+        - {text: "初始 State 的字典消息被 add_messages 转为 HumanMessage，tool_rounds 为 0", dim: concept}
+        - {text: "model 节点返回带 get_order 调用的 AIMessage，route 路由到 tools", dim: principle}
+        - {text: "tools 节点返回 ToolMessage 并把 tool_rounds 加 1，普通边回到 model，第二轮同理调用 get_logistics", dim: principle}
+        - {text: "最后 model 返回无 tool_calls 的回答，route 返回 END，answer 取最后一条消息", dim: concept}
+        - {text: "说明每个节点只返回新增消息，由 add_messages 追加而不是覆盖历史", dim: principle}
+      reference: |
+        **初始**：messages = [Human「SO12345678 到哪了」]（字典被 add_messages 转成 HumanMessage），tool_rounds = 0。
+
+        1. **model**：模型返回 AI(tool_calls=[get_order(order_id=SO12345678)])。节点返回 `{"messages": [AI]}`，add_messages 追加 → [Human, AI1]。route 看到 tool_calls → tools。
+        2. **tools**：执行 get_order，得到包含物流单号的结果，生成 ToolMessage(tool_call_id=调用 id)。返回 `{"messages": [Tool1], "tool_rounds": 1}` → [Human, AI1, Tool1]，tool_rounds 被覆盖为 1。普通边回到 model。
+        3. **model**：模型看到订单结果，返回 AI2(tool_calls=[get_logistics(...)]) → [Human, AI1, Tool1, AI2] → tools。
+        4. **tools**：执行 get_logistics → [..., Tool2]，tool_rounds = 2 → model。
+        5. **model**：模型返回不含 tool_calls 的 AI3（最终回答）→ [..., AI3]，route 返回 END。
+
+        `answer` 取 `result["messages"][-1].content` 即 AI3 的内容。全过程每个节点只返回新消息，**add_messages 负责追加**；如果 messages 没有 reducer，每一步都会覆盖历史，模型将看不到之前的工具结果。
+    - id: d35-c1-q2
+      kp: d35-k4
+      type: code
+      question: 这段代码有两个上线前必须修复的问题：一个会导致会话长时间不结束，一个会导致用户直接看到 500。请指出触发条件、在代码中的位置，并给出具体修改。
+      key_points:
+        - {text: "指出 route 没有检查 tool_rounds，唯一出口依赖模型停止调用工具", dim: principle}
+        - {text: "指出默认 recursion_limit 为 10007 且 answer 未设置，无法及时截停", dim: principle}
+        - {text: "指出 run_tools 中未知工具名 KeyError 或工具内部异常会冒泡导致 graph.invoke 失败", dim: engineering}
+        - {text: "修改：route 超限转 handoff 节点并设 recursion_limit 兜底；run_tools 逐个 try/except 转为错误 ToolMessage", dim: engineering}
+      reference: |
+        **问题一：没有终止条件（route 函数）。**
+        tool_rounds 每轮加 1，但 `route` 只判断有没有 tool_calls。当物流接口一直返回空轨迹、模型反复重试时，model ↔ tools 会持续循环。`answer` 没有传 recursion_limit，当前默认值 10007 几乎不会触发，结果是长时间运行、Token 持续消耗，直到网关超时。
+        修改：
+        ```python
+        def route(state: State) -> Literal["tools", "handoff", "__end__"]:
+            if state["tool_rounds"] >= 4:
+                return "handoff"
+            return "tools" if state["messages"][-1].tool_calls else END
+        ```
+        增加 handoff 节点和 `add_edge("handoff", END)`；`graph.invoke(..., config={"recursion_limit": 20})` 并捕获 GraphRecursionError 返回兜底话术。
+
+        **问题二：工具异常未处理（run_tools 函数）。**
+        触发条件：模型编造了不存在的工具名（`TOOLS[...]` KeyError），或订单、物流服务超时报错。异常从节点冒泡到 `graph.invoke`，FastAPI 返回 500，同一轮已成功的工具结果也丢失。
+        修改：对每个调用 try/except——未知工具返回「工具不存在，可用工具：…」；临时故障重试一次后返回「服务繁忙，请稍后再试」；都用原 `tool_call_id` 生成 ToolMessage，保证每个调用都有结果；程序 bug 记录告警。或改用 `ToolNode([...], handle_tool_errors=...)`。
+interview:
+  - id: d35-i1
+    kp: d35-k1
+    type: oral
+    difficulty: 1
+    question: 什么是 LangGraph？它的核心概念有哪些？
+    key_points:
+      - {text: "说明 LangGraph 是有状态的图运行时，用于编排带循环和分支的 Agent 流程", dim: concept}
+      - {text: "说出 State、Node、Edge 三个核心概念及作用", dim: concept}
+      - {text: "说明节点返回部分更新、由 reducer 合并，条件边实现分支和循环", dim: principle}
+      - {text: "说明与 LangChain 的关系：create_agent 运行在 LangGraph 之上", dim: principle}
+      - {text: "结合项目举例说明为什么选择 LangGraph", dim: project}
+    reference: |
+      LangGraph 是 LangChain 团队的**有状态图运行时**，用来编排需要循环、分支、状态和中断恢复的 Agent 流程。
+
+      **核心概念**：
+      - **State**：所有节点共享的数据，通常是 TypedDict，每个键可以声明 reducer 决定更新如何合并；
+      - **Node**：一个函数，读取 State，返回要更新的部分；
+      - **Edge**：普通边固定下一步，条件边由路由函数根据 State 决定下一步；START、END 标记入口和出口，回指的边形成循环；
+      - **Graph**：用 StateGraph 构建，compile 后可以 invoke、stream，并可挂载 checkpointer 实现持久化。
+
+      **与 LangChain 的关系**：LangChain 1.x 的 create_agent 返回的就是 LangGraph 图；标准 Agent 用 create_agent，需要自定义流程时直接写 StateGraph，节点里仍可以用 LangChain 的模型和工具。
+
+      **项目**：售后退款流程需要按金额分流、大额人工审批、审批后继续执行，用 LCEL 很难表达，所以改用 LangGraph，流程图还能直接导出给业务评审。
+    oral: |
+      LangGraph 是一个有状态的图运行时，专门用来编排有循环、分支、需要中断恢复的 Agent 流程。
+      它有三个核心概念：State 是所有节点共享的数据，每个字段可以配 reducer 决定怎么合并；Node 是读 State、返回部分更新的函数；Edge 决定下一步，条件边根据状态分支，指回前面的边就形成循环。图要 compile 之后才能执行。
+      它和 LangChain 是分层关系，LangChain 的 create_agent 底层就是 LangGraph 图。我们售后退款流程要按金额分流、大额人工审批，用链写不出来，就改成了 LangGraph。
+  - id: d35-i2
+    kp: d35-k2
+    type: oral
+    difficulty: 2
+    question: LangGraph 的 State 是怎么在节点之间更新的？什么是 reducer？你踩过哪些相关的坑？
+    key_points:
+      - {text: "说明节点返回部分更新，运行时对每个键调用 reducer 合并", dim: concept}
+      - {text: "说明默认覆盖、operator.add 拼接、add_messages 追加并按 id 替换", dim: principle}
+      - {text: "说明同一 super-step 并行节点写同一无 reducer 键会报 InvalidUpdateError", dim: principle}
+      - {text: "指出带 reducer 的列表返回空列表无法清空等坑", dim: engineering}
+      - {text: "结合项目给出一个具体踩坑和修复经历", dim: project}
+    reference: |
+      **更新机制**：节点不修改 State，而是返回只包含要更新的键的字典。运行时对每个键调用 reducer：`新值 = reducer(旧值, 更新值)`。
+
+      **三种常见 reducer**：
+      - 默认：覆盖；适合计数器、阶段标记；
+      - `operator.add`：列表拼接；适合并行节点汇总结果；
+      - `add_messages`：消息历史专用，追加新消息、id 相同则替换，还能把字典转为消息对象。
+
+      **常见坑**：
+      1. messages 忘记 `Annotated[..., add_messages]`，每次都被覆盖，Agent 失忆；
+      2. 并行节点写同一个没有 reducer 的键，抛 InvalidUpdateError；
+      3. 带 operator.add 的列表想通过返回空列表清空，实际不会清空；
+      4. 在节点里原地修改 state 字典，绕过了 reducer 和 checkpoint。
+
+      **我的经历**：研究助手三个检索节点并行写 documents，先是报 InvalidUpdateError，加了 operator.add 后又发现重试时文档越积越多，最后加了 retry_round 字段区分轮次才解决。
+    oral: |
+      LangGraph 里节点不直接改 State，而是返回一个只包含要更新字段的字典，运行时对每个字段调用 reducer 合并。默认是覆盖；operator.add 是列表拼接；add_messages 是消息专用的，会追加新消息、同 id 的替换，还能把字典转成消息对象。
+      常见的坑有几个：messages 忘了加 add_messages，历史被覆盖；并行节点写同一个没 reducer 的字段，会报 InvalidUpdateError；带 operator.add 的列表返回空列表清不掉。
+      我在研究助手里两个坑都踩过，并行检索先报错，加了 operator.add 之后重试时文档越积越多，最后加了轮次字段区分才解决。
+  - id: d35-i3
+    kp: d35-k4
+    type: oral
+    difficulty: 3
+    question: 用 LangGraph 实现 ReAct Agent 时，怎么保证它一定会结束？如果遇到 GraphRecursionError，你会怎么排查？
+    key_points:
+      - {text: "说明 ReAct 图的唯一自然出口是模型不再调用工具，不可靠", dim: principle}
+      - {text: "说明 recursion_limit 计 super-step、是 config 顶层键，当前 Python 默认 10007，旧版为 25", dim: principle}
+      - {text: "在 State 计数并由路由函数走到 handoff 或 END，作为可见的业务出口", dim: engineering}
+      - {text: "排查：stream 逐节点看更新，检查工具结果、重复调用、路由条件", dim: engineering}
+      - {text: "结合项目说明一次因默认值变化导致的问题和修复", dim: project}
+    reference: |
+      **为什么不会自然结束**：ReAct 图里 model → tools → model 是循环，唯一出口是模型不再返回 tool_calls。工具一直报错或结果不理想时，模型可能一直重试。
+
+      **三层保障**：
+      1. **业务出口**：State 中加 `tool_rounds`，tools 节点每轮加 1，路由函数超限路由到 handoff 节点（转人工话术、建工单）再到 END；
+      2. **递归上限兜底**：`invoke(..., config={"recursion_limit": 30})`，必须放在 config 顶层；它计的是 super-step（model + tools 一轮是 2 步）。注意 Python 版默认值 1.0.6 前是 25，现在是 10007，不能依赖默认值；捕获 GraphRecursionError 返回兜底话术；
+      3. **外层超时**和 Token 预算。用 create_agent 时可用 ModelCallLimitMiddleware。
+
+      **排查 GraphRecursionError**：
+      - 用 `stream(stream_mode="updates")` 或追踪平台逐节点查看：模型每轮调用了什么工具、参数是否重复、工具返回了什么；
+      - 常见原因：工具持续返回错误或空结果、工具结果没有正确追加（messages 被覆盖导致模型「失忆」重复调用）、路由函数条件写错永远回到 tools；
+      - 用假模型和 mock 工具复现，修复后加回归用例。
+
+      我们升级到 1.x 后就遇到过：团队以为默认 25 步会停，结果一个会话跑了上千步，之后补上了计数出口和显式 recursion_limit。
+    oral: |
+      ReAct 图本身唯一的出口是模型不再调用工具，这不可靠，所以我做三层保障。第一层是业务出口，State 里记工具轮次，路由函数超限就去转人工节点再结束。第二层是 recursion_limit 兜底，放在 config 顶层，捕获 GraphRecursionError 返回兜底话术。要注意它数的是 super-step，而且 Python 版默认值以前是 25，现在是一万零七，不能依赖默认。第三层是外层超时和预算。
+      排查时我用 stream 逐节点看每轮调了什么工具、返回了什么，常见原因是工具一直报错、消息被覆盖导致重复调用、路由条件写错。
+      我们升级 1.x 后就踩过这个坑，以为默认 25 步会停，结果一个会话跑了上千步。
+  - id: d35-i4
+    kp: d35-k3
+    type: design
+    difficulty: 4
+    question: 请用 LangGraph 设计一个企业「智能报销助手」：员工上传发票并描述用途，系统需要识别发票、校验规则、按金额决定自动通过或主管审批、最后通知员工；过程中员工可能补充材料。请说明 State、节点、边的设计，以及 Agent 和确定性逻辑如何分工、如何保证可靠性。
+    key_points:
+      - {text: "State 设计：messages 用 add_messages，发票信息、校验结果、金额、审批状态、轮次计数等覆盖型字段", dim: concept}
+      - {text: "节点划分清晰：解析发票、规则校验、补充材料对话、自动通过、主管审批、通知", dim: engineering}
+      - {text: "规则校验和金额分流用确定性代码和条件边，只有材料补充对话和发票内容理解用模型", dim: principle}
+      - {text: "主管审批和员工补充材料需要中断与 checkpointer 持久化，恢复后继续执行", dim: engineering}
+      - {text: "可靠性：轮次上限与 handoff 出口、显式 recursion_limit、工具错误转消息、写操作幂等", dim: engineering}
+      - {text: "可观测与评估：stream 或追踪记录节点轨迹，导出图评审，用评估集回归", dim: project}
+    reference: |
+      **State**：
+      - `messages: Annotated[list[AnyMessage], add_messages]`：与员工的对话；
+      - `invoice: dict | None`（发票号、金额、开票方、日期）、`violations: list[str]`（本轮校验结果，覆盖型）、`amount: float`、`approval: str | None`、`need_more_info: bool`、`rounds: int`。
+
+      **节点**：
+      1. `parse_invoice`：调用多模态模型或 OCR 服务抽取发票字段（结构化输出），这是需要模型的地方；
+      2. `validate`：**确定性代码**校验发票真伪（税务接口）、是否重复报销、是否超出职级标准，写 violations；
+      3. `ask_more`：如有缺失材料，由模型生成追问话术，然后中断等待员工补充；
+      4. `auto_approve`：小额且无违规时直接通过，提交财务系统（幂等键 = 发票号）；
+      5. `manager_review`：中断等待主管审批；
+      6. `notify`：通知员工结果；
+      7. `handoff`：超过轮次或异常时转财务人工。
+
+      **边**：
+      - `START → parse_invoice → validate`；
+      - `validate` 条件边：有可补救的缺失 → `ask_more`；有硬性违规 → `notify`（驳回）；金额 ≤ 阈值 → `auto_approve`；否则 → `manager_review`；
+      - `ask_more → parse_invoice`（补充材料后重新解析，形成循环），路由中检查 `rounds >= 3` → `handoff`；
+      - `manager_review` 条件边：通过 → `auto_approve`，拒绝 → `notify`；
+      - `auto_approve → notify → END`，`handoff → END`。
+
+      **分工原则**：理解发票内容、生成追问用模型；规则校验、金额分流、审批判断全部用代码和条件边，可测试、可审计，避免模型被诱导绕过审批。
+
+      **可靠性**：compile 时配置 checkpointer，审批和补充材料通过中断持久化，跨天也能恢复；轮次上限 + handoff 出口 + 显式 recursion_limit；外部接口错误在节点内捕获并转为可读消息或进入 handoff；提交财务系统幂等。
+
+      **可观测**：追踪每个节点的输入输出和耗时；`draw_mermaid` 导出流程图给财务评审；用历史报销单构造评估集做回归。
+    oral: |
+      我会把它设计成七个节点：解析发票、规则校验、追问补材料、自动通过、主管审批、通知和转人工。State 里 messages 用 add_messages，发票信息、违规项、金额、审批状态、轮次都是覆盖型字段。
+      边的设计是：解析后进校验，校验后用条件边分流，缺材料去追问，追问后回到解析形成循环，硬性违规直接驳回，小额自动通过，大额进主管审批。
+      分工上，只有读发票和生成追问用模型，规则校验、金额分流、审批全部用代码和条件边，这样可测试、可审计，也不会被员工话术绕过审批。
+      可靠性上，审批和补材料用中断加 checkpointer 持久化；轮次超过 3 次转人工，同时设 recursion_limit 兜底；外部接口错误在节点内处理；提交财务系统要幂等。最后用追踪和评估集持续回归。
+sources:
+  - {title: "LangGraph Docs - Graph API", url: "https://docs.langchain.com/oss/python/langgraph/graph-api"}
+  - {title: "LangGraph Docs - What's new in LangGraph v1", url: "https://docs.langchain.com/oss/python/releases/langgraph-v1"}
+  - {title: "LangGraph v1 migration guide", url: "https://docs.langchain.com/oss/python/migrate/langgraph-v1"}
+  - {title: "LangGraph Reference - ToolNode", url: "https://reference.langchain.com/python/langgraph.prebuilt/tool_node/ToolNode"}
+  - {title: "langgraph 1.0.6 release notes", url: "https://github.com/langchain-ai/langgraph/releases/tag/1.0.6"}
+  - {title: "PyPI - langgraph", url: "https://pypi.org/project/langgraph/"}

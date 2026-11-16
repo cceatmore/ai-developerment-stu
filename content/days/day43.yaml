@@ -1,0 +1,833 @@
+day: 43
+phase: 5
+title: 可观测性：Trace、OpenTelemetry 与 Langfuse/LangSmith
+goals:
+  - 能画出一次 RAG 或 Agent 请求的 Trace 树，并说出 LLM Span 必须记录的字段
+  - 能说明 OpenTelemetry 的组成和 GenAI 语义约定的现状（2026-11），并给出兼容新旧字段的做法
+  - 能用 Langfuse 或 LangSmith 给一个 Python 应用加上 Trace、会话和 Prompt 版本关联
+  - 能为 LLM 应用设计指标大盘和告警，并处理好内容采集的隐私问题
+minutes: 60
+resources:
+  - title: "Langfuse 文档：What does a good trace look like?"
+    url: "https://langfuse.com/docs/observability/best-practices"
+    kind: doc
+    lang: en
+    minutes: 15
+    note: "看「一个 Trace 的范围」和「用 session ID 串起多轮对话」两节，回答今天 k1 的「Trace 怎么划分」"
+  - title: "Langfuse 文档：Core Concepts（Observations、Traces、Sessions）"
+    url: "https://langfuse.com/docs/observability/data-model"
+    kind: doc
+    lang: en
+    minutes: 10
+    note: "看数据模型和 observation 类型（generation、retriever、tool、guardrail 等），对应 k3"
+  - title: "OpenTelemetry GenAI semantic conventions: November 2026 status"
+    url: "https://john-hodge.com/blog/opentelemetry-genai-semantic-conventions/"
+    kind: article
+    lang: en
+    minutes: 20
+    note: "第三方整理但写得最清楚：看「The rename timeline」表和「How to build on a moving spec」两节，理解为什么字段名要兼容新旧，对应 k2"
+  - title: "LangSmith 文档：Evaluation concepts"
+    url: "https://docs.langchain.com/langsmith/evaluation-concepts"
+    kind: doc
+    lang: en
+    minutes: 10
+    note: "只看 Offline and online evaluations 和最后的对照表，理解线上 Trace 怎么接上评测"
+knowledge_points:
+  - id: d43-k1
+    name: Trace 与 Span：看清一次请求经过了什么
+    level: P0
+    summary: 一次请求是一个 Trace，内部每一步是一个有父子关系的 Span；LLM Span 要记模型、Token、成本、耗时和版本
+    analogy: |
+      就是浏览器 DevTools 的 **Performance 面板 / Network 瀑布图**，或者 **Sentry Performance** 里一个 Transaction 下挂的 Span：一眼看出哪一步最慢、谁调用了谁。
+      **不一样的地方**：前端 Span 主要关心耗时；LLM Span 还要记录**模型名、Token、成本、Prompt 版本**，而且 LLM 应用的大多数问题**不报错**（答错、答慢、花钱多），只能通过 Trace 里的内容和指标发现。
+    why: |
+      LLM 应用出问题时，很少是 500，更多是「答得不对」「突然变慢」「成本翻倍」。没有 Trace，只能翻几个服务的日志靠时间戳手工拼。
+      Trace 也是错误分析（Day 41）和线上评测的数据来源，面试官常问「线上出了问题你怎么排查」。
+    problem: |
+      解决「线上一次请求到底发生了什么」的问题：经过了哪些步骤、每步耗时、检索到了什么、调了哪些工具、用了多少 Token、用的是哪个 Prompt 版本、用户满不满意。
+    principle: |
+      **一、Trace、Span、Session**
+
+      - **Span**：一个有开始和结束时间的操作，例如一次检索、一次 LLM 调用、一次工具调用。带属性（模型名、Token）和事件（异常、首 Token 到达）。
+      - **Trace**：同一个 `trace_id` 下的所有 Span，组成一棵调用树，代表**一次请求**。
+      - **Session**：把多个 Trace 串起来。Langfuse 的建议是**聊天应用每轮问答一个 Trace，整段对话一个 Session**（用 `session_id`）。
+
+      ```mermaid
+      flowchart TB
+        T["Trace 用户提问 总耗时 4.2s"] --> S1["Span 鉴权 5ms"]
+        T --> S2["Span 检索 180ms"]
+        T --> S3["Span LLM 生成 3.9s 输入 3100 输出 420 Token"]
+        T --> S4["Span 工具 query_alarms 120ms"]
+        S2 --> S21["Span Embedding 60ms"]
+        S2 --> S22["Span 向量检索 40ms 返回 5 个片段 ID"]
+        S2 --> S23["Span 重排 70ms"]
+      ```
+
+      **二、一个 LLM Span 应该记什么**
+
+      | 类别 | 字段 |
+      |---|---|
+      | 模型 | 提供方、请求的模型名、实际响应的模型名、温度等参数 |
+      | 用量与成本 | 输入、输出、缓存命中 Token，按价格表折算的成本 |
+      | 性能 | 总耗时、**首 Token 时间（TTFT）** |
+      | 结果 | 结束原因（正常、长度截断、内容过滤、工具调用）、错误类型 |
+      | 业务上下文 | 用户 ID、租户 ID、会话 ID、**Prompt 名称与版本** |
+      | 质量信号 | 点赞点踩、线上评审分数（通过 trace_id 关联回来） |
+
+      **内容（Prompt 与回答原文）默认不记**，需要时脱敏后在受控范围内开启（Day 45）。
+
+      **三、跨服务传递：上下文传播**
+
+      学员熟悉的链路是「浏览器 → Node 中间层 → FastAPI → 异步 worker」。要让它们的 Span 落在同一个 Trace 里，必须把 trace 上下文一路传下去。OpenTelemetry 默认用 W3C 的 `traceparent` 请求头。
+
+      ```mermaid
+      sequenceDiagram
+        participant B as 浏览器
+        participant N as Node 中间层
+        participant F as FastAPI
+        participant W as 入库 worker
+        B->>N: 请求 带 traceparent
+        N->>F: 转发 带同一个 traceparent
+        F->>F: 检索 Span 与 LLM Span 挂在同一 Trace
+        F->>W: 投递任务 消息里带 trace 上下文
+        W->>W: 解析与向量化 Span 仍属同一 Trace
+      ```
+
+      漏传一个环节，Trace 就断成两截，排查时还是要手工拼。
+
+      **四、Trace 拿来干什么**
+
+      - **排障**：用户给出会话 ID，直接定位到那次请求，看检索返回了哪些文档、工具参数是什么。
+      - **性能**：看哪一步最慢（通常是 LLM，但也常是重复的工具调用）。
+      - **成本**：按租户、按功能、按 Prompt 版本汇总 Token 和成本。
+      - **评测闭环**：点踩的 Trace 进入复核队列，确认后补进评测集。
+    scenarios: |
+      - 用户投诉回答引用了过期制度：用会话 ID 找到 Trace，看检索 Span 返回的文档版本，确认是入库没更新。
+      - Agent 突然变慢：Trace 显示同一个工具被同参数调用了 4 次，定位到终止条件问题。
+      - 发布新 Prompt 后：按 Prompt 版本分组对比平均 Token 和点踩率。
+    pitfalls: |
+      - **误区：只记错误日志。** LLM 应用大多数问题不报错，正常请求的 Token、耗时、检索结果都要记。
+      - **误区：每个 LLM 调用一个独立 Trace。** 看不到调用树和父子关系，等于没有 Trace。
+      - **误区：跨服务不传 trace 上下文。** Trace 断成几段，异步任务里的问题查不到源头。
+      - **误区：默认记录全部 Prompt 和回答原文。** 可观测平台会变成敏感数据仓库。
+      - **误区：反馈只做统计不关联 Trace。** 知道点踩率高，却找不到是哪些请求。
+    interview_asks:
+      - question: "线上用户说某次回答错了，你怎么排查？"
+        answer: "用 request_id 找到这次 Trace。看检索到的文档、实际提示、工具参数和模型原文。先判断是资料、检索还是生成。没有 Trace 就只能猜。"
+      - question: "一次 LLM 调用你会记录哪些字段？为什么？"
+        answer: "模型名和版本、提示版本、输入输出 Token、延迟、结束原因、调用是否成功。用来算钱、查慢、复现某次回答。正文里的敏感内容按权限保存，不是无限期全存。"
+      - question: "多轮对话的 Trace 怎么组织？"
+        answer: "同一会话一个 Session，每一轮一个 Trace，里面的检索和模型调用是 Span。用会话 id 把它们串起来。不要每轮一个对不上的散日志。"
+    project_example: |
+      **p2 智慧园区运营 Agent（Trace 模块）**：每轮用户消息一个 Trace，整段运营会话共用 `session_id`。
+      Agent 的每一步规划、每次 LLM 调用、每次 MCP 工具调用（`query_alarms`、`create_work_order`）都是子 Span，工具 Span 记录工具名、参数摘要、返回条数、耗时和是否出错；人工审批中断也记成一个 Span，能看到等了多久。
+      Vue3 工作台的「点踩」按钮把消息对应的 `trace_id` 一起提交，后台复核时一键打开 Trace。
+  - id: d43-k2
+    name: OpenTelemetry 与 GenAI 语义约定
+    level: P1
+    summary: 用 OpenTelemetry 埋点，后端平台可替换；GenAI 约定截至 2026-11 全部是 Development，字段要兼容新旧
+    analogy: |
+      像前端的 **统一埋点 SDK + 上报协议**：业务只调用一套 `track()`，后面接神策还是自建平台只改配置。
+      **不一样的地方**：前端埋点字段是公司自己定的；OTel 的 GenAI 字段是社区标准，**还在频繁改名**，你得跟着它的节奏兼容。
+    why: |
+      LLM 可观测平台很多（Langfuse、LangSmith、Phoenix、各家 APM），直接用某一家的私有 SDK 会被锁定。OpenTelemetry 是业界通用的埋点标准，主流平台都支持 OTLP 接入。
+      面试官问「你们用什么标准」，能说清 OTel 和 GenAI 约定的现状，说明你踩过真实的坑。
+    problem: |
+      解决「换平台要改全部埋点代码」以及「不同框架上报的字段五花八门」的问题。
+      同时要避免另一个坑：把还在变化的 GenAI 字段名当成稳定契约写进报表，升级一次埋点库报表就断了。
+    principle: |
+      **一、OpenTelemetry 的组成**
+
+      ```mermaid
+      flowchart LR
+        APP["业务代码 调用 OTel API"] --> SDK["OTel SDK 采样 批量"]
+        SDK --> EXP["OTLP 导出器"]
+        EXP --> COL["OTel Collector 可选 脱敏 采样 多路转发"]
+        COL --> LF["Langfuse"]
+        COL --> APM["公司已有 APM"]
+      ```
+
+      - **API**：代码里创建 Span、设置属性。
+      - **SDK**：决定采样、批量发送。
+      - **OTLP**：标准传输协议。
+      - **Collector**：独立部署的中转站，统一做脱敏、采样，并同时发往多个后端。
+
+      **二、GenAI 语义约定：常见属性**
+
+      | 属性 | 含义 |
+      |---|---|
+      | `gen_ai.operation.name` | 操作类型，如 chat、embeddings、execute_tool |
+      | `gen_ai.provider.name` | 提供方，如 openai、anthropic、deepseek（旧名 `gen_ai.system`） |
+      | `gen_ai.request.model` / `gen_ai.response.model` | 请求的模型 / 实际响应的模型 |
+      | `gen_ai.usage.input_tokens` / `output_tokens` | Token 用量（旧名 `prompt_tokens` / `completion_tokens`） |
+      | `gen_ai.response.finish_reasons` | 结束原因 |
+
+      还有 Agent 相关的 Span（`invoke_agent`、`execute_tool`）和用于关联评测结果的 `gen_ai.evaluation.result` 事件。
+
+      **三、现状（核对于 2026-11）**
+
+      - GenAI 的 Span、指标、事件、属性**全部是 Development 状态**，没有一项 Stable。
+      - 2026 年 6 月主语义约定仓库 v1.42.0 把全部 `gen_ai.*` 内容标记弃用并迁到独立仓库 `semantic-conventions-genai`，该仓库**还没有打标签的正式版本**。
+      - 字段多次改名：`prompt_tokens` → `input_tokens`；`gen_ai.system` → `gen_ai.provider.name`；2026 年 9 月 Token 用量指标 `gen_ai.client.token.usage` 也被拆分替换。
+      - 内容采集**默认不开启**。规范里新增了控制内容采集的环境变量，而 Python 埋点库读取的变量名与规范还不一致，**以你实际使用的埋点包文档为准**。
+
+      **四、工程做法**
+
+      1. **固定版本**：框架、埋点库、OTel SDK 都锁版本，升级前看一眼实际导出的 Span。
+      2. **查询兼容新旧**：例如 `COALESCE(provider.name, system)`，**不要把新旧两个字段相加**（有些框架会同时上报两份相同的值）。
+      3. **自定义属性用自己的命名空间**：`app.prompt_version`、`app.tenant_id`，不要占用 `gen_ai.*`。
+      4. **内部数据模型自己掌握**：报表依赖你自己的字段，再从 OTel 数据映射过来。
+    scenarios: |
+      - 多平台：通过 Collector 同时发往自托管 Langfuse（看 LLM 细节）和公司 APM（看整体服务健康）。
+      - 迁移平台：业务代码用 OTel 埋点，从 SaaS 迁到自托管只改导出端点和鉴权。
+      - 字段兼容：Token 大盘的查询同时识别 `input_tokens` 和 `prompt_tokens`。
+    code: |
+      用 OTel Python SDK 手动给一次 LLM 调用打 Span（属性名以所用版本的约定为准）：
+
+      ```python
+      import os
+
+      from openai import OpenAI
+      from opentelemetry import trace
+      from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+      from opentelemetry.sdk.resources import Resource
+      from opentelemetry.sdk.trace import TracerProvider
+      from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+      provider = TracerProvider(resource=Resource.create({"service.name": "kb-api"}))
+      provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))  # 端点读 OTEL_EXPORTER_OTLP_ENDPOINT
+      trace.set_tracer_provider(provider)
+      tracer = trace.get_tracer("kb-api")
+
+      client = OpenAI()
+      MODEL = os.environ["LLM_MODEL"]
+
+
+      def chat(messages: list[dict], prompt_version: str) -> str:
+          with tracer.start_as_current_span(f"chat {MODEL}") as span:
+              span.set_attribute("gen_ai.operation.name", "chat")
+              span.set_attribute("gen_ai.provider.name", "openai")
+              span.set_attribute("gen_ai.request.model", MODEL)
+              span.set_attribute("app.prompt_version", prompt_version)  # 自定义属性用自己的命名空间
+              resp = client.chat.completions.create(model=MODEL, messages=messages)
+              span.set_attribute("gen_ai.response.model", resp.model)
+              span.set_attribute("gen_ai.usage.input_tokens", resp.usage.prompt_tokens)
+              span.set_attribute("gen_ai.usage.output_tokens", resp.usage.completion_tokens)
+              return resp.choices[0].message.content or ""
+      ```
+    pitfalls: |
+      - **误区：GenAI 约定已经稳定。** 截至 2026-11 全部是 Development，且独立仓库没有正式发布。
+      - **误区：框架说支持 OTel，字段就和最新约定一致。** 实际常常新旧混杂，要看导出的真实数据。
+      - **误区：新旧 Token 字段相加。** 兼容期框架可能重复上报，会算成两倍。
+      - **误区：自定义属性塞进 `gen_ai.*`。** 以后可能和官方字段冲突。
+    interview_asks:
+      - question: "你了解 OpenTelemetry 的 GenAI 语义约定吗？现在能直接用吗？"
+        answer: "它规定了生成式调用在 OTel 里的字段名，比如模型、Token。约定还在演进，可以用，但要锁定你采纳的字段，升级时看有没有改名。不要假设已经完全稳定。"
+      - question: "为什么建议用 OTel 埋点而不是平台私有 SDK？"
+        answer: "私有 SDK 把你绑在一家观测平台上。OTel 是通用导出，换 Langfuse 或其他后端不用改业务代码。业务只对 OTel，导出器再对接具体平台。"
+      - question: "OTel Collector 是干什么的？"
+        answer: "它在应用和观测平台之间收 Trace，做过滤、脱敏和转发。应用挂了采集，也不把平台地址和密钥散落在每个服务里。敏感字段在这里丢掉。"
+    project_example: |
+      **p3 前端 Coding Agent**：Harness 的每一步（读文件、检索仓库、调用模型、在 Docker 沙箱里跑 vitest）都用 OTel 打 Span，工具 Span 记录命令、退出码、耗时。
+      导出走 OTLP，开发时发到本地 Langfuse，演示时可切到别的后端；`app.task_id`、`app.attempt` 等自定义属性放在 `app.*` 下，报表查询兼容新旧 Token 字段。
+    freshness: |
+      核对于 2026-11：GenAI 语义约定已迁到 open-telemetry/semantic-conventions-genai，主仓库 v1.42.0（2026-06-12）将 gen_ai.* 内容弃用并迁出，之后的 v1.43~v1.45 均无 GenAI 条目；独立仓库仍无打标签的版本，所有 GenAI 定义均为 development，稳定化追踪 Issue 511 在 2026-11-06 更新时仍写明核心定义为 development。
+      旧写法 vs 新写法：`gen_ai.system` → `gen_ai.provider.name`（v1.37.0）；`gen_ai.usage.prompt_tokens/completion_tokens` → `input_tokens/output_tokens`（v1.27.0）；`gen_ai.client.token.usage` 指标在独立仓库主分支被拆分为按次直方图与累计计数器（2026-09）。
+    sources:
+      - {title: "open-telemetry/semantic-conventions-genai 仓库", url: "https://github.com/open-telemetry/semantic-conventions-genai"}
+      - {title: "semantic-conventions-genai Issue 511 - 稳定化追踪", url: "https://github.com/open-telemetry/semantic-conventions-genai/issues/511"}
+      - {title: "第三方整理：OpenTelemetry GenAI semantic conventions November 2026 status", url: "https://john-hodge.com/blog/opentelemetry-genai-semantic-conventions/"}
+  - id: d43-k3
+    name: Langfuse 与 LangSmith 实操
+    level: P1
+    summary: 平台负责存储、展示、对比和在线评测；Langfuse 开源可自托管，LangSmith 是商业平台，二者都能接 OTel
+    analogy: |
+      像前端监控里的 **Sentry**：装个 SDK、加几个装饰器，就能在网页上看到每个请求的调用树、报错和性能。
+      **不一样的地方**：LLM 平台还管 **Prompt 版本、数据集、评审打分**，是「监控 + 评测 + 配置中心」的组合。
+    why: |
+      自己从零搭 Trace 存储、对比界面、评审调度成本很高。Langfuse 和 LangSmith 是国内外 JD 里出现最多的两个 LLM 工程平台，会用、能说清选型理由，是面试的基本分。
+    problem: |
+      解决「Trace 存哪、怎么看、怎么和评测与 Prompt 管理连起来」的问题，同时要考虑数据合规：Trace 里可能有敏感数据，能不能自托管。
+    principle: |
+      **一、Langfuse 的数据模型**
+
+      - **Observation**：一个步骤。类型有 `generation`（LLM 调用，带模型、Token、成本）、`retriever`（检索）、`tool`（工具调用）、`agent`、`embedding`、`guardrail`、`evaluator`、`span`（通用）等。
+      - **Trace**：同一 `trace_id` 下的 observations。
+      - **Session**：用 `session_id` 把多轮对话的 Trace 串起来，可以按会话回放。
+      - **Score**：附在 Trace 或 observation 上的分数，来源可以是用户反馈、人工标注、LLM 评审。
+      - **Prompt**：带版本和标签的 Prompt，可以关联到 generation 上，按版本看效果（Day 44 详讲）。
+
+      ```mermaid
+      classDiagram
+        class Session {
+          session_id
+        }
+        class Trace {
+          trace_id
+          user_id
+          tags
+        }
+        class Observation {
+          type generation retriever tool
+          model usage cost
+        }
+        class Score {
+          name value source
+        }
+        class PromptVersion {
+          name version label
+        }
+        Session "1" o-- "n" Trace
+        Trace "1" o-- "n" Observation
+        Trace "1" o-- "n" Score
+        Observation "n" --> "1" PromptVersion
+      ```
+
+      **二、LangSmith 的对应概念**
+
+      - **Run**：一次执行（相当于 Span），根 Run 就是一次请求；**Thread** 把多轮对话串起来。
+      - **离线评测**作用于数据集（有参考答案）；**在线评测**作用于生产 Run / Thread（没有参考答案，看安全、格式、无参考评审）。
+      - 不限于 LangChain 应用，也支持 OTel 接入。
+
+      **三、怎么选**
+
+      | 考虑点 | Langfuse | LangSmith |
+      |---|---|---|
+      | 许可与部署 | 核心 MIT 开源，可免费自托管；2026 年 1 月加入 ClickHouse，官方表示保持开源 | 商业 SaaS，自托管属企业版 |
+      | 生态 | 框架无关，基于 OTel | 与 LangChain / LangGraph 结合最紧，也支持 OTel |
+      | 适合 | 数据不能出内网、想要开源可控 | 已大量使用 LangChain 生态、接受 SaaS |
+
+      **工具不替代方法**：评测集、rubric、阈值仍然要你自己设计（Day 41~42）。
+    scenarios: |
+      - 内网部署的企业知识库：Docker Compose 起一套自托管 Langfuse，业务用 `@observe` 埋点。
+      - LangGraph 写的 Agent：开 LangSmith 追踪，在线评测规则对 5% 的生产 Thread 跑「是否完成任务」评审。
+      - 点踩复核：把点踩的 Trace 加进标注队列，人工确认后一键加入数据集。
+    code: |
+      用 Langfuse Python SDK 的 `@observe` 给 RAG 链路埋点（密钥和地址从环境变量读取，变量名以官方文档为准）：
+
+      ```python
+      import os
+
+      from langfuse import get_client, observe, propagate_attributes
+      from openai import OpenAI
+
+      langfuse = get_client()
+      client = OpenAI()
+      MODEL = os.environ["LLM_MODEL"]
+
+
+      @observe(as_type="retriever")
+      def retrieve(question: str) -> list[dict]:
+          return search_chunks(question, top_k=5)  # 你的混合检索函数
+
+
+      @observe(as_type="generation", name="answer-llm", capture_input=False)  # 不采集原文输入
+      def generate(question: str, chunks: list[dict]) -> str:
+          resp = client.chat.completions.create(model=MODEL, messages=build_messages(question, chunks))
+          langfuse.update_current_generation(
+              model=resp.model,
+              usage_details={"input": resp.usage.prompt_tokens, "output": resp.usage.completion_tokens},
+              metadata={"prompt_version": "answer-v12", "chunk_ids": [c["id"] for c in chunks]},
+          )
+          return resp.choices[0].message.content or ""
+
+
+      @observe(name="ask")
+      def ask(question: str, user_id: str, session_id: str) -> str:
+          with propagate_attributes(user_id=user_id, session_id=session_id):
+              return generate(question, retrieve(question))
+      ```
+    pitfalls: |
+      - **误区：接了平台就等于有了评测。** 平台只负责存、看、比，评测集和评分规则要自己建。
+      - **误区：「开源」等于「任何功能都免费」。** Langfuse 产品功能都是 MIT，但 SCIM、审计日志、数据保留策略等企业模块自托管时需要商业许可。
+      - **误区：把含个人信息的 Trace 直接发往 SaaS。** 先评估合规，必要时自托管或关闭内容采集。
+      - **误区：只会用框架的自动回调，不知道它记了什么。** 至少要检查一次实际上报的字段和内容。
+    interview_asks:
+      - question: "你们用什么平台做 LLM 观测？为什么选它？"
+        answer: "按数据能不能出网来选。能用托管就用带提示对比和评分的平台。不能出网就自建兼容 OTel 的，比如自建 Langfuse。选型理由是数据位置和能不能看清一次调用，不是功能列表长短。"
+      - question: "客户要求数据不出内网，你怎么选型？"
+        answer: "模型、向量库、观测都部署在内网。不用会把提示发到外网的托管观测。导出到自建的 Collector。评测也在内网跑。"
+      - question: "Langfuse 里 Trace、Observation、Session 分别是什么？"
+        answer: "Session 是一段会话。Trace 是一次请求。Observation 是这次请求里的检索、模型或工具调用。用它们把「哪次对话的哪一步」点开。名字以你用的版本文档为准。"
+    project_example: |
+      **p2 智慧园区运营 Agent**：本地用 Docker Compose 起自托管 Langfuse。LangGraph 的每个节点用 `@observe(as_type="agent")`，MCP 工具调用用 `as_type="tool"`，LLM 调用用 `as_type="generation"` 并记录 Prompt 版本；
+      运营人员的会话 ID 作为 `session_id`，工作台点踩写成 Langfuse Score。演示时打开一次「查告警并派单」的会话，能逐步回放 Agent 每一步的决策和工具参数。
+    freshness: |
+      核对于 2026-11：Langfuse 于 2026-01 被 ClickHouse 收购，官方说明核心功能保持 MIT 开源、可自托管（SCIM、审计日志、数据保留策略等 ee 模块需商业许可），当前文档采用以 observation 为中心的数据模型；Python SDK 的 `observe` 支持 `as_type` 为 generation、span、agent、tool、chain、retriever、embedding、evaluator、guardrail，支持 `capture_input` / `capture_output` 关闭输入输出采集。LangSmith 区分离线评测（数据集）与在线评测（生产 Run / Thread）。价格与功能变化快，以官网为准。
+    sources:
+      - {title: "Langfuse - Core Concepts", url: "https://langfuse.com/docs/observability/data-model"}
+      - {title: "Langfuse - Instrumentation（observe 装饰器）", url: "https://langfuse.com/docs/observability/sdk/instrumentation"}
+      - {title: "ClickHouse welcomes Langfuse", url: "https://clickhouse.com/blog/clickhouse-acquires-langfuse-open-source-llm-observability"}
+      - {title: "Langfuse - Why is Langfuse open source", url: "https://langfuse.com/handbook/chapters/open-source"}
+      - {title: "LangSmith - Evaluation concepts", url: "https://docs.langchain.com/langsmith/evaluation-concepts"}
+  - id: d43-k4
+    name: 日志、指标与告警：LLM 应用的大盘
+    level: P1
+    summary: 指标看趋势和告警，Trace 下钻单个请求，结构化日志带 trace_id；LLM 特有指标是 TTFT、Token、成本和质量信号
+    analogy: |
+      像前端的 **性能埋点 + 监控大盘**：FCP、LCP、JS 错误率、接口成功率，超阈值就在群里告警。
+      **不一样的地方**：LLM 应用还要盯**钱**（Token 成本随流量和 Prompt 长度线性涨）和**质量**（点踩率、拒答率），而且质量下降时不会有任何报错。
+    why: |
+      Trace 适合查单个请求，但发现问题要靠指标和告警。LLM 应用的事故经常是「成本一夜翻倍」「某个租户被循环调用打爆配额」「新 Prompt 上线后点踩率上升」，不设指标就只能等用户来报。
+    problem: |
+      解决「问题发生了能不能第一时间知道、知道后能不能快速定位」的问题，以及指标太多或太少、告警太吵或太晚的问题。
+    principle: |
+      **一、三大支柱怎么配合**
+
+      ```mermaid
+      flowchart LR
+        M["指标 趋势与告警"] -->|"发现异常时间段与维度"| T["Trace 下钻具体请求"]
+        T -->|"需要更多细节"| L["结构化日志 带 trace_id"]
+        L -->|"trace_id 跳回"| T
+        F["用户反馈 点踩"] -->|"关联 trace_id"| T
+      ```
+
+      - **指标**：便宜、可长期保存，适合看趋势、做告警。
+      - **Trace**：单请求的完整调用树，适合定位原因。
+      - **日志**：结构化（JSON），每条带 `trace_id`，可以互相跳转。
+
+      **二、LLM 应用该看的指标**
+
+      | 类别 | 指标 |
+      |---|---|
+      | 流量与可用性 | QPS、错误率、**429 限流比例**、超时比例 |
+      | 延迟 | **首 Token 时间 TTFT** 与总耗时的 P50 / P95 |
+      | 成本 | 每请求 Token、按租户和功能的日成本、缓存命中率 |
+      | 质量信号 | **点踩率、拒答率、转人工率**、线上评审通过率 |
+      | Agent | 每次运行的步数、工具调用次数、工具错误率、触发最大步数的比例 |
+
+      流式聊天里，用户感受最强的是 **TTFT**（点发送后多久开始出字），总耗时反而没那么敏感。
+
+      **三、告警怎么设**
+
+      - 看**变化**而不是绝对值：成本日环比、点踩率突增、429 比例突增。
+      - 按**维度**拆：租户、功能、Prompt 版本，避免一个大租户的问题被平均掉。
+      - 有**分级**：错误率暴涨要立刻处理；点踩率缓慢上升进入周报复盘。
+      - 告警消息里带**跳转链接**：直接打开该时间段、该维度的 Trace 列表。
+
+      **四、采样与隐私**
+
+      - 流量大时可以对 Trace 采样，但**错误、慢请求、点踩请求要全量保留**。
+      - 指标和日志里不放原文，只放 ID、长度、Token 数等元数据（详见 Day 45）。
+    scenarios: |
+      - 成本告警：某租户日成本环比超 100%，下钻 Trace 发现一个批量导入任务在重复向量化同一份文档。
+      - 体验告警：TTFT 的 P95 从 1.2 秒升到 4 秒，定位到新加的重排步骤放在了生成之前且串行执行。
+      - 质量周报：按 Prompt 版本对比点踩率和拒答率，决定是否回滚。
+    pitfalls: |
+      - **误区：只监控错误率。** LLM 应用最常见的问题是答错和花钱多，都不报错。
+      - **误区：只看平均延迟。** 平均值会掩盖长尾，看 P95；流式场景重点看 TTFT。
+      - **误区：所有阈值都用绝对值。** 业务量变化后要么一直响、要么一直不响，用环比和按维度拆分。
+      - **误区：Trace 全量采样且存原文。** 成本高且有隐私风险，采样时保留错误和点踩请求。
+    interview_asks:
+      - question: "你们怎么监控 LLM 应用？大盘上有哪些指标？"
+        answer: "请求量、错误率、429、首字时间、总延迟、输入输出 Token、单次成本、评测或点踩率。按模型和功能拆开。只监控 CPU 看不到模型和钱的问题。"
+      - question: "成本突然翻倍你怎么发现、怎么定位？"
+        answer: "按天告警 Token 和金额。定位时按功能、模型、用户拆，看是调用次数变多、提示变长，还是重试放大。找到那一个功能再看它的 Trace。"
+      - question: "流式应用的延迟应该看什么指标？"
+        answer: "看首字时间和 Token 间隔，不要只看整段结束的时间。用户感觉慢，经常是首字晚。结束时间还要看，用来发现生成过长。"
+    project_example: |
+      **p1 企业知识库**：大盘分四块：流量与错误（QPS、错误率、429）、延迟（TTFT 与总耗时 P95）、成本（按部门的日 Token 与成本、Embedding 缓存命中率）、质量（点踩率、拒答率、引用缺失率）。
+      告警三条：错误率 5 分钟内超阈值；任一部门日成本环比翻倍；点踩率按 Prompt 版本对比明显上升。告警消息带 Langfuse 的筛选链接。
+test:
+  - id: d43-t1
+    kp: d43-k1
+    type: single
+    question: 一次用户提问经过鉴权、检索、两次 LLM 调用和一次工具调用。在 Trace 模型中应该如何表示？
+    options:
+      - "每个步骤各生成一个独立的 Trace，再按时间戳拼接查看"
+      - "整个请求是一个 Trace，每个步骤是其中有父子关系的 Span"
+      - "只为 LLM 调用记录 Span，其余步骤写成普通文本日志即可"
+      - "整个请求只记一条日志，把耗时和 Token 写在同一行里"
+    answer: [1]
+    explain: |
+      一次请求对应一个 Trace，内部每个步骤是 Span，Span 之间的父子关系组成调用树，能直接看出谁调用了谁、哪一步最慢。
+      拆成多个独立 Trace 就失去了调用关系；只记 LLM Span 看不到检索和工具的问题；一行日志无法表达嵌套结构。
+  - id: d43-t2
+    kp: d43-k1
+    type: single
+    question: 多轮聊天应用中，Trace 和 Session 怎么划分最合理？
+    options:
+      - "整段对话作为一个 Trace，等对话结束时再统一上报"
+      - "每次 LLM 调用作为一个 Session，方便按模型统计"
+      - "每个用户作为一个 Trace，所有历史对话都挂在下面"
+      - "每轮问答作为一个 Trace，同一对话用 session_id 串起"
+    answer: [3]
+    explain: |
+      Langfuse 的建议是聊天应用每轮一个 Trace、每段对话一个 Session：你无法预知对话何时结束，按轮划分让 Trace 小而易读，Session 视图再把多轮串起来回放。
+      整段对话一个 Trace 会无限变大且迟迟无法上报；按 LLM 调用或按用户划分都不符合「一次请求」的语义。
+  - id: d43-t3
+    kp: d43-k1
+    type: multi
+    question: 一次 LLM 调用的 Span 应该记录哪些信息？
+    options:
+      - "请求的模型名，以及实际响应的模型名"
+      - "输入、输出、缓存 Token 数与折算后的成本"
+      - "首 Token 时间与结束原因，如长度截断"
+      - "用户的登录密码明文，方便排查登录问题"
+    answer: [0, 1, 2]
+    explain: |
+      模型名用于对比和发现厂商侧切换；Token 与成本用于成本归因；TTFT 和结束原因用于体验分析和截断问题排查。
+      密码等凭证任何情况下都不能写入 Trace 或日志，这是严重的安全问题。
+  - id: d43-t4
+    kp: d43-k1
+    type: judge
+    question: Node 中间层、FastAPI 后端、异步 worker 之间需要传递 trace 上下文（如 W3C traceparent 请求头或消息里的上下文字段），才能把一次请求的 Span 串进同一个 Trace。
+    answer: true
+    explain: |
+      每个服务只知道自己的 Span，必须通过上下文传播把 trace_id 和父 Span ID 传下去，下游创建的 Span 才会挂到同一棵树上。OpenTelemetry 默认使用 W3C traceparent 头。
+      异步任务尤其容易漏传，导致入库或后台处理的问题无法追溯到触发它的请求。
+  - id: d43-t5
+    kp: d43-k1
+    type: judge
+    question: LLM 应用的问题大多会抛出异常，所以只要把错误日志记录好，就能定位绝大部分问题。
+    answer: false
+    explain: |
+      LLM 应用最常见的问题是答错、答慢、花钱多，这些都不会抛异常。需要记录正常请求的检索结果、工具参数、Token、耗时和质量信号，才能发现和定位。
+      只看错误日志会漏掉大部分真实问题。
+  - id: d43-t6
+    kp: d43-k2
+    type: single
+    question: 截至 2026 年 11 月，关于 OpenTelemetry GenAI 语义约定（gen_ai.*）的状态，哪项准确？
+    options:
+      - "全部仍是 Development 状态，已迁到独立仓库，尚无正式发布版本"
+      - "已经全部进入 Stable 状态，可以作为长期不变的报表字段契约"
+      - "OpenTelemetry 已放弃 GenAI 约定，改为推荐各厂商的私有格式"
+      - "只有 gen_ai.system 是稳定字段，其余属性都还处于实验阶段"
+    answer: [0]
+    explain: |
+      2026 年 6 月主仓库 v1.42.0 把 gen_ai.* 内容弃用并迁到 semantic-conventions-genai 独立仓库，其中所有 Span、指标、事件、属性都是 development，且没有打标签的版本。
+      gen_ai.system 恰恰已经被改名为 gen_ai.provider.name；OpenTelemetry 也没有放弃这套约定。
+  - id: d43-t7
+    kp: d43-k2
+    type: single
+    question: 你的 Token 大盘按 `gen_ai.usage.prompt_tokens` 统计。升级埋点库后，大盘数据突然变成 0，但账单没变。最可能的原因是？
+    options:
+      - "新版埋点库默认关闭了 Token 统计，需要手动打开开关"
+      - "模型厂商不再返回 Token 用量，需要自己按字数估算"
+      - "字段已改名为 gen_ai.usage.input_tokens，查询要兼容新旧"
+      - "OTLP 协议不支持整数类型的属性，Token 值被直接丢弃"
+    answer: [2]
+    explain: |
+      GenAI 约定早已把 prompt_tokens / completion_tokens 改名为 input_tokens / output_tokens，新版埋点库按新名上报，旧查询自然查不到。应在查询层兼容新旧字段并固定埋点库版本。
+      账单没变说明厂商仍在返回用量；OTLP 支持整数属性；这不是开关问题。
+  - id: d43-t8
+    kp: d43-k2
+    type: multi
+    question: 面对仍在变化的 GenAI 语义约定，哪些工程做法是正确的？
+    options:
+      - "固定埋点库与 SDK 版本，升级前检查实际导出的属性"
+      - "查询层兼容新旧字段名，并且不要把两者的值相加"
+      - "自定义业务属性放在自己的命名空间，如 app.*"
+      - "自定义属性写成 gen_ai.tenant，和官方字段放在一起"
+    answer: [0, 1, 2]
+    explain: |
+      锁版本避免升级后字段突变；兼容期框架可能同时上报新旧两个字段且值相同，相加会算成两倍；自定义属性放在自己的命名空间不会与未来官方字段冲突。
+      占用 gen_ai.* 命名空间可能与未来的官方定义冲突。
+  - id: d43-t9
+    kp: d43-k2
+    type: judge
+    question: 按 GenAI 约定，埋点默认不采集 Prompt 和回答内容，需要显式开启；开启前要评估脱敏和访问权限。
+    answer: true
+    explain: |
+      规范中内容采集的默认值是不采集，各语言埋点库也默认关闭，需要通过环境变量或配置显式开启（具体变量名在规范和实现之间还有差异，以所用埋点包为准）。
+      内容里常含个人信息和企业机密，开启前必须先做脱敏、限制访问和保留期。
+  - id: d43-t10
+    kp: d43-k2
+    type: single
+    question: 除了记录原文带来的隐私问题之外，下面这段埋点代码在 Trace 层面最严重的问题是什么？
+    code: |
+      from opentelemetry import trace
+
+      tracer = trace.get_tracer("kb-api")
+
+      def answer(question: str) -> str:
+          span = tracer.start_span("chat")
+          span.set_attribute("gen_ai.request.model", MODEL)
+          span.set_attribute("app.question", question)
+          resp = llm_call(question)          # 内部也会创建 Span
+          span.set_attribute("gen_ai.usage.output_tokens", resp.output_tokens)
+          return resp.text
+    lang: python
+    options:
+      - "Span 名称必须是大写的 CHAT，否则后端平台无法识别"
+      - "Span 从未结束也没设为当前 Span，不会导出，子调用也挂不上"
+      - "gen_ai.request.model 只能在模型返回之后才能设置"
+      - "OpenTelemetry 不允许在业务函数内部创建 Span"
+    answer: [1]
+    explain: |
+      start_span 创建的 Span 必须调用 end() 才会被导出，这里从未结束；它也没有被设为当前上下文，llm_call 内部创建的 Span 不会成为它的子节点。应改用 `with tracer.start_as_current_span("chat") as span:`。
+      Span 名称没有大写要求；请求参数应在调用前设置；在函数内创建 Span 是标准用法。
+  - id: d43-t11
+    kp: d43-k3
+    type: single
+    question: 在 Langfuse 中，一次 LLM 调用、一次向量检索、一次工具调用，分别最适合用哪种 observation 类型？
+    options:
+      - "event、event、event"
+      - "span、span、span"
+      - "agent、chain、guardrail"
+      - "generation、retriever、tool"
+    answer: [3]
+    explain: |
+      generation 专门记录模型调用（模型名、Token、成本），retriever 表示只读的数据检索，tool 表示一次工具或 API 调用。类型正确才能在界面上按类型筛选和统计成本。
+      event 用于离散事件；全部用 span 会丢失类型信息；agent、chain、guardrail 用于编排、串联和防护，含义不同。
+  - id: d43-t12
+    kp: d43-k3
+    type: single
+    question: 金融客户要求 Trace 数据不能出内网，同时团队希望保留以后切换平台的余地。最合理的方案是？
+    options:
+      - "用 OpenTelemetry 埋点，导出到内网自托管的 Langfuse"
+      - "直接接入 SaaS 观测平台，在合同里约定数据保密条款"
+      - "不做 Trace，只在每台服务器上写本地文本日志就够了"
+      - "使用框架私有的回调埋点，观测平台跟着框架一起选"
+    answer: [0]
+    explain: |
+      自托管满足数据不出内网的合规要求，OTel 埋点让后端可替换，以后换平台只改导出配置。
+      SaaS 的合同条款不能满足「不出内网」；放弃 Trace 会让排障困难；私有回调会把平台和框架绑死。
+  - id: d43-t13
+    kp: d43-k3
+    type: multi
+    question: 关于 Langfuse 和 LangSmith，以下哪些说法正确？
+    options:
+      - "Langfuse 核心功能 MIT 开源可自托管，2026 年 1 月加入 ClickHouse"
+      - "Langfuse 用 session_id 把多轮对话的多个 Trace 归为一组"
+      - "LangSmith 的在线评测作用于生产 Trace，通常没有参考答案"
+      - "LangSmith 只能追踪用 LangChain 编写的应用，其他不支持"
+    answer: [0, 1, 2]
+    explain: |
+      Langfuse 于 2026 年 1 月被 ClickHouse 收购，官方表示核心保持 MIT 开源；Session 通过 session_id 串起多轮；LangSmith 的在线评测针对生产 Run/Thread，没有参考输出，侧重安全、格式和无参考评审。
+      LangSmith 并不限于 LangChain 应用，也支持 SDK 埋点和 OTel 接入。
+  - id: d43-t14
+    kp: d43-k3
+    type: judge
+    question: 接入 Langfuse 或 LangSmith 之后就等于有了完整的评测体系，评测集和评分规则会由平台自动生成。
+    answer: false
+    explain: |
+      平台提供的是存储、展示、实验对比、评审调度和标注队列等能力，评测集的来源与覆盖、rubric 的写法、门槛设定仍然要团队自己设计和校准。
+      工具不能替代 Day 41~42 讲的方法。
+  - id: d43-t15
+    kp: d43-k4
+    type: single
+    question: 流式聊天应用中，用户抱怨「点了发送要等很久才开始出字」，但完整回答的总耗时变化不大。应重点看哪个指标？
+    options:
+      - "每秒请求数 QPS 的变化趋势"
+      - "平均每次输出 Token 数的变化"
+      - "首 Token 时间 TTFT 的 P95"
+      - "向量数据库的磁盘占用情况"
+    answer: [2]
+    explain: |
+      「多久开始出字」就是首 Token 时间，流式场景用户最敏感的就是它；看 P95 才能发现长尾。常见原因是生成前的串行步骤（检索、重排、改写）变慢或排队。
+      QPS、输出长度、磁盘占用都不直接对应这个体验问题。
+  - id: d43-t16
+    kp: d43-k4
+    type: single
+    question: 以下哪条告警规则对 LLM 应用最有价值？
+    options:
+      - "任意一次 LLM 调用耗时超过 1 秒，就立即电话告警"
+      - "按租户统计的日成本环比超阈值或点踩率突增时告警"
+      - "每产生一条 INFO 级别日志，就推送到值班群里"
+      - "只在服务进程崩溃时告警，其他情况一律不告警"
+    answer: [1]
+    explain: |
+      按维度看变化率的告警既能发现成本失控、质量下降这类 LLM 特有问题，又不会因业务量变化而误报。
+      单次耗时超 1 秒对 LLM 很正常，会持续误报；INFO 日志推送会淹没值班群；只看崩溃会漏掉答错和超支。
+  - id: d43-t17
+    kp: d43-k4
+    type: multi
+    question: 关于日志、指标、Trace 的配合，哪些做法正确？
+    options:
+      - "结构化日志带上 trace_id，可以从日志跳到对应的 Trace"
+      - "指标用来看趋势和告警，Trace 用来下钻具体请求"
+      - "用户点赞点踩通过 trace_id 关联回具体的请求"
+      - "有了 Trace 就可以删掉指标，大盘直接扫描全部 Trace"
+    answer: [0, 1, 2]
+    explain: |
+      三者通过 trace_id 互相关联：指标发现异常，Trace 定位原因，日志补充细节，反馈也能对应到具体请求。
+      Trace 数据量大、通常还会采样，直接扫描全部 Trace 做大盘成本高且不准确，指标仍然必要。
+  - id: d43-t18
+    kp: d43-k4
+    type: judge
+    question: Agent 每次运行的步数和工具调用次数也是重要指标，循环失控通常会先表现为步数和 Token 异常上涨。
+    answer: true
+    explain: |
+      Agent 陷入重复调用或无法终止时，不一定报错，但步数、工具调用次数和 Token 会明显上涨，成本随之暴涨。
+      监控每次运行的步数分布和触发最大步数的比例，能尽早发现这类问题。
+exam:
+  - id: d43-e1
+    kp: d43-k1
+    type: single
+    question: 用户反馈某次回答引用了已经废止的旧制度，并提供了会话 ID。系统已经接入 Trace，最快的排查路径是？
+    options:
+      - "用会话 ID 找到 Trace，看检索 Span 返回了哪些文档及其版本"
+      - "在所有服务器上 grep 用户问题关键词，按时间戳拼出调用过程"
+      - "直接重新问一遍同样的问题，看现在的回答是否已经正确了"
+      - "先把生成模型的温度调成 0，再观察是否还有类似的投诉"
+    answer: [0]
+    explain: |
+      Trace 记录了那次请求检索到的文档 ID 和版本，能直接判断是旧文档没下线、入库没更新，还是生成时用错了资料。
+      grep 日志效率低且难以拼全；重问一遍得到的是新请求，复现不了当时的检索结果；调温度与引用旧文档无关。
+  - id: d43-e2
+    kp: d43-k2
+    type: single
+    question: 团队多个服务都用 OTel 埋点，希望统一做脱敏和采样，并同时发往 Langfuse 和公司已有的 APM。最合适的架构是？
+    options:
+      - "每个服务分别集成各平台的私有 SDK，各自独立上报"
+      - "所有服务把 Span 写进同一张数据库表，再写脚本同步"
+      - "放弃 Trace，只把关键字段打印到标准输出由运维收集"
+      - "服务通过 OTLP 发往 OTel Collector，由它处理后多路导出"
+    answer: [3]
+    explain: |
+      Collector 是 OpenTelemetry 的中转组件，可以集中做脱敏、采样、属性改写，并配置多个导出器同时发往不同后端，业务服务只需要一个 OTLP 出口。
+      各自集成私有 SDK 重复且难统一治理；自建表和同步脚本是重复造轮子；放弃 Trace 失去调用链能力。
+  - id: d43-e3
+    kp: d43-k3
+    type: single
+    question: 发布新版 Prompt 后，你想按版本对比点踩率、平均 Token 和延迟。Trace 中最关键要记录什么？
+    options:
+      - "完整的 Prompt 原文全文，方便之后人工逐条肉眼比对差异"
+      - "处理请求的服务器主机名和进程号，方便定位是哪台机器"
+      - "Prompt 名称和版本号，作为属性记录在对应的 generation 上"
+      - "每次请求使用的随机种子，方便之后完全复现相同的输出"
+    answer: [2]
+    explain: |
+      有了 Prompt 名称和版本号，就能按版本分组聚合点踩率、Token、延迟，Langfuse 也支持把 Prompt 版本关联到 generation 上直接对比。
+      记录原文既占空间又有隐私风险，且难以聚合；主机名与 Prompt 版本无关；随机种子不能保证复现，也不能用于分组对比。
+  - id: d43-e4
+    kp: d43-k4
+    type: single
+    question: 大盘显示过去一周某租户的 LLM 成本翻倍，但请求数基本不变。最先该做什么？
+    options:
+      - "按 Trace 下钻该租户的请求，看每次的步数、调用次数和 Token"
+      - "立即对该租户限流，把每日请求数压到上周的一半水平"
+      - "先联系模型厂商，确认这一周内是否悄悄上调了价格"
+      - "把所有租户的模型统一切到更便宜的版本以控制成本"
+    answer: [0]
+    explain: |
+      请求数不变而成本翻倍，说明单次请求的消耗变了：可能是 Agent 循环、重复调用、上下文变长或缓存失效。下钻 Trace 能直接看到原因。
+      限流和换模型都是没有定位原因的粗暴处理；涨价会影响所有租户，不会只体现在一个租户上。
+  - id: d43-e5
+    kp: d43-k1
+    type: multi
+    question: 关于 Trace 中 Prompt 和回答原文的采集，哪些做法合理？
+    options:
+      - "默认只记录元数据，如 Token、耗时、文档 ID"
+      - "排障需要时脱敏后短期开启，并限制可查看人员"
+      - "可观测平台按租户或项目隔离访问权限"
+      - "为方便调试，生产环境默认全量记录原文并长期保存"
+    answer: [0, 1, 2]
+    explain: |
+      默认只记元数据、按需脱敏短期开启、按租户隔离访问，可以在可排障和保护隐私之间取得平衡。
+      默认全量长期保存原文，会让可观测平台变成访问控制更弱的敏感数据仓库，带来合规风险。
+  - id: d43-e6
+    kp: d43-k4
+    type: multi
+    question: 下列哪些是 LLM 应用特有、值得放进监控大盘的指标？
+    options:
+      - "首 Token 时间与总耗时的 P95"
+      - "429 限流比例与模型调用错误率"
+      - "拒答率、点踩率与转人工率"
+      - "前端打包产物的体积大小"
+    answer: [0, 1, 2]
+    explain: |
+      TTFT 对应流式体验；429 比例反映配额与限流问题；拒答率、点踩率、转人工率是没有标准答案时最直接的线上质量信号。
+      前端打包体积属于构建优化指标，与 LLM 服务运行状态无关。
+  - id: d43-e7
+    kp: d43-k3
+    type: judge
+    question: Langfuse 的 Prompt 管理可以把 Prompt 版本关联到 generation 上，从而按版本对比延迟、成本和评分。
+    answer: true
+    explain: |
+      Langfuse 的 generation 支持关联所使用的 Prompt 版本，平台可以按 Prompt 版本聚合延迟、Token、成本和分数，用来判断新版本是否更好。
+      这正是把 Prompt 管理和可观测性放在一起的价值。
+  - id: d43-e8
+    kp: d43-k2
+    type: judge
+    question: 只要某个框架宣称「支持 OpenTelemetry」，它导出的 GenAI 属性就一定与最新约定完全一致，可以直接写死报表字段。
+    answer: false
+    explain: |
+      GenAI 约定仍在变化，各框架实际导出的字段经常新旧混杂（例如同时有 gen_ai.system 和 gen_ai.provider.name），而且指标名在主分支上仍在调整。
+      应以实际导出的 Span 为准，固定版本并在查询层兼容。
+  - id: d43-e9
+    kp: d43-k1
+    type: case
+    question: |
+      p2 园区 Agent 的运营人员反馈「问一句话要等二十多秒」。你打开其中一次请求的 Trace：总耗时 22 秒，5 次 LLM 调用合计约 11 秒；`query_alarms` 工具被调用了 4 次，参数完全相同，每次约 2 秒；最后一次 LLM 调用的输入 Token 是第一次的 6 倍。
+      最合理的判断和修复方向是？
+    options:
+      - "主要是 LLM 太慢，换一个更快的模型就能解决全部问题"
+      - "Agent 重复调用同一工具，应缓存或去重并检查终止条件"
+      - "告警接口太慢，应把全部告警数据直接写进 System Prompt"
+      - "Trace 采样拖慢了请求，应关闭 Trace 以提升响应速度"
+    answer: [1]
+    explain: |
+      同参数重复调用 4 次说明 Agent 没有利用已有结果，可能是工具返回格式让模型以为没拿到数据，或终止条件不清；重复结果被追加进上下文又让输入 Token 涨了 6 倍，拖慢后续 LLM 调用。应对同参数调用做缓存或去重、改进工具返回说明、检查终止条件。
+      换模型不解决重复调用；把告警塞进 Prompt 会让上下文更长；Trace 开销远小于秒级。
+interview:
+  - id: d43-i1
+    kp: d43-k1
+    type: scenario
+    difficulty: 2
+    question: 用户投诉「昨天问年假政策，AI 给的答案是错的」。你怎么排查？
+    key_points:
+      - {text: "通过会话 ID 或 trace_id 定位那次请求的 Trace", dim: engineering}
+      - {text: "按调用树逐步看：改写后的查询、检索返回的文档与版本、Prompt 版本、模型输出", dim: principle}
+      - {text: "判断根因属于检索、数据过期、生成还是 Prompt，而不是只重问一遍", dim: principle}
+      - {text: "修复后把这个案例补进评测集，并检查同类问题的影响范围", dim: engineering}
+      - {text: "说明项目中 Trace 记录了哪些字段支撑这次排查", dim: project}
+    reference: |
+      第一步定位：前端每条消息都带 trace_id，用户反馈时提交；如果没有，就用用户 ID 加时间范围在 Langfuse 里筛选。直接重问一遍没有意义，因为检索结果和模型输出都可能不同。
+      第二步看调用树：查询改写 Span 看改写后的问题是否偏了；检索 Span 看返回了哪些文档 ID 和版本，正确的新政策文档有没有被召回、排第几；生成 Span 看用的是哪个 Prompt 版本和模型、输入里有哪些片段、输出怎么说的。
+      第三步归因：如果检索只召回了旧版政策，是入库或下线流程问题；如果新旧都召回了但模型用了旧的，是 Prompt 没要求优先最新版本或片段缺少日期元数据；如果召回了正确文档却答错，是生成问题。
+      第四步修复和防复发：修复对应环节，把这个问题和正确答案补进评测集；再查同时期是否有其他请求引用了同一份旧文档，评估影响范围。
+      在知识库项目里，检索 Span 记录了片段 ID、文档版本和相似度分数，这类排查一般几分钟就能定位。
+    oral: |
+      我第一步不会去重问一遍，而是用会话 ID 找到那次请求的 Trace。然后沿着调用树看：查询改写有没有偏，检索返回了哪些文档、什么版本，生成用的是哪个 Prompt 版本、输入了哪些片段。
+      如果只召回了旧政策，就是入库或下线的问题；新旧都召回了但用了旧的，就是 Prompt 或元数据的问题；召回对了还答错，才是生成的问题。
+      修好之后我会把这个问题补进评测集，再查同期有没有别的请求也引用了那份旧文档。我们知识库的检索 Span 记了片段 ID 和文档版本，所以这类问题几分钟就能定位。
+  - id: d43-i2
+    kp: d43-k2
+    type: design
+    difficulty: 3
+    question: 请为公司的 RAG + Agent 平台设计一套可观测性方案：记录什么、用什么标准和工具、怎么保护隐私、数据怎么用起来。
+    key_points:
+      - {text: "Trace 结构：每轮一个 Trace，会话用 session_id，检索、LLM、工具、Agent 步骤为 Span，跨服务传递上下文", dim: concept}
+      - {text: "LLM Span 字段：模型、Token、成本、TTFT、结束原因、Prompt 版本、租户与用户", dim: engineering}
+      - {text: "用 OTel 埋点和 Collector，说明 GenAI 约定仍是 Development，需要固定版本和兼容字段", dim: principle}
+      - {text: "隐私：默认不采集内容，脱敏后按需开启，平台按租户隔离，敏感客户自托管", dim: engineering}
+      - {text: "数据使用：指标大盘与告警、反馈关联 Trace、点踩样本回流评测集", dim: project}
+    reference: |
+      记录什么：每轮请求一个 Trace，会话用 session_id 串起；鉴权、查询改写、检索（Embedding、向量检索、重排）、每次 LLM 调用、每次工具调用、Agent 每一步、人工审批中断都是 Span。前端、Node 中间层、FastAPI、异步 worker 之间用 traceparent 传递上下文。LLM Span 记提供方、请求与响应模型名、输入输出与缓存 Token、成本、总耗时与 TTFT、结束原因、Prompt 名称与版本、租户与用户 ID；工具 Span 记工具名、参数摘要、返回条数、错误。
+      标准和工具：业务统一用 OpenTelemetry 埋点，经 OTel Collector 做脱敏和采样，再导出到自托管 Langfuse（看 LLM 细节和评测）和公司 APM（看服务健康）。GenAI 约定截至 2026-11 全部是 Development 且已迁到独立仓库，所以锁定埋点库版本，查询层兼容新旧字段，自定义属性用 app.* 命名空间。
+      隐私：默认不采集 Prompt 和回答原文，只记元数据和文档 ID；排障时在 Collector 脱敏后短期开启；平台按租户和项目隔离权限；高敏客户的数据只进自托管实例。
+      怎么用：指标大盘看流量错误、TTFT 与 P95、按租户成本、点踩率和拒答率；告警看变化率并带 Trace 跳转链接；前端反馈带 trace_id；点踩和低分 Trace 进入标注队列，确认后进评测集；按 Prompt 版本对比支持灰度决策。
+    oral: |
+      我会以 Trace 为核心。每轮请求一个 Trace，会话用 session ID 串起来，检索、模型调用、工具调用、Agent 每一步都是 Span，前端到后端到异步任务都传 traceparent，保证不断链。模型调用的 Span 记模型名、Token、成本、首字时间、结束原因，再加 Prompt 版本和租户。
+      埋点统一用 OpenTelemetry，经 Collector 脱敏后发到自托管的 Langfuse 和公司的 APM。GenAI 约定现在还是开发中状态，所以我们锁版本、查询兼容新旧字段。
+      原文默认不采集。数据主要三个用处：大盘和告警，反馈关联到具体 Trace，点踩样本复核后补进评测集。
+  - id: d43-i3
+    kp: d43-k4
+    type: scenario
+    difficulty: 4
+    question: 凌晨收到告警：LLM 调用成本在一小时内涨了 5 倍。你会怎么处理？事后怎么防止再发生？
+    key_points:
+      - {text: "先止血：按维度定位异常来源（租户、功能、Prompt 版本、API Key），对异常来源限流或熔断", dim: engineering}
+      - {text: "下钻 Trace 找原因：Agent 循环、重复调用、上下文暴涨、缓存失效、被刷接口", dim: principle}
+      - {text: "区分是发布引起还是流量异常，必要时回滚配置", dim: principle}
+      - {text: "事后：每次运行的步数与 Token 上限、按租户预算、环比告警分级、发布时把成本纳入回归", dim: engineering}
+      - {text: "复盘并把触发样本补进评测集或压测用例", dim: project}
+    reference: |
+      先止血再查原因。
+      第一步定位维度：在大盘里按租户、功能、Prompt 版本、模型、API Key 拆分成本曲线，看是全局上涨还是集中在某一个维度。集中在某个租户或接口时，先对它限流或熔断，避免继续烧钱；如果和刚发布的 Prompt 或配置时间吻合，直接回滚。
+      第二步下钻 Trace：筛选该维度最近一小时成本最高的 Trace，看单次请求的步数、工具调用次数、输入 Token。常见原因：Agent 循环不收敛反复调用工具；工具返回过大的结果被塞进上下文；Prompt 缓存或语义缓存失效；接口被脚本高频调用。
+      第三步修复：针对原因修复，比如给工具结果做截断和去重、修终止条件、恢复缓存、给接口加鉴权和频控。
+      事后防范：每次 Agent 运行设最大步数和 Token 上限；按租户和功能设日预算，超预算降级；成本告警按环比和维度分级；发布评测里加入平均 Token 和成本作为回归项；复盘文档记录时间线，把触发问题的请求补进评测集或压测用例。
+    oral: |
+      我会先止血再查原因。先在大盘里按租户、功能、Prompt 版本和 API Key 拆成本曲线，看是不是集中在某一个来源；如果是，就先限流或熔断；如果时间点和刚发布的配置吻合，直接回滚。
+      然后下钻那一小时最贵的 Trace，看步数、工具调用次数、输入 Token，常见原因是 Agent 循环、工具结果太大塞进上下文、缓存失效或者接口被刷。
+      事后我会加三道防线：每次运行限制最大步数和 Token；按租户设日预算，超了降级；发布评测里把平均 Token 和成本也当回归指标。最后把触发问题的请求补进评测集。
+sources:
+  - {title: "Langfuse - What does a good trace look like?", url: "https://langfuse.com/docs/observability/best-practices"}
+  - {title: "Langfuse - Core Concepts", url: "https://langfuse.com/docs/observability/data-model"}
+  - {title: "Langfuse - Observation Types", url: "https://langfuse.com/docs/observability/features/observation-types"}
+  - {title: "open-telemetry/semantic-conventions-genai 仓库", url: "https://github.com/open-telemetry/semantic-conventions-genai"}
+  - {title: "LangSmith - Evaluation concepts", url: "https://docs.langchain.com/langsmith/evaluation-concepts"}
+  - {title: "ClickHouse welcomes Langfuse", url: "https://clickhouse.com/blog/clickhouse-acquires-langfuse-open-source-llm-observability"}

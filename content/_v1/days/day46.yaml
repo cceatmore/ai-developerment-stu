@@ -1,0 +1,743 @@
+day: 46
+phase: 5
+title: 系统性能
+goals:
+  - 能说出 AI 应用的主要性能瓶颈，并用 TTFT、P95/P99、QPS、Token 吞吐准确描述一次压测结果
+  - 能解释 async、uvicorn worker、连接池三者如何共同决定服务的并发上限，并算出数据库连接总数
+  - 能比较固定窗口、滑动窗口、令牌桶三种限流算法，并设计按用户请求数 + 按租户 Token 数的分布式限流
+  - 能用 EXPLAIN 定位慢查询，能设计多级缓存与降级方案，并说清每一层不做会怎样
+knowledge_points:
+  - id: d46-k1
+    name: AI 应用的性能瓶颈与压测指标
+    level: P0
+    summary: AI 应用 80% 以上的时间花在等模型；看 TTFT 和 P99，别只看平均值
+    why: |
+      面试里「你的系统 QPS 多少、P99 多少、瓶颈在哪」几乎是必问题。
+      AI 应用和普通 CRUD 接口的性能画像完全不同：一次请求动辄 5~30 秒，**大头不在你的代码，而在模型推理**。
+      不会拆解延迟，就只能说「模型慢」，既优化不了，也答不好面试。
+    problem: |
+      解决「慢到底慢在哪、能撑多少人、优化有没有效果」的度量问题。
+      没有统一指标，团队会凭感觉优化：花一周把数据库查询从 20ms 优化到 5ms，用户却毫无感知，因为模型生成要 12 秒。
+      指标让你知道**该优化哪一段、优化后提升了多少**。
+    principle: |
+      **一、一次 AI 请求的时间都花在哪**
+
+      以一次 RAG 问答为例，典型耗时分布（量级示意，实际以你的压测为准）：
+
+      ```mermaid
+      flowchart LR
+        A["网关与鉴权 约5ms"] --> B["读缓存与会话 约5ms"]
+        B --> C["问题向量化 50到200ms"]
+        C --> D["向量检索 10到100ms"]
+        D --> E["Rerank 100到500ms"]
+        E --> F["LLM 首Token 0.3到3s"]
+        F --> G["LLM 逐Token生成 数秒到数十秒"]
+        G --> H["写日志与入库 约10ms"]
+      ```
+
+      结论很直接：**LLM 推理通常占总耗时的大头**，其次是外部模型调用（Embedding、Rerank），你自己的 Python 代码和数据库往往只占很小一部分。
+      所以优化顺序一般是：**先减少/缩短 LLM 调用，再并行化外部调用，最后才是抠代码**。
+
+      **二、LLM 特有的三个延迟指标**
+
+      - **TTFT（Time To First Token，首 Token 时间）**：从发出请求到收到第一个 Token。决定用户「觉得卡不卡」。受输入 Token 数（预填充 prefill 阶段要把整个 Prompt 算一遍）、排队、网络影响。
+      - **TPOT / ITL（每个输出 Token 的时间 / Token 间延迟）**：决定「字出来得快不快」。
+      - **端到端延迟** ≈ TTFT + 输出 Token 数 × TPOT。所以**限制输出长度（max_tokens、要求简洁）是最直接的提速手段**。
+
+      ```mermaid
+      sequenceDiagram
+        participant U as 用户
+        participant S as 后端服务
+        participant M as 模型服务
+        U->>S: 发送问题
+        S->>M: 请求 stream=true
+        Note over S,M: 预填充阶段 输入越长越慢
+        M-->>S: 第1个Token 此刻记为TTFT
+        M-->>S: 后续Token 间隔约为TPOT
+        S-->>U: SSE 逐段推送
+        M-->>S: 结束 返回usage
+      ```
+
+      **三、吞吐类指标**
+
+      - **QPS / RPS**：每秒完成多少请求。
+      - **并发数**：同一时刻正在处理的请求数。
+      - **Token 吞吐**：每秒处理多少输入/输出 Token，对接模型厂商时更关键，因为厂商按 **RPM（每分钟请求数）和 TPM（每分钟 Token 数）** 给你配额。
+
+      三者用 **Little 定律** 联系起来：**并发数 = 吞吐 × 平均延迟**。
+      例：平均一次对话 8 秒，想撑 50 QPS，系统同时要挂着约 400 个进行中的请求。这决定了你要多少 worker、多大的连接池、上游给多少配额。
+
+      **四、为什么看 P95/P99 而不是平均值**
+
+      - P99 = 把所有请求耗时排序，第 99% 位置的值，意思是「最慢的 1% 用户至少要等这么久」。
+      - LLM 延迟是**长尾分布**：大多数 3 秒，少数因为输出长、排队、重试变成 40 秒。平均值会被大量快请求「稀释」，掩盖长尾。
+      - 一个页面会触发多次调用时，用户遇到长尾的概率会被放大。
+
+      **五、AI 应用压测的特殊点**
+
+      - **要压流式接口**，分别统计 TTFT 和总时长；只统计「HTTP 返回头的时间」会严重低估。
+      - **要用真实的 Prompt 长度分布**，不能每次发「你好」，否则 TTFT、Token 吞吐都失真。
+      - **区分自己的瓶颈和上游的瓶颈**：可以用 Mock LLM（固定延迟、固定输出）先压自己的服务，再接真实模型压整体。
+      - **注意上游配额与成本**：压测会真实消耗 Token，提前算好预算，必要时申请临时配额。
+      - 常用工具：Locust（Python 写场景）、k6（JS 写场景）。
+    scenarios: |
+      - 上线前做容量评估：用 Locust 模拟 200 并发流式对话，分别输出 TTFT P50/P95/P99 和总时长 P99，判断是否满足「首字 2 秒内」的 SLO。
+      - 用户投诉「有时候特别慢」：按 trace 把慢请求拆成检索、Rerank、LLM 三段，发现是少数超长上下文请求的 TTFT 拉高了 P99。
+      - 和模型厂商谈配额：用峰值 QPS × 平均 Token 数估算 TPM 需求。
+    pitfalls: |
+      - **误区：只看平均延迟。** 平均 4 秒可能藏着 5% 的 30 秒请求，用户投诉都来自这 5%。
+      - **误区：压非流式接口的结果代表流式体验。** 流式体验由 TTFT 决定，非流式只能看到总时长。
+      - **误区：用固定短 Prompt 压测。** 真实请求带检索片段和历史，输入长几十倍，TTFT 完全不同。
+      - **混淆：QPS 和并发数不是一回事。** 延迟 10 秒的系统，10 QPS 就意味着 100 个并发连接。
+      - **误区：压测发现慢就立刻加机器。** 如果瓶颈是上游 TPM 配额，加多少机器都没用，只会更快地撞上 429。
+    interview_asks:
+      - 你们的 AI 接口 P99 延迟是多少？主要耗时在哪一段？
+      - TTFT 是什么？怎么优化首 Token 时间？
+      - 为什么用 P99 而不是平均值衡量延迟？
+      - 你们怎么做 AI 应用的压测？和普通接口压测有什么不同？
+    project_example: |
+      企业知识库问答上线前压测：用 Locust 按线上日志抽样的问题回放，100 并发下 TTFT P95 为 2.8 秒，超过 2 秒的目标。
+      拆 trace 发现 Rerank 平均 600ms 且串行在 LLM 之前；同时检索拼进 Prompt 的片段平均 6000 Token。
+      改为 Top-K 从 10 降到 5、片段截断后输入降到约 3000 Token，Rerank 改用更小模型，TTFT P95 降到 1.6 秒，总成本同时下降约三分之一。
+  - id: d46-k2
+    name: 并发模型：async、uvicorn worker 与连接池
+    level: P0
+    summary: async 解决等待、worker 解决多核、连接池保护下游；三者的乘积决定并发上限
+    why: |
+      AI 后端几乎全是 I/O 等待（等模型、等向量库、等 Redis），用对 async 一个进程就能挂住上百个请求；用错（在 async 函数里调同步阻塞库）整个进程会被卡死。
+      同时 worker 数 × 连接池大小算错，是线上「数据库连接耗尽」最常见的原因。面试常让你现场算。
+    problem: |
+      解决「一台机器能同时服务多少请求、怎么不把下游打爆」的问题。
+      不理解这三层，就会出现：加 worker 后数据库报 too many connections；某个同步 SDK 调用让所有用户一起卡住；每次请求都新建 HTTP 客户端导致连接数和延迟暴涨。
+    principle: |
+      **一、三层并发各管什么**（async/GIL 原理见 Day 06、Day 07）
+
+      ```mermaid
+      flowchart TB
+        LB["负载均衡"] --> P1["容器或进程 1"]
+        LB --> P2["容器或进程 2"]
+        P1 --> W1["uvicorn worker 进程"]
+        W1 --> EL["事件循环 单线程"]
+        EL --> T1["请求协程 A 等模型"]
+        EL --> T2["请求协程 B 等检索"]
+        EL --> T3["请求协程 C 等Redis"]
+        EL --> POOL["进程内连接池 DB 与 HTTP"]
+        POOL --> DB[("PostgreSQL")]
+        POOL --> LLM["LLM API"]
+      ```
+
+      - **协程（async/await）**：一个事件循环在「等待」时切换到别的请求。适合 I/O 密集，**一个进程同时挂几百个等模型的请求毫无压力**。
+      - **worker 进程**：`uvicorn --workers 4` 或 `fastapi run --workers 4` 起 4 个独立进程，用满多核，也让一个进程崩溃不影响全部。每个进程**内存独立**：进程内缓存、连接池、限流计数都不共享。
+      - **连接池**：复用 TCP/数据库连接，避免每次握手；同时**限制对下游的最大并发**，保护数据库和上游 API。
+
+      **二、事件循环被阻塞会怎样**
+
+      事件循环是单线程的。在 `async def` 里调用同步阻塞函数（`time.sleep`、`requests.get`、同步版数据库驱动、同步版 LLM SDK、对大文件做 CPU 密集解析），这段时间**整个进程里所有请求都停住**。
+      表现是：压测 QPS 上不去、P99 暴涨，但 CPU 并不高。
+
+      处理方式：
+      - 用异步客户端：`httpx.AsyncClient`、`AsyncOpenAI`、`asyncpg`/SQLAlchemy async、`redis.asyncio`。
+      - 必须用同步库时，`await asyncio.to_thread(func, ...)` 丢到线程池；或者把路由写成普通 `def`，FastAPI 会自动放进线程池执行。
+      - CPU 密集（PDF 解析、大批量 Embedding 前处理）放到任务队列的独立 worker（见 Day 42）。
+
+      **三、连接数要算清楚**
+
+      数据库最大连接占用 ≈ **副本数 × 每副本 worker 数 × (pool_size + max_overflow)**。
+      例：3 个容器 × 4 个 worker × (10 + 10) = **240**，而 PostgreSQL 默认 `max_connections` 是 100，高峰时必然报错。
+
+      解决方向：
+      - 调小每进程的池；或在数据库前加 **PgBouncer** 做连接复用（注意 prepared statement 兼容性，以所用驱动和 PgBouncer 版本的文档为准）。
+      - 在 Kubernetes 中通常**一个容器一个 uvicorn 进程**，靠副本数扩展（FastAPI 官方部署文档的建议），这样连接数、内存更好估算。
+
+      **四、对 LLM 上游也要「池化 + 限并发」**
+
+      - **复用客户端**：在 lifespan 里创建一次 `AsyncOpenAI`/`httpx.AsyncClient`，不要每个请求 new 一个（每次新建会重新握手，连接数暴涨）。
+      - **用 `asyncio.Semaphore` 限制同时在途的 LLM 调用数**，让超出部分在本地排队或快速失败，而不是一股脑打到上游触发 429。
+      - **显式设置超时**：OpenAI Python SDK 默认超时是 10 分钟、默认自动重试 2 次（以官方 README 为准），在线接口必须改成符合业务 SLO 的值（超时与重试细节见 Day 20）。
+    code: |
+      ```python
+      import asyncio
+      import os
+      from contextlib import asynccontextmanager
+
+      from fastapi import FastAPI
+      from openai import AsyncOpenAI
+      from sqlalchemy.ext.asyncio import create_async_engine
+
+      LLM_MAX_INFLIGHT = int(os.getenv("LLM_MAX_INFLIGHT", "50"))
+
+
+      @asynccontextmanager
+      async def lifespan(app: FastAPI):
+          # 每个 worker 进程各自创建一次，进程内复用
+          app.state.engine = create_async_engine(
+              os.environ["DATABASE_URL"],      # postgresql+asyncpg://...
+              pool_size=5, max_overflow=5,     # 注意乘以 worker 数和副本数
+              pool_timeout=3, pool_pre_ping=True,
+          )
+          app.state.llm = AsyncOpenAI(timeout=30.0, max_retries=1)
+          app.state.llm_sem = asyncio.Semaphore(LLM_MAX_INFLIGHT)
+          yield
+          await app.state.engine.dispose()
+          await app.state.llm.close()
+
+
+      app = FastAPI(lifespan=lifespan)
+      ```
+    scenarios: |
+      - 上线前评审部署配置：根据副本数 × worker 数 × 连接池大小核算数据库连接总数，决定是否需要 PgBouncer。
+      - 排查「CPU 不高但 QPS 上不去」：用 py-spy 或日志耗时定位 async 路由中的同步阻塞调用。
+      - 给 LLM 调用加进程内 Semaphore，避免流量突增时把上游打出大量 429。
+    pitfalls: |
+      - **误区：写了 async 就是高并发。** 在 async 函数里调同步 SDK，比写普通 def 更糟，因为会卡住整个事件循环。
+      - **误区：worker 越多越好。** worker 多了，连接数、内存成倍增长；I/O 密集场景瓶颈通常在上游配额，不在 CPU。
+      - **误区：进程内缓存/计数器能跨 worker 共享。** 每个 worker 是独立进程，限流计数、缓存必须放 Redis 才全局一致。
+      - **混淆：pool_size 是总上限。** 实际上限是 pool_size + max_overflow，并且要乘以进程数。
+      - **误区：每次请求 new 一个 HTTP 客户端。** 连接无法复用，握手开销大，还可能耗尽文件句柄。
+    interview_asks:
+      - FastAPI 里 async def 和 def 路由有什么区别？什么时候会把服务卡住？
+      - uvicorn 开多个 worker 和用 async 有什么区别？各解决什么问题？
+      - 你们数据库连接池怎么配置的？总连接数怎么算？
+      - 怎么防止大量请求同时打到 LLM 上游？
+    project_example: |
+      某客服助手上线后高峰期偶发所有请求一起变慢。排查发现一个「敏感词检测」SDK 只有同步版本，被直接在 async 路由里调用，每次阻塞约 300ms。
+      改为 `asyncio.to_thread` 包装后 P99 从 9 秒降到 3 秒。同时把 4 副本 × 4 worker × 默认池（5+10）共 240 个连接的配置，调整为每进程 5+5 并加 PgBouncer，数据库连接告警消失。
+  - id: d46-k3
+    name: 限流算法与 AI 场景的限流设计
+    level: P0
+    summary: 令牌桶允许适度突发又能控平均速率；AI 场景要同时限请求数、Token 数和并发流
+    why: |
+      LLM 调用按 Token 计费、上游有 RPM/TPM 配额，一个脚本刷接口就能在几分钟内烧掉一天预算，或者把配额耗尽让所有用户 429。
+      OWASP LLM Top 10 把「无限制消耗（Unbounded Consumption）」列为独立风险。限流是 AI 后端必须有的基础设施，也是面试高频题。
+    problem: |
+      解决「谁能用、用多快、用多少」的问题：保护上游配额与成本、保护自身资源、在租户之间公平分配。
+      不限流时：单个用户/租户可以占满全部配额；恶意请求能制造巨额账单；突发流量直接把服务和上游一起打挂。
+    principle: |
+      **一、四种经典算法**
+
+      | 算法 | 做法 | 优点 | 缺点 |
+      |---|---|---|---|
+      | 固定窗口 | 每个自然分钟一个计数器 | 实现最简单 | 窗口边界可出现 2 倍突发 |
+      | 滑动窗口日志 | 记录每次请求时间戳，统计最近 N 秒 | 精确 | 内存随请求数增长 |
+      | 滑动窗口计数 | 当前窗口 + 上个窗口按比例加权 | 近似精确、省内存 | 是估算值 |
+      | 令牌桶 | 按速率往桶里加令牌，请求取令牌 | 允许突发、控平均速率 | 需维护两个状态 |
+
+      **固定窗口的边界问题**：限制每分钟 100 次，用户在 00:59 发 100 次、01:00 再发 100 次，1 秒内打进 200 次，限流形同虚设。
+
+      **令牌桶**（最常用）：
+
+      ```mermaid
+      flowchart LR
+        R["按速率 r 补充令牌"] --> B["令牌桶 容量 C"]
+        Q["请求到达 需要 n 个令牌"] --> J{"桶内令牌 够 n 吗"}
+        B --> J
+        J -->|"够"| OK["扣减 n 个 放行"]
+        J -->|"不够"| NO["拒绝 返回429与Retry-After"]
+      ```
+
+      - 容量 C 决定**最多允许多大突发**，速率 r 决定**长期平均速率**。
+      - 不需要定时器：每次请求时根据「距上次补充过了多久」懒计算应补多少令牌。
+      - **n 可以不是 1**：AI 场景可以把「本次预估 Token 数」作为 n，直接实现按 Token 限流。
+
+      **二、分布式限流必须原子**
+
+      多 worker、多副本时计数必须放在 Redis。关键是「读出 → 计算 → 写回」必须原子，否则两个并发请求同时读到「还剩 1 个」都放行。
+      常用做法是 **Redis Lua 脚本**（Redis 单线程执行脚本，天然原子），或用 `INCR` + `EXPIRE` 实现固定窗口（注意 EXPIRE 只在首次创建时设置）。
+
+      **三、AI 场景要限的不只是请求数**
+
+      ```mermaid
+      flowchart TB
+        IN["请求进入"] --> L1["按用户 RPM 防刷"]
+        L1 --> L2["按租户 TPM 和日预算 控成本"]
+        L2 --> L3["并发流数量 防占满连接"]
+        L3 --> L4["进程内 Semaphore 保护上游"]
+        L4 --> UP["LLM 上游 有自己的RPM与TPM"]
+        UP -->|"返回429"| BK["退避重试 或 降级"]
+      ```
+
+      - **请求数（RPM）**：防脚本刷接口。
+      - **Token 数（TPM）和预算**：请求前按输入长度 + max_tokens **预扣**，返回 usage 后**按实际值多退少补**。
+      - **并发流数**：SSE/WebSocket 长连接占资源，一个用户开 50 个标签页也要限制。
+      - **上游配额**：本地限流阈值要低于厂商配额，留出余量，并对 429 做退避（Day 20）。
+
+      **四、被限流后怎么回应**
+
+      - 返回 **HTTP 429**，带 `Retry-After` 头和清晰的错误码（区分「你超了」和「系统忙」）。
+      - 对付费等级不同的租户设置不同桶参数。
+      - Redis 不可用时是**放行（fail-open）还是拒绝（fail-closed）**要提前决策：面向成本保护的限流更倾向 fail-closed 或降级到进程内粗限流，并必须告警。
+    scenarios: |
+      - SaaS 知识库按套餐给租户不同的 TPM 与月度 Token 预算，超出后提示升级套餐。
+      - 对外开放的 API 按 API Key 做令牌桶，防止单个调用方脚本刷接口。
+      - 流式对话接口限制每个用户同时最多 3 个 SSE 连接，防止多标签页占满连接。
+    pitfalls: |
+      - **误区：用 GET 再 SET 的方式在 Redis 里计数。** 非原子，高并发下会超发；要用 Lua 或原子命令。
+      - **误区：只按请求数限流。** 一次请求可以带 10 万 Token 上下文，按次数限流挡不住成本攻击。
+      - **误区：用客户端传来的 IP 或 X-Forwarded-For 作为限流 key。** 可伪造；应以鉴权后的用户/租户 ID 为主，IP 只在可信网关处取。
+      - **误区：本地阈值等于厂商配额。** 多实例叠加、重试流量都会超出，必须留余量。
+      - **误区：Redis 挂了就默默放行。** 没有告警的 fail-open 等于没有限流。
+    interview_asks:
+      - 常见限流算法有哪些？令牌桶和固定窗口有什么区别？
+      - 多实例部署时怎么做分布式限流？怎么保证原子性？
+      - LLM 应用为什么要按 Token 限流？具体怎么实现预扣和结算？
+      - Redis 挂了，你的限流怎么办？
+    project_example: |
+      多租户知识库平台：网关层按用户每分钟 30 次做令牌桶，业务层按租户做 TPM 令牌桶（容量 = 2 分钟配额）和日预算计数，均用 Redis Lua 实现。
+      请求前按「输入 Token + max_tokens」预扣，结束后按 usage 退回差额。上线后某租户的爬虫脚本被拦在第二层，没有影响其他租户；月度账单波动从 ±40% 降到 ±8%。
+  - id: d46-k4
+    name: 数据库慢查询与 EXPLAIN
+    level: P1
+    summary: 先用 pg_stat_statements 找最耗时的 SQL，再用 EXPLAIN ANALYZE 看它为什么慢
+    why: |
+      LLM 之外，AI 应用的会话历史、消息、文档元数据、权限过滤全在数据库里。数据量上来后，一个缺索引的查询就能让接口多出几百毫秒，并占住连接池拖垮整个服务。
+      面试中「怎么排查慢 SQL」是后端岗位的基本功问题（索引基础见 Day 10）。
+    problem: |
+      解决「哪条 SQL 慢、为什么慢、改完是否真的变快」的问题。
+      不会看执行计划，就只能盲目加索引：加错了列顺序没用，加多了拖慢写入，还以为数据库「就是这么慢」。
+    principle: |
+      **一、先找到慢 SQL**
+
+      - 打开 `pg_stat_statements` 扩展，按 **总耗时（调用次数 × 平均耗时）** 排序，而不是只看单次最慢。一个 20ms 但每秒调用 500 次的查询，比一个 2 秒但一天跑一次的报表更值得优化。
+      - 应用侧在 trace 里记录 DB span 耗时，对应到具体接口。
+
+      **二、读 EXPLAIN ANALYZE 的关键点**
+
+      `EXPLAIN (ANALYZE, BUFFERS) SELECT ...` 会**真正执行**查询并给出每个节点的实际耗时和行数（对写操作要放在事务里回滚）。重点看：
+
+      - **扫描方式**：`Seq Scan`（全表扫）在大表上通常是问题；`Index Scan`/`Index Only Scan`/`Bitmap Heap Scan` 用到了索引。
+      - **估算行数 vs 实际行数**：差距巨大说明统计信息过期或数据倾斜，优化器会选错计划，可以 `ANALYZE 表名` 更新统计。
+      - **最耗时的节点**：执行计划是一棵树，从最内层往外读，找 actual time 最大的那一层。
+      - **Rows Removed by Filter**：读了很多行又过滤掉，说明索引没覆盖过滤条件。
+
+      **三、AI 应用里常见的慢查询**
+
+      - **会话消息分页**：`ORDER BY created_at DESC OFFSET 10000` 要先扫过前 1 万行。改为**键集分页**：`WHERE (conversation_id = ? AND created_at < 上一页最后时间)` 配合复合索引 `(conversation_id, created_at)`。
+      - **N+1 查询**：循环里逐条查每个文档的作者、标签。ORM 中用预加载（如 SQLAlchemy 的 `selectinload`）一次查完。
+      - **复合索引列顺序不对**：等值条件列放前面，范围/排序列放后面。
+      - **向量检索 + 元数据过滤**：带 `tenant_id` 过滤的近似向量检索，可能出现过滤后结果数不足或退化为全表扫，需要结合 pgvector 文档调整索引与查询方式（见 Day 25、Day 30）。
+
+      **四、优化手段的优先级**
+
+      先改 SQL 和索引 → 再加缓存 → 再考虑读写分离、分区。不要一上来就上缓存掩盖问题，缓存失效那一刻慢查询会一起冒出来。
+    scenarios: |
+      - 对话历史、消息列表接口随数据增长变慢，用 EXPLAIN ANALYZE 确认是否缺复合索引或深分页。
+      - 管理后台「文档列表」出现 N+1 查询，用 ORM 预加载合并查询。
+      - 每周查看 pg_stat_statements 前 10 名总耗时 SQL，作为例行性能巡检。
+    pitfalls: |
+      - **误区：只用 EXPLAIN 不加 ANALYZE。** 只有估算值，看不到真实耗时；但 ANALYZE 会真的执行，UPDATE/DELETE 要放事务里回滚。
+      - **误区：哪里慢就给哪一列加索引。** 索引会拖慢写入、占空间，复合索引列顺序错了也用不上。
+      - **误区：只看单条最慢的 SQL。** 高频的中等耗时查询总影响往往更大。
+      - **误区：深分页用 OFFSET。** 页数越深越慢，换键集分页。
+    interview_asks:
+      - 你怎么定位一个慢查询？EXPLAIN 输出你重点看什么？
+      - 什么是 N+1 查询？怎么发现和解决？
+      - 为什么深分页慢？怎么优化？
+    project_example: |
+      对话历史接口 P95 达到 800ms。pg_stat_statements 显示「按会话取最近 20 条消息」调用量最大，EXPLAIN ANALYZE 显示在 600 万行的 messages 表上走了 Seq Scan + Sort。
+      新增复合索引 `(conversation_id, created_at DESC)` 后变为 Index Scan，单次耗时从 420ms 降到 1.2ms，接口 P95 降到 60ms。
+  - id: d46-k5
+    name: 多级缓存与降级
+    level: P1
+    summary: 缓存越靠近用户越省；降级是预先设计好的「少做一点但不挂」
+    why: |
+      LLM 调用又贵又慢，同样的问题、同样的 Embedding、同样的检索结果被反复计算，是 AI 应用最常见的浪费。
+      而模型厂商故障、限流是常态，没有降级预案，上游一抖整个产品就不可用。面试中「怎么提升性能」「上游挂了怎么办」都会落到这里。
+    problem: |
+      解决两个问题：**重复计算的浪费**（缓存）与**依赖故障时的可用性**（降级）。
+      不做缓存，成本和延迟线性增长；不做降级，任何一个下游（模型、Rerank、Redis）故障都会变成全站故障。
+    principle: |
+      **一、AI 应用的缓存层次**（Redis 基础、穿透/击穿/雪崩见 Day 41）
+
+      ```mermaid
+      flowchart LR
+        U["用户请求"] --> C1["客户端或CDN 静态资源"]
+        C1 --> C2["进程内缓存 配置与热点数据"]
+        C2 --> C3["Redis 会话 检索结果 精确答案"]
+        C3 --> C4["Embedding 缓存 按文本哈希"]
+        C4 --> C5["厂商侧前缀缓存 长System Prompt"]
+        C5 --> M["LLM 推理"]
+      ```
+
+      - **Embedding 缓存**：key = 模型名 + 文本哈希。同一段文本永远得到同一向量，命中率高、风险低。
+      - **检索结果缓存**：key 必须包含**租户/权限范围 + 规范化后的问题 + 知识库版本号**。知识库更新后版本号变化，旧缓存自然失效。
+      - **精确答案缓存**：适合 FAQ 类、温度为 0、无个性化的问题。
+      - **语义缓存**（相似问题复用答案）：命中率高但风险大，「查订单 1001」和「查订单 1002」语义极相近却答案不同；只在答案与具体实体无关的场景使用，并设置较高阈值。
+      - **厂商前缀缓存（Prompt Caching）**：把不变的长前缀（System Prompt、工具定义）放在消息最前面，能降低 TTFT 和输入成本；触发条件与计费以各厂商文档为准。
+
+      **二、降级：提前设计「少做一点」的路径**
+
+      | 故障 | 降级动作 |
+      |---|---|
+      | 主模型超时或 429 | 切换备用模型或更小模型 |
+      | Rerank 服务故障 | 跳过 Rerank，直接用向量检索 Top-K |
+      | 检索服务慢 | 减少 Top-K，或只用关键词检索 |
+      | 全部模型不可用 | 返回缓存答案或「系统繁忙」，保留问题稍后回复 |
+
+      配合**熔断器**：连续失败超过阈值就短时间内直接走降级，不再让每个请求都等满超时，避免线程/连接被耗尽。
+
+      **三、不做会怎样**
+
+      没有缓存，成本与流量线性增长；没有版本号的缓存会返回过期答案；没有降级，上游故障时所有请求都卡满超时时间，连接池耗尽，连不依赖模型的接口也一起挂掉（级联故障）。
+    scenarios: |
+      - 文档批量重新入库时，Embedding 缓存让未修改的片段不再重复调用向量化接口。
+      - 客服 FAQ 类问题使用精确答案缓存，高峰期显著降低模型调用量。
+      - 模型厂商故障时熔断主模型，自动切换备用模型并在界面上提示精简模式。
+    pitfalls: |
+      - **误区：缓存 key 只用问题文本。** 不同租户、不同权限会拿到别人的答案，这是数据泄露（见 Day 47）。
+      - **误区：语义缓存对所有问题开启。** 含实体、时间、个人数据的问题会答错。
+      - **误区：降级只写在文档里没演练。** 真故障时备用模型的 Key 早已过期、配额为零。
+      - **混淆：重试和降级。** 重试是再试同一个依赖，降级是换一条更便宜的路径；对已过载的上游盲目重试会雪上加霜。
+    interview_asks:
+      - 你们的 AI 应用做了哪些缓存？缓存 key 怎么设计？
+      - 语义缓存有什么风险？
+      - 模型服务挂了，你的系统会怎样？
+    project_example: |
+      知识库问答对 Embedding 做「模型名 + SHA256(文本)」缓存，重复入库与相同问题的向量化调用减少约 70%。
+      检索结果缓存 key 加入 `tenant_id`、角色和知识库版本号，文档更新时版本号自增。
+      主模型连续 5 次超时触发熔断 30 秒，期间切换到备用模型并在回答下方标注「当前为精简模式」，故障期间可用性保持在 99% 以上。
+quiz:
+  - id: d46-q1
+    kp: d46-k1
+    type: single
+    question: 用户反馈「流式对话点了发送之后要等很久才开始出字，但出字之后挺快的」。最应该关注并优化哪个指标？
+    options:
+      - "QPS"
+      - "TTFT（首 Token 时间）"
+      - "TPOT（每个输出 Token 的时间）"
+      - "数据库连接池使用率"
+    answer: [1]
+    explain: |
+      「开始出字前等得久」对应的是首 Token 时间 TTFT，常见原因是输入过长（预填充耗时）、Rerank 等前置步骤串行、上游排队。
+      TPOT 决定出字速度，用户说出字后挺快，说明不是它；QPS 是吞吐指标不直接反映单请求体验；连接池使用率可能是原因之一，但不是描述现象的指标。
+  - id: d46-q2
+    kp: d46-k2
+    type: multi
+    question: 在 FastAPI 的 `async def` 路由中，以下哪些调用会阻塞事件循环，导致同进程其他请求一起变慢？
+    options:
+      - "time.sleep(2)"
+      - "requests.post(llm_url, json=payload)"
+      - "await asyncio.sleep(2)"
+      - "使用同步 OpenAI 客户端 client.chat.completions.create(...)"
+      - "await httpx_async_client.post(url, json=payload)"
+    answer: [0, 1, 3]
+    explain: |
+      time.sleep、requests 和同步 OpenAI 客户端都是同步阻塞调用，在 async 函数里执行时事件循环无法切换到其他协程，整个进程的请求都会停住。
+      asyncio.sleep 和 httpx.AsyncClient 是可等待对象，等待期间会把控制权交还事件循环，不会阻塞。
+      常见误解是「函数写成 async def 里面就都是异步的」，其实是否阻塞取决于被调用的库本身。
+  - id: d46-q3
+    kp: d46-k3
+    type: judge
+    question: 固定窗口限流设置为「每分钟 100 次」时，可以保证任意连续 60 秒内请求数都不超过 100 次。
+    answer: false
+    explain: |
+      固定窗口按自然分钟计数，在窗口边界处存在突发：用户在 00:59 发 100 次、01:00 再发 100 次，两个窗口各自都没超限，但 2 秒内实际放行了 200 次。
+      要限制任意连续 60 秒，需要滑动窗口；若希望允许一定突发但控制平均速率，用令牌桶。
+  - id: d46-q4
+    kp: d46-k2
+    type: single
+    question: 服务部署 3 个容器，每个容器 `uvicorn --workers 4`，SQLAlchemy 配置 `pool_size=10, max_overflow=10`。高峰时数据库理论上最多会被占用多少连接？
+    options:
+      - "20"
+      - "40"
+      - "120"
+      - "240"
+    answer: [3]
+    explain: |
+      每个 worker 进程有独立的连接池，单池上限是 pool_size + max_overflow = 20；总进程数 = 3 × 4 = 12；最大占用 = 12 × 20 = 240。
+      选 120 的常见错误是忽略了 max_overflow；选 20 或 40 是误以为连接池在进程间共享。PostgreSQL 默认 max_connections 为 100，这个配置在高峰时会出现连接耗尽。
+  - id: d46-q5
+    kp: d46-k1
+    type: short
+    question: 你的流式问答接口平均耗时 6 秒，产品希望高峰支撑 80 QPS。请估算系统需要同时承载多少个进行中的请求，并说明这个数字会影响哪些配置。
+    key_points:
+      - {text: "用 Little 定律估算并发数 = 吞吐 × 平均延迟 = 80 × 6 = 480", dim: principle}
+      - {text: "指出这影响 worker 数、单进程能挂住的协程数和 LLM 并发信号量大小", dim: engineering}
+      - {text: "指出这影响上游 LLM 的 RPM 和 TPM 配额需求，需按平均 Token 数估算", dim: engineering}
+      - {text: "指出应以 P95/P99 延迟留余量，因为长尾请求会让瞬时并发更高", dim: principle}
+    reference: |
+      按 Little 定律，并发数 = 吞吐 × 平均延迟 = 80 × 6 ≈ 480，即高峰时同时有约 480 个流式请求在进行。
+      它影响：① 应用层：每个进程能挂住多少协程、需要几个副本，SSE 长连接数和文件句柄上限；② 进程内保护上游的 Semaphore 大小；③ 上游配额：80 QPS 约 4800 RPM，再乘以平均输入+输出 Token 数得到 TPM，需要确认厂商配额是否足够；④ 网关/负载均衡的连接与超时设置。
+      平均值只是估算起点，长尾请求（P99 可能 20 秒以上）会让瞬时并发显著高于 480，容量规划要按 P95/P99 留出余量。
+  - id: d46-q6
+    kp: d46-k3
+    type: scenario
+    question: |
+      压测 100 并发时一切正常，加到 300 并发后：大量请求返回 500，日志里是上游 LLM 的 429，且每个失败请求都耗时 20 秒以上。
+      请分析原因，并给出至少三项改进。
+    key_points:
+      - {text: "指出瓶颈是上游 RPM 或 TPM 配额，而不是本服务的 CPU 或 worker 数量", dim: principle}
+      - {text: "指出 SDK 自动重试叠加业务重试导致请求放大和耗时变长", dim: principle}
+      - {text: "提出本地用 Semaphore 或令牌桶限制在途 LLM 调用，阈值低于上游配额", dim: engineering}
+      - {text: "提出 429 应转换为对用户的 429 或降级响应，并带 Retry-After，而不是 500", dim: engineering}
+      - {text: "提出退避加抖动重试、备用模型或申请更高配额等手段", dim: engineering}
+    reference: |
+      原因：300 并发超过了上游配额，上游返回 429。SDK 默认会自动重试，若业务代码又包一层重试，每个请求会被放大成多次调用，进一步加剧限流，耗时也被拉长到 20 秒以上；最后异常未被分类处理，统一变成 500。
+      改进：① 在服务内用 asyncio.Semaphore 或 Redis 令牌桶限制同时在途的 LLM 请求，阈值设在上游配额以下，多出的请求排队或快速返回 429；② 统一重试策略，只在一层做带抖动的指数退避，尊重 Retry-After，设置总超时；③ 把上游 429 映射为对用户的 429/503 加友好提示，或降级到备用模型、缓存答案，而不是 500；④ 按租户做 TPM 限流保证公平；⑤ 根据压测结果向厂商申请提额或多区域/多账号分流。
+    followup:
+      question: 如果只能先做一件事，你会先做哪一项？为什么？
+      key_points: [先限制在途并发并统一重试层级, 这能立刻阻止请求放大并让错误可控]
+      reference: 先在服务内加并发上限并去掉重复重试。请求放大是让问题从「部分失败」恶化为「全部超时」的关键，限住在途数后超出部分可以快速失败或排队，用户体验和上游配额都能立刻稳定下来，再做降级和提额。
+  - id: d46-q7
+    kp: d46-k5
+    type: design
+    question: 为多租户企业知识库设计检索结果缓存与降级方案。要求说明缓存 key 的组成、失效策略，以及 Rerank 服务和主模型分别故障时的降级路径。
+    key_points:
+      - {text: "缓存 key 包含租户 ID、权限范围、规范化问题和知识库版本号", dim: engineering}
+      - {text: "说明知识库更新时通过版本号自增让旧缓存失效，并设置 TTL 兜底", dim: engineering}
+      - {text: "Rerank 故障时跳过 Rerank 直接用向量检索 Top-K 结果", dim: engineering}
+      - {text: "主模型故障时用熔断器切换到备用模型或返回缓存答案，并对用户标注", dim: engineering}
+      - {text: "指出缓存 key 不含权限维度会造成跨租户数据泄露", dim: principle}
+    reference: |
+      缓存 key：`retr:{tenant_id}:{role_scope_hash}:{kb_version}:{sha256(规范化问题)}`。规范化包括去空白、统一大小写和全半角。权限范围必须进入 key，否则 A 部门缓存的检索结果可能被 B 部门命中，造成数据泄露。
+      失效：每次知识库文档新增/更新/删除时 kb_version 自增，旧 key 不再被访问，靠 TTL（如 1 小时）自然清理；不必逐条删除。
+      降级：Rerank 服务超时或错误率超阈值时熔断，直接使用向量检索 Top-K（可适当减小 K）；主模型连续失败触发熔断，切换备用模型，若备用也不可用则返回同问题的缓存答案或「繁忙」提示并记录问题异步回复。所有降级都打点、告警，并在回答中标注精简模式。
+  - id: d46-q8
+    kp: d46-k4
+    type: short
+    question: |
+      一条查询的 `EXPLAIN ANALYZE` 显示：`Seq Scan on messages (rows=20) (actual rows=20 loops=1)`，并且 `Rows Removed by Filter: 5980000`，耗时 410ms。请解读这段信息并给出优化方案。
+    key_points:
+      - {text: "指出在近 600 万行表上做了全表扫描，只保留 20 行，绝大多数行被过滤丢弃", dim: principle}
+      - {text: "指出过滤条件对应的列缺少合适索引", dim: principle}
+      - {text: "提出按等值条件在前、排序列在后建立复合索引，如 conversation_id 与 created_at", dim: engineering}
+      - {text: "提出优化后再次 EXPLAIN ANALYZE 验证变为 Index Scan 并对比耗时", dim: engineering}
+    reference: |
+      Seq Scan 表示全表顺序扫描；Rows Removed by Filter 约 598 万，说明数据库读了几乎整张表，再用 WHERE 条件过滤后只剩 20 行，410ms 几乎都花在无效读取上。根因是过滤条件（例如 conversation_id）没有可用索引。
+      方案：根据查询的 WHERE 和 ORDER BY 建复合索引，等值列在前、排序列在后，如 `(conversation_id, created_at DESC)`，这样既能快速定位会话，又能直接按时间顺序取前 20 条免去排序。建索引后再执行 EXPLAIN ANALYZE，确认变为 Index Scan 且耗时降到毫秒级；同时关注索引对写入的影响，大表上用 CREATE INDEX CONCURRENTLY 避免长时间锁表。
+code_reading:
+  id: d46-c1
+  kp: [d46-k3, d46-k2]
+  title: 基于 Redis 的用户级令牌桶限流依赖
+  scenario: 企业 AI 助手的 FastAPI 服务部署了 3 个副本、每副本 2 个 worker。所有对话接口都通过 `Depends(rate_limit)` 做按用户限流，限流状态存在 Redis。下面是团队新同学提交的实现，请你做代码审查。
+  language: python
+  code: |
+    import logging
+    import time
+
+    import redis.asyncio as redis
+    from fastapi import Depends, HTTPException, Request
+
+    from app.auth import CurrentUser, get_current_user
+
+    logger = logging.getLogger(__name__)
+
+    CAPACITY = 20          # 桶容量：最多允许 20 次突发
+    REFILL_PER_SEC = 0.5   # 每秒补充 0.5 个令牌，即平均每分钟 30 次
+
+    _redis = redis.from_url("redis://redis:6379/0", decode_responses=True)
+
+
+    async def _take_token(user_id: str, cost: float = 1.0) -> tuple[bool, float]:
+        key = f"rl:user:{user_id}"
+        now = time.time()
+        data = await _redis.hgetall(key)
+        tokens = float(data.get("tokens", CAPACITY))
+        last = float(data.get("ts", now))
+
+        tokens = min(CAPACITY, tokens + (now - last) * REFILL_PER_SEC)
+        if tokens < cost:
+            retry_after = (cost - tokens) / REFILL_PER_SEC
+            return False, retry_after
+
+        await _redis.hset(key, mapping={"tokens": tokens - cost, "ts": now})
+        await _redis.expire(key, 3600)
+        return True, 0.0
+
+
+    async def rate_limit(
+        request: Request,
+        user: CurrentUser = Depends(get_current_user),
+    ) -> None:
+        try:
+            allowed, retry_after = await _take_token(user.id)
+        except Exception:
+            return
+
+        if not allowed:
+            logger.info("rate limited user=%s path=%s", user.id, request.url.path)
+            raise HTTPException(
+                status_code=429,
+                detail="请求过于频繁，请稍后再试",
+                headers={"Retry-After": str(int(retry_after) + 1)},
+            )
+  walkthrough:
+    function: |
+      实现一个按用户维度的令牌桶限流 FastAPI 依赖：每个用户桶容量 20，每秒补充 0.5 个令牌。依赖在路由执行前运行，令牌不足时抛出 429 并告诉客户端多久后重试。
+    key_functions: |
+      - `_take_token`：从 Redis 哈希读取剩余令牌数和上次时间，按流逝时间懒补充令牌，够则扣减并写回，不够则计算还需等待的秒数。
+      - `rate_limit`：FastAPI 依赖，先通过 `get_current_user` 拿到鉴权后的用户，再调用 `_take_token`，根据结果放行或抛 429。
+    params: |
+      - `user.id` 来自鉴权依赖 `get_current_user`（JWT 解析，见 Day 45），作为限流 key 的一部分，这比用客户端 IP 更可靠。
+      - `cost` 默认 1，表示每次请求消耗 1 个令牌；按 Token 限流时可传入预估 Token 数。
+      - `retry_after` 由 `_take_token` 返回，最终放进响应头 `Retry-After`。
+    data_flow: |
+      ```mermaid
+      sequenceDiagram
+        participant C as 客户端
+        participant F as FastAPI依赖
+        participant R as Redis
+        C->>F: 请求对话接口
+        F->>F: get_current_user 解析JWT
+        F->>R: HGETALL rl:user:id
+        R-->>F: tokens与ts
+        F->>F: 计算补充后的令牌数
+        F->>R: HSET 扣减后的tokens与ts
+        F->>R: EXPIRE 3600
+        F-->>C: 放行 或 返回429与Retry-After
+      ```
+    failure_points: |
+      - **竞态条件（重点）**：HGETALL → 计算 → HSET 是三次独立的 Redis 往返，不是原子操作。同一用户的两个并发请求（不同 worker、不同副本）可能同时读到 tokens=1，都判断放行，导致超发；并发越高超发越严重。
+      - **异常被吞掉（重点）**：`except Exception: return` 在 Redis 超时或宕机时静默放行所有请求，既没有日志也没有指标，限流在故障时完全失效而没人知道。
+      - Redis 地址硬编码，且未设置 socket 超时，Redis 网络抖动时每个请求都会卡住。
+      - 时间取自各应用实例的 `time.time()`，实例间时钟漂移会影响补充计算；用 Redis 服务端时间更一致。
+    debugging: |
+      - 复现竞态：写一个脚本用 `asyncio.gather` 同时对同一用户发 50 个请求，桶容量 20，统计放行数，若明显大于 20 说明超发。
+      - 复现吞异常：停掉 Redis 容器后请求接口，观察是否全部放行且无任何日志。
+      - 线上排查：为限流结果打指标（allowed/limited/error 三类计数），用 `redis-cli MONITOR`（仅测试环境）观察命令序列。
+    change_request: |
+      若需求改为「按租户每分钟 Token 数（TPM）限流」：
+      - key 改为 `rl:tenant:{tenant_id}:tpm`，`CAPACITY` 和 `REFILL_PER_SEC` 按租户套餐从配置读取；
+      - `cost` 改为本次请求的预估 Token 数（输入 Token + max_tokens）；
+      - 请求结束后根据 usage 实际值做差额返还，需要新增一个原子的「加回令牌」操作；
+      - 把读-算-写整体改为 Lua 脚本（`register_script`）保证原子性。
+  questions:
+    - id: d46-c1-q1
+      kp: d46-k3
+      type: code
+      question: 假设某用户桶里只剩 1 个令牌，他同时发出 2 个请求，分别落在两个不同副本上。请按时间顺序说明这段代码可能的执行过程，以及最终会发生什么。
+      key_points:
+        - {text: "两个请求几乎同时执行 HGETALL，都读到 tokens 约为 1", dim: principle}
+        - {text: "两者都判断 tokens 不小于 cost，都返回放行", dim: principle}
+        - {text: "两次 HSET 先后覆盖，最终 tokens 约为 0，但实际放行了 2 次，出现超发", dim: principle}
+        - {text: "提出用 Lua 脚本把读取、计算、写回合并为一次原子执行", dim: engineering}
+      reference: |
+        时间线：副本 A 执行 HGETALL 读到 tokens=1；在 A 写回之前，副本 B 也执行 HGETALL，同样读到 tokens=1。两者各自计算补充后的令牌约为 1，都满足 tokens ≥ cost，于是都执行 HSET 写入 tokens≈0，并都返回 (True, 0)。
+        结果是桶里只有 1 个令牌却放行了 2 个请求，后写的 HSET 覆盖了先写的值，扣减丢失。并发越高超发越严重，压测时会发现限流阈值「不准」。
+        修复：把整段逻辑写成 Redis Lua 脚本，通过 `_redis.register_script(LUA)` 注册后 `await script(keys=[key], args=[capacity, rate, cost])` 调用。Redis 单线程执行脚本，读-算-写在一次原子操作内完成；时间也可以在脚本内用 `redis.call('TIME')` 获取，避免实例间时钟差异。
+    - id: d46-c1-q2
+      kp: d46-k3
+      type: code
+      question: 如果 Redis 发生故障（连接超时），这段代码会如何表现？这种表现有什么风险？你会如何修改？
+      key_points:
+        - {text: "指出 _take_token 抛出的异常被 except Exception 捕获后直接 return，等于放行所有请求", dim: principle}
+        - {text: "指出没有日志和指标，限流失效无人察觉，可能造成成本失控或上游 429", dim: engineering}
+        - {text: "提出至少记录错误日志与指标并告警", dim: engineering}
+        - {text: "提出明确 fail-open 或 fail-closed 策略，或降级到进程内粗限流，并为 Redis 设置超时", dim: engineering}
+      reference: |
+        Redis 故障时，`_take_token` 中的 `hgetall` 会抛出连接或超时异常，被 `rate_limit` 里的 `except Exception: return` 捕获，依赖正常返回，请求全部放行。如果 redis 客户端没有设置 socket 超时，每个请求还会先卡住较长时间再放行。
+        风险：限流在故障期间完全失效，且没有任何日志或指标，团队毫不知情；此时若有脚本刷接口，LLM 成本和上游配额会被迅速耗尽，进而让所有用户收到 429。
+        修改：① 创建客户端时设置 `socket_timeout`/`socket_connect_timeout` 等短超时；② except 中 `logger.exception` 并上报 `rate_limit_errors` 指标、触发告警；③ 按业务明确策略：对成本敏感的对话接口采用 fail-closed 返回 503，或降级到进程内的粗粒度令牌桶（每进程按总阈值除以进程数）；④ 不要捕获过宽的 Exception，只处理 Redis 相关异常。
+    - id: d46-c1-q3
+      kp: d46-k2
+      type: code
+      question: 这段代码在模块导入时就创建了 `_redis` 客户端。结合 uvicorn 多 worker 的运行方式，说明这个客户端在进程中是怎样被创建和使用的，以及更推荐的写法。
+      key_points:
+        - {text: "指出每个 worker 进程导入模块时都会各自创建一个 Redis 客户端和连接池，进程间不共享", dim: principle}
+        - {text: "指出地址硬编码，无法按环境配置，也缺少超时等参数", dim: engineering}
+        - {text: "提出在 lifespan 中创建并在关闭时释放，放到 app.state 或依赖里注入", dim: engineering}
+      reference: |
+        uvicorn 以多 worker 启动时，每个 worker 是独立进程，会各自导入这个模块并执行模块级代码，因此每个进程都有自己的 `_redis` 客户端和连接池；连接是在第一次执行命令时按需建立的。限流状态本身存在 Redis 中，所以多进程间计数是共享的，但客户端对象和连接不共享。
+        问题：地址硬编码在代码里，测试/生产环境无法切换；没有超时参数；模块级对象在测试中难以替换为假实现；进程退出时没有显式关闭连接。
+        推荐：在 FastAPI 的 lifespan 中按配置（环境变量）创建 `redis.from_url(settings.redis_url, socket_timeout=0.2, ...)`，存到 `app.state.redis`，通过依赖函数注入到 `rate_limit`；在 lifespan 退出时 `await client.aclose()`。这样每个进程仍然各自一个客户端，但生命周期清晰、可配置、可测试。
+interview:
+  - id: d46-i1
+    kp: d46-k1
+    type: oral
+    difficulty: 1
+    question: AI 应用的性能指标有哪些？为什么说 P99 比平均值更重要？
+    key_points:
+      - {text: "说出 TTFT、TPOT 或 Token 间延迟、端到端延迟三个 LLM 延迟指标", dim: concept}
+      - {text: "说出 QPS、并发数、Token 吞吐，并提到厂商 RPM 和 TPM 配额", dim: concept}
+      - {text: "解释 LLM 延迟是长尾分布，平均值会掩盖少数极慢请求", dim: principle}
+      - {text: "结合项目给出实际指标或 SLO，例如首字 2 秒内", dim: project}
+    reference: |
+      AI 应用的性能指标分两类。延迟类：TTFT（首 Token 时间，决定用户觉得卡不卡）、TPOT/Token 间延迟（决定出字速度）、端到端延迟（约等于 TTFT + 输出 Token 数 × TPOT）。吞吐类：QPS、并发数，以及 Token 吞吐；对接模型厂商时还要看 RPM/TPM 配额。
+      P99 更重要，因为 LLM 延迟是典型的长尾分布：大部分请求 3 秒，少数因为输出长、上下文长、排队、重试变成几十秒。平均值被大量快请求稀释，看起来很健康，但投诉恰恰来自长尾用户；而且一个页面多次调用时，用户遇到长尾的概率会被放大。
+      实践中我会设定类似「TTFT P95 < 2 秒、总时长 P99 < 15 秒」的 SLO，压测和监控都按分位数看。
+    oral: |
+      我把指标分成延迟和吞吐两类。延迟看三个：首 Token 时间 TTFT，它决定用户觉得卡不卡；每个 Token 的生成时间，决定出字快不快；以及端到端总时长。吞吐看 QPS、并发数和 Token 吞吐，因为模型厂商是按 RPM 和 TPM 给配额的。
+      为什么看 P99？因为 LLM 延迟长尾很重，大多数 3 秒，少数几十秒，平均值会把这些慢请求藏起来。在我做的知识库项目里，我们的 SLO 是首字 P95 两秒以内，压测时就是按分位数验收的。
+  - id: d46-i2
+    kp: d46-k2
+    type: oral
+    difficulty: 2
+    question: FastAPI 中 async def 和普通 def 路由有什么区别？uvicorn 多 worker 和 async 分别解决什么问题？
+    key_points:
+      - {text: "说明 async def 在事件循环中执行，普通 def 被放到线程池执行", dim: principle}
+      - {text: "说明在 async def 中调用同步阻塞库会阻塞整个事件循环", dim: principle}
+      - {text: "说明 async 解决 I/O 等待期间的并发，worker 解决多核利用与进程隔离", dim: concept}
+      - {text: "指出多 worker 时连接池、进程内缓存不共享，连接数要乘以进程数", dim: engineering}
+      - {text: "给出实际排查或修复阻塞调用的项目经历", dim: project}
+    reference: |
+      FastAPI 中，`async def` 路由直接在事件循环中运行，遇到 await 时把控制权交还事件循环；普通 `def` 路由会被放进线程池执行，不会阻塞事件循环，但受线程池大小限制。
+      最大的坑是在 async def 里调用同步阻塞库（requests、同步 SDK、time.sleep），此时事件循环是单线程的，整个进程所有请求都会卡住。解决方法是换异步库、用 asyncio.to_thread，或者 CPU 密集任务放到任务队列。
+      async 和 worker 解决不同问题：async 让一个进程在等待 I/O（等模型、等数据库）时同时处理很多请求；worker 是多个进程，用来利用多核、隔离崩溃。代价是进程间不共享内存，每个进程都有自己的连接池，数据库连接总数 = 副本数 × worker 数 × (pool_size + max_overflow)，必须提前算好；限流计数、缓存要放 Redis。在 Kubernetes 中通常一个容器一个进程，用副本数扩展。
+    oral: |
+      简单说，async 解决等待，worker 解决多核。async def 路由跑在事件循环里，等模型、等数据库时可以切去处理别的请求；普通 def 路由会被扔到线程池。
+      最危险的是在 async def 里调同步库，比如 requests 或者同步的 SDK，事件循环被卡住，整个进程一起慢。我之前就遇到过一个只有同步版本的敏感词 SDK，P99 被拉到 9 秒，用 to_thread 包一下就降到 3 秒。
+      多 worker 要注意进程之间不共享内存，连接池会乘以进程数，所以我们重新算了连接总数并加了 PgBouncer。
+  - id: d46-i3
+    kp: d46-k3
+    type: oral
+    difficulty: 3
+    question: 如何为一个多租户 LLM 应用设计限流？请讲算法选择、分布式实现和异常情况的处理。
+    key_points:
+      - {text: "比较固定窗口的边界突发问题和令牌桶允许突发控均值的特点", dim: principle}
+      - {text: "提出多层限流：用户 RPM、租户 TPM 或预算、并发流数、上游保护", dim: engineering}
+      - {text: "说明用 Redis Lua 脚本保证读算写原子性，key 使用鉴权后的用户或租户 ID", dim: engineering}
+      - {text: "说明 Token 预扣与按 usage 结算多退少补", dim: engineering}
+      - {text: "说明 Redis 故障时的 fail-open 或 fail-closed 策略与告警", dim: engineering}
+    reference: |
+      算法上我优先用令牌桶：容量控制允许的突发，补充速率控制长期平均；固定窗口虽简单但窗口边界可能放行 2 倍流量。
+      分层：① 网关层按用户 RPM 防刷；② 业务层按租户做 TPM 令牌桶和日/月预算，因为 LLM 成本按 Token 计；③ 限制每用户同时打开的流式连接数；④ 进程内用 Semaphore 控制在途 LLM 调用，阈值低于上游配额并留余量。
+      实现：多副本下状态放 Redis，用 Lua 脚本把读取、补充、扣减、写回放在一次原子执行中，时间用 Redis 服务端 TIME；key 用鉴权后的 user_id/tenant_id，不信任客户端传的 IP。Token 限流在请求前按「输入 Token + max_tokens」预扣，返回 usage 后按实际值退还差额。
+      响应：被限返回 429 + Retry-After，区分用户超限与系统繁忙；不同套餐不同桶参数。
+      异常：Redis 故障时，成本敏感接口选择 fail-closed 或降级到进程内粗限流，绝不能静默放行；所有限流结果和错误打指标并告警。
+    oral: |
+      我会做三层限流，算法都用令牌桶，因为它允许适度突发又能控平均速率，固定窗口在边界会放进两倍流量。
+      第一层按用户限请求数防刷；第二层按租户限 Token 数和预算，因为 LLM 是按 Token 花钱的，请求前按输入加 max_tokens 预扣，返回 usage 后多退少补；第三层进程内用信号量保护上游配额。
+      实现上状态放 Redis，用 Lua 脚本保证原子，key 用鉴权后的租户 ID。Redis 挂了不能静默放行，我们是降级到进程内粗限流并告警。上线后一个租户的爬虫被第二层拦住，其他租户完全没受影响。
+  - id: d46-i4
+    kp: d46-k1
+    type: oral
+    difficulty: 4
+    question: 线上反馈 AI 问答接口「越来越慢」，P99 从 8 秒涨到 25 秒。请讲一下你的完整排查思路和可能的优化方向。
+    key_points:
+      - {text: "先用 trace 把延迟拆分到网关、检索、Rerank、LLM 的 TTFT 与生成等各段", dim: engineering}
+      - {text: "区分是自身资源问题如事件循环阻塞、连接池等待，还是上游排队或 429 重试", dim: principle}
+      - {text: "检查输入 Token 是否增长，如历史消息无截断、检索片段过多导致 TTFT 上升", dim: principle}
+      - {text: "检查数据库慢查询与数据量增长，用 pg_stat_statements 与 EXPLAIN 定位", dim: engineering}
+      - {text: "给出对应优化：截断上下文、并行化、限并发、缓存、降级，并用压测验证", dim: project}
+    reference: |
+      排查思路：先定界，再定位，最后验证。
+      ① 看监控确认变化时间点，对照发布记录、流量变化、上游状态页。② 抽取 P99 慢请求的 trace，把时间拆到各 span：鉴权、DB、向量检索、Rerank、LLM 的 TTFT 和生成时间。③ 如果 LLM 段变长，查看输入 Token 是否随时间增长——常见是会话历史没有截断，用户越聊越长，TTFT 线性上升；或检索片段数被调大。再看是否有 429 和重试叠加。④ 如果自身 span 变长而 CPU 不高，怀疑事件循环被同步调用阻塞，或连接池耗尽在排队（看 pool timeout 日志、连接等待时间）。⑤ 如果 DB span 变长，用 pg_stat_statements 找总耗时最高的 SQL，EXPLAIN ANALYZE 看是否因数据增长退化为全表扫。
+      优化：历史消息按 Token 预算截断或摘要；减少 Top-K 与片段长度；Embedding、检索、权限查询并行；限制 max_tokens；对上游加并发上限与统一重试；加缓存与降级。每项改动用同样的回放压测验证 P95/P99，确认有效再上线。
+    oral: |
+      我的思路是先定界、再定位、再验证。先看 P99 是从什么时候开始涨的，对一下发布记录和流量。然后抽几个最慢的 trace，把时间拆到检索、Rerank、模型首 Token、生成这几段。
+      我遇到过的真实原因是会话历史没截断，用户越聊越长，输入 Token 涨了好几倍，首 Token 时间跟着线性上升。另外也要看有没有 429 重试叠加、事件循环被同步调用卡住、或者某个 SQL 因为数据量增长退化成全表扫。
+      对应地做历史截断、减少检索片段、并行化外部调用、加并发上限，最后用同一份回放数据压测，确认 P99 回到目标再上线。
+  - id: d46-i5
+    kp: d46-k5
+    type: oral
+    difficulty: 4
+    question: 公司要办发布会，预计 AI 助手流量是平时的 10 倍，给你两周准备。你会怎么做？
+    key_points:
+      - {text: "先做容量估算：峰值 QPS、并发数、TPM 需求，并确认上游配额与预算", dim: engineering}
+      - {text: "按真实 Prompt 分布压测找出第一个瓶颈，区分自身与上游", dim: engineering}
+      - {text: "准备多层限流、排队与熔断，保护上游和核心功能", dim: engineering}
+      - {text: "设计并演练降级路径：备用模型、跳过 Rerank、缓存答案、关闭非核心功能", dim: engineering}
+      - {text: "准备监控大盘、告警阈值与值班预案", dim: project}
+    reference: |
+      第一步容量估算：按平时峰值 × 10 得到目标 QPS，用 Little 定律算并发数，用平均输入/输出 Token 算 TPM 和当天预算，第一时间向厂商申请提额或准备多账号、多区域、多厂商备用。
+      第二步压测：用线上日志回放真实问题分布，先 Mock LLM 压自身服务（worker、连接池、Redis、DB），再接真实模型压整体，找到第一个瓶颈并逐个解决（扩副本、调连接池、加 PgBouncer、修阻塞调用）。
+      第三步保护：多层限流（用户 RPM、租户 TPM、并发流数），超过容量的请求排队或友好拒绝；上游调用加并发上限、超时和熔断。
+      第四步降级：准备并演练备用模型切换、跳过 Rerank、FAQ 精确缓存预热、关闭非核心功能（如自动摘要），通过配置开关一键切换。
+      第五步观测与值班：大盘展示 QPS、TTFT/P99、错误率、429 率、Token 消耗与成本，设置告警阈值，明确值班人和回滚/降级决策流程。发布会后复盘实际峰值与预估差距。
+    oral: |
+      我会分五步。第一，算账：平时峰值乘十，用 Little 定律算并发，用平均 Token 数算 TPM 和预算，马上找厂商提额，同时准备备用模型。
+      第二，用线上日志回放压测，先 Mock 模型压自己的服务，再接真实模型压整体，找到第一个瓶颈。
+      第三，加多层限流和熔断，超出容量的请求排队或友好提示。第四，准备降级开关：切小模型、跳过 Rerank、预热 FAQ 缓存，并且真的演练一遍。第五，准备大盘、告警和值班表。
+      之前我们做过一次类似活动，提前演练发现备用模型的 Key 配额是零，幸亏提前发现了。
+sources:
+  - {title: "FastAPI - Server Workers (Uvicorn with Workers)", url: "https://fastapi.tiangolo.com/deployment/server-workers/"}
+  - {title: "OWASP Top 10 for LLM Applications 2026 - LLM06 Unbounded Consumption", url: "https://genai.owasp.org/resource/owasp-genai-llm-top-10-2026/"}

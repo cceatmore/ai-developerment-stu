@@ -1,0 +1,767 @@
+day: 37
+phase: 4
+title: Agent 控制机制：循环、终止条件、超时与重试
+goals:
+  - 能画出 Agent 循环的状态图，并列出至少 4 种终止条件及各自的触发场景
+  - 能区分总超时与单工具超时，解释 deadline 预算如何在多步调用中传递
+  - 能判断哪些错误该重试、哪些不该重试，并设计重试与降级策略
+  - 能分析 Agent 无限循环、成本失控、错误决策的根因并给出护栏方案
+knowledge_points:
+  - id: d37-k1
+    name: Agent 循环与终止条件
+    level: P0
+    summary: Agent 是一个由模型决定是否继续的 while 循环，必须由代码兜底：最大步数、重复检测、明确完成信号
+    why: |
+      Day 32 讲过 ReAct 的「思考 → 行动 → 观察」循环。循环意味着**可能停不下来**：模型反复调用同一个工具、在两个工具之间来回跳、或者一直觉得「信息还不够」。
+      线上 Agent 事故里，最常见的就是死循环导致的超时和账单暴涨。面试官问「你的 Agent 怎么保证会停」，是在考你有没有生产经验。
+    problem: |
+      - 「什么时候停」默认交给模型判断，而模型的判断不可靠：可能幻觉出「还需要再查一次」。
+      - 工具返回错误时，模型常常原样重试同一调用，形成死循环。
+      - 没有终止兜底，单个请求可能跑几十步，占满并发、耗光 Token 预算。
+    principle: |
+      **一、Agent 循环的本质**
+
+      用伪代码表示（与 Day 33 的工具调用流程一致）：
+
+      ```text
+      messages = [system, user]
+      while True:
+          reply = LLM(messages, tools)
+          if reply 没有 tool_calls: return reply.content   # 模型认为完成
+          for call in reply.tool_calls:
+              result = 执行工具(call)
+              messages.append(result)                      # 观察结果回填
+      ```
+
+      这里**唯一的自然出口**是「模型不再调用工具」。只靠它是危险的。
+
+      **二、终止条件分两类**
+
+      ```mermaid
+      stateDiagram-v2
+        state "调用模型" as CallLLM
+        state "正常完成" as Done
+        state "检查护栏" as Guard
+        state "强制停止" as Stop
+        state "执行工具" as RunTool
+        [*] --> CallLLM
+        CallLLM --> Done: 无工具调用 或 调用 finish 工具
+        CallLLM --> Guard: 有工具调用
+        Guard --> Stop: 超过最大步数
+        Guard --> Stop: 重复动作超限
+        Guard --> Stop: 超时或超预算
+        Guard --> RunTool: 通过
+        RunTool --> CallLLM: 结果回填
+        Done --> [*]
+        Stop --> [*]
+      ```
+
+      - **正常终止（模型决定）**：
+        - 模型返回纯文本答案、不再调用工具。
+        - 模型调用一个显式的 `finish` / `submit_answer` 工具（带结构化结果），比「没有工具调用」更明确，便于校验输出。
+      - **强制终止（代码决定，护栏）**：
+        - **最大步数**：最常用的兜底。一般业务 5~15 步足够，按任务复杂度设定。
+        - **重复动作检测**：把 `工具名 + 规范化后的参数` 做签名，同一签名出现超过 N 次就停止或提示模型换思路。
+        - **无进展检测**：连续几步 State 中的关键字段没有变化（例如检索结果相同），判定卡住。
+        - **超时 / 成本超限**：见本日 k2、k4。
+        - **人工中止**：用户点击「停止」，后端取消任务。
+
+      **三、LangGraph 中的步数限制**
+
+      - LangGraph 用 `recursion_limit` 限制 **super-step 数**（Day 36），超过抛 `GraphRecursionError`。
+      - 它是 config 的**顶层键**：`graph.invoke(input, {"recursion_limit": 30, "configurable": {...}})`。放进 `configurable` 里**不生效**。
+      - **不要依赖默认值**：当前 Python 版默认值很大（核对源码为 10007，文档曾写错成 1000；JS 版为 25），远超业务需要，起不到护栏作用。
+      - 注意一个 ReAct 轮次在图里通常是「模型节点 + 工具节点」两个 super-step，换算步数时要算上。
+      - LangChain `create_agent` 还提供 `ModelCallLimitMiddleware` / `ToolCallLimitMiddleware`，按模型调用次数、工具调用次数限制，`exit_behavior="end"` 时会优雅结束而不是抛异常。
+
+      **四、停下来之后怎么办**
+
+      强制终止**不等于报错给用户**。好的做法：
+      - 返回「已完成部分 + 未完成原因」，例如「已查到订单状态，物流接口暂不可用，已转人工」。
+      - 记录 `stop_reason`（final_answer / max_steps / repeated_action / timeout / budget），用于监控告警：max_steps 比例突然升高，往往说明 Prompt 或工具出了问题。
+      - 必要时转人工或进入 interrupt 等待（Day 36）。
+
+      **五、不这样做会怎样**
+
+      没有护栏的 Agent，一次工具故障就可能让大量请求同时进入死循环，并发被占满、上游 API 被打爆、Token 账单在几分钟内翻倍。这正是 OWASP LLM Top 10（2026）中 **LLM06 Unbounded Consumption（无限制消耗）** 描述的风险。
+    scenarios: |
+      - **客服 Agent**：最大 8 步；查订单接口连续两次同参数失败就停止并转人工。
+      - **数据分析 Agent**：生成 SQL → 执行 → 报错 → 修正，最多修正 3 次，仍失败返回错误说明和最后一版 SQL。
+      - **研究型 Agent**：步数上限较高（如 20），但配合「无进展检测」：连续 3 次搜索结果与已有资料高度重复则收敛。
+      - **监控**：仪表盘统计各 stop_reason 占比，max_steps 超过 5% 告警。
+    code: |
+      ```python
+      from langgraph.errors import GraphRecursionError
+
+      config = {
+          "recursion_limit": 20,                     # 顶层键，不要放进 configurable
+          "configurable": {"thread_id": "chat-42"},
+      }
+      try:
+          result = graph.invoke({"messages": [("user", "帮我查订单 1001 的物流")]}, config)
+      except GraphRecursionError:
+          # 兜底：记录 stop_reason 并给用户可理解的答复
+          result = {"messages": [("assistant", "处理步骤过多，已为你转接人工客服。")]}
+      ```
+    pitfalls: |
+      - **只靠「模型不再调用工具」终止**：模型随时可能陷入循环，必须有代码兜底。
+      - **依赖框架默认步数限制**：Python LangGraph 默认值远超业务所需，相当于没有限制。
+      - **recursion_limit 放错位置**：放在 `configurable` 里不生效。
+      - **重复检测只比较工具名**：同一工具不同参数（查不同订单）是正常的；应比较「工具名 + 规范化参数」。
+      - **终止后直接抛 500**：用户体验差，且丢失了已完成的部分结果。
+      - **混淆步数与 super-step**：一个 ReAct 轮次在 LangGraph 中通常占两个 super-step。
+    interview_asks:
+      - 你的 Agent 如何保证一定会停下来？有哪些终止条件？
+      - 如何检测 Agent 陷入了重复调用同一个工具的循环？
+      - LangGraph 的 recursion_limit 是什么？默认值够用吗？
+    project_example: |
+      某物流客服 Agent 上线第一周，物流查询接口故障返回 503，模型每次都「再试一次」，部分请求跑到几十步才被网关超时切断，Token 成本当天翻了 3 倍。
+      整改：图调用设置 `recursion_limit=16`（约 8 个 ReAct 轮次）；工具节点前加重复签名检测，同签名超过 2 次直接走「转人工」节点；工具错误结果中明确写「该接口暂不可用，请不要重试，告知用户稍后再查」；监控 stop_reason，max_steps 和 repeated_action 占比超过阈值时告警。
+    freshness: |
+      核对于 2026-11（langgraph 1.2.20）：`recursion_limit` 为 config 顶层键，超限抛 `GraphRecursionError`。Python 版默认值据 langgraph 源码为 10007（可用环境变量 LANGGRAPH_DEFAULT_RECURSION_LIMIT 修改），官方文档曾误写为 1000，已有 issue 指出；JS 版默认 25。早期 Python 版本默认是 25，很多旧教程沿用这个数字，以当前版本为准。LangChain 1.x 内置 `ModelCallLimitMiddleware(thread_limit, run_limit, exit_behavior)` 与 `ToolCallLimitMiddleware`。
+    sources:
+      - {title: "LangGraph Reference - GraphRecursionError", url: "https://reference.langchain.com/python/langgraph/errors/GraphRecursionError"}
+      - {title: "langchain-ai/docs Issue 7034 - Python 默认 recursion limit 为 10007", url: "https://github.com/langchain-ai/docs/issues/7034"}
+      - {title: "LangChain Docs - Prebuilt middleware", url: "https://docs.langchain.com/oss/python/langchain/middleware/built-in"}
+      - {title: "OWASP Top 10 for LLM Applications 2026", url: "https://genai.owasp.org/resource/owasp-genai-llm-top-10-2026/"}
+
+  - id: d37-k2
+    name: 超时控制：总超时与单工具超时
+    level: P0
+    summary: 总超时是整次任务的 deadline，单工具超时取「工具上限」与「剩余预算」的较小值
+    why: |
+      Agent 一次请求会串行调用多次 LLM 和多个工具，任何一个环节卡住，整个请求就卡住。Day 20 讲过单次 LLM 调用的超时，Agent 场景下问题被放大：**每一步都不超时，总时长仍然可能超时**。
+      面试常问「你的 Agent 接口 P99 延迟怎么控制」「某个工具卡死了怎么办」。
+    problem: |
+      - 外部工具（HTTP 接口、数据库、爬虫）可能无响应，不设超时就无限等待。
+      - 只设单步超时：8 步 × 每步 30 秒 = 4 分钟，前端和网关早就超时断开了，后端还在继续烧 Token。
+      - 超时后资源没有真正释放：任务被前端放弃，后端协程还在跑。
+    principle: |
+      **一、三层超时**
+
+      | 层级 | 作用 | 典型值 |
+      |---|---|---|
+      | 总超时（deadline） | 整次 Agent 任务的最长时间 | 同步接口 30~60 秒；后台任务可更长 |
+      | 单次 LLM 调用超时 | 防止模型接口卡住 | 按模型和输出长度定，20~60 秒 |
+      | 单工具超时 | 防止某个外部依赖卡死 | 查询类 3~10 秒，写操作按业务 |
+
+      **二、deadline 预算传递（核心）**
+
+      不要给每一步一个固定超时，而是在任务开始时算出**绝对截止时间**，每一步用「剩余时间」约束：
+
+      ```mermaid
+      flowchart LR
+        S["任务开始 deadline = 现在 + 60 秒"] --> L1["LLM 调用 超时 = min 30 秒 和 剩余"]
+        L1 --> T1["工具调用 超时 = min 工具上限 和 剩余"]
+        T1 --> C{"剩余时间 大于 最小可用时间"}
+        C -->|"是"| L2["下一轮 LLM"]
+        C -->|"否"| E["停止 返回部分结果"]
+      ```
+
+      - `step_timeout = min(该步自己的上限, deadline - now())`。
+      - 剩余时间不足以完成一次有意义的调用（例如少于 3 秒）时，**提前终止**，而不是发起注定超时的调用。
+      - 下游是 HTTP 服务时，可以把 deadline 通过请求头传下去，让下游也知道还剩多少时间（gRPC 的 deadline 传播就是这个思想）。
+
+      **三、Python 里怎么实现**
+
+      - `asyncio.wait_for(coro, timeout=秒)` 或 Python 3.11+ 的 `async with asyncio.timeout(秒):`，超时抛 `TimeoutError` 并**取消**内部协程。
+      - HTTP 客户端自身也要设超时（`httpx.AsyncClient(timeout=...)`），双保险。
+      - **同步阻塞代码无法被安全取消**：`time.sleep`、同步 requests 放在线程里跑，`wait_for` 超时后线程仍在后台运行。这也是 LangGraph 节点超时**只支持 async 节点**的原因（同步节点设置 timeout 编译时直接报错），阻塞 IO 要用 `asyncio.to_thread` 包装（Day 06、Day 07 讲过事件循环与线程）。
+
+      **四、LangGraph 的节点超时（langgraph 1.2+）**
+
+      - `builder.add_node("call_api", fn, timeout=30)`：单次尝试的硬超时。
+      - `timeout=TimeoutPolicy(run_timeout=120, idle_timeout=30)`：`run_timeout` 是硬上限；`idle_timeout` 在节点有进度信号（如流式输出）时会刷新，适合流式 LLM。
+      - 超时抛 `NodeTimeoutError`，清除该次尝试的写入，交给 retry_policy 决定是否重试；**每次重试计时重新开始**——所以「超时 × 重试次数」可能超过总预算，总超时仍要在外层控制。
+
+      **五、超时之后**
+
+      - 返回部分结果和原因，不要静默失败。
+      - 写操作超时要特别小心：**超时不代表没执行**（请求可能已到达对方），重试前要用幂等键或先查询状态。
+      - 用户断开连接（SSE 中断）时，应取消后端任务，避免继续消耗。
+    scenarios: |
+      - **同步问答接口**：网关 60 秒超时，Agent 总 deadline 设 50 秒，留 10 秒给序列化和网络。
+      - **慢工具**：报表导出工具可能要 2 分钟，不放在同步 Agent 里，改为提交异步任务、返回任务 ID（Day 42 异步任务）。
+      - **流式输出**：LLM 节点用 idle_timeout，只要还在吐 Token 就不判超时，卡住 30 秒没输出才判超时。
+      - **写操作**：创建工单接口超时后，先按幂等键查询是否已创建，再决定是否重试。
+    code: |
+      ```python
+      import asyncio
+      import time
+
+
+      class Deadline:
+          def __init__(self, total_s: float):
+              self.end = time.monotonic() + total_s
+
+          def remaining(self) -> float:
+              return self.end - time.monotonic()
+
+          def budget(self, cap_s: float, min_s: float = 2.0) -> float:
+              left = self.remaining()
+              if left < min_s:
+                  raise TimeoutError("剩余时间不足，提前终止")
+              return min(cap_s, left)
+
+
+      async def call_tool(tool, args: dict, dl: Deadline, cap_s: float = 10.0):
+          # 单工具超时取「工具上限」和「剩余预算」的较小值
+          return await asyncio.wait_for(tool(**args), timeout=dl.budget(cap_s))
+      ```
+    pitfalls: |
+      - **只设单步超时不设总超时**：每步都合规，总时长仍然超标。
+      - **工具超时固定值且忽略剩余预算**：最后一步还给 30 秒，必然超出总 deadline。
+      - **以为 wait_for 能取消同步阻塞代码**：线程里的阻塞调用不会被中断，资源继续占用。
+      - **超时后直接重试写操作**：请求可能已经成功执行，导致重复写入。
+      - **用 `time.time()` 计算 deadline**：系统时间可能被调整，应使用单调时钟 `time.monotonic()`。
+      - **超时 × 重试次数超过总预算**：LangGraph 节点超时每次重试重新计时，外层仍需要总超时。
+    interview_asks:
+      - Agent 一次请求要调多个工具，你怎么设置超时？总超时和单步超时是什么关系？
+      - 工具调用超时了，可以直接重试吗？
+      - 为什么 LangGraph 的节点超时只支持 async 节点？
+    project_example: |
+      在一个销售助手 Agent 中，网关超时 60 秒，但用户经常看到「请求超时」而后台日志显示 Agent 还在运行。排查发现每个工具固定 20 秒超时、失败重试 3 次，单个 CRM 工具最坏要 60 秒以上。
+      改造：入口创建 `Deadline(50)`，LLM 和工具调用都用 `min(上限, 剩余)`；剩余少于 3 秒直接终止并返回已获取的信息；重试前检查剩余预算是否够一次完整尝试；SSE 连接断开时取消 Agent 任务。改造后超时率从 4% 降到 0.5%，而且不再有「前端已放弃、后端还在烧 Token」的情况。
+    freshness: |
+      核对于 2026-11：LangGraph `add_node(..., timeout=...)` 需要 langgraph>=1.2，支持数字、timedelta 或 `TimeoutPolicy(run_timeout, idle_timeout)`；仅支持 async 节点，同步节点设置 timeout 在编译时被拒绝；超时抛 `NodeTimeoutError`，默认可重试，每次重试重新计时。`asyncio.timeout()` 自 Python 3.11 起可用。
+    sources:
+      - {title: "LangGraph Docs - Fault tolerance（Retries 与 Timeouts）", url: "https://docs.langchain.com/oss/python/langgraph/fault-tolerance"}
+      - {title: "LangGraph Docs - Configure nodes", url: "https://docs.langchain.com/oss/python/langgraph/graph-api-nodes"}
+      - {title: "Python Docs - asyncio.timeout", url: "https://docs.python.org/3/library/asyncio-task.html#timeouts"}
+
+  - id: d37-k3
+    name: 重试与降级策略
+    level: P1
+    summary: 只重试暂时性错误且操作幂等；参数错误交还模型修正；重试耗尽走降级而不是报错
+    why: |
+      Agent 依赖的外部服务（LLM 接口、业务 API）都会偶发失败。重试能提高成功率，但**乱重试**会放大故障、重复扣款。
+      面试中这是工程素养题：能不能说清楚「什么错误重试、谁来重试、重试几次、失败了怎么办」。
+    problem: |
+      - 网络抖动、429 限流、5xx 是暂时性的，重试大概率成功。
+      - 参数错误（400）、权限不足（403）、资源不存在（404）重试一万次也不会成功，只会浪费时间和额度。
+      - 非幂等写操作（创建订单、退款）重试可能重复执行。
+      - 所有重试都失败后，需要一个「体面」的结果。
+    principle: |
+      **一、错误分三类，处理者不同**
+
+      | 错误类型 | 例子 | 谁处理 | 怎么处理 |
+      |---|---|---|---|
+      | 暂时性基础设施错误 | 超时、连接重置、429、5xx | 代码层 | 指数退避 + 抖动重试 |
+      | 模型可修正的错误 | 参数缺失、格式错误、查无结果 | 模型 | 把错误信息作为观察结果回填，让模型改参数或换工具 |
+      | 不可恢复错误 | 403 权限不足、业务规则拒绝 | 代码层 | 不重试，直接终止或转人工 |
+
+      **关键区分**：基础设施重试是代码在同一步里重新执行同一个调用；「让模型修正」是把错误回填进 messages，**下一步**由模型决定怎么办（Day 33 讲过工具结果回填）。两者不要混淆，更不要把 400 错误交给代码层无限重试。
+
+      **二、指数退避 + 抖动**
+
+      - 等待时间 `initial × factor^n`，加随机抖动，设置上限。抖动是为了避免大量请求同时失败后**同时重试**造成二次雪崩。
+      - 遇到 429 且响应带 `Retry-After` 时，优先按它等待。
+      - 重试次数小（2~3 次），并且**受总 deadline 约束**（k2）。
+
+      **三、幂等性是重试的前提**
+
+      - 读操作天然可重试。
+      - 写操作必须带幂等键（如 `Idempotency-Key: 订单号-动作`），或者重试前先查询是否已执行。
+      - 工具注册时标记 `idempotent: bool`，执行器据此决定是否允许自动重试。
+
+      **四、框架内置能力**
+
+      - LangGraph：`add_node(..., retry_policy=RetryPolicy(max_attempts=3))`。默认 `max_attempts=3`（含首次）、`initial_interval=0.5`、`backoff_factor=2.0`、`jitter=True`；默认重试判定**不重试** `ValueError`、`TypeError` 等编程类错误，对 requests / httpx 的 HTTP 错误只重试 5xx。
+      - LangChain `create_agent`：`ToolRetryMiddleware`（`on_failure="continue"` 时把错误包装成 ToolMessage 交给模型）、`ModelFallbackMiddleware`（主模型失败切换备用模型）。
+
+      **五、降级（Fallback）**
+
+      ```mermaid
+      flowchart TD
+        A["调用主模型或主工具"] --> B{"成功"}
+        B -->|"是"| OK["正常返回"]
+        B -->|"暂时性失败"| R["退避重试 2 到 3 次"]
+        R --> B2{"成功"}
+        B2 -->|"是"| OK
+        B2 -->|"否"| F["降级 备用模型 或 缓存 或 简化流程"]
+        B -->|"不可恢复"| H["终止 转人工 说明原因"]
+        F --> P["返回部分结果并标注"]
+      ```
+
+      常见降级：主模型 → 备用模型（不同厂商）；实时接口 → 缓存数据（标注「数据截至某时」）；完整 Agent 流程 → 固定 FAQ 回答；自动执行 → 生成草稿让人确认。
+    scenarios: |
+      - **LLM 接口 429**：退避重试，仍失败切到备用厂商模型（Day 20 讲过多模型路由）。
+      - **查询订单接口返回 404**：不重试，把「订单号不存在」回填给模型，让模型请用户核对订单号。
+      - **退款接口超时**：带幂等键重试；不支持幂等键则先查退款状态再决定。
+      - **知识库检索服务挂了**：降级为「无法查询资料，以下是通用建议」，并在回答中明示。
+    pitfalls: |
+      - **`except Exception` 一律重试**：参数错误、权限错误也重试，浪费时间和额度，还掩盖了真正的 bug。
+      - **非幂等写操作自动重试**：重复下单、重复退款。
+      - **重试没有抖动**：故障恢复瞬间所有请求同时重试，把刚恢复的服务再次打垮。
+      - **多层重复重试**：SDK 内部重试 2 次 × 工具层 3 次 × 节点层 3 次 = 18 次，延迟爆炸。要明确只在一层重试。
+      - **降级不告知用户**：用缓存数据却不标注时效，用户以为是实时信息。
+    interview_asks:
+      - Agent 调用工具失败了，你怎么处理？哪些错误重试、哪些不重试？
+      - 重试会带来什么问题？怎么避免重复扣款？
+    project_example: |
+      某报销助手的「提交报销单」工具最初被包在通用重试装饰器里，财务系统偶尔响应慢，超时后自动重试，导致同一张发票被提交两次。
+      整改：工具注册表增加 `idempotent` 字段，提交类工具标记为 false，执行器只对 idempotent 工具自动重试；提交接口改为携带 `Idempotency-Key = 报销单号`，财务系统侧去重；400 类错误不再重试，而是把错误详情（如「发票抬头与公司名称不一致」）回填给模型，由模型提示用户修改。SDK 自带重试关闭，只在执行器一层重试。
+    freshness: |
+      核对于 2026-11：LangGraph `RetryPolicy` 参数默认值 max_attempts=3、initial_interval=0.5、backoff_factor=2.0、max_interval=128.0、jitter=True；默认不重试 ValueError、TypeError 等，HTTP 库错误仅重试 5xx（官方 Fault tolerance 文档）。LangChain 1.x `ToolRetryMiddleware` 默认 max_retries=2、on_failure="continue"；`ModelFallbackMiddleware` 接收备用模型列表。
+    sources:
+      - {title: "LangGraph Docs - Fault tolerance", url: "https://docs.langchain.com/oss/python/langgraph/fault-tolerance"}
+      - {title: "LangChain Reference - ToolRetryMiddleware", url: "https://reference.langchain.com/python/langchain/agents/middleware/tool_retry/ToolRetryMiddleware"}
+      - {title: "LangChain Docs - Prebuilt middleware", url: "https://docs.langchain.com/oss/python/langchain/middleware/built-in"}
+
+  - id: d37-k4
+    name: 成本上限与错误决策纠偏
+    level: P1
+    summary: 用 Token 与调用次数预算封顶成本；用参数校验、计划审查和人工确认纠正错误决策
+    why: |
+      Agent 的成本和行为都**不是事先确定的**：同一个问题，这次 3 步完成，下次可能 15 步；这次调用对的工具，下次可能调错。
+      企业落地关心两件事：「最多花多少钱」和「做错了能不能拦住」。这两件事都必须在代码层控制，而不是寄希望于 Prompt。
+    problem: |
+      - 单个请求的 Token 消耗没有上限，长对话 + 多次工具结果回填，上下文越滚越大，每步成本递增。
+      - 模型可能选错工具（该查询却调用了修改）、填错参数（把 A 客户的 ID 填成 B 的）、过早下结论（没查就编答案）。
+      - 错误决策如果直接执行，就会变成真实的业务事故。
+    principle: |
+      **一、成本预算**
+
+      - **Token 预算**：每次 LLM 调用后累加 `usage`，超过单任务预算就停止。注意 Agent 每一步都会把**全部历史**重新发给模型，第 n 步的输入 Token 约等于前面所有消息之和，成本随步数**超线性**增长。
+      - **调用次数预算**：限制模型调用次数和昂贵工具（搜索、OCR）的调用次数。
+      - **多级预算**：单请求预算 + 单用户每日预算 + 租户月度预算，后两者通常放在网关或 Redis 计数（Day 41）。
+      - **上下文控制**：工具结果过长时截断或摘要后再回填（Day 13 上下文窗口）。
+
+      **二、错误决策的类型与纠偏手段**
+
+      | 错误类型 | 例子 | 纠偏手段 |
+      |---|---|---|
+      | 参数错误 | 日期格式错、ID 不存在 | Schema 校验 + 业务校验，错误回填让模型修正（Day 19） |
+      | 越权 / 选错工具 | 查询任务调用了删除工具 | 按任务阶段动态限制可用工具；执行层权限校验（Day 40） |
+      | 过早结论 / 编造 | 没调用工具就回答订单状态 | 要求关键结论必须引用工具结果；输出校验 |
+      | 方向错误 | 一直在搜无关资料 | 先产出计划再执行，计划由规则或另一个模型审查 |
+      | 高风险动作 | 退款、发邮件、删数据 | 人工确认（Day 36 interrupt） |
+
+      **三、纠偏的位置：越靠近执行越可靠**
+
+      - Prompt 里写「不要调用删除工具」只是**建议**，模型可能不听，也可能被注入攻击绕过。
+      - 真正可靠的是**执行层**的硬校验：参数校验、权限校验、金额阈值、白名单——不管模型怎么想，不满足就不执行。
+      - 校验失败的信息要**可操作**：「order_id 必须是 10 位数字，你传的是 abc」，模型才能改对。
+
+      **四、反思 / 审查（Reflection）**
+
+      让模型（或另一个模型）检查自己的计划或结果，可以减少一部分错误，但会增加成本和延迟，而且审查者本身也会错。适合高价值任务，不能替代硬校验。
+
+      **五、不这样做会怎样**：成本不可预测，财务无法核算；错误决策直接落到业务系统，事后只能人工补救。
+    scenarios: |
+      - **客服 Agent**：单请求 Token 预算 2 万，超出转人工；每用户每日 50 次。
+      - **数据分析 Agent**：只开放只读 SQL 工具；生成的 SQL 先经过 SQL 解析器校验只含 SELECT，再执行。
+      - **运维 Agent**：先输出执行计划（要执行哪些命令），由规则引擎检查危险命令，再人工确认后执行。
+      - **报告生成 Agent**：结论段落必须带工具结果引用，没有引用的数字被输出校验拦截。
+    pitfalls: |
+      - **只统计输出 Token**：Agent 成本大头是每步重复发送的输入 Token。
+      - **用 Prompt 代替执行层校验**：Prompt 约束可被忽略或被注入绕过。
+      - **校验错误信息含糊**：只返回「参数错误」，模型无法修正，于是反复重试形成循环。
+      - **把反思当万能药**：反思增加成本，审查模型也会犯错，不能替代硬规则。
+      - **预算触发后无提示**：用户只看到「失败」，应该说明原因并给出后续路径。
+    interview_asks:
+      - 如何控制 Agent 的成本？为什么 Agent 的 Token 消耗会随步数快速增长？
+      - Agent 做了错误决策（比如调错工具、填错参数），你有哪些手段发现和纠正？
+    project_example: |
+      在一个 BI 问答 Agent 中，月底账单发现少数长会话占了 40% 的成本：用户连续追问，每轮都带着前面所有 SQL 结果。
+      改造：SQL 结果超过 50 行只回填前 20 行和统计摘要；单请求 Token 预算 3 万、模型调用 6 次；会话超过 10 轮自动摘要历史。错误决策方面，SQL 执行器用 SQL 解析库校验语句类型和表白名单，校验失败返回具体原因（如「表 salary 不在允许范围内」），模型据此改写；涉及导出明细数据的请求走人工确认。
+    freshness: |
+      核对于 2026-11：OWASP Top 10 for LLM Applications 2026 版中 LLM06 为 Unbounded Consumption（无限制消耗），LLM03 Excessive Agency 升至第三位，均与 Agent 的成本与行为控制直接相关。LangChain 1.x 提供 `ModelCallLimitMiddleware`、`ToolCallLimitMiddleware` 做次数限制；Token 金额预算需要自己按 usage 累计实现。
+    sources:
+      - {title: "OWASP Top 10 for LLM Applications 2026", url: "https://genai.owasp.org/resource/owasp-genai-llm-top-10-2026/"}
+      - {title: "GitHub - OWASP GenAI LLM Top 10 2026 条目列表", url: "https://github.com/GenAI-Security-Project/GenAI-LLM-Top10/tree/main/2026"}
+      - {title: "LangChain Docs - Prebuilt middleware", url: "https://docs.langchain.com/oss/python/langchain/middleware/built-in"}
+
+quiz:
+  - id: d37-q1
+    kp: d37-k1
+    type: multi
+    question: 下列哪些属于 Agent 循环中「由代码强制执行」的终止条件？（多选）
+    options:
+      - "模型返回了纯文本答案，没有调用任何工具"
+      - "已执行步数达到最大步数上限"
+      - "同一工具以相同参数被调用超过 2 次"
+      - "本次任务累计 Token 超过预算"
+    answer: [1, 2, 3]
+    explain: |
+      最大步数、重复动作检测、Token 预算都是代码层的护栏，不依赖模型判断。模型不再调用工具是「正常终止」，由模型决定，恰恰是不可靠的那一个出口，所以才需要其余三个兜底。
+  - id: d37-q2
+    kp: d37-k1
+    type: single
+    question: |
+      同事在 LangGraph 中这样调用：`graph.invoke(inputs, {"configurable": {"thread_id": "t1", "recursion_limit": 10}})`，发现 Agent 跑了几十步也没停。最可能的原因是？
+    options:
+      - "recursion_limit 只限制工具节点，不限制模型节点"
+      - "recursion_limit 应该放在 config 顶层，放进 configurable 不生效，于是使用了很大的默认值"
+      - "recursion_limit 只有配置 checkpointer 时才生效"
+      - "recursion_limit 的单位是秒，10 秒内跑几十步是正常的"
+    answer: [1]
+    explain: |
+      recursion_limit 是 config 顶层键，放在 configurable 里会被当成普通配置项忽略，图使用默认值（当前 Python 版很大，核对为 10007）。它限制的是 super-step 数量，包括模型和工具节点，与是否配置 checkpointer 无关，单位是步数而不是秒。
+  - id: d37-q3
+    kp: d37-k2
+    type: judge
+    question: 只要给 Agent 的每次 LLM 调用和每个工具调用都设置了 30 秒超时，就能保证整个 Agent 请求在 60 秒的网关超时内完成。
+    answer: false
+    explain: |
+      单步超时只限制每一步，Agent 会串行执行多步，8 步每步接近 30 秒总计远超 60 秒，再加上重试时间更长。需要设置总 deadline，每一步的超时取「该步上限」和「剩余预算」中的较小值，剩余不足时提前终止。
+  - id: d37-q4
+    kp: d37-k3
+    type: single
+    question: Agent 调用「查询订单」工具，业务接口返回 HTTP 404「订单不存在」。最合适的处理方式是？
+    options:
+      - "代码层指数退避重试 3 次，可能是暂时性错误"
+      - "立即抛出异常终止整个 Agent，返回 500 给用户"
+      - "不重试，把「订单号不存在」作为工具结果回填给模型，让模型请用户核对订单号"
+      - "降级为调用备用模型重新生成订单号"
+    answer: [2]
+    explain: |
+      404 是确定性的业务结果，重试不会改变结果，只浪费时间。它也不是系统故障，不应直接 500。属于「模型可修正」的错误：把清晰的错误信息回填，模型可以向用户确认或换个查询方式。让模型生成订单号属于编造数据，绝对不行。
+  - id: d37-q5
+    kp: d37-k2
+    type: short
+    question: 为什么说「工具调用超时了，不能直接重试」？什么情况下可以重试，重试前要做什么？
+    key_points:
+      - {text: "指出超时不代表对方没执行，请求可能已到达并成功", dim: principle}
+      - {text: "区分读操作可重试、写操作需幂等保障", dim: concept}
+      - {text: "给出幂等键或重试前先查询状态的方案", dim: engineering}
+      - {text: "提到重试要受剩余总预算约束", dim: engineering}
+    reference: |
+      超时只说明「在规定时间内没收到响应」，不说明请求失败。请求可能已经到达对方并执行成功，只是响应慢或在返回途中丢了。如果是创建工单、退款这类写操作，直接重试就会重复执行。
+      可以重试的情况：读操作（查询）天然幂等，可以直接重试；写操作只有在接口支持幂等键（同一个键重复请求只执行一次）时才能直接重试，或者重试前先按业务单号查询是否已执行，未执行才重试。
+      另外重试前要检查总 deadline 的剩余时间，够一次完整尝试才重试，否则直接停止并返回部分结果，避免整次请求超出网关超时。
+  - id: d37-q6
+    kp: d37-k1
+    type: scenario
+    question: 线上监控发现某客服 Agent 有 8% 的请求以 max_steps 结束（平时不到 1%），平均 Token 消耗翻倍。日志显示这些请求反复调用 query_logistics 工具，参数相同，工具每次返回 {"error":"upstream 503"}。请分析根因并给出短期止血和长期改进方案。
+    key_points:
+      - {text: "指出根因是物流上游故障，模型看到错误后反复重试同一调用形成循环", dim: principle}
+      - {text: "指出缺少重复动作检测，只靠最大步数兜底导致每个请求都耗满步数", dim: engineering}
+      - {text: "短期止血：熔断或临时下线该工具，返回明确的不可用提示并转人工", dim: engineering}
+      - {text: "长期：增加工具名加参数的重复签名检测，错误信息写明不要重试，代码层对 5xx 有限退避重试", dim: engineering}
+      - {text: "长期：按 stop_reason 建立监控告警", dim: project}
+    reference: |
+      **根因**：物流上游 503 故障。工具把错误原样回填给模型，模型的典型反应是「再试一次」，于是相同参数反复调用。系统没有重复动作检测，只能等到最大步数才停，每个请求都跑满步数，而每一步都要把越来越长的历史重新发给模型，Token 成本翻倍。
+      **短期止血**：给 query_logistics 加熔断（连续失败率超过阈值时短时间内直接返回「物流查询暂不可用」，不再请求上游）；或者从工具列表中临时移除该工具，让 Agent 直接告知用户稍后查询或转人工。
+      **长期改进**：
+      1. 执行器层对 5xx 做 1~2 次带抖动的退避重试，模型不再参与这种基础设施重试。
+      2. 重试耗尽后回填的错误要明确：「物流服务暂时不可用，请不要重复调用，告知用户稍后再查」。
+      3. 增加重复签名检测（工具名 + 规范化参数），同签名超过 2 次直接终止并转人工。
+      4. 监控各 stop_reason 占比和单请求 Token 分布，max_steps 或 repeated_action 异常升高时告警，比用户投诉更早发现问题。
+    followup:
+      question: 如果模型每次调用时参数略有不同（比如多了一个空格或字段顺序不同），重复检测还能生效吗？怎么改进？
+      key_points: [对参数做规范化后再签名, 如 JSON 排序键 去空白 统一大小写, 或检测连续失败次数而非完全相同]
+      reference: 简单拼接字符串的签名会因为字段顺序、空格不同而失效。应先对参数规范化：JSON 序列化时排序键、去掉首尾空白、统一大小写等，再计算签名；也可以额外按「同一工具连续失败次数」判断，不要求参数完全相同。
+  - id: d37-q7
+    kp: d37-k4
+    type: short
+    question: 为什么 Agent 的 Token 消耗会随着步数超线性增长？请说明原因和至少两种控制手段。
+    key_points:
+      - {text: "指出每一步调用都要把完整历史（含之前的工具结果）重新作为输入发送", dim: principle}
+      - {text: "指出第 n 步输入约等于前面所有消息之和，累计成本接近平方级增长", dim: principle}
+      - {text: "控制手段：工具结果截断或摘要后回填", dim: engineering}
+      - {text: "控制手段：步数或 Token 预算上限、历史摘要、缓存", dim: engineering}
+    reference: |
+      LLM 接口是无状态的，Agent 每一步调用模型时，都要把 system prompt、用户问题、之前所有的模型回复和工具结果作为输入重新发送。第 1 步输入是 A，第 2 步是 A + 第 1 步回复与工具结果，第 n 步约等于前面全部之和。所以单步输入在线性增长，累计总消耗接近步数的平方级增长，而且工具结果（例如返回一大段 JSON）往往是大头。
+      控制手段：
+      1. 工具结果在回填前截断或摘要，例如只保留前 20 行和统计信息。
+      2. 设置单任务 Token 预算和最大步数，超出即停止。
+      3. 长对话做历史摘要，或清理早期的工具调用细节（LangChain 有 ContextEditingMiddleware 这类能力）。
+      4. 利用模型厂商的前缀缓存：把稳定内容（system prompt、工具定义）放在前面并保持不变，提高缓存命中（Day 20 成本优化）。
+  - id: d37-q8
+    kp: d37-k3
+    type: design
+    question: 你负责一个「采购下单 Agent」的工具执行器设计，工具包括 search_product（查询）、get_price（查询）、create_order（下单）。请设计这三类工具的超时、重试、降级策略，并说明理由。
+    key_points:
+      - {text: "查询类工具设置较短超时，允许对超时和 5xx 有限退避重试", dim: engineering}
+      - {text: "create_order 非幂等，不自动重试或必须携带幂等键，超时后先查询订单状态", dim: engineering}
+      - {text: "所有调用受总 deadline 约束，重试前检查剩余预算", dim: principle}
+      - {text: "4xx 类错误不重试，回填给模型修正；降级方案如价格缓存并标注时效", dim: engineering}
+      - {text: "create_order 前增加人工确认或金额阈值校验", dim: project}
+    reference: |
+      **总体**：执行器入口创建总 deadline（例如 45 秒），所有调用的超时取「工具上限」与「剩余预算」较小值；工具注册时声明 `idempotent`、`timeout`、`max_retries`。只在执行器这一层重试，关闭 HTTP SDK 自带重试，避免多层叠加。
+      **search_product / get_price（查询，幂等）**：超时 5 秒；对超时、连接错误、429、5xx 做最多 2 次指数退避加抖动重试，429 优先按 Retry-After；400/404 不重试，把具体错误回填给模型（例如「商品编号不存在」）。降级：get_price 失败时可用 10 分钟内的价格缓存，回答中标注「价格截至某时，下单前以实际为准」。
+      **create_order（写操作，非幂等）**：超时 15 秒；默认不自动重试。若接口支持 `Idempotency-Key`（例如 `采购单号-下单`），可在超时、5xx 时重试 1 次；不支持时，超时后先按采购单号查询订单是否已创建，再决定。下单前要求人工确认或金额阈值校验（超过 1 万必须审批），这是 Day 40 安全话题的预告。
+      **失败兜底**：重试耗尽或剩余预算不足，返回「已选好的商品和价格 + 下单未完成的原因」，并生成草稿让用户手动确认，而不是直接报错。
+    followup:
+      question: 如果下单接口超时后查询发现订单状态是「处理中」，你会怎么处理？
+      key_points: [不重试下单, 返回处理中状态给用户, 后台轮询或回调确认最终结果]
+      reference: 状态为处理中说明请求已被接收，绝不能再次下单。应告诉用户「订单正在处理中」，并通过后台任务轮询或业务系统回调确认最终结果，再通知用户。Agent 本次可以先结束，把订单号返回给用户便于后续查询。
+
+code_reading:
+  id: d37-c1
+  kp: [d37-k1, d37-k2, d37-k3]
+  title: 带护栏的 Agent 主循环
+  scenario: 企业内部 IT 服务台 Agent 的核心循环，被 FastAPI 接口调用。llm 是封装好的模型客户端（complete 返回内容、工具调用和 usage），tools 是工具注册表，包含查询工单、重置密码、创建工单等工具。
+  language: python
+  code: |
+    import asyncio
+    import json
+    import logging
+    import time
+    from dataclasses import dataclass
+    from typing import Any, Awaitable, Callable
+
+    logger = logging.getLogger("agent_loop")
+
+    MAX_STEPS = 8
+    TOTAL_TIMEOUT_S = 60
+    TOOL_TIMEOUT_S = 20
+    TOKEN_BUDGET = 40_000
+    MAX_REPEAT = 2
+
+
+    @dataclass
+    class Tool:
+        name: str
+        fn: Callable[..., Awaitable[dict]]
+        schema: dict
+        idempotent: bool = True
+
+
+    @dataclass
+    class RunResult:
+        answer: str
+        stop_reason: str
+        steps: int
+        tokens: int
+
+
+    async def call_tool_with_retry(tool: Tool, args: dict, attempts: int = 3) -> dict:
+        for i in range(attempts):
+            try:
+                return await asyncio.wait_for(tool.fn(**args), timeout=TOOL_TIMEOUT_S)
+            except Exception as e:
+                logger.warning("tool %s failed (%d/%d): %r", tool.name, i + 1, attempts, e)
+                if i == attempts - 1:
+                    raise
+                await asyncio.sleep(2 ** i)
+
+
+    async def run_agent(llm: Any, tools: dict[str, Tool], system: str, question: str) -> RunResult:
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": question}]
+        deadline = time.monotonic() + TOTAL_TIMEOUT_S
+        seen: dict[str, int] = {}
+        tokens = 0
+        for step in range(1, MAX_STEPS + 1):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return RunResult("处理超时，已为你转接人工。", "total_timeout", step, tokens)
+            reply = await asyncio.wait_for(
+                llm.complete(messages, tools=[t.schema for t in tools.values()]),
+                timeout=remaining,
+            )
+            tokens += reply.usage.total_tokens
+            if tokens > TOKEN_BUDGET:
+                return RunResult("问题较复杂，已为你转接人工。", "token_budget", step, tokens)
+            if not reply.tool_calls:
+                return RunResult(reply.content, "final_answer", step, tokens)
+            messages.append(reply.to_message())
+            for call in reply.tool_calls:
+                sig = f"{call.name}:{json.dumps(call.arguments, sort_keys=True, ensure_ascii=False)}"
+                seen[sig] = seen.get(sig, 0) + 1
+                if seen[sig] > MAX_REPEAT:
+                    return RunResult("检测到重复操作，已停止并转人工。", "repeated_action", step, tokens)
+                tool = tools.get(call.name)
+                if tool is None:
+                    result = {"error": f"未知工具 {call.name}，请从可用工具中选择"}
+                else:
+                    try:
+                        result = await call_tool_with_retry(tool, call.arguments)
+                    except Exception as e:
+                        result = {"error": f"{type(e).__name__}: {e}"}
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": json.dumps(result, ensure_ascii=False),
+                })
+        return RunResult("处理步骤过多，已为你转接人工。", "max_steps", MAX_STEPS, tokens)
+  walkthrough:
+    function: |
+      实现一个带护栏的 ReAct 风格 Agent 主循环：反复调用模型，模型请求工具时执行工具并回填结果，直到模型给出最终答案。护栏包括最大步数、总超时、Token 预算、重复动作检测、未知工具处理和工具失败重试，并用 `stop_reason` 标记每次结束的原因。
+    key_functions: |
+      - `Tool`：工具注册信息，含函数、JSON Schema 和 `idempotent` 标记。
+      - `call_tool_with_retry`：单工具超时 + 指数退避重试（1 秒、2 秒）。**问题集中在这里**：它对所有异常都重试，并且没有使用 `idempotent` 字段；超时固定 20 秒，不看总 deadline。
+      - `run_agent`：主循环。每步先检查剩余时间，再调用模型、累计 Token、判断是否结束、做重复签名检测、执行工具、回填结果。
+      - `RunResult`：统一返回结构，`stop_reason` 用于监控。
+    params: |
+      - `llm`：模型客户端，`complete(messages, tools=...)` 返回带 `content`、`tool_calls`、`usage`、`to_message()` 的对象。
+      - `tools`：名称到 Tool 的映射，`tools=[t.schema ...]` 把 Schema 传给模型（Day 18 的工具定义）。
+      - `call.arguments`：模型生成的参数字典，直接 `**args` 展开传给工具函数，没有经过 Schema 校验。
+      - 工具结果被 `json.dumps` 后以 `role=tool` 消息回填，`tool_call_id` 关联到对应的调用。
+    data_flow: |
+      ```mermaid
+      flowchart TD
+        Q["用户问题"] --> M["messages 初始化 设置 deadline"]
+        M --> C{"剩余时间大于 0"}
+        C -->|"否"| T1["stop total_timeout"]
+        C -->|"是"| L["llm.complete 超时等于剩余"]
+        L --> B{"Token 超预算"}
+        B -->|"是"| T2["stop token_budget"]
+        B -->|"否"| F{"有工具调用"}
+        F -->|"否"| A["stop final_answer"]
+        F -->|"是"| S{"签名重复超过 2 次"}
+        S -->|"是"| T3["stop repeated_action"]
+        S -->|"否"| X["call_tool_with_retry 固定 20 秒 最多 3 次"]
+        X --> R["结果或错误回填 messages"]
+        R --> C
+      ```
+    failure_points: |
+      - **问题一：重试不区分错误类型和幂等性。** `except Exception` 把参数错误（TypeError）、权限错误、业务 4xx 都重试 3 次；`idempotent=False` 的「创建工单」「重置密码」超时后也会被重试，可能重复创建工单或连续重置密码。
+      - **问题二：工具超时不受总 deadline 约束。** 每次尝试固定 20 秒，3 次加退避最坏约 63 秒，单个工具就能超过 60 秒总超时；而 deadline 只在下一步开头才检查。
+      - `llm.complete` 外的 `wait_for` 超时抛出 TimeoutError 没有被捕获，整个请求以异常结束，而不是返回 total_timeout 结果。
+      - `call.arguments` 未经 Schema 校验直接 `**` 展开，模型多传或少传参数会抛 TypeError（又被问题一重试 3 次）。
+      - 工具结果原样回填，没有长度截断，大结果会让后续每步 Token 激增。
+    debugging: |
+      - 按 `stop_reason` 聚合日志，max_steps / repeated_action 异常升高说明工具或 Prompt 有问题。
+      - 搜索 「tool %s failed」 警告，若同一请求出现 TypeError 被重试 3 次，即可确认问题一。
+      - 记录每个工具调用的开始、结束时间和剩余预算，若工具耗时超过剩余预算，即可确认问题二。
+      - 单测：mock 一个永远 sleep 的工具，断言 run_agent 在约 60 秒内返回；mock 一个非幂等工具抛超时，断言只被调用 1 次。
+    change_request: |
+      如果需求改为「创建工单类工具绝不能自动重试，查询类最多重试 2 次，且所有调用必须在总 60 秒内完成」：
+      1. `call_tool_with_retry` 增加 `deadline` 参数，每次尝试的超时为 `min(TOOL_TIMEOUT_S, deadline - now)`，剩余不足 2 秒直接放弃；退避前也检查剩余时间。
+      2. `attempts = 3 if tool.idempotent else 1`；只对 `TimeoutError`、连接错误、5xx 重试，TypeError / 4xx 直接返回错误给模型。
+      3. 执行前用 `tool.schema` 校验参数（如 jsonschema 或 Pydantic），校验失败返回具体错误信息。
+      4. 捕获 `llm.complete` 的 TimeoutError，返回 `stop_reason="total_timeout"`。
+  questions:
+    - id: d37-c1-q1
+      kp: d37-k1
+      type: code
+      question: 假设模型连续三步都以相同参数调用 get_ticket(ticket_id="T-100")，工具每次都返回 {"error":"not found"}。按执行顺序说明循环在第几步、因为哪个条件结束，返回什么 stop_reason？如果参数顺序不同但内容相同，结果会变吗？
+      key_points:
+        - {text: "说明每次调用生成签名并计数，第一、二次计数为 1、2 未超过 MAX_REPEAT", dim: principle}
+        - {text: "说明第三步计数为 3 大于 2，返回 repeated_action，并给出 step 值为 3", dim: principle}
+        - {text: "说明 json.dumps 使用了 sort_keys，参数字段顺序不同仍得到相同签名", dim: engineering}
+      reference: |
+        第 1 步：模型返回工具调用，签名 `get_ticket:{"ticket_id": "T-100"}` 计数为 1，不超过 MAX_REPEAT=2，执行工具，回填 not found。
+        第 2 步：同样签名计数为 2，仍不超过 2，再次执行并回填。
+        第 3 步：计数为 3，大于 2，直接返回 `RunResult("检测到重复操作…", "repeated_action", 3, tokens)`，这一次工具不会被执行。
+        签名使用 `json.dumps(..., sort_keys=True)`，字典按键排序后序列化，所以字段顺序不同但内容相同时签名一致，检测仍然有效。但如果值里多了空格或大小写不同（如 "t-100"），签名就不同，需要在签名前做规范化。
+    - id: d37-c1-q2
+      kp: d37-k2
+      type: code
+      question: 假设第 2 步时剩余总时间只有 15 秒，模型调用了 search_kb 工具，而该工具的上游一直无响应。请按时间顺序推算 call_tool_with_retry 的执行过程和总耗时，并说明这暴露了什么问题、怎么改。
+      key_points:
+        - {text: "推算三次尝试各等待 20 秒超时，中间退避 1 秒与 2 秒，总计约 63 秒", dim: principle}
+        - {text: "指出单工具超时固定 20 秒未考虑仅剩 15 秒的总预算", dim: engineering}
+        - {text: "指出 deadline 只在每步开头检查，工具执行期间不会中断", dim: engineering}
+        - {text: "给出修复：传入 deadline，单次超时取较小值，重试前检查剩余预算", dim: engineering}
+      reference: |
+        时间线：第 1 次尝试等 20 秒超时 → 记录警告 → sleep 1 秒 → 第 2 次尝试再等 20 秒超时 → sleep 2 秒 → 第 3 次尝试等 20 秒超时 → 抛出异常，被 run_agent 捕获后回填错误。总计约 20 + 1 + 20 + 2 + 20 = 63 秒。
+        而此时总预算只剩 15 秒，这个工具一步就超出约 48 秒。run_agent 只在每轮循环开头检查 deadline，工具执行期间没有任何约束，等下一轮开头发现 remaining 小于 0 才返回 total_timeout，此时网关早已超时断开，用户看到的是失败。
+        修复：把 deadline 传给 `call_tool_with_retry`，每次尝试 `timeout=min(TOOL_TIMEOUT_S, deadline - time.monotonic())`；剩余时间少于一个最小值（比如 2 秒）就不再尝试；退避 sleep 之前也检查剩余时间是否足够。
+    - id: d37-c1-q3
+      kp: d37-k3
+      type: code
+      question: 模型调用 create_ticket(title="打印机故障")，该工具 idempotent=False。工单系统处理很慢，第一次请求在第 20 秒时超时，但实际上工单系统在第 25 秒创建成功。请说明这段代码接下来会发生什么，以及应如何修改重试逻辑。
+      key_points:
+        - {text: "说明 wait_for 超时后进入 except，sleep 1 秒后发起第二次请求", dim: principle}
+        - {text: "指出第一次请求实际已成功，第二次乃至第三次会重复创建工单", dim: engineering}
+        - {text: "指出代码虽有 idempotent 字段但重试逻辑没有使用它", dim: engineering}
+        - {text: "给出修复：非幂等工具不自动重试或使用幂等键，超时后先查询状态", dim: engineering}
+      reference: |
+        第一次调用在 20 秒时被 `asyncio.wait_for` 取消并抛出 TimeoutError，进入 except，记录警告，sleep 1 秒后发起第二次 create_ticket。但工单系统其实已经收到了第一次请求，并在第 25 秒创建成功。第二次请求如果成功，就会产生第二张工单；如果第二次也超时，还会有第三次。结果是同一个故障被创建了 2~3 张工单。
+        根本问题是 `Tool` 有 `idempotent` 字段，但 `call_tool_with_retry` 完全没用它，对所有工具、所有异常一视同仁地重试。另外 asyncio 取消的只是本地等待，不会撤回已经发到对方的请求。
+        修复：`attempts = 3 if tool.idempotent else 1`；对非幂等工具，如果业务系统支持，传入幂等键（例如 `会话ID-工具调用ID`）后才允许重试；不支持幂等键时，超时后先按标题和提交人查询最近是否已创建，再决定是否重新提交，或者直接告诉模型「创建结果未知，请让用户稍后确认」。
+
+interview:
+  - id: d37-i1
+    kp: d37-k1
+    type: oral
+    difficulty: 1
+    question: Agent 为什么可能陷入无限循环？你会设置哪些终止条件？
+    key_points:
+      - {text: "说明 Agent 是由模型决定是否继续的循环，自然出口只有模型不再调用工具", dim: concept}
+      - {text: "列举无限循环的诱因：工具持续报错、模型反复重试、在工具间来回跳", dim: principle}
+      - {text: "列出代码层终止条件：最大步数、重复检测、超时、预算", dim: engineering}
+      - {text: "提到终止后返回部分结果并记录 stop_reason", dim: project}
+    reference: |
+      Agent 本质上是一个 while 循环：调用模型 → 模型要工具就执行并回填 → 再调用模型。唯一的自然出口是模型认为任务完成、不再调用工具。但模型的判断不可靠：工具一直返回错误时，模型倾向于反复重试同一个调用；有时在两个工具之间来回切换；有时总觉得信息不够，一直搜索。
+      所以必须在代码层加终止条件：最大步数（按任务复杂度，一般 5~15 步）；重复动作检测（工具名 + 规范化参数做签名，同签名超过 N 次停止）；总超时；Token 或调用次数预算；用户主动取消。在 LangGraph 里还要显式设置顶层的 recursion_limit，不能依赖很大的默认值。
+      终止后不要直接报错，而是返回已完成的部分和原因，必要时转人工，同时记录 stop_reason 用于监控。
+    oral: |
+      Agent 其实就是一个由模型决定要不要继续的循环，唯一的正常出口是模型不再调用工具。问题在于模型的判断不可靠，比如工具一直报错，它就会反复重试同一个调用。
+      所以我会在代码层加几道兜底：最大步数、按工具名加参数做重复检测、总超时、Token 预算，LangGraph 里还要显式设置 recursion_limit。触发之后不直接报错，而是返回已经拿到的结果并转人工。我们之前物流接口故障时 Agent 死循环，加了重复检测和 stop_reason 监控之后，这类问题能在几分钟内发现。
+  - id: d37-i2
+    kp: d37-k2
+    type: oral
+    difficulty: 2
+    question: 一个 Agent 请求要串行调用多次模型和工具，你如何设计超时，保证接口在网关 60 秒内返回？
+    key_points:
+      - {text: "提出总 deadline 概念并预留网络与序列化余量", dim: concept}
+      - {text: "说明每步超时取该步上限与剩余预算的较小值，剩余不足提前终止", dim: principle}
+      - {text: "说明 asyncio 取消对同步阻塞代码无效，阻塞 IO 用线程包装且自身设超时", dim: principle}
+      - {text: "说明写操作超时不能直接重试，重试受总预算约束", dim: engineering}
+      - {text: "提到前端断开时取消后台任务或长任务改异步", dim: project}
+    reference: |
+      设计分三层：总 deadline、单次 LLM 超时、单工具超时。网关 60 秒，Agent 总 deadline 设 50 秒左右，给序列化、网络留余量。任务开始时用单调时钟算出绝对截止时间，之后每一步超时都取「该步自己的上限」和「剩余时间」中的较小值；剩余时间不足以完成一次有意义的调用（比如少于 2~3 秒）就提前终止，返回已有结果。
+      实现上用 `asyncio.wait_for` 或 `asyncio.timeout`，HTTP 客户端本身也设超时。要注意 asyncio 的取消对同步阻塞代码无效，阻塞调用要用 `asyncio.to_thread` 包装，并且底层客户端自己也要有超时，否则线程一直挂着。LangGraph 1.2 的节点 timeout 只支持 async 节点，也是这个原因；而且节点超时每次重试重新计时，所以外层仍要有总超时。
+      重试要受总预算约束；写操作超时不能直接重试，因为对方可能已执行，需要幂等键或先查状态。如果用户断开 SSE 连接，要取消后台任务；确实很慢的工具（如导出报表）改成异步任务返回任务 ID。
+    oral: |
+      我会用 deadline 预算的方式。网关 60 秒，Agent 总预算设 50 秒，开始时算出截止时间，之后每次调用模型或工具，超时都取它自己的上限和剩余时间里较小的那个；剩余不到两三秒就不再发起调用，直接返回已有结果。
+      有两个坑要注意：一是 asyncio 取消不了同步阻塞代码，所以阻塞调用要放线程里而且底层客户端自己要设超时；二是写操作超时不能直接重试，因为对方可能已经执行了。另外用户断开连接时我们会取消后台任务，特别慢的工具改成异步任务。
+  - id: d37-i3
+    kp: d37-k3
+    type: oral
+    difficulty: 3
+    question: Agent 调用工具失败时，你的重试和降级策略是什么？如何避免重试带来的副作用？
+    key_points:
+      - {text: "把错误分为暂时性、模型可修正、不可恢复三类并分别处理", dim: concept}
+      - {text: "暂时性错误用指数退避加抖动，次数有限且受总预算约束", dim: principle}
+      - {text: "可修正错误回填给模型，错误信息要具体可操作", dim: principle}
+      - {text: "非幂等操作不自动重试或使用幂等键，只在一层做重试", dim: engineering}
+      - {text: "说明降级手段并结合项目举例", dim: project}
+    reference: |
+      我把错误分三类处理。第一类是暂时性基础设施错误：超时、连接错误、429、5xx，由执行器代码层做 2~3 次指数退避加抖动重试，429 按 Retry-After 等待，每次重试前检查总预算。第二类是模型可修正的错误：参数格式错、资源不存在、业务校验不通过，不在代码层重试，而是把具体错误回填给模型，例如「日期必须是 YYYY-MM-DD 格式」，让模型改参数或询问用户。第三类是不可恢复错误：权限不足、业务规则拒绝，直接终止或转人工。
+      避免副作用：工具注册时标记是否幂等，只对幂等工具自动重试；写操作要求带幂等键，超时后先查询状态；关闭 SDK 自带重试，确保只在一层重试，避免 SDK、工具、节点三层叠加导致几十次重试。LangGraph 的 RetryPolicy 默认就不重试 ValueError、TypeError，HTTP 错误只重试 5xx，这个默认设计也体现了同样的思想。
+      降级：主模型失败切备用厂商模型；实时接口失败用缓存并标注时效；自动执行失败改为生成草稿让人确认。我们的报销助手就是因为提交接口超时被重试，导致发票重复提交，后来按这个思路整改。
+    oral: |
+      我会先给错误分类。超时、429、5xx 这种暂时性错误，由执行器做两三次指数退避加抖动的重试；参数错、查不到这类模型能修正的错误，不在代码里重试，而是把具体的错误信息回填给模型让它改；权限不足这种不可恢复的直接终止或转人工。
+      副作用方面，工具注册时标记是否幂等，只有幂等的才自动重试，写操作必须带幂等键，而且只在一层重试。我们报销助手就踩过坑，提交接口超时被重试，同一张发票提交了两次。降级的话，主模型失败切备用模型，实时数据失败用缓存但会标注时效。
+  - id: d37-i4
+    kp: d37-k4
+    type: oral
+    difficulty: 3
+    question: 老板问「这个 Agent 每次最多花多少钱？做错了能拦住吗？」你怎么回答并落地？
+    key_points:
+      - {text: "说明成本不确定的原因：步数不定且每步重发完整历史", dim: principle}
+      - {text: "给出多级预算：单请求 Token 与调用次数、用户日预算、租户月预算", dim: engineering}
+      - {text: "说明错误决策拦截要放在执行层：参数校验、权限、白名单、金额阈值", dim: engineering}
+      - {text: "高风险动作人工确认，Prompt 约束只是辅助", dim: principle}
+      - {text: "给出可观测指标如 stop_reason、单请求成本分布", dim: project}
+    reference: |
+      成本：Agent 的成本不确定，因为步数不固定，而且每一步都要把完整历史重新发给模型，成本随步数超线性增长。所以我用硬上限把它变成「有上界」：单请求最多 N 次模型调用、Token 预算 X（超出转人工），可以直接换算成金额上限；单用户每日、单租户每月的预算放在 Redis 计数，在网关拦截。同时通过工具结果截断、历史摘要、前缀缓存降低平均成本。
+      拦截错误：不依赖 Prompt。在工具执行层做硬校验：参数用 Schema 和业务规则校验；工具按任务阶段和用户角色白名单开放；金额、数量设阈值；写操作和高风险操作走人工确认（LangGraph interrupt）。关键结论要求引用工具结果，输出再做一次校验。
+      可观测：监控单请求成本分布（P50/P99）、各 stop_reason 占比、被拦截的工具调用次数，每周复盘。这样我能回答老板：单次最多花多少钱，有哪些动作一定会被拦住或需要人确认。
+    oral: |
+      我会说成本可以封顶。Agent 成本不确定是因为步数不固定，而且每一步都要重发完整历史。我们给每个请求设了模型调用次数和 Token 预算，换算下来单次最多几毛钱，超了就转人工；再加用户日预算和租户月预算在网关拦。
+      做错能不能拦住，关键是不靠 Prompt，靠执行层：参数校验、按角色的工具白名单、金额阈值，涉及钱和数据修改的动作一律人工确认。再配合 stop_reason 和成本分布的监控，每周复盘被拦截的调用。
+  - id: d37-i5
+    kp: d37-k1
+    type: design
+    difficulty: 4
+    question: 请设计一个生产级 Agent 运行时的「控制层」，要求覆盖：终止条件、超时、重试与降级、成本上限、错误决策纠偏和可观测性。说明各组件放在哪一层、如何协作，以及在 LangGraph 中如何落地。
+    key_points:
+      - {text: "分层设计：入口层（deadline 与预算初始化）、循环层（步数、重复、无进展检测）、执行层（超时、重试、校验、权限）", dim: engineering}
+      - {text: "LangGraph 落地：顶层 recursion_limit、节点 retry_policy 与 async 节点 timeout、条件边路由到兜底节点", dim: principle}
+      - {text: "错误分类处理与幂等约束，只在一层重试，降级路径明确", dim: engineering}
+      - {text: "高风险动作通过 interrupt 人工确认，校验放在执行层而非 Prompt", dim: principle}
+      - {text: "可观测：stop_reason、每步耗时与 Token、被拦截调用、告警阈值", dim: project}
+    reference: |
+      **分层**：
+      1. **入口层**：生成 run_id，创建总 deadline（如 50 秒）和预算对象（Token、模型调用次数、昂贵工具次数），检查用户与租户日预算（Redis）。这些放进 State 或 context，供后续节点读取。
+      2. **循环控制层**：每次进入模型节点前检查步数、剩余时间、预算；工具节点前做重复签名检测和无进展检测。触发任一条件，条件边路由到 `fallback` 节点：整理已完成结果、写 stop_reason、必要时转人工。
+      3. **执行层**（工具执行器）：参数 Schema 校验 → 权限与白名单校验 → 高风险判断（需要人工确认则 interrupt）→ 带超时执行（min(上限, 剩余)）→ 按错误分类处理（暂时性错误只对幂等工具退避重试；可修正错误回填具体信息；不可恢复直接终止）→ 结果截断后回填。
+      **LangGraph 落地**：`graph.invoke(input, {"recursion_limit": 20, "configurable": {"thread_id": ...}})` 作为最后兜底；工具节点 `add_node(..., retry_policy=RetryPolicy(max_attempts=3, retry_on=只匹配暂时性错误), timeout=TimeoutPolicy(run_timeout=...))`，节点必须是 async；模型节点可用 `ModelFallbackMiddleware` 或自己实现备用模型；高风险工具用 interrupt（或 HumanInTheLoopMiddleware），配合 PostgresSaver 持久化。注意节点超时每次重试重新计时，总 deadline 仍由入口层控制。
+      **降级**：备用模型、缓存数据（标注时效）、草稿模式（只生成不执行）、转人工。
+      **可观测**：每步记录节点名、耗时、Token、工具名、结果状态；按 stop_reason、被拦截调用、重试次数、单请求成本做仪表盘；max_steps 占比、重复检测触发率、预算触发率设置告警阈值；保留 checkpoint 历史用于事后复盘（Day 36）。
+    oral: |
+      我会把控制层分成三层。入口层负责创建总 deadline 和各种预算，并检查用户和租户的日预算。循环层在每次调用模型前检查步数、剩余时间和预算，工具调用前做重复和无进展检测，触发了就走兜底节点，返回部分结果并记录 stop_reason。执行层是工具执行器：先校验参数和权限，高风险的走 interrupt 人工确认，然后带超时执行，按错误类型决定重试、回填给模型还是终止。
+      在 LangGraph 里，recursion_limit 作为最后兜底，工具节点用 retry_policy 和 timeout，但总 deadline 还是入口层控制，因为节点超时每次重试会重新计时。可观测方面，每一步记录耗时、Token 和结果，按 stop_reason 做告警。我们上线后，物流接口故障那类死循环问题能在几分钟内被发现，而不是等月底看账单。
+
+sources:
+  - {title: "LangGraph Docs - Fault tolerance", url: "https://docs.langchain.com/oss/python/langgraph/fault-tolerance"}
+  - {title: "LangGraph Reference - GraphRecursionError", url: "https://reference.langchain.com/python/langgraph/errors/GraphRecursionError"}
+  - {title: "langchain-ai/docs Issue 7034 - recursion limit 默认值", url: "https://github.com/langchain-ai/docs/issues/7034"}
+  - {title: "LangChain Docs - Prebuilt middleware", url: "https://docs.langchain.com/oss/python/langchain/middleware/built-in"}
+  - {title: "OWASP Top 10 for LLM Applications 2026", url: "https://genai.owasp.org/resource/owasp-genai-llm-top-10-2026/"}

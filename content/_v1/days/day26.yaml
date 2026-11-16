@@ -1,0 +1,690 @@
+day: 26
+phase: 3
+title: 检索机制：Top-K、相似度检索与混合检索
+goals:
+  - 能解释 Top-K 和相似度阈值分别控制什么，并说出取值过大/过小的后果与调参方法
+  - 能用直觉讲清 BM25 的三个核心因素，以及它和向量检索各自擅长的查询类型
+  - 能说明混合检索为什么在编号、专有名词场景优于纯向量，并能手算 RRF 融合分数
+  - 能读懂 PostgreSQL 全文检索 + pgvector 的混合检索代码，并找出过滤不一致、Top-K 写死等问题
+knowledge_points:
+  - id: d26-k1
+    name: 相似度检索：Top-K 与相似度阈值
+    level: P0
+    summary: Top-K 决定「最多给几条」，阈值决定「够不够格」；两者都要在评估集上调，不能拍脑袋写死
+    why: |
+      检索是 RAG 效果的**天花板**：正确的片段没被检索出来，后面的 Prompt 写得再好、模型再强也答不对。
+      而 Top-K 和阈值是检索层最常被问、也最常被写死的两个参数。面试官问「Top-K 你们取多少」，
+      其实是在考你**是否理解召回与噪声的权衡**，以及有没有用数据调过参。
+    problem: |
+      - 用户问题和文档片段之间**没有精确匹配**，只能按「语义接近程度」排序，所以必须决定**取前几条**。
+      - 取少了会漏掉答案（召回不足），取多了会把无关片段塞给模型（噪声、成本、延迟上升）。
+      - 当知识库里**根本没有答案**时，Top-K 仍然会硬返回 K 条「最不差」的结果，需要阈值来判断「其实都不相关」。
+    principle: |
+      **一、相似度检索到底在做什么**
+
+      1. 把用户问题用**同一个** Embedding 模型转成向量（见 Day 14、Day 24）。
+      2. 在向量库里找与它**距离最近**的 K 个 chunk 向量。数据量大时用 HNSW 等近似索引（ANN，见 Day 25），所以结果是「近似的 Top-K」。
+      3. 返回 chunk 文本、元数据和分数。
+
+      注意 pgvector 的 `<=>` 返回的是**余弦距离**（越小越近），**余弦相似度 = 1 − 余弦距离**。代码里把距离当相似度用，阈值方向就会整个反过来。
+
+      **二、Top-K 太小 / 太大分别会怎样**
+
+      | K 的取值 | 后果 |
+      |---|---|
+      | 太小（如 1~2） | 答案恰好排在第 3 名就丢了；需要多段信息综合的问题（对比、汇总）答不全 |
+      | 太大（如 30 条全塞给模型） | 无关片段变多，模型被带偏；Token 成本和首字延迟上升；长上下文中间的内容容易被忽略 |
+
+      所以工程上通常分**两层 K**：
+
+      - **召回 K（候选数）**：从库里先多取一些，例如 20~100 条，目标是「答案在里面」，看的是 **Recall@K**。
+      - **送入模型的 K**：经过融合、Rerank（Day 27）后只保留 3~8 条，目标是「给模型的都有用」，看的是 **Precision**。
+      - 送入模型的条数最好由**上下文 Token 预算**动态决定（Day 28），而不是写死一个数字。
+
+      **三、相似度阈值：用来判断「够不够格」**
+
+      阈值有两个用途：过滤明显无关的片段；以及当**最高分也低于阈值**时直接走「无答案」分支，而不是让模型硬编。
+
+      阈值难调的原因：
+
+      - **分数不可跨模型比较**：有的 Embedding 模型分数集中在 0.7~0.9，有的分布更宽，换模型就要重调。
+      - **分数不可跨问题比较**：短问题（「年假」）和长问题的分数分布不同。
+      - **相关 ≠ 高分**：语义接近只代表「话题相似」，不保证片段包含答案。
+
+      正确做法：在**评估集**上把「相关片段」和「不相关片段」的分数画成两组分布，找一个能较好分开两组的值；并配合「至少保留 N 条」或「阈值只用于判断无答案」等策略，避免把所有结果都过滤掉。
+
+      ```mermaid
+      flowchart LR
+        Q["用户问题"] --> E["问题向量化"]
+        E --> S["ANN 检索 召回 K 等于 50"]
+        S --> F{"最高分低于阈值"}
+        F -->|是| N["走无答案分支"]
+        F -->|否| R["融合与 Rerank"]
+        R --> B["按 Token 预算截断到 3 到 8 条"]
+        B --> L["组装 Prompt 交给 LLM"]
+      ```
+
+      **四、过滤条件会让 Top-K「不够数」**
+
+      HNSW 这类近似索引是**先在索引里找候选、再应用 WHERE 过滤**。pgvector 默认 `hnsw.ef_search = 40`，如果过滤条件只命中 10% 的行，平均只剩 4 条。pgvector **0.8.0 起**提供 iterative index scan（`hnsw.iterative_scan`），会自动多扫一些直到凑够结果（受 `hnsw.max_scan_tuples` 限制）。不知道这一点，就会出现「明明 LIMIT 10 却只返回 3 条」的怪现象。
+
+      ```mermaid
+      flowchart TB
+        A["HNSW 按距离找 ef_search 个候选"] --> B["应用 WHERE 过滤"]
+        B --> C{"剩余条数够 K 吗"}
+        C -->|够| D["返回 Top-K"]
+        C -->|不够 未开迭代扫描| E["返回不足 K 条"]
+        C -->|不够 开启迭代扫描| A
+      ```
+    scenarios: |
+      - **企业制度问答**：召回 K=50 → Rerank → 送 5 条给模型；最高 Rerank 分低于阈值时回复「知识库中没有找到相关规定」。
+      - **客服机器人**：问题短、口语化，分数整体偏低，需要单独为客服语料标定阈值。
+      - **多知识库产品**：每个租户语料差异大，阈值和 K 作为**租户级配置**，而不是全局常量。
+    code: |
+      ```python
+      # 阈值只用于判断「是否有答案」，并保证至少保留 min_keep 条供后续 Rerank
+      def select_candidates(hits: list[dict], threshold: float, min_keep: int = 3) -> list[dict]:
+          # hits 已按相似度降序，score = 1 - cosine_distance
+          if not hits or hits[0]["score"] < threshold:
+              return []            # 交给上层走无答案分支
+          kept = [h for h in hits if h["score"] >= threshold]
+          return kept if len(kept) >= min_keep else hits[:min_keep]
+      ```
+    pitfalls: |
+      - **误区：K 越大越保险。** 召回率会升，但噪声、成本、延迟一起升，模型还可能被无关片段带偏。正确做法是「召回多、送入少」。
+      - **误区：阈值 0.8 是通用经验值。** 分数分布依赖具体模型和语料，换模型必须重新标定。
+      - **把距离当相似度。** `<=>` 返回距离，`ORDER BY ... ASC` 才是最相近；阈值写成 `distance > 0.8` 会把最相关的过滤掉。
+      - **过滤 + ANN 导致结果不足 K 条**，误以为是数据问题；应检查 `ef_search` 和 iterative scan 设置。
+      - **只看 Top-1 是否命中** 来评估检索，忽略了多段综合类问题。
+    interview_asks:
+      - 你们 RAG 的 Top-K 取多少？为什么？怎么调的？
+      - 相似度阈值怎么定？换了 Embedding 模型之后还能沿用吗？
+      - 知识库里没有答案时，你们的检索层怎么处理？
+    project_example: |
+      在一个内部制度问答项目里，最初 Top-K=3 直接送模型，评估发现「差旅标准 + 审批流程」这类综合问题经常答不全。
+      调整为**召回 40 条 → Rerank → 按 2500 Token 预算取 4~6 条**后，Recall@40 从 0.71 提升到 0.93，
+      同时用 120 条标注样本画出相关/不相关的分数分布，把「最高 Rerank 分 < 0.2 时拒答」作为无答案判断，
+      幻觉投诉明显下降。阈值和 K 都放进了知识库配置表，可以按租户单独调整。
+    freshness: |
+      核对于 2026-11：pgvector README 当前版本为 v0.8.7；`hnsw.ef_search` 默认 40；iterative index scan 自 0.8.0 起提供，
+      参数为 `hnsw.iterative_scan`（strict_order / relaxed_order）与 `hnsw.max_scan_tuples`（默认 20000）。旧版本（0.7.x 及以前）没有迭代扫描，只能手动调大 ef_search 或改用分区/部分索引。
+    sources:
+      - {title: "pgvector README（Filtering / Iterative Index Scans）", url: "https://github.com/pgvector/pgvector"}
+  - id: d26-k2
+    name: 关键词检索与 BM25 原理直觉
+    level: P1
+    summary: BM25 = 稀有词更重要 + 词频收益递减 + 长文档降权，擅长精确词，不懂同义
+    why: |
+      向量检索不是万能的：错误码、合同编号、产品型号、人名这类**精确词**，Embedding 往往会把它们「抹平」。
+      BM25 是搜索引擎几十年的主力算法，也是混合检索中「关键词那一路」的标准实现，面试时经常被要求和向量检索对比。
+    problem: |
+      - 用户搜「ERR-4031」「合同 HT-2024-0918」，向量检索可能返回一堆「错误处理」「合同管理」的泛泛内容，真正含该编号的片段排不上来。
+      - 简单的「包含关键词就算命中」无法排序：一个词在 100 篇文档里都出现，和只在 2 篇里出现，价值完全不同。
+    principle: |
+      **BM25 给「文档 d 对查询 q 的相关度」打分**，查询里每个词贡献一部分分数，最后相加。每个词的贡献由三个直觉决定：
+
+      1. **IDF（稀有度）**：越少文档包含的词越有区分度。「的」「制度」几乎每篇都有，权重很低；「ERR-4031」只出现在一篇里，权重很高。
+      2. **词频饱和（参数 k1）**：词在文档里出现越多分越高，但**收益递减**。出现 1 次到 3 次加分明显，30 次和 50 次几乎没差别，防止堆关键词刷分。
+      3. **长度归一化（参数 b）**：同样出现 2 次，在 100 字的段落里比在 1 万字的文档里更说明问题，所以长文档要降权。常见默认值 k1 约 1.2~2.0，b 约 0.75。
+
+      **和向量检索的对比**
+
+      | 维度 | BM25（稀疏检索） | 向量检索（稠密检索） |
+      |---|---|---|
+      | 匹配方式 | 词面精确匹配 | 语义接近 |
+      | 擅长 | 编号、型号、人名、术语、新词 | 同义改写、口语提问、跨表述 |
+      | 不擅长 | 同义词（「休假」vs「年假」）、错别字 | 精确编号、罕见专有名词、数字 |
+      | 依赖 | **分词质量**（中文尤其关键） | Embedding 模型质量 |
+
+      **中文的特殊点**：BM25 以「词」为单位，中文没有空格，必须先分词。分词把「手扶拖拉机」切错，关键词检索就失效。PostgreSQL 内置配置没有中文分词，需要 zhparser / pg_jieba 等扩展，或在应用层预分词。
+
+      **PostgreSQL 的 `ts_rank` 不是 BM25**：它考虑词频和长度，但**没有 IDF**，常见词和罕见词同等对待。需要真正 BM25 时可用 ParadeDB 的 `pg_search` 或 Tiger Data 的 `pg_textsearch` 扩展（详见 d26-k4）。
+    scenarios: |
+      - **运维知识库**：按错误码、告警名检索故障处理手册，关键词检索命中率远高于向量。
+      - **法务合同库**：按合同号、条款编号「第 12.3 条」检索。
+      - **产品文档**：按 API 名称、配置项名（如 `max_tokens_per_doc`）检索。
+    pitfalls: |
+      - **误区：BM25 过时了，有向量就够了。** 精确词场景 BM25 依然更强，主流做法是两者混合。
+      - **中文不分词直接建全文索引**：整句被当成一个词，几乎什么都搜不到。
+      - **把 `ts_rank` 当 BM25**：没有 IDF，排序质量明显差；在 RAG 里需要好的关键词排序时应评估 BM25 扩展。
+      - **用 AND 语义解析自然语言问题**：`plainto_tsquery` / `websearch_to_tsquery` 默认要求所有词都出现，长问题常常零结果。
+    interview_asks:
+      - BM25 的原理是什么？和 TF-IDF 有什么区别？
+      - 什么情况下关键词检索比向量检索好？
+    project_example: |
+      某运维助手上线初期只有向量检索，值班同学搜「Kafka ISR shrink 告警」总是返回泛泛的 Kafka 介绍。
+      排查发现 Embedding 把「ISR shrink」这种专有缩写和普通 Kafka 内容放得很近。补上 BM25 一路（同时加了自定义词典，
+      避免把「ISR」切碎）后，这类告警类问题的 Recall@10 从 0.55 提升到 0.9。
+  - id: d26-k3
+    name: 混合检索与 RRF 融合
+    level: P0
+    summary: 向量管语义、关键词管精确词，两路各取候选再用 RRF 按名次融合，避开分数不可比的问题
+    why: |
+      企业文档里大量存在编号、型号、人名、内部缩写，纯向量检索会稳定地漏掉这类问题；纯关键词又不懂同义和口语。
+      混合检索几乎是生产级 RAG 的**标配**，「为什么用混合检索、怎么融合」是 RAG 面试的高频题。
+    problem: |
+      - 两种检索各有盲区，单独用任何一种，召回率都有明显短板。
+      - 两路结果的分数**量纲完全不同**：余弦距离在 0~2，`ts_rank_cd` 是小数，BM25 分数无上界，直接相加没有意义。
+      - 需要一种简单、稳定、不太依赖调参的方式把两份排名合成一份。
+    principle: |
+      **一、为什么混合可能比纯向量好**
+
+      - Embedding 把文本压缩成几百到几千维的「语义摘要」，**精确字符信息会丢失**：「ERR-4031」和「ERR-4032」在向量空间里几乎重合。
+      - 罕见专有名词、新产品名可能根本不在 Embedding 模型的训练分布里，向量表示不可靠。
+      - BM25 靠精确词面匹配 + IDF，恰好补上这块；而向量检索补上 BM25 不懂同义改写的短板。
+      - 两路**互补**时，融合后的召回率通常高于任意一路——但这需要在自己的评估集上验证，不是必然。
+
+      **二、整体流程**
+
+      ```mermaid
+      flowchart LR
+        Q["用户问题"] --> V["向量检索 取 50 条"]
+        Q --> K["关键词检索 BM25 取 50 条"]
+        V --> F["RRF 按名次融合"]
+        K --> F
+        F --> R["可选 Rerank 精排"]
+        R --> T["取前 N 条送入 Prompt"]
+      ```
+
+      两路必须使用**相同的过滤条件**（知识库、租户、权限、版本），否则某一路会把不该出现的数据带进来。
+
+      **三、RRF（Reciprocal Rank Fusion，倒数排名融合）**
+
+      公式：**score(d) = Σ 1 / (k + rank_i(d))**，对文档 d 出现过的每个排名列表求和；k 通常取 **60**（来自 Cormack 等人 2009 年的论文）。
+
+      手算一个例子（k=60）：
+
+      | 文档 | 向量名次 | 关键词名次 | RRF 分数 |
+      |---|---|---|---|
+      | A | 1 | 1 | 1/61 + 1/61 ≈ 0.0328 |
+      | B | 2 | 未出现 | 1/62 ≈ 0.0161 |
+      | C | 6 | 2 | 1/66 + 1/62 ≈ 0.0313 |
+
+      结论：**在两路里都排得不错的 C，会超过只在一路排第 2 的 B**——「被两种方法同时认可」是强信号。
+
+      **为什么用名次不用分数**：RRF 只看排名，完全绕开了分数归一化问题。k 的作用是**平滑**：k 越大，第 1 名和第 10 名的差距越小，单一列表的头部优势被削弱。
+
+      **四、另一种融合：加权线性融合**
+
+      先把两路分数做 min-max 归一化，再按 `α × 向量分 + (1−α) × 关键词分` 合并。优点是能精细调权重；缺点是归一化对异常值敏感、每个语料都要调 α。RRF 也能加权：`0.7/(60+r1) + 0.3/(60+r2)`，但权重同样要用评估集确定。
+
+      **五、成本**：多一路查询（通常几毫秒到几十毫秒），多维护一个全文索引；融合本身几乎无成本。真正影响效果的是**每路候选数**——候选太少，一路排第 30 的好结果就没机会被另一路「救回来」。
+    scenarios: |
+      - **IT 服务台**：「VPN 报错 809 怎么办」——错误码靠关键词，「怎么办」靠向量。
+      - **医药/制造企业**：药品批号、零件型号与自然语言描述混合的查询。
+      - **合同与法规库**：「第 5.2 条关于违约金的规定」，条款号精确匹配 + 语义匹配同时需要。
+    pitfalls: |
+      - **把两路原始分数直接相加**：量纲不同，结果由分数范围大的那一路主导，相当于没融合。
+      - **两路过滤条件不一致**：向量路过滤了知识库，关键词路忘了，结果混入其他部门甚至其他租户的数据。
+      - **每路候选只取 5 条**：融合空间太小，混合检索的收益发挥不出来；一般每路取最终数量的 3~5 倍以上。
+      - **误区：混合检索一定更好。** 如果语料几乎没有编号/专有名词、分词又差，关键词路可能只贡献噪声，要用评估集对比纯向量和混合的 Recall@K。
+      - RRF 的 rank 从 **1** 开始计；从 0 开始会让第一名得分偏大（1/60）。
+    interview_asks:
+      - 为什么要做混合检索？什么场景纯向量检索会失败？
+      - RRF 是怎么计算的？为什么不直接把两路分数相加？
+      - 混合检索的两路结果，过滤条件应该在哪里加？
+    project_example: |
+      在一个设备维修知识库中，用户经常输入「E-1027 报警 + 现象描述」。纯向量检索 Recall@10 只有 0.62，
+      分析失败样本发现 70% 是型号/报警码类问题。增加 PostgreSQL 全文检索一路（pg_jieba 分词 + 自定义词典收录报警码），
+      每路取 40 条，用 RRF（k=60）融合后 Recall@10 提升到 0.88；再接 Rerank 后送 5 条给模型。
+      上线前还专门加了一条测试：两路 SQL 的 WHERE 条件必须来自同一个过滤构造函数，避免过滤不一致。
+    sources:
+      - {title: "Cormack et al. 2009 - Reciprocal Rank Fusion outperforms Condorcet and individual Rank Learning Methods", url: "https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf"}
+      - {title: "pgvector README - Hybrid Search", url: "https://github.com/pgvector/pgvector"}
+  - id: d26-k4
+    name: 在 PostgreSQL 中落地混合检索
+    level: P1
+    summary: tsvector+GIN 管关键词、pgvector 管向量，两个 CTE 各取候选后在 SQL 或应用层做 RRF
+    why: |
+      很多团队已经在用 PostgreSQL + pgvector（Day 25），不想再引入 Elasticsearch。能否在一个数据库里把混合检索做好，
+      直接决定了架构复杂度和运维成本，也是「为什么选 pgvector」面试题的延伸。
+    problem: |
+      - 需要在同一张 chunk 表上同时支持全文检索和向量检索，并保证两路过滤一致。
+      - 中文分词、`ts_rank` 不是 BM25、AND 语义导致零结果等坑，不了解就会得出「混合检索没用」的错误结论。
+    principle: |
+      **一、表结构**：同一张 `chunks` 表上放两种索引。
+
+      ```sql
+      -- 需要 pg_jieba 扩展（或 zhparser）提供中文分词配置 jiebacfg
+      ALTER TABLE chunks ADD COLUMN tsv tsvector
+        GENERATED ALWAYS AS (to_tsvector('jiebacfg', content)) STORED;
+      CREATE INDEX ON chunks USING gin (tsv);
+      CREATE INDEX ON chunks USING hnsw (embedding vector_cosine_ops);
+      ```
+
+      **二、查询模式**：两个 CTE 各自用 `row_number()` 得到名次，`FULL OUTER JOIN` 后按 `1/(60+rank)` 求和。也可以两条 SQL 分别查询，在 Python 里做 RRF（便于记录日志和调试）。
+
+      ```mermaid
+      flowchart TB
+        P["参数 问题文本 问题向量 过滤条件"] --> A["CTE 向量路 ORDER BY 余弦距离 LIMIT 40"]
+        P --> B["CTE 关键词路 tsv 匹配 ORDER BY 相关度 LIMIT 40"]
+        A --> J["FULL OUTER JOIN 按 id 合并"]
+        B --> J
+        J --> S["COALESCE 后两路 RRF 分数相加"]
+        S --> O["ORDER BY 分数 LIMIT 10"]
+      ```
+
+      **三、必须知道的坑**
+
+      - **中文分词**：内置配置不支持中文，需 zhparser（基于 SCWS）或 pg_jieba（基于结巴），云数据库要确认厂商是否提供该扩展。
+      - **`ts_rank` / `ts_rank_cd` 不是 BM25**：缺少 IDF。需要 BM25 可评估 ParadeDB `pg_search` 或 `pg_textsearch`（用 `bm25` 索引和 `<@>` 运算符）。两者许可证、复制支持不同，且**不能装在同一个数据库**（都注册了名为 bm25 的访问方法）。
+      - **AND 语义**：`plainto_tsquery` 要求所有词都出现，自然语言长问题经常零结果；可改成 OR 查询再交给排序。
+      - **过滤 + HNSW**：向量路加过滤后可能不足 LIMIT 条，需要 iterative scan 或调大 `ef_search`；向量路候选数不要超过 `ef_search`（默认 40），否则要同步调大。
+    scenarios: |
+      - 中小企业知识库：单个 PostgreSQL 实例同时承担业务数据、全文检索和向量检索，运维最简单。
+      - 已有 PG 业务库的 SaaS：chunk 表按 tenant_id 过滤，两路共用同一个 WHERE 子句。
+    pitfalls: |
+      - 只在向量路加 `WHERE tenant_id = ...`，关键词路漏加，导致跨租户数据进入候选。
+      - 云厂商不支持 zhparser/pg_jieba 时直接用 `'simple'` 配置处理中文，等于没有分词。
+      - 把 `pg_search` 和 `pg_textsearch` 的语法混用；以各自官方文档为准。
+      - 生成列使用的分词配置和查询时 `to_tsquery` 的配置不一致，导致永远匹配不上。
+    interview_asks:
+      - 你们为什么不用 Elasticsearch 而是在 PostgreSQL 里做混合检索？
+      - PostgreSQL 做中文全文检索要注意什么？
+    project_example: |
+      一个 200 万 chunk 的内部知识库，选择在 PostgreSQL 16 上用 pgvector + pg_jieba 做混合检索：两路各取 40 条，
+      在应用层做 RRF 并记录两路名次日志。上线后发现「申请流程」类长问题关键词路经常零结果，原因是 plainto_tsquery 的 AND 语义，
+      改为把分词结果用 OR 连接后，关键词路有结果的问题比例从 35% 升到 92%。
+    freshness: |
+      核对于 2026-11：pgvector README 仍推荐「全文检索 + RRF 或 cross-encoder」做混合检索；PostgreSQL 原生 `ts_rank`/`ts_rank_cd` 无 IDF，不是 BM25。
+      BM25 扩展：ParadeDB `pg_search`（AGPL-3.0，基于 Tantivy）与 Tiger Data `pg_textsearch`（PostgreSQL 许可证，`CREATE INDEX ... USING bm25(content) WITH (text_config='english')`，查询用 `<@>`，返回负分以便升序排序）。
+      第三方测评显示两种扩展的 nDCG@10 约为原生 ts_rank_cd 的两倍（单一数据集结论，以自己的评估为准）。中文分词扩展 zhparser、pg_jieba 均为第三方开源项目，阿里云 RDS 等提供 pg_jieba。具体版本与语法以各项目官方文档为准。
+    sources:
+      - {title: "pgvector README - Hybrid Search", url: "https://github.com/pgvector/pgvector"}
+      - {title: "ParadeDB - Implementing BM25 in PostgreSQL", url: "https://www.paradedb.com/learn/search-in-postgresql/bm25"}
+      - {title: "timescale/pg_textsearch", url: "https://github.com/timescale/pg_textsearch"}
+      - {title: "pg_jieba", url: "https://github.com/jaiminpan/pg_jieba"}
+      - {title: "zhparser", url: "https://github.com/amutu/zhparser"}
+quiz:
+  - id: d26-q1
+    kp: d26-k1
+    type: single
+    question: "在 pgvector 中执行 `ORDER BY embedding <=> :qvec LIMIT 5`（余弦距离运算符），下列说法正确的是？"
+    options:
+      - "返回余弦相似度最高的 5 条，因为 <=> 返回相似度，ORDER BY 默认降序"
+      - "返回余弦距离最小即最相似的 5 条，余弦相似度等于 1 减去余弦距离"
+      - "返回余弦距离最大的 5 条，需要加 DESC 才能得到最相似结果"
+      - "返回结果一定是精确的 Top-5，与是否建了 HNSW 索引无关"
+    answer: [1]
+    explain: |
+      `<=>` 返回余弦距离，越小越相似，ORDER BY 默认升序，所以取到的是最相似的 5 条；相似度 = 1 − 距离。
+      A 混淆了距离与相似度，且 ORDER BY 默认是升序；C 加 DESC 反而得到最不相似的结果；D 错在走 HNSW 等近似索引时结果是近似 Top-K，并且有过滤条件时可能不足 5 条。
+  - id: d26-q2
+    kp: d26-k3
+    type: judge
+    question: 使用 RRF 融合向量检索和 BM25 检索结果之前，必须先把两路分数归一化到 0~1 区间，否则融合结果没有意义。
+    answer: false
+    explain: |
+      RRF 只使用每个文档在各列表中的**名次**，公式是 Σ 1/(k+rank)，完全不使用原始分数，所以不需要归一化——这正是它的优点。
+      需要归一化的是「加权线性融合」（如 α×向量分 + (1−α)×关键词分），因为两路分数量纲不同。
+  - id: d26-q3
+    kp: d26-k2
+    type: multi
+    question: 以下哪些查询，**纯向量检索**更容易失败、需要关键词检索补充？
+    options:
+      - "「工单系统报错 ERR-4031 怎么处理」"
+      - "「我想请几天假，要走什么流程」"
+      - "「合同 HT-2024-0918 的付款节点」"
+      - "「新上线的产品 Zephyrus X3 支持哪些协议」"
+      - "「出差住宿能报多少钱」"
+    answer: [0, 2, 3]
+    explain: |
+      错误码、合同编号、新产品名都属于精确词或罕见专有名词，Embedding 会把它们和相近编号/泛泛内容混在一起，BM25 通过精确匹配 + IDF 能准确命中。
+      「请假流程」「住宿报销」是口语化、需要同义理解的问题（请假≈年假/事假，住宿≈差旅标准），恰恰是向量检索的强项，关键词检索反而可能因用词不同而漏掉。
+  - id: d26-q4
+    kp: d26-k2
+    type: short
+    question: 用自己的话解释 BM25 打分的三个直觉，并说明 PostgreSQL 的 `ts_rank` 和 BM25 的关键差别。
+    key_points:
+      - {text: "IDF：越少文档包含的词权重越高，常见词权重低", dim: principle}
+      - {text: "词频饱和：词频增加时得分增长递减，由 k1 控制", dim: principle}
+      - {text: "长度归一化：长文档中的命中要降权，由 b 控制", dim: principle}
+      - {text: "指出 ts_rank 没有 IDF，常见词和罕见词同等对待，排序质量较差", dim: engineering}
+    reference: |
+      BM25 对查询中每个词计算贡献再求和，有三个直觉：
+      1. **IDF**：一个词出现在越少的文档里，越有区分度，权重越高。「制度」到处都有，权重低；「ERR-4031」只在一篇出现，权重高。
+      2. **词频饱和**：词在文档中出现越多得分越高，但收益递减（k1 控制），避免堆关键词刷分。
+      3. **长度归一化**：同样命中两次，短段落比长文档更相关，长文档要降权（b 控制，常见 0.75）。
+      PostgreSQL 的 `ts_rank`/`ts_rank_cd` 考虑词频、位置和长度，但**没有 IDF**，不知道哪个词更稀有；而且没有针对 Top-K 的优化，要给所有命中行打分。
+      在 RAG 中如果关键词路的排序质量很重要，可以评估 pg_search 或 pg_textsearch 这类真正的 BM25 扩展。
+  - id: d26-q5
+    kp: d26-k1
+    type: scenario
+    question: |
+      某制度问答系统把向量检索 Top-20 全部塞进 Prompt。现在出现两类投诉：
+      ① 问「报销需要哪些材料」时，回答混进了采购流程的内容；
+      ② 问公司根本没有的「股票期权行权规则」，系统却给出了一套像模像样的规则。
+      请分析检索层的原因并给出改进方案。
+    key_points:
+      - {text: "指出 Top-20 全部送入导致无关片段进入上下文，模型被噪声带偏", dim: principle}
+      - {text: "提出召回多、送入少：召回候选后经 Rerank 或阈值筛选只送 3~8 条，或按 Token 预算决定", dim: engineering}
+      - {text: "指出 Top-K 总会返回 K 条，无答案时需要相似度或 Rerank 分阈值判断", dim: principle}
+      - {text: "提出阈值要在评估集上看相关与不相关分数分布来标定，不能拍脑袋", dim: engineering}
+      - {text: "提到无答案时走拒答分支或在 Prompt 中要求证据不足时拒答", dim: project}
+    reference: |
+      **问题①**：Top-20 中只有少数片段真正相关，采购流程和报销流程语义相近（都涉及单据、审批），被一起召回并送进 Prompt，模型把它们混在一起回答。K 越大，噪声越多，模型越容易被带偏，成本和延迟也更高。
+      改进：分两层 K——召回 30~50 条候选，经 Rerank（Day 27）后按 Token 预算只送 3~8 条；同时记录每条片段的分数，便于排查。
+
+      **问题②**：Top-K 检索**永远会返回 K 条**「最不差」的结果，即使知识库里根本没有期权规则，也会返回薪酬、福利相关片段，模型据此「编」出规则。
+      改进：设置阈值——最高相似度（或 Rerank 分）低于阈值时直接走无答案分支；阈值要用评估集标定：把相关/不相关片段的分数分布画出来，找能分开两组的值，换 Embedding 模型后要重新标定。
+      生成层再配合 Prompt 约束「证据不足时回答未找到」（Day 28），形成双保险。
+    followup:
+      question: 如果你只能先改一处，你会先加阈值还是先减少送入条数？为什么？
+      key_points:
+        - "看投诉类型的占比和风险：编造规则风险更高，优先加无答案判断"
+        - "阈值需要标注数据，减少送入条数改动最小、立刻见效"
+      reference: 取决于风险和数据条件。编造制度属于高风险错误，如果已有少量标注样本，优先上无答案阈值；如果完全没有标注数据，先把送入条数降到 5 并配合 Prompt 拒答指令，是最快见效的改动，同时开始积累评估集再标定阈值。
+  - id: d26-q6
+    kp: d26-k3
+    type: scenario
+    question: |
+      运维知识库只用了向量检索。值班同学反馈：搜「ERR-4031」时，返回的都是「错误处理通用规范」「ERR-4032 处理方法」这类文档，真正的 ERR-4031 处理手册排在第 15 名之后。
+      请解释原因，并设计一个改进方案（说明融合方式和需要注意的工程细节）。
+    key_points:
+      - {text: "解释 Embedding 会抹平精确字符差异，相近编号在向量空间几乎重合", dim: principle}
+      - {text: "提出增加 BM25/全文检索一路，利用精确匹配和 IDF 命中编号", dim: concept}
+      - {text: "说明用 RRF 按名次融合，并解释不能直接把两路分数相加", dim: principle}
+      - {text: "指出两路必须使用相同的过滤条件，并给出每路候选数需大于最终条数", dim: engineering}
+      - {text: "提到中文分词或自定义词典，保证编号不会被切碎", dim: engineering}
+    reference: |
+      **原因**：Embedding 把整段文本压缩成语义向量，「ERR-4031」和「ERR-4032」、以及泛泛的「错误处理」在语义上高度接近，精确字符差异基本丢失，所以向量检索无法区分具体编号。
+      **方案**：
+      1. 增加关键词检索一路（PostgreSQL 全文检索或 BM25 扩展）。「ERR-4031」出现的文档极少，IDF 很高，精确匹配能把正确手册排到前列。
+      2. 两路各取 30~50 条候选，用 **RRF（k=60）** 按名次融合：score = Σ 1/(60+rank)。不能直接相加原始分数，因为余弦距离、ts_rank、BM25 量纲不同。
+      3. 工程细节：两路的 WHERE（知识库、权限、版本）由同一个函数生成，避免过滤不一致；分词配置要保证「ERR-4031」作为整体词条（自定义词典或 simple 配置处理编码字段）；记录每条结果在两路的名次，便于调试。
+      4. 用评估集对比纯向量与混合检索的 Recall@10，确认收益。
+    followup:
+      question: 如果加了关键词路后，口语化问题的效果反而变差了，可能是什么原因？
+      key_points:
+        - "关键词路给口语问题带来噪声，等权 RRF 把噪声抬上来"
+        - "可对两路加权或按查询类型路由"
+      reference: 口语问题在关键词路上可能命中大量只含常见词的无关片段，等权 RRF 会把这些噪声和向量路的好结果混在一起。可以给向量路更高权重（如 0.7/0.3），或者按查询特征（是否包含编号模式）动态调整权重，再用评估集分别看两类问题的指标。
+  - id: d26-q7
+    kp: d26-k4
+    type: short
+    question: 团队决定在 PostgreSQL + pgvector 上实现中文混合检索。请列出至少 4 个需要注意的技术点。
+    key_points:
+      - {text: "内置配置不支持中文分词，需要 zhparser 或 pg_jieba，或应用层预分词", dim: engineering}
+      - {text: "ts_rank 不是 BM25，排序质量要求高时评估 pg_search 或 pg_textsearch", dim: principle}
+      - {text: "plainto_tsquery 是 AND 语义，长问题容易零结果，可改为 OR", dim: engineering}
+      - {text: "两路使用相同过滤条件，向量路过滤后结果不足要用 iterative scan 或调 ef_search", dim: engineering}
+    reference: |
+      1. **中文分词**：PostgreSQL 内置文本搜索配置没有中文分词，需要安装 zhparser 或 pg_jieba 并创建配置；云数据库先确认是否支持该扩展；不支持时可在应用层分词后用 simple 配置存储。生成列和查询必须使用同一个分词配置。
+      2. **排序算法**：`ts_rank`/`ts_rank_cd` 没有 IDF，不是 BM25；如果关键词路排序质量重要，评估 pg_search 或 pg_textsearch（注意许可证、复制支持，且两者不能装在同一个库）。
+      3. **查询语义**：`plainto_tsquery`/`websearch_to_tsquery` 要求所有词都出现，自然语言问题经常零结果，可以把词项改成 OR 连接，交给排序和 RRF 处理。
+      4. **过滤与索引**：两路 WHERE 完全一致；HNSW 先扫描后过滤，默认 `ef_search=40`，过滤后可能不足 LIMIT，需要 pgvector 0.8+ 的 iterative scan 或调大 ef_search。
+      5. **融合**：用 RRF，每路候选数是最终条数的 3~5 倍以上。
+interview:
+  - id: d26-i1
+    kp: d26-k1
+    type: oral
+    difficulty: 1
+    question: 你们的 RAG 系统 Top-K 取多少？为什么这么取？
+    key_points:
+      - {text: "说明 K 太小会漏召回、太大会引入噪声并增加成本和延迟", dim: concept}
+      - {text: "区分召回 K（候选数）和送入模型的 K", dim: principle}
+      - {text: "提到用评估集上的 Recall@K 等指标调参而不是拍脑袋", dim: engineering}
+      - {text: "结合项目给出具体数字和依据，如召回 40 送入 5", dim: project}
+    reference: |
+      Top-K 是检索返回的条数，本质是**召回率与噪声的权衡**：K 太小，答案排在第 K+1 名就丢了，综合类问题答不全；K 太大，无关片段进入上下文，模型被带偏，Token 成本和首字延迟上升，长上下文中间的信息也容易被忽略。
+      工程上分两层：**召回 K** 取 20~100，目标是 Recall@K 足够高；经过 RRF 融合和 Rerank 后，**送入模型的 K** 取 3~8，并按上下文 Token 预算动态截断。
+      具体数字用评估集确定：画出 Recall@K 随 K 变化的曲线，找到收益明显变平的拐点作为召回 K；送入条数则比较不同条数下的回答正确率和忠实度。K 和阈值作为配置项，可按知识库调整。
+    oral: |
+      我们没有用一个固定的 K，而是分了两层。第一层是召回，每路取 40 条，目标是让答案尽量在候选里，我们用评估集画过 Recall@K 曲线，40 之后基本不涨了。
+      第二层是送给模型的，经过 RRF 融合和 Rerank 后按 2500 Token 预算取 4 到 6 条。之所以不直接给 20 条，是因为无关片段多了模型容易被带偏，成本和延迟也会上去。
+      另外最高 Rerank 分低于阈值时我们直接拒答，避免没有答案时硬编。这些参数都是按知识库配置的，不是写死在代码里。
+  - id: d26-i2
+    kp: d26-k2
+    type: oral
+    difficulty: 2
+    question: BM25 和向量检索有什么区别？各自适合什么场景？
+    key_points:
+      - {text: "说明 BM25 基于词面精确匹配，核心是 IDF、词频饱和、长度归一化", dim: principle}
+      - {text: "说明向量检索基于语义相似，能处理同义改写和口语", dim: concept}
+      - {text: "举出编号、型号、专有名词适合 BM25，口语问题适合向量", dim: concept}
+      - {text: "提到中文 BM25 依赖分词质量，并给出混合检索的结论", dim: engineering}
+    reference: |
+      **BM25 是稀疏检索**：按词面匹配打分，查询里每个词贡献一部分，核心是三点——IDF（稀有词权重高）、词频饱和（出现越多分越高但收益递减）、长度归一化（长文档降权）。它对**精确词**非常敏感：错误码、合同号、型号、人名、内部缩写；缺点是不懂同义词和口语改写，「休假」搜不到「年假」。
+      **向量检索是稠密检索**：用 Embedding 把文本映射到语义空间按距离排序，擅长同义改写、口语问题、跨表述匹配；缺点是会抹平精确字符差异，ERR-4031 和 ERR-4032 几乎分不开，罕见专有名词表示也不稳定。
+      中文场景 BM25 的效果高度依赖分词，切错了就失效。两者互补，所以生产中通常做混合检索，用 RRF 融合，再用评估集验证收益。
+    oral: |
+      我理解 BM25 是按「词」精确匹配打分的，核心是三个直觉：越稀有的词越重要，词频高加分但会饱和，长文档要降权。所以它特别擅长错误码、合同号、产品型号这种精确词。
+      向量检索是按语义接近排序，擅长口语和同义表达，比如「请几天假」能找到「年假管理办法」，但它会把相近编号混在一起。
+      在我们的运维知识库里，纯向量对报警码类问题召回很差，加了 BM25 一路后明显改善。中文要特别注意分词，我们给报警码加了自定义词典，否则会被切碎。
+  - id: d26-i3
+    kp: d26-k3
+    type: oral
+    difficulty: 3
+    question: 为什么混合检索可能比纯向量检索效果好？RRF 是怎么融合的？为什么不直接把分数相加？
+    key_points:
+      - {text: "指出 Embedding 丢失精确字符信息，编号和专有名词召回差，BM25 可以互补", dim: principle}
+      - {text: "写出 RRF 公式 Σ 1/(k+rank)，k 通常 60，并说明两路都靠前的文档会胜出", dim: principle}
+      - {text: "解释两路分数量纲不同，直接相加会被范围大的一路主导", dim: principle}
+      - {text: "提到两路过滤条件一致、每路候选数足够、用评估集验证收益", dim: engineering}
+      - {text: "结合项目说明混合检索带来的指标变化", dim: project}
+    reference: |
+      **为什么更好**：向量检索把文本压缩成语义向量，对编号、型号、新名词等精确信息不敏感；BM25 靠精确匹配和 IDF 恰好能补上。反过来 BM25 不懂同义改写，向量检索能补。两路互补时，融合后的召回通常高于任一单路，但要在自己的评估集上验证。
+      **RRF**：每路各自排序，文档 d 的融合分 = Σ 1/(k + rank_i(d))，k 常取 60，rank 从 1 开始。在两路都排得靠前的文档分数最高，例如两路分别第 6 和第 2 的文档（≈0.0313）会超过只在一路排第 2 的文档（≈0.0161）。k 越大越平滑。
+      **为什么不相加**：余弦距离、ts_rank、BM25 分数量纲和分布完全不同，直接相加会被数值范围大的一路主导；若要用分数融合，需先归一化并调权重，对异常值敏感。RRF 只用名次，绕开了这个问题，几乎不用调参。
+      **工程注意**：两路 WHERE 条件一致；每路候选是最终数量的 3~5 倍以上；记录各路名次便于排查；必要时给两路加权。
+    oral: |
+      结论是：向量和关键词各有盲区，混合检索是互补。向量检索会把 ERR-4031 和 ERR-4032 这种相近编号混在一起，BM25 靠精确匹配和 IDF 正好能补上，而口语化问题又是向量更强。
+      融合我们用 RRF，每路按名次给 1/(60+rank) 分再相加，两路都靠前的文档自然胜出。不直接加分数是因为余弦距离和 BM25 分数量纲不同，相加就被一路主导了。
+      在设备维修知识库里我们每路取 40 条做 RRF，Recall@10 从 0.62 提到 0.88。另外我们强制两路 SQL 共用一个过滤构造函数，避免一路漏掉知识库或权限过滤。
+  - id: d26-i4
+    kp: d26-k4
+    type: oral
+    difficulty: 3
+    question: 如果让你在 PostgreSQL 里实现中文混合检索，你会怎么设计？会遇到哪些坑？
+    key_points:
+      - {text: "给出表结构：tsvector 生成列 + GIN 索引，embedding 列 + HNSW 索引", dim: engineering}
+      - {text: "说明中文分词需要 zhparser 或 pg_jieba，且建索引与查询配置一致", dim: engineering}
+      - {text: "指出 ts_rank 不是 BM25 以及 AND 语义零结果问题", dim: principle}
+      - {text: "说明两路用 CTE 或应用层取候选再 RRF，并处理过滤后 HNSW 结果不足", dim: engineering}
+    reference: |
+      **设计**：chunk 表包含 content、embedding、tsv（`GENERATED ALWAYS AS (to_tsvector('jiebacfg', content)) STORED`）以及 tenant_id、kb_id、doc_id、version 等元数据；tsv 建 GIN 索引，embedding 建 HNSW（vector_cosine_ops）。查询时两个 CTE（或两条 SQL）各取 40 条，用 row_number 得到名次，FULL OUTER JOIN 后按 1/(60+rank) 求和排序；我更倾向在应用层做 RRF，方便记录每路名次和耗时。
+      **坑**：① 内置配置不支持中文，需要 pg_jieba/zhparser，云数据库要确认支持；业务编号要加入自定义词典。② `ts_rank` 不是 BM25（无 IDF），对排序要求高时评估 pg_search/pg_textsearch。③ plainto_tsquery 是 AND 语义，长问题常零结果，改成 OR。④ HNSW 先扫后过滤，`ef_search` 默认 40，带租户过滤时可能不足，需要 iterative scan（0.8.0+）或调参；向量路 LIMIT 不应超过 ef_search。⑤ 两路过滤条件必须一致。
+      **为什么选 PG**：业务数据、权限、向量、全文在一个库里，事务一致、运维简单；数据规模和 QPS 很大或需要复杂搜索功能时再考虑 Elasticsearch/OpenSearch。
+    oral: |
+      我会用一张 chunk 表同时放两种索引：embedding 列建 HNSW，另加一个用 pg_jieba 分词的 tsvector 生成列建 GIN。查询时两路各取 40 条，在应用层用 RRF 融合，这样日志里能看到每条结果在两路的名次。
+      坑我踩过几个：一是中文必须装分词扩展，业务编号要进自定义词典；二是 plainto_tsquery 默认是 AND，长问题经常零结果，我们改成了 OR；三是 ts_rank 没有 IDF，不是真正的 BM25；四是向量路加租户过滤后 HNSW 可能返回不够数，要开 iterative scan。
+      选 PG 主要是想让权限数据和检索在同一个库里，事务一致、运维也简单。
+  - id: d26-i5
+    kp: d26-k3
+    type: design
+    difficulty: 4
+    question: 线上 RAG 系统反馈「答非所问、找不到明明存在的文档」。请说明你如何系统地定位检索层问题，并给出一套检索层的优化方案。
+    key_points:
+      - {text: "先区分没召回（候选里没有答案）和排序差（有但排在后面）两类问题", dim: principle}
+      - {text: "提出构建带标注的评估集，用 Recall@K、MRR 等指标量化并做回归", dim: engineering}
+      - {text: "针对编号类问题引入混合检索，针对排序问题引入 Rerank，针对无答案引入阈值", dim: engineering}
+      - {text: "检查过滤与 ANN 交互、分词、Embedding 模型、切片等根因", dim: engineering}
+      - {text: "提到记录检索日志（每路名次、分数、过滤条件）支撑排查", dim: project}
+    reference: |
+      **第一步：定位**。收集失败问题，人工标注每个问题的正确 chunk，然后看检索日志：
+      - 正确 chunk **不在召回候选里** → 召回问题：检查 Embedding 模型是否适合中文/领域，切片是否把答案切断（Day 23），是否是编号类问题（向量弱项），过滤条件是否错误，HNSW + 过滤是否导致结果不足。
+      - 正确 chunk **在候选里但排名靠后、没被送入模型** → 排序问题：引入 Rerank 或调整融合权重。
+      - 送入了正确 chunk 但回答仍错 → 生成层问题（Day 28），不在检索层改。
+      **第二步：量化**。建立 100~300 条评估集（按问题类型分层：事实类、编号类、综合类、无答案类），离线跑 Recall@K、MRR，形成基线。
+      **第三步：优化**（每改一处跑一次回归）：
+      1. 混合检索：BM25 + 向量，RRF 融合，两路过滤一致，每路 40 条。
+      2. Rerank 精排后按 Token 预算送 3~8 条。
+      3. 阈值判断无答案。
+      4. 修正 iterative scan、分词词典等工程问题。
+      **第四步：可观测**。每次请求记录问题、改写后的查询、每路名次与分数、过滤条件、最终送入的 chunk id，便于复现和持续优化。
+    oral: |
+      我的思路是先分清是「没召回」还是「排序差」。我会拿失败问题标注正确的 chunk，去日志里看它在不在候选里：不在候选里，说明召回有问题，就查 Embedding、切片、过滤条件，以及是不是编号类问题；在候选里但排在后面没送进模型，就是排序问题，用 Rerank 或调融合权重解决。
+      然后建一个分层评估集，跑 Recall@K 和 MRR 作为基线，每做一个优化都回归一次。优化手段一般是混合检索、Rerank、无答案阈值，再加上 HNSW 过滤和分词这类工程修正。
+      之前我们在一个维修知识库就是这么做的，日志里记录了每路名次，定位到 70% 失败是报警码类问题，加了关键词路后 Recall@10 提升了二十多个点。
+code_reading:
+  id: d26-c1
+  kp: [d26-k1, d26-k3, d26-k4]
+  title: PostgreSQL 混合检索与 RRF 融合
+  level: 2
+  scenario: |
+    企业知识库的检索服务。问答接口收到用户问题后，先调用 Embedding 服务得到问题向量，再调用 hybrid_search，
+    在 chunks 表（已安装 pgvector 和 pg_jieba，tsv 为 jiebacfg 分词的生成列）中做向量 + 关键词混合检索，
+    结果交给后续的 Prompt 组装模块。每个部门有独立知识库，用 kb_id 区分。
+  language: python
+  code: |
+    import logging
+    from dataclasses import dataclass, field
+
+    import numpy as np
+    import psycopg
+
+    logger = logging.getLogger("rag.retrieval")
+
+    RRF_K = 60
+    CANDIDATES = 20
+
+
+    @dataclass
+    class Hit:
+        chunk_id: int
+        content: str
+        score: float = 0.0
+        sources: list[str] = field(default_factory=list)
+
+
+    VECTOR_SQL = """
+    SELECT id, content FROM chunks
+    WHERE kb_id = %(kb_id)s
+    ORDER BY embedding <=> %(qvec)s
+    LIMIT %(limit)s
+    """
+
+    KEYWORD_SQL = """
+    SELECT id, content FROM chunks, plainto_tsquery('jiebacfg', %(q)s) query
+    WHERE tsv @@ query
+    ORDER BY ts_rank_cd(tsv, query) DESC
+    LIMIT %(limit)s
+    """
+
+
+    def rrf_fuse(ranked: dict[str, list[tuple[int, str]]], k: int = RRF_K) -> list[Hit]:
+        fused: dict[int, Hit] = {}
+        for source, rows in ranked.items():
+            for rank, (chunk_id, content) in enumerate(rows, start=1):
+                hit = fused.setdefault(chunk_id, Hit(chunk_id, content))
+                hit.score += 1.0 / (k + rank)
+                hit.sources.append(source)
+        return sorted(fused.values(), key=lambda h: h.score, reverse=True)
+
+
+    def hybrid_search(conn: psycopg.Connection, kb_id: int, query: str, qvec: np.ndarray) -> list[Hit]:
+        # conn 创建时已调用 pgvector.psycopg.register_vector(conn)
+        params = {"kb_id": kb_id, "q": query, "qvec": qvec, "limit": CANDIDATES}
+        ranked: dict[str, list[tuple[int, str]]] = {}
+        with conn.cursor() as cur:
+            cur.execute(VECTOR_SQL, params)
+            ranked["vector"] = cur.fetchall()
+            try:
+                cur.execute(KEYWORD_SQL, params)
+                ranked["keyword"] = cur.fetchall()
+            except psycopg.Error:
+                logger.exception("keyword search failed, fallback to vector only")
+                conn.rollback()
+                ranked["keyword"] = []
+        hits = rrf_fuse(ranked)
+        logger.info("hybrid kb=%s vec=%d kw=%d fused=%d",
+                    kb_id, len(ranked["vector"]), len(ranked["keyword"]), len(hits))
+        return hits[:5]
+  walkthrough:
+    function: |
+      对同一张 chunks 表执行两路检索：向量路按余弦距离取最近的 20 条，关键词路用 pg_jieba 分词后的全文检索按 ts_rank_cd 取 20 条；
+      然后用 RRF（k=60）按名次融合两份列表，返回融合分最高的 5 条 Hit，每条记录它来自哪一路（sources）。
+    key_functions: |
+      - `VECTOR_SQL`：带 kb_id 过滤的向量检索，`<=>` 是余弦距离，升序即最相似。
+      - `KEYWORD_SQL`：`plainto_tsquery('jiebacfg', q)` 把问题分词成 tsquery，`tsv @@ query` 走 GIN 索引匹配，按 ts_rank_cd 排序。
+      - `rrf_fuse`：遍历每一路结果，名次从 1 开始，对同一 chunk 累加 1/(k+rank)，并记录来源，最后按分数降序。
+      - `hybrid_search`：组织参数、执行两路查询、关键词路失败时降级为只用向量路，记录日志并截取前 5 条。
+    params: |
+      调用方传入数据库连接 conn、知识库 kb_id、原始问题 query、问题向量 qvec（numpy 数组，依赖连接上已注册 pgvector 类型适配）。
+      四个值打包进 params 字典，以命名占位符 `%(name)s` 同时传给两条 SQL，由 psycopg 做参数化，避免 SQL 注入。
+      候选数来自模块常量 CANDIDATES=20，RRF 的 k 来自 RRF_K=60，最终返回条数写死为 5。
+    data_flow: |
+      ```mermaid
+      sequenceDiagram
+        participant API as 问答接口
+        participant HS as hybrid_search
+        participant DB as PostgreSQL
+        participant F as rrf_fuse
+        API->>HS: kb_id 问题 问题向量
+        HS->>DB: VECTOR_SQL 带 kb_id 过滤 取 20 条
+        DB-->>HS: 向量路 id 和 content
+        HS->>DB: KEYWORD_SQL 未带 kb_id 过滤 取 20 条
+        DB-->>HS: 关键词路 id 和 content
+        HS->>F: 两路名次列表
+        F-->>HS: 按 RRF 分数降序的 Hit 列表
+        HS-->>API: 前 5 条 Hit
+      ```
+    failure_points: |
+      - **过滤不一致（安全问题）**：KEYWORD_SQL 没有 `WHERE kb_id = ...`，关键词路会召回其他部门知识库的 chunk，经 RRF 融合后可能进入最终结果，造成越权泄露。
+      - **Top-K 写死**：候选数 20 和返回条数 5 都写死，无法按知识库、问题类型或 Token 预算调整；每路 20 条对融合来说空间偏小。
+      - **AND 语义零结果**：plainto_tsquery 要求所有词都出现，长问题常导致关键词路为空，此时混合检索退化为纯向量，但日志里只能看到 kw=0。
+      - **HNSW + 过滤不足数**：kb_id 选择性高时，默认 ef_search=40 先扫后过滤，向量路可能少于 20 条。
+      - **未注册 vector 类型**：连接没调用 register_vector 时，numpy 数组无法作为参数传入，会抛类型适配异常。
+      - 关键词路异常后 rollback 会结束当前事务，若调用方在同一事务里还有其他操作会受影响。
+    debugging: |
+      - 看 `hybrid kb=... vec=... kw=...` 日志：kw 长期为 0 说明分词或 AND 语义有问题；vec 小于 20 说明过滤与 HNSW 交互导致不足数。
+      - 对失败问题在 psql 里单独执行两条 SQL，并用 `SELECT to_tsquery('jiebacfg', '问题')` 查看分词结果。
+      - 在 rrf_fuse 中打印每个 chunk 的 sources 和两路名次，确认融合是否符合预期。
+      - 用 `EXPLAIN ANALYZE` 确认两路都走了索引（HNSW、GIN）。
+      - 构造一个其他 kb 中独有关键词的问题，验证是否会返回其他知识库的数据（复现越权问题）。
+    change_request: |
+      - **修复越权**：抽出 `build_filter(kb_id, user)` 生成同一份 WHERE 子句，同时用于两条 SQL；增加测试覆盖。
+      - **参数可配**：hybrid_search 增加 `candidates`、`top_n` 参数，由调用方根据知识库配置和 Token 预算传入。
+      - **加权 RRF**：rrf_fuse 增加 `weights: dict[str, float]`，score += weights[source] / (k + rank)。
+      - **关键词路 OR 语义**：把 plainto_tsquery 改成用分词结果以 `|` 拼接的 to_tsquery，或换用 BM25 扩展。
+      - **开启迭代扫描**：执行向量 SQL 前 `SET LOCAL hnsw.iterative_scan = relaxed_order`。
+  questions:
+    - id: d26-c1-q1
+      kp: d26-k3
+      type: code
+      question: 假设向量路返回 [c7, c3, c9]，关键词路返回 [c3, c12]。按代码执行顺序说明 rrf_fuse 如何计算，每个 chunk 的分数和最终顺序是什么？sources 字段分别是什么？
+      key_points:
+        - {text: "说明 enumerate 从 1 开始，按来源依次遍历两个列表", dim: principle}
+        - {text: "正确算出 c3 = 1/62 + 1/61，排第一", dim: principle}
+        - {text: "正确给出 c7 = 1/61，c12 = 1/62，c9 = 1/63 的顺序", dim: principle}
+        - {text: "说明 setdefault 保证同一 chunk 只创建一次 Hit，sources 记录两路来源", dim: concept}
+      reference: |
+        rrf_fuse 先遍历 vector 列表：c7 名次 1，得 1/61≈0.01639；c3 名次 2，得 1/62≈0.01613；c9 名次 3，得 1/63≈0.01587。
+        再遍历 keyword 列表：c3 名次 1，`setdefault` 取到已有的 Hit，累加 1/61，总分≈0.03252；c12 名次 2，新建 Hit 得 1/62≈0.01613。
+        最终降序：c3（0.0325，sources=[vector, keyword]）> c7（0.0164，[vector]）> c12（0.0161，[keyword]）> c9（0.0159，[vector]）。
+        c3 在两路都出现，所以排第一，体现了 RRF「被两种方法同时认可」的思想。c12 与向量路第 2 名分数相同（都是 1/62），排序按 sorted 的稳定性保持插入顺序。
+    - id: d26-c1-q2
+      kp: d26-k3
+      type: code
+      question: 这段代码里有两个值得在代码审查中提出的问题（一个安全问题、一个可维护性/效果问题）。请找出来，说明会造成什么后果，以及怎么改。
+      key_points:
+        - {text: "指出 KEYWORD_SQL 缺少 kb_id 过滤，两路过滤不一致", dim: engineering}
+        - {text: "说明后果：其他知识库的 chunk 经 RRF 进入结果，造成越权泄露", dim: principle}
+        - {text: "指出 CANDIDATES=20 和 hits[:5] 写死，无法按配置或 Token 预算调整", dim: engineering}
+        - {text: "给出修改：统一过滤构造函数，候选数与返回数参数化", dim: engineering}
+      reference: |
+        **问题一（安全）**：VECTOR_SQL 有 `WHERE kb_id = %(kb_id)s`，KEYWORD_SQL 没有。关键词路会在全表检索，其他部门知识库中含相同关键词的 chunk 会被召回，并通过 RRF 融合进最终结果，发给 LLM 和用户，造成越权泄露。因为向量路过滤正确，普通测试很难发现。
+        修改：抽出统一的过滤构造函数（包含 kb_id、租户、权限、版本），两条 SQL 都使用；增加「其他知识库独有关键词不应被检索到」的测试。
+        **问题二（Top-K 写死）**：每路候选 20、最终返回 5 都是常量。不同知识库、不同问题类型需要的数量不同；送入模型的条数应由 Token 预算决定；每路 20 条对融合来说偏少，一路排 25 名的好结果无法被另一路救回。
+        修改：hybrid_search 增加 candidates、top_n 参数，从知识库配置读取，并保证向量路候选不超过 ef_search 或同步调参。
+    - id: d26-c1-q3
+      kp: d26-k1
+      type: code
+      question: 需求变更：「当知识库里没有相关内容时，检索服务应该返回空列表，让上层回复『未找到』。」只用当前代码中的 RRF 分数能做到吗？你会怎么修改？
+      key_points:
+        - {text: "指出 RRF 分数只反映名次，不反映绝对相关度，无法判断无答案", dim: principle}
+        - {text: "提出需要保留向量相似度（1 减距离）或 Rerank 分作为绝对分数", dim: engineering}
+        - {text: "说明阈值需要在评估集上标定，并修改 SQL 返回距离列", dim: engineering}
+      reference: |
+        不能。RRF 分数只由名次决定：无论知识库里有没有答案，第一名总能拿到 1/61 左右的分数，它不反映「到底有多相关」。
+        修改方式：
+        1. 在 VECTOR_SQL 中返回距离：`SELECT id, content, embedding <=> %(qvec)s AS distance`，在 Hit 上保存 `vec_sim = 1 - distance`；
+        2. 更推荐在融合后接 Rerank，用 cross-encoder 的相关度分数（如 normalize 后的 0~1 分）作为绝对分；
+        3. 在评估集上标定阈值：最高分低于阈值时返回空列表，由上层走拒答分支；
+        4. 阈值写入知识库配置，并在日志中记录最高分，方便后续调整。
+sources:
+  - {title: "pgvector README", url: "https://github.com/pgvector/pgvector"}
+  - {title: "DigitalOcean Docs - How to Query with Hybrid Search（PostgreSQL + pgvector + RRF）", url: "https://docs.digitalocean.com/products/vector-databases/postgresql/how-to/use-hybrid-search/"}
+  - {title: "Cormack et al. 2009 - Reciprocal Rank Fusion", url: "https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf"}
+  - {title: "ParadeDB - Implementing BM25 in PostgreSQL", url: "https://www.paradedb.com/learn/search-in-postgresql/bm25"}
+  - {title: "timescale/pg_textsearch", url: "https://github.com/timescale/pg_textsearch"}

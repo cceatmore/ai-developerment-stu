@@ -1,0 +1,718 @@
+day: 33
+phase: 4
+title: Tool Calling：工具注册、执行与结果反馈
+goals:
+  - 能设计一个工具注册表，说明它如何让工具定义（给模型看）与实现（给程序跑）保持一致
+  - 能设计工具执行器：参数校验、超时、错误分类与回传、结果序列化与截断
+  - 能分析并行工具调用的并发控制问题，区分只读工具与有副作用工具
+  - 能评审一个工具的描述和参数设计，指出会让模型用错的地方
+knowledge_points:
+  - id: d33-k1
+    name: 工具注册表：定义与实现的单一事实来源
+    level: P0
+    summary: 注册表把函数、参数 Schema、描述和元数据登记在一处，自动生成给模型的定义，并按场景筛选工具
+    why: |
+      Day 18 讲的是 API 层：怎么在请求里声明 tools、模型怎么返回调用。真实 Agent 有十几到上百个工具，**谁来维护这些定义、怎么保证定义和代码不脱节、不同用户看到哪些工具**，是运行时层面的问题。
+      面试问「你们的工具是怎么管理的」，能讲出注册表设计的人明显比只会写 tools 数组的人高一个层次。
+    problem: |
+      手写 tools JSON 数组 + 一个 if/else 分发函数，会出现：
+      - 改了函数参数忘了改 Schema，模型按旧参数调用，运行时报错；
+      - 工具名拼写不一致，分发时找不到；
+      - 所有用户都拿到全部工具，管理员工具暴露给普通用户；
+      - 工具越来越多，所有定义都塞进上下文，Token 浪费且模型更容易选错。
+    principle: |
+      **一、注册表要登记什么**
+
+      | 字段 | 用途 | 谁用 |
+      |---|---|---|
+      | name | 唯一标识，模型按它调用 | 模型 + 运行时 |
+      | description | 什么时候用、返回什么、和其他工具的边界 | 模型 |
+      | 参数 Schema | 参数类型、格式、必填、说明 | 模型 + 校验 |
+      | 实现函数 | 真正执行的代码 | 运行时 |
+      | 元数据 | 超时、是否有副作用、所需权限、是否需人工确认 | 运行时 |
+
+      核心原则：**Schema 从代码生成，而不是手写**。用 Python 类型注解或 Pydantic 模型定义参数，注册时自动生成 JSON Schema。这样改参数时只改一处，定义和实现不会脱节。
+
+      ```mermaid
+      classDiagram
+        class ToolSpec {
+          name
+          description
+          args_model
+          func
+          timeout_s
+          side_effect
+          required_role
+        }
+        class ToolRegistry {
+          register()
+          schemas_for(user)
+          get(name)
+        }
+        class ToolExecutor {
+          execute(call)
+          execute_all(calls)
+        }
+        ToolRegistry "1" --> "many" ToolSpec : 管理
+        ToolExecutor --> ToolRegistry : 查表
+      ```
+
+      **二、工具的生命周期**
+
+      ```mermaid
+      flowchart LR
+        A["启动时注册：函数加参数模型加元数据"] --> B["生成 JSON Schema"]
+        B --> C["每次请求按用户权限和场景筛选子集"]
+        C --> D["随请求发给模型"]
+        D --> E["模型返回工具名加参数"]
+        E --> F["执行器按名查表"]
+        F --> G["校验参数后执行"]
+        G --> H["序列化结果并回传"]
+      ```
+
+      **三、按场景筛选（动态工具集）**
+
+      注册表里有全部工具，但每次请求只给模型**当前用户有权限、当前场景需要的**子集：
+      - 权限：普通员工看不到 reset_password；
+      - 场景：客服会话不需要代码执行工具；
+      - 数量：OpenAI 文档建议一个回合开始时可用的函数**少于 20 个**（软建议），工具很多时用 namespace 分组或 tool_search 延迟加载（仅部分新模型支持）。
+
+      **注意**：筛选只是第一道防线。执行器执行前**还要再校验一次权限**，因为模型可能「幻觉」出一个没给它的工具名，或者被 Prompt Injection 诱导。
+
+      **四、框架里的对应物**
+
+      LangChain 的 `@tool` 装饰器就是一个轻量注册器：从函数名、类型注解、docstring 自动生成 name、description 和参数 Schema（BaseTool 对象上的 `.name`、`.description`、`.args`）。MCP Server（Day 38）则是把注册表放到独立进程，通过协议对外暴露工具列表。
+
+      **五、不这样做会怎样**
+
+      没有注册表的系统，工具定义散落在各处，新增一个工具要改三个地方；权限靠 Prompt 里一句「不要调用管理员工具」，被注入一句话就能绕过。
+    scenarios: |
+      - **企业助手**：注册 40 多个工具，按部门和角色动态下发，每次请求只带 8~15 个。
+      - **多租户 SaaS**：租户开通了哪些集成（CRM、工单），注册表就只下发对应工具。
+      - **灰度上线新工具**：元数据里加版本号和开关，只对部分用户可见。
+    code: |
+      LangChain 1.x 中用 `@tool` 从函数生成工具定义（`from langchain.tools import tool`，也可从 `langchain_core.tools` 导入）：
+
+      ```python
+      from langchain.tools import tool
+
+      @tool
+      def get_order(order_id: str) -> dict:
+          """按订单号查询订单状态、金额和物流单号。订单号格式为 SO 加 8 位数字。"""
+          return {"order_id": order_id, "status": "shipped"}
+
+      print(get_order.name)         # get_order
+      print(get_order.description)  # 来自 docstring
+      print(get_order.args)         # 由类型注解生成的参数 Schema
+      print(get_order.invoke({"order_id": "SO12345678"}))
+      ```
+    pitfalls: |
+      - **误区：工具定义手写一份 JSON 就行。** 手写 Schema 和函数签名迟早不一致，应从代码生成。
+      - **误区：没下发给模型的工具就不会被调用。** 模型可能编造工具名，执行器必须查表并二次鉴权。
+      - **误区：工具越多 Agent 越强。** 工具越多，模型越容易选错，上下文越贵；按场景筛选比全量下发好。
+      - **忽略重名**：两个模块注册同名工具，后注册的覆盖前一个，行为悄悄改变。注册时应检测重名直接报错。
+    interview_asks:
+      - 你们 Agent 的工具是怎么管理和注册的？
+      - 工具很多（比如上百个）时怎么办？
+      - 工具权限怎么控制？只靠不下发够吗？
+    project_example: |
+      企业助手项目初期把 30 多个工具全量下发，模型经常把 search_hr_policy 和 search_it_policy 用混，单次请求工具定义就占了约 4000 Token。
+      我们做了注册表：每个工具声明 required_role 和 scene 标签，请求时按「用户角色 + 当前入口」筛选，平均只下发 9 个工具。执行器执行前再按 required_role 校验一次。工具误选率明显下降，输入 Token 也减少了约三分之一。
+    freshness: |
+      核对于 2026-11：OpenAI Function calling 指南建议「一个回合开始时可用函数少于 20 个（软建议）」，并支持 namespace 分组和 tool_search 延迟加载（文档注明仅 gpt-5.4 及以后的模型支持 tool_search）。LangChain 1.x（langchain 1.5.0 / langchain-core 1.8.0）中 `from langchain.tools import tool` 可用，已在本地安装验证导入。
+    sources:
+      - {title: "OpenAI Docs - Function calling", url: "https://platform.openai.com/docs/guides/function-calling"}
+      - {title: "LangChain Docs - Agents（Tools 部分）", url: "https://docs.langchain.com/oss/python/langchain/agents"}
+
+  - id: d33-k2
+    name: 工具执行器：校验、超时、错误回传与结果反馈
+    level: P0
+    summary: 执行器把模型的调用意图变成安全的执行，并把成功或失败都变成模型看得懂的结果回传，而不是让异常打断循环
+    why: |
+      Agent 线上故障大部分发生在工具执行这一层：参数不对、外部接口超时、返回数据太大、异常没接住。
+      执行器设计得好，Agent 遇到错误能自己修正；设计得差，一个工具报错就让整个请求 500。这正是面试中「Agent 的异常怎么处理」要考察的点。
+    problem: |
+      模型给出的调用不可信，外部服务也不可靠：
+      - 工具名可能不存在，参数可能缺字段、类型错、格式不符合业务规则；
+      - 外部接口可能超时、限流、返回 5xx；
+      - 工具代码本身可能有 bug；
+      - 结果可能是几万字的数据，直接塞回去会撑爆上下文。
+      执行器需要对每种情况给出明确的处理策略。
+    principle: |
+      **一、执行流程**
+
+      ```mermaid
+      flowchart TD
+        A["收到工具调用：name、arguments、call_id"] --> B{"工具存在且有权限吗"}
+        B -- "否" --> X1["回传错误：工具不存在或无权限"]
+        B -- "是" --> C{"参数通过 Schema 和业务校验吗"}
+        C -- "否" --> X2["回传错误：具体哪个参数不对、正确格式是什么"]
+        C -- "是" --> D{"需要人工确认吗"}
+        D -- "是" --> X3["暂停，等待确认"]
+        D -- "否" --> E["带超时执行"]
+        E --> F{"结果"}
+        F -- "成功" --> G["序列化、截断、标注"]
+        F -- "临时错误" --> H["有限次退避重试"]
+        F -- "业务错误" --> X4["回传可操作的错误信息"]
+        F -- "程序缺陷" --> X5["记录告警，向上抛或返回通用错误"]
+        G --> R["按 call_id 回传结果"]
+        X1 --> R
+        X2 --> R
+        X4 --> R
+      ```
+
+      **二、错误分类：回传、重试还是抛出**
+
+      | 错误类型 | 例子 | 推荐处理 |
+      |---|---|---|
+      | 工具不存在 / 无权限 | 模型编造工具名 | 回传错误并列出可用工具 |
+      | 参数不合法 | 订单号格式错、日期倒置 | **回传给模型**，说明哪里错、正确格式 |
+      | 业务失败 | 订单不存在、余额不足 | 回传给模型，让它换思路或告知用户 |
+      | 临时故障 | 超时、429、5xx | 执行器内**有限次重试**，仍失败再回传「服务暂不可用」 |
+      | 程序缺陷 | 代码 bug、空指针 | 记录告警；不要伪装成参数问题让模型反复重试 |
+
+      LangChain v1 文档给出的建议与此一致：用 `wrap_tool_call` 中间件把「参数通过 Schema 但运行时不合法」的错误转为工具消息回传；网络故障交给重试中间件；实现错误应该冒泡。LangGraph 的 `ToolNode` 默认也只捕获**参数调用错误**并回传，**工具执行中的异常会重新抛出**（可通过 `handle_tool_errors` 配置）。
+
+      **三、超时**
+
+      - 每个工具单独设超时（查缓存 2 秒、查报表 30 秒），外层还要有整个 Agent 的总超时。
+      - Python 异步工具用 `asyncio.wait_for` 或 `asyncio.timeout` 控制；**同步函数放进线程池后，超时只是不再等待，线程里的代码仍在运行**，真正的取消要靠底层客户端自身的超时（例如 HTTP 客户端的 timeout 参数）。
+
+      **四、结果反馈：给模型看的结果也是 Prompt**
+
+      - **每个调用都要有结果**：模型发出 N 个调用，就要按 call_id 回传 N 个结果，缺失通常会导致下一次 API 调用报错（以各家文档为准）。
+      - **序列化**：统一转成 JSON 字符串，日期、Decimal 等要能序列化。
+      - **只返回高信号字段**：Anthropic 建议避免返回 uuid、mime_type 这类低层标识，优先返回名称等有语义的字段。
+      - **截断并说明**：超长结果截断并写明「已截断，共 N 条，可用 page 参数翻页」，引导模型用更精确的查询。
+      - **错误信息可操作**：「order_id 格式应为 SO 加 8 位数字，你传入的是 12345」远好于「ValidationError」或一整段堆栈。
+
+      **五、不这样做会怎样**
+
+      异常直接抛出：一个工具超时就让整个请求失败，前面几步的结果白做。错误信息不可读：模型看到一段堆栈，不知道该改什么，只能原样重试，形成空转。
+    scenarios: |
+      - **订单查询**：参数校验失败回传格式说明；订单不存在回传「未找到该订单，请向用户确认订单号」。
+      - **报表工具**：查询可能 20 秒，单独设 30 秒超时；超时回传「报表生成较慢，建议缩小日期范围」。
+      - **外部天气 API**：429 时退避重试 2 次，仍失败回传「服务暂时不可用」，模型据此告知用户。
+    pitfalls: |
+      - **误区：工具异常都应该回传给模型。** 程序 bug 回传只会让模型反复重试同一个必然失败的调用，应该告警并终止或降级。
+      - **误区：asyncio.wait_for 能杀掉同步函数。** 线程池里的同步代码不会被中断，必须给底层客户端设置超时。
+      - **漏回传**：并行调用中某个工具失败时直接 return，导致它的 call_id 没有结果，下一轮 API 报错。
+      - **把堆栈原样回传**：既浪费 Token，又可能泄露内部路径、SQL 等敏感信息。
+    interview_asks:
+      - 工具调用失败了怎么办？你们怎么把错误反馈给模型？
+      - 工具执行超时怎么处理？
+      - 工具返回的数据很大怎么办？
+    project_example: |
+      客服 Agent 的物流查询工具依赖第三方接口，高峰期偶发 3 秒以上超时。最初异常直接抛出，导致约 2% 的会话整体失败。
+      重构执行器后：物流工具单独 5 秒超时、对超时和 5xx 退避重试 1 次；仍失败则回传「物流系统繁忙，可稍后再查或提供快递公司官网查询方式」。参数错误回传具体格式说明。整体失败率降到 0.1% 以下，且 trace 中能按错误类型统计各工具的健康度。
+    freshness: |
+      核对于 2026-11：LangGraph `ToolNode` 参考文档中 `handle_tool_errors` 默认值为 `_default_handle_tool_errors`，说明为「捕获因模型参数无效导致的调用错误并返回描述性消息，工具执行错误会被重新抛出」。旧版本教程中常见「ToolNode 默认捕获所有异常」的说法，与当前默认行为不同，以当前文档为准。LangChain v1 迁移指南示例使用 `@wrap_tool_call` 中间件自定义工具错误处理，并注明网络错误应使用工具重试中间件。
+    sources:
+      - {title: "LangGraph Reference - ToolNode", url: "https://reference.langchain.com/python/langgraph.prebuilt/tool_node/ToolNode"}
+      - {title: "LangChain v1 migration guide（Handling tool errors）", url: "https://docs.langchain.com/oss/python/migrate/langchain-v1"}
+      - {title: "Anthropic - Writing effective tools for agents", url: "https://www.anthropic.com/engineering/writing-tools-for-agents"}
+
+  - id: d33-k3
+    name: 并行工具调用与并发控制
+    level: P1
+    summary: 模型一轮可能返回多个调用；只读且独立的可以并发，有副作用的要串行或加幂等，单个失败不能拖垮整批
+    why: |
+      主流模型默认可以在一轮中返回多个工具调用（例如同时查三个城市天气）。并发执行能显著降低延迟，但处理不好会出现整批失败、重复写入、打爆下游接口等问题。
+      这是 Day 6 asyncio 知识在 Agent 中的直接应用，也是面试常见的工程追问。
+    problem: |
+      - 一轮 3 个调用串行执行，延迟是三者之和；
+      - 并发执行时，一个失败可能让 gather 直接抛异常，其他结果丢失；
+      - 两个调用都是「创建退款」，并发执行可能重复退款；
+      - 一次并发 20 个调用，下游接口被限流。
+    principle: |
+      **一、模型侧：一轮多个调用**
+
+      OpenAI 文档明确：模型一次响应可能包含零个、一个或多个工具调用，**最佳实践是默认按多个处理**；可以设置 `parallel_tool_calls=false` 限制每轮最多一个调用。
+
+      **二、执行侧：按工具性质分组**
+
+      ```mermaid
+      sequenceDiagram
+        participant L as LLM
+        participant X as 执行器
+        participant A as 只读工具 A
+        participant B as 只读工具 B
+        participant W as 写操作工具
+        L->>X: 一轮返回三个调用
+        par 只读调用并发执行
+          X->>A: 查询城市一
+          X->>B: 查询城市二
+        end
+        A-->>X: 结果
+        B-->>X: 超时错误，转为错误结果
+        X->>W: 写操作单独串行执行
+        W-->>X: 结果
+        X-->>L: 三个结果按 call_id 回传
+      ```
+
+      - **只读、互不依赖**：并发执行。
+      - **有副作用（写库、发消息、付款）**：串行执行，并带**幂等键**（同一 call_id 或业务键只执行一次），必要时需人工确认。
+      - **有依赖关系**：模型一般会分到不同轮次；若同一轮出现，按顺序执行。
+
+      **三、asyncio 的关键细节**
+
+      - `asyncio.gather(*tasks)` 默认**遇到第一个异常就向调用方抛出**，其他任务不会被自动取消、仍在后台运行，但你已经拿不到它们的结果。
+      - 解决：`gather(..., return_exceptions=True)` 让异常作为结果返回；或者在每个执行函数内部 try/except，保证**每个调用都返回一个结果**（推荐，错误信息更可控）。
+      - 用 `asyncio.Semaphore` 限制同时执行的数量，保护下游。
+      - 结果按 call_id 对应，不依赖完成顺序。
+
+      **四、不这样做会怎样**
+
+      并发但不隔离错误：一个慢接口超时，整批结果丢失，模型得不到任何观察，只能重新发起全部调用，延迟和成本翻倍。写操作并发：模型对同一订单发出两次退款调用，两次都执行成功。
+    scenarios: |
+      - **出行助手**：同时查天气、航班、酒店，三者并发，总延迟取最慢一个。
+      - **数据看板 Agent**：同时查 5 个指标，Semaphore 限制最多 3 个并发，避免打爆数据库。
+      - **批量通知**：发送消息属于写操作，串行并按「用户 + 消息模板 + 日期」做幂等键。
+    pitfalls: |
+      - **误区：并发越多越快。** 下游有连接池和限流，过高并发反而导致大量 429 和超时。
+      - **误区：模型不会对同一操作发两次调用。** 模型可能在同一轮或相邻轮重复调用写工具，必须靠幂等兜底。
+      - **混淆**：`parallel_tool_calls` 控制的是**模型是否在一轮里返回多个调用**，不是你的代码是否并发执行。
+    interview_asks:
+      - 模型一次返回多个工具调用，你怎么执行？
+      - 并发执行工具时，一个失败了怎么办？
+      - 怎么防止 Agent 重复执行写操作？
+    project_example: |
+      出行助手中，模型常在一轮里同时调用 get_weather、search_flights、search_hotels。最初串行执行，平均工具耗时约 4.5 秒；改为 gather 并发后降到约 2 秒。
+      但上线第一周发现航班接口偶发超时会让整批失败，于是改成每个调用内部 try/except 返回错误结果，并对 book_hotel 等写工具强制串行、用 call_id 做幂等键。
+    freshness: |
+      核对于 2026-11：OpenAI Function calling 指南写明「模型响应可能包含零个、一个或多个调用，最佳实践是默认按多个处理」，`parallel_tool_calls` 设为 false 可保证每轮零个或一个调用。asyncio.gather 行为依据 Python 官方文档。
+    sources:
+      - {title: "OpenAI Docs - Function calling（Parallel function calling）", url: "https://platform.openai.com/docs/guides/function-calling"}
+      - {title: "Python Docs - asyncio.gather", url: "https://docs.python.org/3/library/asyncio-task.html#asyncio.gather"}
+
+  - id: d33-k4
+    name: 工具描述与参数设计质量
+    level: P1
+    summary: 工具描述是写给模型看的 Prompt；名称、描述、参数和返回内容的设计直接决定模型会不会用错
+    why: |
+      Anthropic 在开发 SWE-bench Agent 时提到，他们**优化工具花的时间比优化整体 Prompt 还多**。很多「模型不聪明」的问题，根源是工具描述含糊、参数容易填错、返回内容难以理解。
+      这是最容易被忽视、但投入产出比最高的优化点。
+    problem: |
+      常见的糟糕工具设计：
+      - 名称含糊：`query`、`search`、`get_data`，模型不知道该用哪个；
+      - 描述只有一句「查询数据」，不说明什么时候用、返回什么；
+      - 参数可以填相对路径、自由格式日期，模型经常填错；
+      - 返回一大段原始 JSON，夹杂大量无用的内部 ID。
+    principle: |
+      **一、把工具当作给新同事写的接口文档**
+
+      Anthropic 提出 ACI（Agent-Computer Interface）的概念：设计给模型用的接口，要投入和设计人机界面一样多的精力。检查方法：**站在模型的角度，只看名称、描述、参数，能不能一眼知道怎么用？**
+
+      **二、五个设计要点**
+
+      | 要点 | 差的写法 | 好的写法 |
+      |---|---|---|
+      | 名称有命名空间 | search | crm_search_customers、jira_search_issues |
+      | 描述写清用途和边界 | 查询订单 | 按订单号查当前用户的订单状态和物流单号；查物流轨迹请用 get_logistics |
+      | 参数防呆（poka-yoke） | path 可以是相对路径 | 必须是绝对路径；日期用 YYYY-MM-DD 并给示例 |
+      | 返回高信号内容 | 原始 JSON 带 uuid、mime_type | 名称、状态、关键数字；需要 ID 时再提供 |
+      | 错误信息可操作 | ValidationError | 「start_date 不能晚于 end_date，你传入的是……」 |
+
+      Anthropic 举过一个例子：他们发现模型调用 web search 时会无意义地在 query 末尾加年份，改进工具描述后才纠正。
+
+      **三、合并与拆分**
+
+      - **频繁串联的操作可以合并**：如果模型总是「查用户 → 查订单 → 查物流」，提供一个 `get_order_overview` 一次返回，减少步数（Day 31 的错误累积）。
+      - **相似工具要拉开边界**：两个都能搜索的工具，描述里必须写清楚各自数据范围。
+      - **可选详略**：Anthropic 建议可以提供 `response_format` 参数（concise / detailed），让模型按需选择是否返回 ID 等细节。
+
+      **四、如何验证**
+
+      ```mermaid
+      flowchart LR
+        A["写工具定义"] --> B["用真实问题跑评估集"]
+        B --> C["统计：误选率、参数错误率、重复调用、Token"]
+        C --> D["改名称、描述、参数、返回格式"]
+        D --> B
+      ```
+      参数错误多 → 描述或示例不清；重复调用多 → 分页或返回内容需要调整。
+    scenarios: |
+      - 文件工具强制绝对路径，避免 Agent 切换目录后路径错乱（Anthropic SWE-bench 实践）。
+      - 日期参数在描述中给示例「2026-11-01」，并在校验失败时回传正确格式。
+      - CRM 和工单系统都有搜索，命名为 crm_search_customers 和 ticket_search，并在描述中写明数据范围。
+    pitfalls: |
+      - **误区：描述越短越省 Token。** 含糊的描述导致选错和重试，浪费的 Token 远多于几十字描述。
+      - **误区：模型能自己理解业务术语。** 「有效订单」在你们公司的定义要写进描述。
+      - **只改 Prompt 不改工具**：模型反复填错参数时，改参数设计（枚举、格式约束）往往比在 System Prompt 里加警告更有效。
+    interview_asks:
+      - 怎样写一个好的工具描述？
+      - 模型总是选错工具或填错参数，你会怎么优化？
+    project_example: |
+      HR 助手里有 search_policy 和 search_announcement 两个搜索工具，模型约有 15% 的问题选错。
+      我们把名称改为 hr_policy_search 和 company_news_search，描述里写明「制度类问题（假期、报销、考勤）用前者，活动和通知用后者」，并给出两个示例问题；date 参数改为 YYYY-MM-DD 格式并附示例。评估集上误选率降到 3% 左右。
+    sources:
+      - {title: "Anthropic - Writing effective tools for agents", url: "https://www.anthropic.com/engineering/writing-tools-for-agents"}
+      - {title: "Anthropic - Building effective agents（Appendix 2）", url: "https://www.anthropic.com/engineering/building-effective-agents"}
+      - {title: "OpenAI Docs - Function calling（Best practices）", url: "https://platform.openai.com/docs/guides/function-calling"}
+
+quiz:
+  - id: d33-q1
+    kp: d33-k1
+    type: single
+    question: 关于工具注册表中的权限控制，以下哪种做法最稳妥？
+    options:
+      - "在 System Prompt 中写明「普通用户不得调用 reset_password」"
+      - "按用户角色只下发有权限的工具定义给模型，执行器无需再检查"
+      - "按用户角色筛选下发的工具，同时执行器执行前根据注册表元数据再次校验权限"
+      - "把所有工具都下发给模型，依靠模型判断用户是否有权限"
+    answer: [2]
+    explain: |
+      C 是纵深防御：筛选下发减少误用和 Token，执行前二次校验防止模型编造工具名或被注入诱导调用。A 和 D 把权限交给模型判断，Prompt Injection 一句话就可能绕过。B 看似合理，但模型可能输出没下发过的工具名，执行器如果直接按名查表执行就会越权。
+  - id: d33-q2
+    kp: d33-k2
+    type: judge
+    question: 用 asyncio.wait_for 包住 asyncio.to_thread(同步函数) 并设置 5 秒超时，超时后该同步函数会被立即终止，不会再对外部系统产生任何影响。
+    answer: false
+    explain: |
+      wait_for 超时只是让调用方不再等待并抛出 TimeoutError，线程池里的同步代码不会被中断，仍会继续执行直到结束，可能在之后完成写库或发请求。真正可靠的做法是给底层客户端（HTTP、数据库驱动）设置自身超时；有副作用的工具还需要幂等设计。
+  - id: d33-q3
+    kp: d33-k3
+    type: multi
+    question: 模型在一轮中返回了 3 个工具调用：get_weather（北京）、get_weather（上海）、create_refund（订单 A）。以下哪些处理是合理的？
+    options:
+      - "两个 get_weather 并发执行，create_refund 单独串行执行并使用幂等键"
+      - "用 asyncio.gather 并发执行全部三个，不设 return_exceptions，任一失败就整体重试"
+      - "保证三个调用都按各自 call_id 回传结果，即使其中一个失败也回传错误信息"
+      - "设置 parallel_tool_calls=false 后，代码就不需要再处理一轮多个调用的情况"
+    answer: [0, 2]
+    explain: |
+      A 区分只读与写操作，是正确的并发策略。C 正确：每个调用都需要对应结果，缺失通常导致下一轮 API 报错。B 错：一个失败会丢掉其他结果，整体重试还可能重复执行 create_refund。D 错：parallel_tool_calls=false 只保证每轮最多一个调用，但执行器写成通用的多调用处理更稳健，而且其他模型或配置下仍可能出现多个调用。
+  - id: d33-q4
+    kp: d33-k2
+    type: short
+    question: 工具执行时可能遇到「工具不存在」「参数不合法」「业务失败」「临时故障」「程序缺陷」五类错误。请分别说明你会回传给模型、在执行器内重试，还是告警并上抛，以及原因。
+    key_points:
+      - {text: "工具不存在和参数不合法回传给模型，并附可用工具列表或正确格式，让模型自我修正", dim: engineering}
+      - {text: "业务失败如订单不存在回传给模型，让它换思路或告知用户", dim: engineering}
+      - {text: "超时、429、5xx 等临时故障在执行器内有限次退避重试，仍失败再回传", dim: engineering}
+      - {text: "程序缺陷应记录告警，不应伪装成可修正错误让模型反复重试", dim: principle}
+      - {text: "说明回传的错误信息要具体可操作且不泄露堆栈等敏感信息", dim: engineering}
+    reference: |
+      - **工具不存在**：回传「工具 X 不存在，可用工具有……」。模型编造了名称，告诉它正确选项即可修正。
+      - **参数不合法**：回传具体哪个字段错、期望格式和示例，比如「order_id 应为 SO 加 8 位数字」。这是模型最容易自己修正的错误。
+      - **业务失败**：例如订单不存在、余额不足，回传给模型，让它换个思路（请用户确认订单号）或如实告知用户。
+      - **临时故障**：超时、429、5xx 与模型无关，模型改参数也没用，所以在执行器内**有限次退避重试**；仍失败再回传「服务暂不可用」，让模型告知用户稍后再试。
+      - **程序缺陷**：例如 KeyError、空指针，模型怎么改参数都不会成功，回传只会造成空转。应记录告警（带堆栈到日志，不进上下文），返回通用错误或终止本次 Agent 运行。
+      所有回传给模型的错误都应该简短、具体、可操作，不要包含堆栈、SQL、内部路径。
+  - id: d33-q5
+    kp: d33-k4
+    type: scenario
+    question: |
+      某数据分析 Agent 有一个工具：
+      名称 query，描述「查询数据」，参数 sql（字符串）、date（字符串）。
+      线上统计：参数错误率 18%，模型经常把日期写成「上周」「11月」，偶尔还写出 DELETE 语句；返回结果是数据库原始行，常常上千行。
+      请指出这个工具设计的问题，并给出改进后的设计。
+    key_points:
+      - {text: "指出名称和描述含糊，没有说明数据范围、使用时机和返回内容", dim: concept}
+      - {text: "指出 date 是自由文本，应改为 YYYY-MM-DD 格式或起止日期并给出示例", dim: engineering}
+      - {text: "指出允许任意 SQL 有安全风险，应只读账号、语句白名单或改为结构化查询参数", dim: engineering}
+      - {text: "指出返回原始千行数据造成上下文膨胀，应限制行数、聚合、截断并提示分页", dim: engineering}
+      - {text: "提出校验失败时回传具体可操作的错误，并用评估集验证改进效果", dim: project}
+    reference: |
+      **问题**：
+      1. 名称 query、描述「查询数据」太含糊：查哪个库、哪些表、什么时候用都没说。
+      2. date 是自由字符串，模型自然会写「上周」；而且 sql 里已经可以写日期条件，两个参数职责重叠。
+      3. 接收任意 SQL，模型可能写出 DELETE，属于严重安全问题。
+      4. 返回原始上千行，撑爆上下文，模型也很难从中总结。
+
+      **改进设计**：
+      - 名称改为 `sales_db_query_readonly`，描述写明「只读查询销售库的 orders、customers 两张表，表结构如下……；仅支持 SELECT」。
+      - 删除独立的 date 参数，或改为 `start_date`、`end_date`，格式 YYYY-MM-DD 并给示例；相对日期由模型先换算（可在系统提示中注入当前日期）。
+      - 安全：使用只读数据库账号；执行前解析 SQL，只允许 SELECT，强制添加 LIMIT；设置语句超时。
+      - 返回：最多 50 行 + 总行数；超出时提示「结果已截断，请增加过滤条件或使用聚合」。
+      - 错误回传：「start_date 格式应为 2026-11-01」「只允许 SELECT 语句」。
+      改进后用评估集统计参数错误率、任务成功率和平均 Token，验证效果。
+    followup:
+      question: 只读账号已经能防止 DELETE 了，为什么还要在执行器里校验只允许 SELECT？
+      key_points: [纵深防御, 账号配置可能被误改, 提前拦截能给模型可操作的错误信息]
+      reference: 这是纵深防御：数据库账号权限可能因为运维变更被放宽；执行器提前拦截还能返回「只允许 SELECT」这样可操作的错误，让模型立即修正，而不是得到一条难懂的数据库权限报错。
+  - id: d33-q6
+    kp: d33-k3
+    type: design
+    question: |
+      请设计一个支持并发的工具执行器的核心逻辑：输入是模型一轮返回的多个工具调用，输出是按 call_id 对应的结果列表。要求：单个工具超时或失败不影响其他工具；写操作不并发且不重复执行；下游接口最多 5 个并发。
+    key_points:
+      - {text: "按注册表元数据把调用分为只读和写操作两组，只读并发，写操作串行", dim: engineering}
+      - {text: "每个调用内部 try/except 并带单独超时，保证每个调用都返回结果", dim: engineering}
+      - {text: "使用 Semaphore 限制最大并发数为 5", dim: engineering}
+      - {text: "写操作使用 call_id 或业务键作为幂等键，执行前检查是否已执行", dim: engineering}
+      - {text: "结果按 call_id 组装，不依赖完成顺序，并记录每个调用的耗时和状态", dim: principle}
+    reference: |
+      **核心逻辑**：
+      1. **分组**：遍历调用，按注册表中 `side_effect` 元数据分为只读组和写操作组；未知工具直接生成错误结果。
+      2. **安全执行单个调用**：`run_one(call)` 内部完成参数校验、`asyncio.timeout(spec.timeout_s)` 超时控制、try/except 捕获异常，**无论成功失败都返回** `{call_id, output, status}`，异常转成可读错误。
+      3. **并发控制**：只读组用 `asyncio.Semaphore(5)` 包住 `run_one`，再用 `asyncio.gather` 并发执行；因为 run_one 不会抛异常，单个失败不影响其他结果。
+      4. **写操作**：写操作组按模型给出的顺序逐个执行；执行前用 call_id（或「订单号 + 操作类型」业务键）查幂等表，已执行则直接返回上次结果；执行成功后写入幂等表。需要人工确认的写操作先返回「待确认」。
+      5. **组装结果**：用字典按 call_id 收集所有结果，再按原始调用顺序输出 function_call_output 列表；每个调用记录工具名、耗时、状态到 trace。
+    followup:
+      question: 为什么推荐在 run_one 内部捕获异常，而不是只用 gather 的 return_exceptions=True？
+      key_points: [可以在调用级别把异常转成可读错误信息, 能区分错误类型决定重试或告警, 统一记录耗时和状态]
+      reference: return_exceptions 只是把异常对象原样放进结果列表，还要再遍历转换；在 run_one 内部捕获可以就地按错误类型决定重试、回传或告警，生成给模型看的可读信息，并统一记录耗时和状态，逻辑更集中。
+code_reading:
+  id: d33-c1
+  kp: [d33-k1, d33-k2, d33-k3]
+  title: 工具注册表与异步执行器
+  scenario: |
+    客服 Agent 运行时的工具层。业务模块用装饰器注册工具，Agent 循环每轮调用 `registry.schemas()` 把工具定义发给模型，再把模型返回的 function_call 列表交给 `execute_all` 并发执行，结果作为 function_call_output 回传。
+  language: python
+  code: |
+    import asyncio
+    import json
+    import logging
+    from dataclasses import dataclass
+    from typing import Any, Awaitable, Callable
+
+    from pydantic import BaseModel, Field, ValidationError
+
+    logger = logging.getLogger("tools")
+
+    @dataclass
+    class ToolSpec:
+        name: str
+        description: str
+        args_model: type[BaseModel]
+        func: Callable[..., Awaitable[Any]]
+        timeout_s: float = 10.0
+
+    class ToolRegistry:
+        def __init__(self) -> None:
+            self._tools: dict[str, ToolSpec] = {}
+
+        def register(self, name: str, description: str, args_model: type[BaseModel], timeout_s: float = 10.0):
+            def deco(func: Callable[..., Awaitable[Any]]):
+                if name in self._tools:
+                    raise ValueError(f"duplicate tool name: {name}")
+                self._tools[name] = ToolSpec(name, description, args_model, func, timeout_s)
+                return func
+            return deco
+
+        def schemas(self) -> list[dict]:
+            return [{"type": "function", "name": t.name, "description": t.description,
+                     "parameters": t.args_model.model_json_schema()} for t in self._tools.values()]
+
+        async def execute(self, name: str, raw_args: str) -> str:
+            spec = self._tools.get(name)
+            if spec is None:
+                return json.dumps({"error": f"unknown tool {name}", "available": list(self._tools)})
+            try:
+                args = spec.args_model.model_validate_json(raw_args)
+            except ValidationError as exc:
+                detail = exc.errors(include_url=False)
+                return json.dumps({"error": "invalid arguments", "detail": detail}, ensure_ascii=False, default=str)
+            logger.info("tool=%s args=%s", name, args.model_dump())
+            result = await asyncio.wait_for(spec.func(**args.model_dump()), timeout=spec.timeout_s)
+            return json.dumps(result, ensure_ascii=False, default=str)
+
+        async def execute_all(self, calls: list[Any]) -> list[dict]:
+            outputs = await asyncio.gather(*(self.execute(c.name, c.arguments) for c in calls))
+            return [{"type": "function_call_output", "call_id": c.call_id, "output": out}
+                    for c, out in zip(calls, outputs)]
+
+    registry = ToolRegistry()
+
+    class RefundArgs(BaseModel):
+        order_id: str = Field(pattern=r"^SO\d{8}$", description="订单号，SO 加 8 位数字")
+        reason: str = Field(max_length=200)
+
+    @registry.register("create_refund", "为当前用户的订单发起退款申请。", RefundArgs, timeout_s=8)
+    async def create_refund(order_id: str, reason: str) -> dict: ...  # 调用售后服务，省略实现
+  walkthrough:
+    function: |
+      实现一个工具注册表和异步执行器：注册时用 Pydantic 模型描述参数并自动生成 JSON Schema；执行时按名查表、校验参数、带超时执行、把结果序列化为字符串，并按 call_id 组装成回传给模型的 function_call_output。
+    key_functions: |
+      - `register`：装饰器工厂，登记工具名、描述、参数模型、实现函数和超时，重名直接报错。
+      - `schemas`：从注册表生成发给模型的工具定义，参数 Schema 来自 `model_json_schema()`，保证与代码一致。
+      - `execute`：执行单个调用——查表、`model_validate_json` 校验、`wait_for` 超时执行、JSON 序列化。
+      - `execute_all`：用 `asyncio.gather` 并发执行一轮中的全部调用，并用 `zip` 按顺序配上 call_id。
+    params: |
+      模型返回的 `arguments` 是 JSON 字符串，原样作为 `raw_args` 传入，由 Pydantic 直接解析并校验（格式、正则、长度）；校验通过后 `model_dump()` 转为字典，用 `**` 展开调用实现函数。
+      `calls` 是 Responses API 输出中的 function_call 项列表，每项有 `name`、`arguments`、`call_id`。
+    data_flow: |
+      ```mermaid
+      flowchart TD
+        A["模型输出多个 function_call"] --> B["execute_all"]
+        B --> C["gather 并发调用 execute"]
+        C --> D{"工具存在吗"}
+        D -- "否" --> E["返回 unknown tool 错误 JSON"]
+        D -- "是" --> F{"Pydantic 校验通过吗"}
+        F -- "否" --> G["返回 invalid arguments 错误 JSON"]
+        F -- "是" --> H["wait_for 带超时执行实现函数"]
+        H -- "成功" --> I["json.dumps 结果"]
+        H -- "超时或异常" --> J["异常向上冒泡，gather 整体抛出"]
+        E --> K["zip 配对 call_id，生成 function_call_output 列表"]
+        G --> K
+        I --> K
+      ```
+    failure_points: |
+      - **工具执行异常和超时没有捕获**：`wait_for` 超时抛 TimeoutError，实现函数里的网络错误、业务异常也会直接抛出。`gather` 没有 `return_exceptions=True`，第一个异常会直接抛给 Agent 循环，**同一轮其他工具的结果全部丢失**，而且其余任务仍在后台继续执行。
+      - **写操作也被并发执行**：create_refund 和其他工具一起放进 gather；如果模型在同一轮对同一订单发出两次 create_refund，会并发执行两次，没有幂等保护。
+      - 结果没有截断：查询类工具返回大列表时会原样进入上下文。
+      - 注册表没有权限和副作用元数据，无法按用户筛选工具，也无法区分哪些需要人工确认。
+      - `model_json_schema()` 生成的 Schema 默认不含 `additionalProperties: false`，如果要开启 OpenAI strict 模式需要额外处理。
+      - 做得好的地方：Schema 从代码生成；重名检测；未知工具和参数错误会作为结果回传而不是抛异常。
+    debugging: |
+      - 写单测：注册一个 `await asyncio.sleep(20)` 的工具和一个正常工具，同一轮执行，验证超时时另一个结果是否丢失。
+      - 在 `execute` 入口和出口都打日志（工具名、耗时、状态），现在只在执行前打日志，失败时无法知道耗时和错误类型。
+      - 对同一 call_id 的 create_refund 发起两次调用，检查售后服务是否收到两次请求，复现重复退款。
+      - 打印 `registry.schemas()`，确认 description 和 pattern 是否出现在发给模型的定义里。
+    change_request: |
+      如果需求改成「单个工具失败不影响其他工具，且写操作不能重复执行」：
+      1. 在 `execute` 中用 try/except 包住 `wait_for`，超时返回「服务超时，请稍后重试」，其他异常记录告警并返回通用错误；
+      2. `ToolSpec` 增加 `side_effect: bool` 字段，`execute_all` 中只读工具 gather 并发、写工具逐个串行，并用 call_id 或「订单号 + 操作」做幂等键；
+      3. 序列化后超过阈值的结果截断并标注。
+  questions:
+    - id: d33-c1-q1
+      kp: d33-k1
+      type: code
+      question: 请说明 `create_refund` 从注册到被模型调用执行的完整过程：注册时发生了什么、发给模型的定义从哪里来、模型传来的参数如何变成函数调用。
+      key_points:
+        - {text: "导入模块时装饰器执行 register，检查重名并把 ToolSpec 存入 _tools 字典", dim: concept}
+        - {text: "schemas 用 RefundArgs.model_json_schema 生成参数 Schema，包含 pattern 和 max_length 等约束", dim: principle}
+        - {text: "模型返回的 arguments JSON 字符串由 model_validate_json 解析校验，失败则回传错误 JSON", dim: principle}
+        - {text: "校验通过后 model_dump 转字典并用双星号展开调用 create_refund，结果 json.dumps 后按 call_id 回传", dim: principle}
+      reference: |
+        **注册阶段**：模块导入时，`@registry.register(...)` 先调用 `register` 得到 `deco`，再用 `deco(create_refund)` 执行：检查 `create_refund` 是否重名，然后把名称、描述、`RefundArgs`、函数本身和 8 秒超时封装成 `ToolSpec` 存入 `_tools`，最后返回原函数。
+
+        **生成定义**：每轮 Agent 调用 `schemas()`，对每个 ToolSpec 生成 `{"type": "function", "name", "description", "parameters"}`，其中 parameters 来自 `RefundArgs.model_json_schema()`，自动包含 order_id 的正则、描述和 reason 的最大长度。改参数模型就自动改定义，不会脱节。
+
+        **执行阶段**：模型返回 function_call，`execute_all` 调用 `execute("create_refund", arguments)`。查表得到 spec；`model_validate_json` 解析 JSON 字符串并校验，订单号不匹配正则时返回 invalid arguments 和具体错误；通过后记录日志，`model_dump()` 得到字典，`**` 展开调用 `create_refund(order_id=..., reason=...)`，用 `wait_for` 限制 8 秒；结果 `json.dumps` 后与 call_id 组成 function_call_output。
+    - id: d33-c1-q2
+      kp: d33-k2
+      type: code
+      question: 假设模型在同一轮返回两个调用：get_logistics（物流接口此刻会超时）和 create_refund。请说明当前代码的执行结果，以及它带来的两个问题，并给出修改方案。
+      key_points:
+        - {text: "两个调用被 gather 并发执行，get_logistics 超过超时后 wait_for 抛出 TimeoutError", dim: principle}
+        - {text: "gather 未设 return_exceptions，异常直接抛给 Agent 循环，create_refund 的结果丢失且该任务仍可能已执行", dim: principle}
+        - {text: "指出写操作参与并发且无幂等保护，Agent 若因异常重试会重复退款", dim: engineering}
+        - {text: "修改：execute 内捕获超时和异常转为错误结果，写操作串行并加幂等键", dim: engineering}
+      reference: |
+        **执行结果**：`execute_all` 用 gather 同时启动两个 `execute`。create_refund 可能很快执行成功（退款已经发起），而 get_logistics 在 `wait_for` 超时后抛 TimeoutError。由于 `execute` 没有捕获、gather 没有 `return_exceptions=True`，这个异常直接从 `execute_all` 抛出，Agent 循环拿不到任何结果。
+
+        **问题一：结果丢失。** 已经成功的 create_refund 结果没有回传给模型，模型也不知道退款已发起。如果上层捕获异常后整轮重试，或者模型下一轮再次请求退款，就会**重复退款**。
+        **问题二：写操作没有隔离。** create_refund 和只读工具一起并发，没有幂等保护，同一轮的重复调用也会执行两次。
+
+        **修改**：
+        1. `execute` 里 try/except：`TimeoutError` 返回「物流服务超时，请稍后再试」；其他异常记录告警并返回通用错误，保证每个调用都有结果。
+        2. ToolSpec 增加 `side_effect` 字段，写工具在只读工具之后逐个串行执行，并以 call_id 或「订单号 + refund」作为幂等键，执行前检查是否已处理。
+interview:
+  - id: d33-i1
+    kp: d33-k1
+    type: oral
+    difficulty: 1
+    question: 在 Agent 里，一次工具调用从模型发出到结果返回给模型，中间经历了哪些步骤？
+    key_points:
+      - {text: "说明工具定义由运行时随请求发给模型，模型只返回工具名、参数和调用 ID", dim: concept}
+      - {text: "说明运行时查注册表、校验权限和参数后执行", dim: principle}
+      - {text: "说明结果序列化后按 call_id 回传，模型基于结果继续决策", dim: principle}
+      - {text: "提到失败时把可读错误作为结果回传而不是中断循环", dim: engineering}
+      - {text: "结合项目举例说明某一步的设计", dim: project}
+    reference: |
+      1. **下发定义**：运行时从注册表中按用户权限和场景筛选工具，把名称、描述、参数 Schema 随请求发给模型。
+      2. **模型决策**：模型返回结构化调用，包含工具名、JSON 参数和 call_id。模型本身不执行任何东西。
+      3. **查表与鉴权**：执行器按名查注册表，工具不存在或无权限就生成错误结果。
+      4. **参数校验**：用 Schema（如 Pydantic）校验类型、格式，再做业务校验。
+      5. **执行**：带单独超时执行；临时故障有限次重试；写操作可能需要人工确认和幂等保护。
+      6. **结果处理**：序列化为 JSON，裁剪字段、截断超长内容。
+      7. **回传**：按 call_id 回传，模型基于结果决定下一步。
+
+      失败时把具体、可操作的错误作为结果回传，让模型修正，而不是抛异常中断整个循环。我们客服项目中物流接口超时会回传「物流系统繁忙」，模型会告知用户稍后再查。
+    oral: |
+      整个过程大概七步。运行时先从注册表筛出当前用户能用的工具，把定义发给模型；模型返回工具名、参数和调用 ID；执行器按名字查表、校验权限和参数；然后带超时执行，临时故障会重试；结果序列化、截断后，按调用 ID 回传给模型，模型再决定下一步。
+      关键是失败时不抛异常中断，而是把可读的错误当结果回传。比如我们客服项目的物流接口超时，就回传「物流系统繁忙」，模型会告诉用户稍后再查。
+  - id: d33-i2
+    kp: d33-k2
+    type: oral
+    difficulty: 2
+    question: Agent 调用工具失败了怎么办？你们是怎么做错误处理的？
+    key_points:
+      - {text: "按错误类型分类：工具不存在、参数错误、业务失败、临时故障、程序缺陷", dim: concept}
+      - {text: "可修正的错误回传给模型并给出具体可操作信息", dim: engineering}
+      - {text: "临时故障在执行器内有限次退避重试，程序缺陷告警而不是让模型重试", dim: engineering}
+      - {text: "提到 LangGraph ToolNode 默认只捕获参数调用错误、执行异常会重新抛出等框架行为", dim: principle}
+      - {text: "结合项目说明改造前后失败率或空转的变化", dim: project}
+    reference: |
+      我按错误类型分别处理：
+      - **工具不存在、参数不合法**：回传给模型，附上可用工具或正确格式，模型通常下一轮就能修正。
+      - **业务失败**（订单不存在）：回传，让模型请用户确认或换思路。
+      - **临时故障**（超时、429、5xx）：执行器内退避重试 1~2 次，仍失败回传「服务暂不可用」。
+      - **程序缺陷**：记录告警和堆栈到日志，返回通用错误或终止，不让模型反复重试一个必然失败的调用。
+
+      回传的信息要简短、具体、可操作，不包含堆栈和内部信息。每个调用都必须有结果，否则下一轮 API 会因调用和结果不配对而报错。
+
+      框架方面要注意：LangGraph 的 ToolNode 当前默认只捕获参数调用错误，工具执行异常会重新抛出，需要通过 handle_tool_errors 或 LangChain 的 wrap_tool_call 中间件自定义。
+
+      我们客服项目重构执行器后，因工具异常导致的会话失败率从约 2% 降到 0.1% 以下。
+    oral: |
+      我会先给错误分类。工具不存在或参数不合法，回传给模型并告诉它正确格式，它一般能自己改；业务失败比如订单不存在，也回传，让它去和用户确认；超时、限流这种临时故障，在执行器里退避重试一两次；代码 bug 则告警，不让模型反复重试。
+      回传的信息要具体、可操作，不能带堆栈。另外要注意框架默认行为，比如 LangGraph 的 ToolNode 现在默认只兜住参数错误，执行异常会抛出来，需要自己配置。
+      我们客服项目这样改完，因工具异常导致的会话失败从 2% 左右降到了 0.1% 以下。
+  - id: d33-i3
+    kp: d33-k3
+    type: oral
+    difficulty: 3
+    question: 模型一次返回多个工具调用时，你怎么执行？如何保证性能和安全？
+    key_points:
+      - {text: "说明模型一轮可能返回多个调用，默认按多个处理，可用 parallel_tool_calls 限制", dim: concept}
+      - {text: "只读独立调用并发执行，写操作串行并加幂等键", dim: engineering}
+      - {text: "每个调用内部捕获异常并带超时，保证单个失败不影响整批且每个调用都有结果", dim: engineering}
+      - {text: "使用 Semaphore 限制并发保护下游，结果按 call_id 组装", dim: engineering}
+      - {text: "结合项目给出并发前后的延迟数据或踩过的坑", dim: project}
+    reference: |
+      **前提**：模型一轮可能返回零个、一个或多个调用，执行器要默认按多个处理。如果业务确实不需要并行，可以设置 parallel_tool_calls=false，但执行器仍写成通用逻辑。
+
+      **执行策略**：
+      1. 按注册表元数据把调用分成只读和写操作两组。
+      2. **只读组并发**：`asyncio.gather` 并发执行，`Semaphore` 限制最大并发，避免打爆下游。
+      3. **错误隔离**：每个调用在自己的函数里 try/except 并带单独超时，无论成功失败都返回结果，所以一个超时不会让整批丢失。
+      4. **写操作串行 + 幂等**：逐个执行，用 call_id 或业务键做幂等，必要时先请求用户确认。
+      5. **按 call_id 组装结果**，不依赖完成顺序，每个调用都回传。
+
+      **项目经验**：出行助手里三个查询并发后，工具耗时从约 4.5 秒降到 2 秒；但第一版用 gather 不隔离错误，航班接口一超时整批失败，后来改成调用内部捕获异常才稳定。
+    oral: |
+      首先模型一轮可能返回多个调用，所以执行器默认按多个处理。我会按工具性质分组：只读、互不依赖的用 gather 并发，加信号量限制并发数；写操作串行执行，用调用 ID 或业务键做幂等，必要时让用户确认。
+      每个调用在自己的函数里捕获异常、带单独超时，保证一个失败不影响其他，每个调用都有结果，最后按调用 ID 回传。
+      我们出行助手并发之后工具耗时从 4.5 秒降到 2 秒左右。第一版踩过坑，没隔离错误，航班接口一超时整批结果都丢了，后来改成调用内部兜底才稳定。
+  - id: d33-i4
+    kp: d33-k4
+    type: design
+    difficulty: 4
+    question: 公司有 120 个内部 API 想开放给 Agent 使用。请设计工具层：如何把 API 变成工具、怎么管理、怎么保证模型选得准、用得安全、成本可控？
+    key_points:
+      - {text: "不是一个 API 对应一个工具，而是按任务合并高频串联操作、精简为面向任务的工具", dim: principle}
+      - {text: "注册表登记 Schema、描述、超时、副作用、权限、版本等元数据，Schema 从代码生成", dim: engineering}
+      - {text: "按用户权限和场景动态下发工具子集，工具多时用命名空间或延迟加载控制数量", dim: engineering}
+      - {text: "执行器做二次鉴权、参数校验、超时重试、错误回传、结果截断，写操作确认加幂等", dim: engineering}
+      - {text: "工具名、描述、参数防呆和返回内容按 ACI 原则设计", dim: concept}
+      - {text: "用评估集统计误选率、参数错误率、步数和 Token，持续迭代工具设计", dim: project}
+    reference: |
+      **一、从 API 到工具：面向任务，而不是一比一映射**
+      120 个 API 直接变成 120 个工具，模型几乎必然选错。先分析真实任务：高频串联的 API（查用户 → 查订单 → 查物流）合并成 `get_order_overview`；低频 API 不开放或放到延迟加载组。目标是常用工具几十个，每次下发少于 20 个。
+
+      **二、注册表**
+      每个工具登记：name（带命名空间，如 crm_、ticket_）、description（用途、边界、示例）、Pydantic 参数模型（自动生成 Schema）、超时、side_effect、required_role、版本和开关。
+
+      **三、动态下发**
+      按用户角色和入口场景筛选工具子集；工具确实很多时，用 namespace 分组或 tool_search 延迟加载（取决于模型是否支持），或者先用路由把请求分到某个业务域再下发该域工具。
+
+      **四、执行器**
+      二次鉴权（身份从登录态注入，工具内校验数据归属）；参数校验和业务校验；单工具超时 + 临时故障重试；错误分类回传；结果只返回高信号字段、超长截断；写操作需要确认并带幂等键；全部调用写 trace。
+
+      **五、描述质量与评估**
+      按 ACI 原则写名称、描述和参数（枚举、日期格式、绝对路径等防呆）。建立评估集，统计误选率、参数错误率、平均步数、Token 和成功率；根据数据合并、拆分或改写工具。
+
+      这套方式在我们企业助手里把 30 多个工具的误选问题明显降下来，平均每次只下发 9 个工具。
+    oral: |
+      我不会一比一把 120 个 API 都变成工具，而是先看真实任务，把高频串联的 API 合并成面向任务的工具，低频的不开放或延迟加载，保证每次下发少于 20 个。
+      工具统一进注册表，登记命名空间化的名称、清楚的描述、从 Pydantic 生成的 Schema，以及超时、是否有副作用、所需权限这些元数据。请求时按角色和场景下发子集。
+      执行器负责二次鉴权、校验、超时重试、错误回传和结果截断，写操作要确认并做幂等。
+      最后用评估集看误选率、参数错误率、步数和 Token，持续改工具。我们企业助手就是这么做的，平均每次只下发 9 个工具，误选明显减少。
+sources:
+  - {title: "OpenAI Docs - Function calling", url: "https://platform.openai.com/docs/guides/function-calling"}
+  - {title: "Anthropic - Writing effective tools for agents", url: "https://www.anthropic.com/engineering/writing-tools-for-agents"}
+  - {title: "LangGraph Reference - ToolNode", url: "https://reference.langchain.com/python/langgraph.prebuilt/tool_node/ToolNode"}
+  - {title: "LangChain v1 migration guide", url: "https://docs.langchain.com/oss/python/migrate/langchain-v1"}

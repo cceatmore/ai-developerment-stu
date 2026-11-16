@@ -1,0 +1,781 @@
+day: 29
+phase: 3
+title: RAG 评测：检索指标、生成指标、RAGAS 与评测集构建
+goals:
+  - 能手算 Hit@K、Recall@K、MRR，并用「检索层 / 生成层」分层指标定位问题出在哪一环
+  - 能解释 Faithfulness、Answer Relevancy、答案正确率分别衡量什么，以及它们为什么不能互相替代
+  - 能用 RAGAS 0.4 的新接口跑通基础指标，知道 LLM 评审的偏差和校准方法
+  - 能设计一份覆盖多类问题的评测集，并把它接入改动前后的回归对比
+minutes: 60
+resources:
+  - title: "RAGAS 文档 - Available Metrics"
+    url: "https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/"
+    kind: doc
+    lang: en
+    minutes: 25
+    note: "重点看 Retrieval Augmented Generation 分组下的 Context Precision、Context Recall、Faithfulness、Response Relevancy 四页，每页看定义、所需字段和计算示例"
+  - title: "LangSmith 文档 - Evaluate a RAG application"
+    url: "https://docs.langchain.com/langsmith/evaluate-rag-tutorial"
+    kind: doc
+    lang: en
+    minutes: 20
+    note: "看评估器划分：correctness、relevance、groundedness、retrieval relevance 四类，以及哪些需要参考答案；代码部分扫读即可，Day 41~44 再系统学评测平台"
+  - title: "Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena"
+    url: "https://arxiv.org/abs/2306.05685"
+    kind: article
+    lang: en
+    minutes: 15
+    note: "只看第 3 节 LLM as a Judge 中的位置偏差、冗长偏差、自我偏好三种局限及缓解方法，理解为什么 LLM 评分要校准"
+knowledge_points:
+  - id: d29-k1
+    name: 检索指标：Hit@K、Recall@K、MRR、nDCG 与分层定位
+    level: P0
+    summary: 检索层指标回答「正确资料有没有被找回来、排在第几」，用来判断问题出在召回、重排还是生成
+    analogy: |
+      **像搜索框的下拉建议**：Hit@5 = 用户想要的那项有没有出现在前 5 条建议里；MRR = 它平均排第几（排第 1 得 1 分，排第 3 得 1/3 分）。
+
+      **不一样的地方**：前端下拉对不对，用户一眼就知道；RAG 检索要**提前人工标好「哪些片段是正确资料」**，没有标注就没法算这些指标。
+    why: |
+      RAG 答错时，原因可能在检索（没找到）、重排（找到但排太后被截断）或生成（资料对但模型答错）。没有分层指标，你只能「感觉」效果变好或变差。
+      面试官问「你怎么评估 RAG」，第一句就应该是「分检索层和生成层」；能手算 MRR、说清 Recall@50 和 Recall@5 的差异，是区分「做过」和「看过」的关键。
+    problem: |
+      - 改了切块或换了 Embedding 模型，不知道检索到底变好还是变差。
+      - 回答错误时，分不清是没检索到还是模型没用好。
+      - 只看端到端正确率，优化方向全靠猜。
+    principle: |
+      **一、常用检索指标**（设每个问题已标注一组「正确片段或文档」）
+
+      | 指标 | 计算 | 适合回答的问题 |
+      |---|---|---|
+      | **Hit@K** | 前 K 条中至少有一条正确 → 1，否则 0，再取平均 | 正确资料有没有进前 K |
+      | **Recall@K** | 前 K 条中命中的正确项数 ÷ 正确项总数 | 需要多份资料时，找回了几成 |
+      | **Precision@K** | 前 K 条中正确项数 ÷ K | 前 K 条里噪声多不多 |
+      | **MRR** | 第一条正确结果排名的倒数，再取平均；没找到记 0 | 正确资料排得够不够靠前 |
+      | **nDCG@K** | 按位置折扣累加分级相关度，再除以理想排序的值 | 有「很相关、一般相关」等分级标注时 |
+
+      **手算示例**：3 个问题，第一条正确结果分别排第 1、第 4、没找到 → MRR =（1 + 1/4 + 0）÷ 3 ≈ 0.42；Hit@3 =（1 + 0 + 0）÷ 3 ≈ 0.33；Hit@5 =（1 + 1 + 0）÷ 3 ≈ 0.67。
+
+      **二、分层定位：在不同截断点算指标**
+
+      ```mermaid
+      flowchart TB
+        Q["评测问题"] --> R1["混合召回 Top-50"]
+        R1 -->|算 Recall@50| R2["Rerank 后 Top-5"]
+        R2 -->|算 Recall@5 与 MRR| G["生成回答"]
+        G -->|算 Faithfulness 与正确率| A["最终结果"]
+        R1 -.->|Recall@50 低| F1["问题在召回 查切块 Embedding 关键词路"]
+        R2 -.->|Recall@50 高但 Recall@5 低| F2["问题在重排或截断"]
+        G -.->|Recall@5 高但正确率低| F3["问题在 Prompt 组装或生成"]
+      ```
+
+      **三、标注粒度要稳定**
+
+      - 用 `chunk_id` 标注最精确，但**重新切块后 ID 全变**，旧标注失效；
+      - 更稳妥的做法是标注**文档 ID + 页码或原文片段**，评测时判断检索到的 chunk 是否覆盖该位置。
+
+      **四、不需要 LLM 的优势**：检索指标是确定性计算，便宜、快、可重复，适合每次改动都跑；LLM 评审类指标（d29-k3）更贵、有波动。
+    scenarios: |
+      - **换 Embedding 模型**：只跑检索层指标，对比 Recall@50 与 MRR，十几秒出结论，不用每次都调用生成模型。
+      - **调 Top-K 与 Rerank 截断**：观察 Recall@5、Recall@10 和上下文 Token 成本的权衡。
+      - **排查用户投诉**：投诉样本加入评测集，看它在哪一层失败。
+    code: |
+      ```python
+      def hit_at_k(retrieved: list[str], gold: set[str], k: int) -> float:
+          return 1.0 if any(d in gold for d in retrieved[:k]) else 0.0
+
+      def recall_at_k(retrieved: list[str], gold: set[str], k: int) -> float:
+          return len(set(retrieved[:k]) & gold) / len(gold) if gold else 0.0
+
+      def reciprocal_rank(retrieved: list[str], gold: set[str]) -> float:
+          for rank, d in enumerate(retrieved, start=1):
+              if d in gold:
+                  return 1 / rank
+          return 0.0
+
+      # MRR = 所有问题的 reciprocal_rank 取平均；无答案问题不参与检索指标，单独统计拒答
+      ```
+    pitfalls: |
+      - **只看 Hit@K 不看 MRR**：正确资料总在第 5 名，Hit@5 很好看，但截断到 Top-3 后就丢了。
+      - **用 chunk_id 标注后重切块**：旧标注全部失效，指标断崖式下跌却不是真变差。
+      - **把无答案问题算进检索指标**：它们没有正确资料，应单独统计拒答表现。
+      - **误区：Recall@50 很高就说明系统没问题。** 最终只有 Top-5 进入 Prompt，要看截断后的指标。
+    interview_asks:
+      - question: "你怎么评估 RAG 的检索效果？用哪些指标？"
+        answer: "看正确片段有没有出现在前 K 里，用 Recall@K 或 Hit@K。还看它排第几，用 MRR。评测集里每题要有标注的相关文档。没有标注就只是在看感觉。"
+      - question: "MRR 怎么算？和 Recall@K 有什么区别？"
+        answer: "MRR 看第一个正确结果排第几，排第 1 就是 1，排第 2 就是 1/2，再对所有题平均。Recall@K 看前 K 里召回了多少应该召回的文档，不关心它是第 1 还是第 K。两个一起看。"
+      - question: "RAG 答错了，你怎么判断是检索问题还是生成问题？"
+        answer: "正确文档不在送给模型的上下文里，就是检索问题。在里面但回答矛盾或没使用，就是生成问题。分层统计占比，先修占比高的那一层。"
+    project_example: |
+      p1 的评测模块（Day 29）先实现检索层：`eval/retrieval_eval.py` 读取评测集（问题 + 标注的文档 ID 与页码），对混合召回 Top-50 和 Rerank 后 Top-5 分别计算 Hit@K、Recall@K、MRR，按问题类型输出表格。
+      每次改切块、换 Embedding、调 RRF 参数都先跑这一步；报告里写【填你的 Recall@50 / Recall@5 / MRR 数字】，面试时用来说明每次优化的收益。
+  - id: d29-k2
+    name: 生成指标：Faithfulness、Answer Relevancy 与答案正确率
+    level: P0
+    summary: Faithfulness 看回答是否有资料依据，Answer Relevancy 看是否答了所问，正确率看是否和参考答案一致；三者衡量不同的失败
+    analogy: |
+      **像代码评审的三个问题**：
+      - Faithfulness ↔「每一行逻辑都有出处吗」，像 TS 检查每个用到的变量都有声明；
+      - Answer Relevancy ↔「这个 PR 解决的是 issue 里说的问题吗」；
+      - 正确率 ↔ 单元测试断言「输出等于期望值」。
+
+      **不一样的地方**：TS 检查是确定的，Faithfulness 通常要**让 LLM 拆句并逐条判断**，本身会有误差。
+    why: |
+      检索指标再好，也不代表回答可信。最常见的两种失败恰好方向相反：「资料对但模型自己编了一句」和「回答有依据但依据是错的旧版文件」。
+      只看一个指标会漏掉另一种。面试时能说出「忠实但错误」「正确但不忠实」两种情况及原因，说明你真正排查过 RAG 问题。
+    problem: |
+      - 回答听起来很对，但有一句是模型补充的常识，资料里没有。
+      - 回答完全基于资料，但检索到的是作废版本，结论错误。
+      - 回答绕开了问题，讲了一堆相关但无用的内容。
+    principle: |
+      **一、三个核心生成指标**
+
+      | 指标 | 衡量什么 | 需要参考答案吗 | 典型计算 |
+      |---|---|---|---|
+      | **Faithfulness**（忠实度） | 回答中的陈述是否都能被检索到的资料支持 | 不需要 | 把回答拆成陈述，被支持的条数 ÷ 总条数 |
+      | **Answer Relevancy**（相关性） | 回答是否切题 | 不需要 | 由回答反推若干问题，与原问题算向量相似度 |
+      | **正确率**（Correctness） | 回答与参考答案是否一致 | **需要** | 人工判断或 LLM 对照参考答案打分 |
+
+      **Faithfulness 示例**：回答拆出 4 条陈述，其中 3 条能在资料中找到依据 → 0.75。
+
+      **二、两种「方向相反」的失败**
+
+      ```mermaid
+      flowchart LR
+        A["回答"] --> F{"忠实于资料吗"}
+        F -->|是| C1{"正确吗"}
+        F -->|否| C2{"正确吗"}
+        C1 -->|是| OK["理想情况"]
+        C1 -->|否| W1["忠实但错误 检索到旧版或错误文档"]
+        C2 -->|是| W2["正确但不忠实 模型用了自身知识 资料未覆盖"]
+        C2 -->|否| W3["编造 最危险"]
+      ```
+
+      - **忠实但错误**：问题在检索或数据——版本过滤、元数据、文档治理（Day 22、Day 30）。
+      - **正确但不忠实**：这次碰巧对，但无法溯源、下次可能错；企业场景应按不合格处理，并检查资料覆盖与 Prompt 约束。
+
+      **三、拒答也要评**
+
+      - 「无答案」样本：看**正确拒答率**；
+      - 「有答案」样本：看**误拒率**（本能回答却拒答）。
+      两者一起看，避免靠「多拒答」刷高 Faithfulness。
+
+      **四、和引用校验的关系**：Day 27 的引用校验（编号存在、权限、抽样支持性判断）是线上逐条检查；Faithfulness 是离线批量统计。二者口径接近，可以复用同一套判断 Prompt。
+    scenarios: |
+      - **上线前验收**：Faithfulness、正确率、正确拒答率、误拒率四项同时达标才上线。
+      - **调 Prompt**：比如加了「资料不足时说明」，观察误拒率有没有明显上升。
+      - **用户投诉复盘**：判断属于忠实但错误还是编造，分别找检索和生成的责任环节。
+    pitfalls: |
+      - **误区：Faithfulness 高就说明回答正确。** 资料本身错了或过期，回答照样「忠实地错」。
+      - **只看正确率**：正确但不忠实的回答被算作通过，埋下编造隐患。
+      - **Answer Relevancy 当正确率用**：它只看切题，不看事实对不对。
+      - **不统计误拒率**：系统越来越保守，用户觉得「什么都答不了」。
+    interview_asks:
+      - question: "Faithfulness 和答案正确率有什么区别？"
+        answer: "Faithfulness 是回答有没有被给出的资料支持，不管资料本身对不对。答案正确率是和标准答案比，说得对不对。资料错了，模型可以很忠实但答案仍然错。"
+      - question: "什么情况下回答忠实于资料但仍然是错的？"
+        answer: "检索到了过期版本或错误文档，模型照着说。或者资料只覆盖了一半，它忠实地说了这一半，标准答案还要另一半。所以忠实和正确要分开评。"
+    project_example: |
+      p1 评测模块的生成层：对每条样本记录 `answer / contexts / citations / refused`，计算 Faithfulness（复用 Day 27 的支持性判断 Prompt）、正确率（对照参考答案）、正确拒答率与误拒率。
+      报告按问题类型分组，并列出每类最差的 5 条样本链接，方便人工复核；面试时可以讲【填你发现的一个「忠实但错误」案例及其修复】。
+  - id: d29-k3
+    name: RAGAS 与 LLM 评审：用法、偏差与校准
+    level: P1
+    summary: RAGAS 用 LLM 自动计算 RAG 指标，省去大量人工；但 LLM 评审有偏差和波动，必须用人工标注校准并固定评审配置
+    analogy: |
+      **像 Lighthouse 跑分**：自动、方便，但同一页面跑几次分数会波动，换了机器或版本分数就不可比——所以要固定环境、多跑取均值，并且别只盯总分。
+
+      **不一样的地方**：Lighthouse 的波动来自网络和机器，LLM 评审还有**系统性偏差**（偏爱长回答、偏爱排在前面的答案），不校准会一直偏向同一个方向。
+    why: |
+      人工评审几百条样本成本很高，自动化评测是持续迭代的前提。RAGAS 是 RAG 评测最常被提到的开源库，面试中「你用过 RAGAS 吗」很常见。
+      但只会调库不够：面试官会追问「LLM 打分可信吗」，你需要说清偏差来源和校准方法。
+    problem: |
+      - 每次改动都人工评几百条，不现实。
+      - 直接相信 LLM 打分，结果和人工判断差距大却不自知。
+      - 换了评审模型，分数整体漂移，历史数据无法对比。
+    principle: |
+      **一、RAGAS 0.4 的指标与所需字段**
+
+      | 指标 | 主要输入 | 需要参考答案 |
+      |---|---|---|
+      | Faithfulness | 问题、回答、检索资料 | 否 |
+      | AnswerRelevancy | 问题、回答（还需 Embedding） | 否 |
+      | ContextPrecision | 问题、检索资料、参考答案 | 是 |
+      | ContextRecall | 问题、检索资料、参考答案 | 是 |
+      | ContextUtilization | 问题、回答、检索资料 | 否（用回答代替参考答案） |
+
+      另有不依赖 LLM 的 `NonLLMContextRecall`、按 ID 比对的 `IDBasedContextRecall` 等，适合已有标注 ID 的场景。
+
+      **二、LLM 评审的常见偏差**（Zheng 等 2023）
+
+      - **位置偏差**：成对比较时偏好排在前面（或后面）的答案 → 交换顺序各评一次；
+      - **冗长偏差**：偏好更长的回答 → 评分标准里明确「不因篇幅加分」；
+      - **自我偏好**：偏好与自己风格相近或自己生成的回答 → 评审模型尽量与被测模型不同。
+
+      **三、让评审可信的做法**
+
+      ```mermaid
+      flowchart TB
+        S["抽样 100 条左右"] --> H["人工标注"]
+        S --> J["LLM 评审打分"]
+        H --> C["计算一致率"]
+        J --> C
+        C -->|一致率低| P["修改评分标准 补充示例"]
+        P --> J
+        C -->|一致率达标| F["固定评审模型 版本 Prompt 温度"]
+        F --> RUN["批量评测 定期抽检"]
+      ```
+
+      - **固定配置**：评审模型和版本、Prompt、温度都写进评测报告，变更配置后要重新建立基线；
+      - **只比较相对变化**：同一配置下的改动前后对比，比单次绝对分数更有意义；
+      - **评分标准具体化**：例如正确率按「完全正确 / 部分正确 / 错误」三档并给出定义。
+
+      评测平台、LLM-as-judge 的系统方法见 Day 41~42。
+    scenarios: |
+      - **每晚定时评测**：固定配置跑 RAGAS 四项指标，与昨天的基线对比。
+      - **评审校准**：新项目先人工标注 100 条，计算 LLM 评审与人工的一致率，再决定能否自动化。
+      - **成本控制**：检索指标每次改动都跑，LLM 评审指标只在合并前或每晚跑。
+    code: |
+      ```python
+      import asyncio
+      from openai import AsyncOpenAI
+      from ragas.llms import llm_factory
+      from ragas.metrics.collections import Faithfulness, ContextRecall
+
+      client = AsyncOpenAI()
+      judge = llm_factory("gpt-4o-mini", client=client)   # 评审模型按你的供应商替换，并固定版本
+
+      async def score_one(row: dict) -> dict:
+          faith = await Faithfulness(llm=judge).ascore(
+              user_input=row["question"],
+              response=row["answer"],
+              retrieved_contexts=row["contexts"],
+          )
+          recall = await ContextRecall(llm=judge).ascore(
+              user_input=row["question"],
+              retrieved_contexts=row["contexts"],
+              reference=row["reference"],               # ContextRecall 必须有参考答案
+          )
+          return {"faithfulness": faith.value, "context_recall": recall.value}
+      ```
+    pitfalls: |
+      - **照搬旧教程**：`SingleTurnSample`、`single_turn_ascore` 等旧接口在 0.4 已弃用、计划在 1.0 移除，新代码用 `ragas.metrics.collections`。
+      - **换评审模型后直接对比历史分数**：分数口径变了，不可比。
+      - **不做人工校准**：不知道 LLM 打分和人工差多少。
+      - **误区：RAGAS 分数是客观绝对值，越高就一定越好。** 它是 LLM 估计值，要结合人工抽检和业务指标看。
+    interview_asks:
+      - question: "你用过 RAGAS 吗？用了哪些指标？"
+        answer: "用过它把忠实度、答案相关性和检索召回做成可重复的打分。它底层常用另一个模型来评，分数只能当筛选，关键题还要人看。版本不同接口不同，以你锁定的版本为准。"
+      - question: "LLM 评审有哪些偏差？你怎么保证它可信？"
+        answer: "它偏爱长答案、偏爱和自己类似的说法，顺序不同分也不同。用固定量表，打乱选项，拿一批人工标注算一致率。一致率不够就不要用它做上线门禁。"
+    project_example: |
+      p1 评测模块中，`eval/llm_eval.py` 用 RAGAS 计算 Faithfulness、ContextRecall，评审模型、版本、温度写入报告头部。
+      项目初期我人工标注了一批样本，对比 LLM 评审与人工的一致率【填你的样本数和一致率】，一致率不达标的指标只做参考，不作为上线门槛。
+    freshness: |
+      核对于 2026-11：RAGAS 最新版本 0.4.3（仓库已迁移至 vibrantlabsai/ragas）。推荐接口为 `from ragas.metrics.collections import Faithfulness, ContextRecall, ContextPrecision, AnswerRelevancy, ContextUtilization`，用 `llm_factory(模型名, client=AsyncOpenAI())` 创建评审模型，调用 `await metric.ascore(...)` 或 `.score(...)`，结果取 `.value`。AnswerRelevancy 还需 `embedding_factory` 提供的 Embedding。旧的 `SingleTurnSample`、`single_turn_ascore` 等接口在 0.4 弃用、计划于 1.0 移除。
+      LLM 评审偏差（位置、冗长、自我偏好）见 Zheng 等 2023（arXiv:2306.05685）。
+    sources:
+      - {title: "RAGAS - Available Metrics", url: "https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/"}
+      - {title: "RAGAS - Faithfulness", url: "https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/faithfulness/"}
+      - {title: "RAGAS - Context Recall", url: "https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/context_recall/"}
+      - {title: "ragas on PyPI", url: "https://pypi.org/project/ragas/"}
+      - {title: "Zheng et al. 2023 - Judging LLM-as-a-Judge", url: "https://arxiv.org/abs/2306.05685"}
+  - id: d29-k4
+    name: 评测集构建与回归
+    level: P0
+    summary: 评测集要覆盖事实、多跳、表格、追问、无答案、越权等类型，标注稳定的出处和参考答案，并在每次改动前后按类别对比
+    analogy: |
+      **像前端的单元测试 + 快照测试 + CI 门禁**：评测集就是测试用例，每次改动跑一遍，和基线快照对比，关键指标退化就不让合并。
+
+      **不一样的地方**：前端测试是「通过 / 失败」，RAG 评测是**带波动的分数**，要按类别看、设合理阈值，不能只看总平均。
+    why: |
+      没有评测集，所有「优化」都是主观感受；评测集质量差（全是简单事实题、没有无答案题），指标再高也代表不了线上效果。
+      面试里「你的评测集怎么来的、多少条、覆盖哪些类型」是追问重灾区，答得具体才能让人相信你的数字。
+    problem: |
+      - 评测集全是开发者自己想的简单问题，线上真实问题答不好。
+      - 没有无答案和越权样本，拒答与权限从来没被测过。
+      - 改动后只看总平均分，某一类问题明显退化却被平均掩盖。
+    principle: |
+      **一、样本来源**
+
+      1. **真实日志**（最有价值）：脱敏后抽样，尤其是点踩和投诉的问题；
+      2. **业务专家出题**：覆盖关键制度和高风险问题；
+      3. **LLM 从文档合成**：快速扩充数量，但**必须人工审核**，避免问题过于贴合原文措辞。
+
+      **二、类别覆盖**（每类都要有样本，单独统计）
+
+      | 类别 | 主要看什么 |
+      |---|---|
+      | 单一事实 | 检索命中、正确率 |
+      | 多跳与对比 | 是否找全多份资料 |
+      | 表格与数字 | 数字是否准确 |
+      | 多轮追问 | 指代消解（Day 26） |
+      | 无答案 | 正确拒答率 |
+      | 越权尝试 | 必须 100% 拒绝且不泄露 |
+      | 版本冲突 | 是否引用现行版本 |
+
+      **三、每条样本的字段**
+
+      `question`、`history`（追问类）、`user_role`（权限类）、`gold_sources`（文档 ID + 页码或原文片段）、`reference_answer`、`should_refuse`、`category`。
+
+      **四、评测集的生命周期**
+
+      ```mermaid
+      flowchart LR
+        L["线上日志与投诉"] --> D["脱敏与抽样"]
+        X["专家出题"] --> A["人工审核与标注"]
+        S["LLM 合成问题"] --> A
+        D --> A
+        A --> V["评测集 带版本号"]
+        V --> R["改动前后回归对比"]
+        R --> G{"关键类别退化"}
+        G -->|是| B["阻止上线 分析失败样本"]
+        G -->|否| P["上线并更新基线"]
+        P --> L
+      ```
+
+      **五、回归规则**
+
+      - 评测集**带版本号**，指标只和同版本评测集的基线比较；
+      - 门禁按类别设：例如越权类必须 100%、无答案类正确拒答率不低于基线、整体正确率下降不超过阈值；
+      - 文档更新后要检查标注是否过期（答案变了），否则会出现「系统对了、标注错了」。
+      自动化门禁接入 CI 见 Day 44。
+    scenarios: |
+      - **冷启动**：业务专家出 50 题 + LLM 合成 100 题人工审核，先跑出基线。
+      - **上线后迭代**：每周从点踩日志里补充失败样本。
+      - **制度改版**：同步更新受影响样本的参考答案和出处。
+    pitfalls: |
+      - **只有简单事实题**：评测分数虚高。
+      - **没有无答案和越权样本**：拒答与权限从未被验证。
+      - **日志直接入库不脱敏**：评测集本身变成数据泄露源。
+      - **评测集悄悄改动却不升版本**：前后分数不可比。
+      - **误区：总平均分没降就可以上线。** 某一类可能明显退化被平均掩盖。
+    interview_asks:
+      - question: "你的评测集是怎么构建的？有多少条？覆盖哪些类型？"
+        answer: "从真实问题和文档里抽，每条有问题、应引用的文档、标准答案。覆盖能答、该拒答、多跳、表格和权限外。规模先做到能覆盖类型，比如一两百条，再按坏例补充。没有标注来源的题不算数。"
+      - question: "评测集和线上效果不一致怎么办？"
+        answer: "说明评测集的问题和线上分布不同。把线上的坏例补进集里，去掉从不出现的题。对比线上抽样和评测分。评测集要版本化，不能为了分高去改题。"
+      - question: "怎么防止一次改动让某类问题退化？"
+        answer: "评测按类型出分，不只看总分。门禁要求每一类都不能掉过阈值。改动前后出一份对比。总分涨了、拒答类崩了，也不能上。"
+    project_example: |
+      p1 评测集 `eval/dataset_v1.jsonl` 按上表 7 类组织，来源包括我自己根据制度文档出的题、LLM 合成后人工审核的题，以及试用期间收集的点踩问题（已脱敏）。
+      `eval/run_eval.py` 一次跑完检索层和生成层，输出按类别的表格并与基线对比；越权类不是 100% 或无答案类明显退化就标红。
+      面试时说【填你的评测集条数、类别分布和一次回归拦截的例子】。
+test:
+  - id: d29-t1
+    kp: d29-k1
+    type: single
+    question: 3 个评测问题中，第一条正确结果的排名分别为第 1 名、第 2 名、未找到。MRR 是多少？
+    options:
+      - "1.0"
+      - "0.75"
+      - "0.5"
+      - "0.33"
+    answer: [2]
+    explain: |
+      倒数排名分别为 1、1/2、0（未找到记 0），平均值为（1 + 0.5 + 0）÷ 3 = 0.5。
+      选 0.75 是把未找到的问题排除在分母外；0.33 是只算了第一名命中的比例，那是 Hit@1。
+  - id: d29-t2
+    kp: d29-k1
+    type: single
+    question: 只想知道「正确资料有没有出现在最终送入 Prompt 的前 5 条里」，最直接的指标是？
+    options:
+      - "Hit@5"
+      - "nDCG@50"
+      - "Answer Relevancy"
+      - "Faithfulness"
+    answer: [0]
+    explain: |
+      Hit@5 正是「前 5 条中是否至少有一条正确资料」。
+      nDCG@50 关注前 50 条的分级排序质量；Answer Relevancy 和 Faithfulness 是生成层指标，不直接衡量检索命中。
+  - id: d29-t3
+    kp: d29-k1
+    type: judge
+    question: 混合召回阶段 Recall@50 达到 0.95，说明检索环节已经没有问题，回答错误一定是生成环节造成的。
+    answer: false
+    explain: |
+      最终只有 Rerank 后的前几条进入 Prompt。如果 Recall@50 高但 Recall@5 低，说明正确资料被找到了却在重排或截断时丢失，问题在重排环节。
+      要在每个截断点分别算指标，才能定位到具体环节。
+  - id: d29-t4
+    kp: d29-k1
+    type: single
+    question: 下面的 Recall@K 实现有什么问题？
+    code: |
+      def recall_at_k(retrieved: list[str], gold: set[str], k: int) -> float:
+          hits = 0
+          for doc_id in retrieved[:k]:
+              if doc_id in gold:
+                  hits += 1
+          return hits / k
+    options:
+      - "应该遍历 gold 而不是 retrieved，否则结果偏大"
+      - "retrieved[:k] 应该改为 retrieved[k:]"
+      - "doc_id in gold 在集合上查找太慢，应改用列表"
+      - "除以 k 算的是 Precision@K，Recall@K 应除以正确项总数 len(gold)"
+    answer: [3]
+    explain: |
+      Recall 的分母是「应该找回的正确项总数」，Precision 的分母才是「返回的条数 K」。只有 1 条正确资料时，命中后 Recall 应为 1，而这段代码会得到 1/K。
+      A 遍历哪一边结果相同；B 切片方向错误；C 集合查找比列表更快。
+  - id: d29-t5
+    kp: d29-k1
+    type: multi
+    question: 一次改动后观察到：Recall@50 从 0.92 降到 0.80，Rerank 后的 MRR 也下降了。下列哪些改动最可能是原因？
+    options:
+      - "调整了切块大小"
+      - "更换了 Embedding 模型"
+      - "去掉了关键词检索这一路"
+      - "修改了生成回答的 System Prompt"
+      - "调大了生成模型的温度"
+    answer: [0, 1, 2]
+    explain: |
+      Recall@50 是召回阶段指标，切块、Embedding、检索路数都会直接影响它；召回少了，Rerank 能挑的正确资料也少，MRR 随之下降。
+      D、E 只影响生成阶段，不会改变召回结果。
+  - id: d29-t6
+    kp: d29-k2
+    type: single
+    question: 一个回答被拆成 5 条陈述，其中 4 条能在检索资料中找到依据，1 条是模型补充的常识。Faithfulness 是多少？
+    options:
+      - "1.0，因为补充的常识本身是对的"
+      - "0.8"
+      - "0.2"
+      - "无法计算，必须先有参考答案"
+    answer: [1]
+    explain: |
+      Faithfulness = 被资料支持的陈述数 ÷ 总陈述数 = 4 ÷ 5 = 0.8。它只看是否有资料依据，不看常识是否正确。
+      0.2 把分子分母弄反了；Faithfulness 不需要参考答案，需要参考答案的是正确率和 ContextRecall。
+  - id: d29-t7
+    kp: d29-k2
+    type: single
+    question: 某回答 Faithfulness 为 1.0，但与参考答案不符。最可能的原因是？
+    options:
+      - "生成模型的温度设得太高"
+      - "Answer Relevancy 指标计算错误"
+      - "回答太短，评审模型没有理解"
+      - "检索到的资料本身是错误或过期的版本，回答忠实地复述了它"
+    answer: [3]
+    explain: |
+      Faithfulness 满分说明每句话都有资料依据，答案仍错，问题就在资料本身——典型是检索到了作废版本或错误文档。应排查版本过滤与元数据。
+      A 温度高通常导致不忠实而非忠实但错；B、C 与这种现象无关。
+  - id: d29-t8
+    kp: d29-k2
+    type: judge
+    question: 只要 Faithfulness 足够高，就可以认为 RAG 系统的回答是正确的。
+    answer: false
+    explain: |
+      Faithfulness 衡量的是「有没有依据」，不是「对不对」。资料过期、检索错文档时，回答可以完全忠实却错误。
+      正确率需要对照参考答案单独评估，还要配合正确拒答率和误拒率。
+  - id: d29-t9
+    kp: d29-k2
+    type: multi
+    question: 下列哪些指标在计算时需要人工准备的参考答案？
+    options:
+      - "答案正确率"
+      - "RAGAS ContextRecall"
+      - "RAGAS ContextPrecision"
+      - "Faithfulness"
+      - "Answer Relevancy"
+    answer: [0, 1, 2]
+    explain: |
+      正确率要对照参考答案；RAGAS 的 ContextRecall、ContextPrecision 用参考答案判断资料是否覆盖、是否相关。
+      Faithfulness 只需问题、回答和资料；Answer Relevancy 用回答反推问题与原问题比较，也不需要参考答案。
+  - id: d29-t10
+    kp: d29-k2
+    type: single
+    question: Answer Relevancy 主要衡量的是什么？
+    options:
+      - "回答是否切题、是否针对用户的问题作答"
+      - "回答中的每句话是否都有资料依据"
+      - "回答是否与参考答案在事实上一致"
+      - "检索资料中有多少比例与问题相关"
+    answer: [0]
+    explain: |
+      Answer Relevancy 关注回答是否回应了问题本身，常见做法是由回答反推问题，再与原问题计算相似度。
+      B 是 Faithfulness；C 是正确率；D 接近 ContextPrecision 一类的检索层指标。
+  - id: d29-t11
+    kp: d29-k3
+    type: single
+    question: 用 LLM 对两个版本的回答做成对比较时，发现总是判排在第一位的回答更好。应对这种偏差的标准做法是？
+    options:
+      - "把评审温度调高，让判断结果更随机一些"
+      - "改为让被测模型自己当评审，减少分歧"
+      - "交换顺序各评一次，两次不一致记平局或人工复核"
+      - "只保留两个回答中更长、信息更多的那个"
+    answer: [2]
+    explain: |
+      这是位置偏差，交换顺序各评一次可以抵消。
+      A 只是增加噪声；B 会引入自我偏好偏差；D 会引入冗长偏差。
+  - id: d29-t12
+    kp: d29-k3
+    type: multi
+    question: 为了让 LLM 自动评分结果可信、可比较，下列哪些做法是必要的？
+    options:
+      - "用人工标注样本计算 LLM 评审与人工的一致率"
+      - "固定评审模型版本、Prompt 和温度，并写入评测报告"
+      - "评分标准具体化，给出各档定义和示例"
+      - "更换评审模型后重新建立基线，不直接对比历史分数"
+      - "每次评测随机选择一个评审模型，避免单一模型偏差"
+    answer: [0, 1, 2, 3]
+    explain: |
+      A 验证评审可信度；B、D 保证分数可比；C 降低评审的随意性。
+      E 会让每次分数口径不同，前后无法对比；降低单模型偏差应在固定配置下做校准或固定组合投票。
+  - id: d29-t13
+    kp: d29-k3
+    type: single
+    question: 下面用 RAGAS 0.4 计算 ContextRecall 的代码，问题出在哪里？
+    code: |
+      from ragas.metrics.collections import ContextRecall
+
+      recall = ContextRecall(llm=judge)
+      result = await recall.ascore(
+          user_input="试用期最长多久？",
+          retrieved_contexts=["劳动合同期限一年以上不满三年的，试用期不得超过二个月……"],
+      )
+      print(result.value)
+    options:
+      - "ascore 是异步方法，不能用 await 调用"
+      - "ContextRecall 需要参考答案，缺少 reference 参数"
+      - "retrieved_contexts 必须是单个字符串而不是列表"
+      - "ContextRecall 不需要 LLM，不应传入 llm"
+    answer: [1]
+    explain: |
+      ContextRecall 的含义是「参考答案中的信息有多少能在检索资料中找到」，必须提供 reference。
+      A 错，ascore 正是用 await 调用；C 错，资料是字符串列表；D 错，LLM 版本的 ContextRecall 需要评审模型，不需要 LLM 的是 NonLLMContextRecall 等。
+  - id: d29-t14
+    kp: d29-k3
+    type: judge
+    question: 用模型 A 当评审跑出的 Faithfulness 为 0.82，换成模型 B 当评审后为 0.88，说明系统效果提升了。
+    answer: false
+    explain: |
+      评审模型变了，打分口径也变了，两次分数不可比。要比较系统效果，必须在同一评审配置下评测改动前后的版本；更换评审模型后需重新建立基线。
+  - id: d29-t15
+    kp: d29-k4
+    type: single
+    question: 某团队的评测集 200 条全是「某制度规定了什么」的单一事实题，正确率 92%。上线后用户频繁投诉「明明没有的内容也给出了答案」。评测集最主要的缺陷是？
+    options:
+      - "样本数量太少，应扩充到 2000 条"
+      - "参考答案写得太简略"
+      - "没有区分简单和困难问题"
+      - "缺少无答案类样本，从未评测过拒答能力"
+    answer: [3]
+    explain: |
+      投诉指向的是「该拒答时没拒答」，而评测集中没有无答案样本，这项能力从来没被测过。
+      A 加再多同类事实题也测不到拒答；B、C 不是这次问题的根源。
+  - id: d29-t16
+    kp: d29-k4
+    type: multi
+    question: 一条 RAG 评测样本通常应包含哪些字段，才能同时支持检索、生成、拒答和权限评测？
+    options:
+      - "问题与多轮历史"
+      - "标注的出处：文档 ID 加页码或原文片段"
+      - "参考答案"
+      - "是否应拒答、提问用户的角色与问题类别"
+      - "当时线上回答的点赞数"
+    answer: [0, 1, 2, 3]
+    explain: |
+      A 支持追问类评测；B 支持检索指标；C 支持正确率与 ContextRecall；D 支持拒答、权限与按类统计。
+      E 是线上反馈信号，可以用来挑选样本，但不是评测样本的必要字段。
+  - id: d29-t17
+    kp: d29-k4
+    type: judge
+    question: 评测集如果只用 chunk_id 标注正确资料，重新切块后这些标注会失效；用文档 ID 加页码或原文片段标注更稳定。
+    answer: true
+    explain: |
+      重新切块会生成新的 chunk 和新 ID，旧 ID 对不上，检索指标会断崖式下跌而系统并未变差。按文档和位置标注，评测时判断检索到的 chunk 是否覆盖该位置，可以跨切块方案使用。
+  - id: d29-t18
+    kp: d29-k4
+    type: single
+    question: 设计 RAG 的上线回归门禁时，下列哪种规则最合理？
+    options:
+      - "按类别设阈值：越权类必须全部拒绝，无答案类不低于基线，整体正确率下降不超过阈值"
+      - "只要整体平均分不低于上一版就允许上线"
+      - "只看 Faithfulness，高于 0.9 即可上线"
+      - "每次随机抽 10 条人工看一下，觉得没问题就上线"
+    answer: [0]
+    explain: |
+      按类别设门禁能防止某一类严重退化被平均分掩盖，越权这类安全问题更要求零容忍。
+      B 会掩盖局部退化；C 不看正确率和拒答；D 样本太少，无法发现系统性退化。
+exam:
+  - id: d29-e1
+    kp: d29-k1
+    type: single
+    question: 评测结果显示 Hit@5 为 0.90，但 MRR 只有 0.35。最合理的解读和优化方向是？
+    options:
+      - "正确资料基本找不回来，应更换 Embedding 模型"
+      - "正确资料大多在前 5 内但排名靠后，应优化重排或截断策略"
+      - "生成模型能力不足，应换更强的模型"
+      - "两个指标互相矛盾，说明评测代码有错误"
+    answer: [1]
+    explain: |
+      Hit@5 高说明正确资料多数被找回到前 5，MRR 低说明它们往往不在第一名附近。若只把前 2~3 条送入 Prompt，就会丢失，应优化 Rerank 或调整截断。
+      A 与 Hit@5 高矛盾；C 不是检索指标能说明的；D 两者并不矛盾。
+  - id: d29-e2
+    kp: d29-k2
+    type: single
+    question: 抽检发现一类回答与参考答案一致，但其中关键数字在检索资料中找不到，引用的片段也不包含该数字。这属于哪种情况、应如何处理？
+    options:
+      - "忠实但错误，应排查检索到的文档版本"
+      - "回答切题，Answer Relevancy 高即可，不需处理"
+      - "正确但不忠实，模型用了自身知识，应按不合格处理并检查资料覆盖与 Prompt 约束"
+      - "评审模型出错，应更换评审模型"
+    answer: [2]
+    explain: |
+      答案碰巧正确但没有资料依据，属于「正确但不忠实」。企业场景下无法溯源的回答不可信，下次可能就是编造；应补全资料或加强「只依据资料」的约束。
+      A 方向相反；B 忽视了可信度问题；D 没有证据表明评审出错。
+  - id: d29-e3
+    kp: d29-k3
+    type: single
+    question: 新项目准备用 LLM 自动评估正确率，抽样 100 条后发现 LLM 评审与人工的一致率只有 62%。下一步最合理的是？
+    options:
+      - "细化评分标准和示例后重新评审并计算一致率，达标前只把 LLM 分数当参考"
+      - "直接采用 LLM 评审，样本多了误差会自然抵消"
+      - "放弃自动评测，所有改动都改为全量人工评审"
+      - "换一个更大的评审模型，不再与人工比较"
+    answer: [0]
+    explain: |
+      一致率低说明评分标准不清或评审有系统偏差，系统偏差不会因样本多而抵消。应细化标准、补示例后再校准，达标前不作为门槛。
+      C 成本过高且不可持续；D 跳过了验证环节。
+  - id: d29-e4
+    kp: d29-k4
+    type: single
+    question: 团队打算把近三个月的线上问答日志直接导入评测集。最需要先处理的问题是？
+    options:
+      - "日志太多，只保留最短的问题"
+      - "日志中的问题不够难，应全部改写成多跳问题"
+      - "先让 LLM 回答一遍，作为参考答案直接使用"
+      - "先做脱敏，去除姓名、工号、手机号等个人信息与敏感内容，并审核后再标注"
+    answer: [3]
+    explain: |
+      真实日志价值最高，但可能包含个人信息和敏感业务内容，直接导入会让评测集本身成为泄露源；脱敏和审核是前提。
+      A、B 会让样本失真；C 用模型输出当参考答案会把错误固化进评测集。
+  - id: d29-e5
+    kp: d29-k1
+    type: multi
+    question: 下列哪些检索指标会考虑正确结果在列表中的具体排名位置？
+    options:
+      - "Hit@K"
+      - "MRR"
+      - "Recall@K"
+      - "nDCG@K"
+      - "Precision@K"
+    answer: [1, 3]
+    explain: |
+      MRR 取第一条正确结果排名的倒数，nDCG 按位置做对数折扣，两者都对排名敏感。
+      Hit@K、Recall@K、Precision@K 只看前 K 条中有没有、有多少，正确资料排第 1 还是第 K 结果相同。
+  - id: d29-e6
+    kp: d29-k4
+    type: multi
+    question: 企业知识库问答的评测集中，下列哪些问题类别需要单独统计？
+    options:
+      - "知识库中没有答案的问题"
+      - "用户试图访问无权文档的问题"
+      - "涉及新旧版本冲突的问题"
+      - "依赖上一轮对话的追问"
+      - "所有问题合并成一个总分即可，无需分类"
+    answer: [0, 1, 2, 3]
+    explain: |
+      无答案类看拒答，越权类看权限，版本冲突类看是否引用现行版本，追问类看指代消解——它们的失败模式不同，混在总分里会被掩盖。
+      E 正是需要避免的做法。
+  - id: d29-e7
+    kp: d29-k3
+    type: judge
+    question: 让被测模型同时担任评审，打分可能系统性偏高，因此评审模型最好与被测模型不同。
+    answer: true
+    explain: |
+      LLM 评审存在自我偏好：倾向于给与自己风格相近或自己生成的回答更高分。用不同模型当评审，并用人工标注校准，可以减轻这种偏差。
+  - id: d29-e8
+    kp: d29-k2
+    type: judge
+    question: Answer Relevancy 得分高，说明回答中的事实是正确的。
+    answer: false
+    explain: |
+      Answer Relevancy 只衡量回答是否切题，不判断事实对错。一个切题但事实错误的回答同样可以得高分，事实正确性要靠正确率和 Faithfulness 评估。
+  - id: d29-e9
+    kp: d29-k4
+    type: case
+    question: |
+      团队更换 Embedding 模型后跑回归评测，整体正确率从 86% 变为 87%，按规则「整体不下降即可上线」准备发布。
+      你查看分类报告发现：「无答案」类的正确拒答率从 90% 降到 62%，「越权尝试」类有 2 条样本返回了无权文档的片段。
+      最合理的处理是？
+    options:
+      - "整体正确率有提升，符合现有规则，按计划正常上线"
+      - "阻止上线，排查拒答阈值与权限过滤，门禁改为按类别设阈值"
+      - "删除这两类样本，让评测集更聚焦于核心的事实类问题"
+      - "先灰度上线，观察一周用户投诉情况再决定是否回滚"
+    answer: [1]
+    explain: |
+      新模型的分数分布变了，原拒答阈值可能失效；越权返回片段更是安全事故，必须阻止上线。门禁只看整体平均分的规则要改为按类别设阈值。
+      A 忽视安全与拒答退化；C 是掩盖问题；D 把风险转嫁给用户，越权数据一旦泄露无法撤回。
+interview:
+  - id: d29-i1
+    kp: d29-k1
+    type: scenario
+    difficulty: 2
+    question: 你简历上写 RAG 问答正确率 85%，面试官追问：「这个 85% 是怎么算出来的？你怎么评估 RAG？」
+    key_points:
+      - {text: "先说明评测集：来源、条数、类别分布、标注方式", dim: project}
+      - {text: "分层指标：检索层 Recall@K 与 MRR，生成层 Faithfulness 与正确率", dim: concept}
+      - {text: "拒答单独统计：正确拒答率与误拒率", dim: principle}
+      - {text: "说明正确率的判定方式：人工或 LLM 评审，以及与人工的一致率", dim: engineering}
+    reference: |
+      **先讲评测集**：数字必须有出处。例如「评测集 N 条，来自专家出题、LLM 合成后人工审核和脱敏的线上点踩问题，覆盖单一事实、多跳、表格、追问、无答案、越权、版本冲突 7 类，每条标注了文档 ID + 页码和参考答案」。
+      **再讲分层指标**：
+      - 检索层：混合召回 Top-50 的 Recall@50，Rerank 后的 Recall@5 和 MRR，用来判断召回和重排；
+      - 生成层：Faithfulness（是否有依据）和正确率（是否和参考答案一致）；
+      - 拒答：无答案类的正确拒答率、有答案类的误拒率。
+      **最后讲 85% 的口径**：它是「有答案样本的正确率」，判定方式是 LLM 评审对照参考答案三档打分，评审模型和 Prompt 固定，并在 100 条人工标注样本上校准过一致率。同时报告其他指标，避免单一数字误导。
+    oral: |
+      这个 85% 是在我自己建的评测集上算的。评测集有【填条数】条，来自专家出题、模型合成后我人工审过的题，以及脱敏后的点踩问题，分了七类，每条都标了出处页码和参考答案。
+      评估是分层做的：检索层看 Recall@5 和 MRR，生成层看 Faithfulness 和正确率，无答案题单独看正确拒答率，有答案题看误拒率。
+      85% 指的是有答案样本的正确率，用固定配置的 LLM 评审对照参考答案打分，之前在一百条人工标注上校准过，一致率是【填你的一致率】。所以我一般会把这几个指标放在一起说，不只报一个数。
+  - id: d29-i2
+    kp: d29-k2
+    type: scenario
+    difficulty: 3
+    question: 你调整了切块策略，评测报告显示 RAGAS 平均分上升了，但业务方反馈「效果变差了」。你怎么排查？
+    key_points:
+      - {text: "先确认评测可比：评测集版本、评审配置是否一致，标注是否因重切块失效", dim: engineering}
+      - {text: "按类别和分层指标拆开看，找出退化的类别与环节", dim: principle}
+      - {text: "收集业务方的具体失败样本，补进评测集复现", dim: project}
+      - {text: "区分忠实但错误、正确但不忠实、误拒等失败类型并对症修复", dim: concept}
+      - {text: "改进评测本身：补齐缺失类别，门禁按类别设置", dim: engineering}
+    reference: |
+      **第一步：评测是否可比**。确认改动前后用的是同一版评测集、同一评审模型和 Prompt；重新切块后若标注是 chunk_id，旧标注会失效，指标本身就不可信。
+      **第二步：拆开看**。平均分会掩盖局部退化：按类别（表格、多跳、追问等）和分层指标（Recall@5、MRR、Faithfulness、正确率、误拒率）逐项对比。例如切块变小可能让 Faithfulness 上升，却让表格和长条款问题的正确率下降。
+      **第三步：用业务样本复现**。请业务方给出具体问题，加入评测集，看它们在哪一层失败。
+      **第四步：对症修复**。召回不到就调切块或父子块（Day 23）；排序问题调 Rerank；生成问题调 Prompt 组装。
+      **第五步：改进评测**。说明原评测集缺了业务关心的类别，补齐后把门禁改为按类别设置，避免再出现「分数涨、体验降」。
+    oral: |
+      我会先怀疑评测本身。第一看可不可比：评测集和评审配置有没有变，重新切块后如果标注用的是 chunk ID，旧标注已经失效了，分数没有意义。
+      第二是把平均分拆开，按问题类别和检索、生成分层对比。比如切块变小 Faithfulness 可能变好，但表格和长条款题的正确率掉了，平均下来反而涨。
+      第三请业务方给具体例子，加进评测集复现，定位在哪一层失败再对症改。最后把评测集缺的类别补上，门禁按类别设。我之前【填你遇到过的类似情况】。
+  - id: d29-i3
+    kp: d29-k4
+    type: design
+    difficulty: 4
+    question: 请为一个从零开始的企业知识库问答项目设计完整的评测体系：从评测集构建、指标选择到自动化回归和线上反馈闭环。
+    key_points:
+      - {text: "评测集：多来源、按类别覆盖、稳定标注出处与参考答案、脱敏、带版本号", dim: project}
+      - {text: "指标分层：检索层确定性指标，生成层 LLM 评审指标，拒答与权限单独统计", dim: concept}
+      - {text: "LLM 评审校准与固定配置，只比较同配置下的相对变化", dim: principle}
+      - {text: "自动化：检索指标每次改动跑，LLM 指标合并前或每晚跑，按类别门禁", dim: engineering}
+      - {text: "线上闭环：点踩与投诉进入评测集，监控线上拒答率、引用点击率等信号", dim: engineering}
+    reference: |
+      **1. 评测集**：冷启动用业务专家出题 + LLM 合成后人工审核；上线后持续从点踩、投诉中补样本，导入前脱敏。按事实、多跳、表格、追问、无答案、越权、版本冲突分类；每条标注文档 ID + 页码或原文片段、参考答案、是否应拒答、用户角色；评测集带版本号。
+      **2. 指标分层**：
+      - 检索层（确定性、便宜）：Recall@50、Recall@5、MRR；
+      - 生成层（LLM 评审）：Faithfulness、正确率；
+      - 安全与拒答：越权拦截率（必须 100%）、正确拒答率、误拒率；
+      - 工程：P95 延迟、单次成本。
+      **3. 评审可信**：100 条左右人工标注校准一致率，固定评审模型版本、Prompt、温度，换配置重建基线。
+      **4. 自动化回归**：检索指标每次改动都跑；LLM 指标在合并前或每晚跑；与同版本基线对比，按类别门禁（越权零容忍、无答案不低于基线、整体正确率下降不超过阈值），接入 CI（Day 44）。
+      **5. 线上闭环**：监控拒答率、点踩率、引用点击率、无结果率；异常样本进入待标注队列，审核后补入评测集并升版本。
+    oral: |
+      我会分五块来做。评测集先用专家出题加模型合成、人工审核冷启动，上线后从点踩和投诉里持续补充，入库前脱敏；按七类组织，每条标出处页码、参考答案、是否该拒答和用户角色，评测集带版本号。
+      指标分三层：检索层用 Recall 和 MRR，便宜且确定；生成层用 Faithfulness 和正确率，靠 LLM 评审；越权和拒答单独统计，越权必须百分之百拦住。LLM 评审先用人工标注校准，再固定配置。
+      自动化上，检索指标每次改动都跑，LLM 指标合并前跑，按类别设门禁。线上监控点踩率和拒答率，坏样本回流评测集。在我的项目里【填你的评测集规模和一次被门禁拦下的例子】。
+sources:
+  - {title: "RAGAS - Available Metrics", url: "https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/"}
+  - {title: "RAGAS - Context Precision", url: "https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/context_precision/"}
+  - {title: "RAGAS - Response Relevancy", url: "https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/answer_relevance/"}
+  - {title: "LangSmith - Evaluate a RAG application", url: "https://docs.langchain.com/langsmith/evaluate-rag-tutorial"}
+  - {title: "Zheng et al. 2023 - Judging LLM-as-a-Judge", url: "https://arxiv.org/abs/2306.05685"}

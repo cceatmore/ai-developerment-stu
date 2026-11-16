@@ -1,0 +1,751 @@
+day: 22
+phase: 3
+title: 文档处理：PDF、Word、TXT 与文档解析
+goals:
+  - 能解释 PDF、Word、TXT 三种格式在「结构信息」上的本质差异，以及为什么 PDF 最难解析
+  - 能说出扫描件 OCR、表格、页眉页脚、多栏排版、编码问题的成因、检测方法和处理思路
+  - 能根据文档类型、质量要求和部署约束，对 pypdf、PyMuPDF、unstructured、docling、MinerU 做出选型
+  - 能读懂一段 PDF/TXT 解析代码，找出吞异常、静默乱码等隐患
+knowledge_points:
+  - id: d22-k1
+    name: 文档解析的本质：从排版文件还原文本与结构
+    level: P0
+    summary: 解析不是「读出文字」，而是还原阅读顺序、结构和出处；垃圾进，垃圾出
+    why: |
+      RAG 的效果上限由入库数据决定：解析错了，后面的切片、向量化、检索、生成全部白做。
+      实际项目里**一半以上的 RAG 质量问题出在解析环节**（乱码、错序、表格拍平、空文本），而它又是最容易被「一行代码读 PDF」糊弄过去的环节。
+    problem: |
+      企业文档格式五花八门：电子版 PDF、扫描件、Word、Excel、TXT、网页。它们存储文字的方式完全不同，有的根本没有「段落」「标题」的概念。
+      解析要解决的是：把这些格式统一转成**干净的文本 + 结构信息（标题、段落、表格）+ 出处信息（来源、页码）**，供后续切片使用。
+    principle: |
+      **一、三种格式的本质差异**
+
+      | 格式 | 内部是什么 | 有没有结构 | 主要难点 |
+      |---|---|---|---|
+      | PDF | 页面绘制指令：在坐标 (x, y) 处用某字体画某字形 | 基本没有，只有坐标 | 阅读顺序、表格、扫描件、乱码字体 |
+      | Word（docx） | 一个 zip 包，里面是 XML：段落、样式、表格节点 | 有，标题样式、表格都保留 | 表格单独存放、旧版 .doc 格式 |
+      | TXT | 一串字节 | 没有 | 编码未知、换行不统一 |
+
+      **二、为什么 PDF 最难**
+
+      PDF 的设计目标是「**在任何设备上打印出来都一样**」，而不是「让程序读懂内容」。它的内容流本质上是一串指令：
+
+      - 「移动到坐标 (72, 700)，用宋体 12 号，画出这几个字形」
+      - 「移动到坐标 (300, 700)，再画几个字形」
+
+      PDF 里**没有「段落」「标题」「表格」这些概念**，只有字形和坐标。解析器要根据坐标**猜**：哪些字属于同一行、哪些行属于同一段、先读左栏还是右栏、哪些线条围成了表格。所以：
+
+      - 双栏论文可能被读成「左栏第一行 + 右栏第一行」交错的句子。
+      - 表格只剩一堆按坐标排列的数字，行列关系丢失。
+      - 有的字体没有提供「字形 → Unicode」的映射表，提取出来就是乱码或空白。
+      - 扫描件每页只是一张图片，根本没有文字，必须 OCR。
+
+      **三、Word 和 TXT**
+
+      - **docx** 结构清晰：段落带样式名（如「Heading 1」），可以直接还原标题层级；表格是独立的 XML 节点；页眉页脚存放在单独的部分，不会混进正文。难点是：遍历段落时容易漏掉表格，旧版 .doc 是二进制格式需要先转换。
+      - **TXT** 最简单也最危险：没有任何结构，而且文件本身不记录编码，读错编码就是满屏乱码。
+
+      **四、解析的目标产物：统一的文档模型**
+
+      不管输入是什么格式，解析层都应该输出同一种结构，后面的切片、入库只依赖这个结构：
+
+      ```mermaid
+      classDiagram
+        class ParsedDocument {
+          doc_id
+          source_path
+          file_hash
+          doc_type
+          version
+          acl
+        }
+        class Block {
+          block_type
+          text
+          page
+          heading_path
+          bbox
+        }
+        ParsedDocument "1" --> "*" Block : 包含
+      ```
+
+      - `block_type`：标题 / 段落 / 表格 / 列表 / 图片说明，切片时可以区别对待。
+      - `page`、`heading_path`：后面用于引用出处和按标题切片（Day 23）。
+      - `file_hash`：用于判断文件是否变化、避免重复入库。
+
+      **五、解析流水线：按类型路由、按质量降级**
+
+      ```mermaid
+      flowchart TD
+        F["上传文件"] --> T["按文件头识别真实类型 不只看扩展名"]
+        T -->|"PDF"| P["检查每页是否有文本层"]
+        P -->|"有文本"| PT["提取文本和版面"]
+        P -->|"无文本或乱码多"| OCR["OCR 识别"]
+        T -->|"docx"| W["按段落样式和表格节点解析"]
+        T -->|"txt"| X["检测编码后解码"]
+        PT --> N["统一成 Block 列表"]
+        OCR --> N
+        W --> N
+        X --> N
+        N --> Q["质量检查 空页率 乱码率 字数"]
+        Q -->|"不合格"| H["进入人工复核队列"]
+        Q -->|"合格"| C["进入切片"]
+      ```
+
+      两个关键设计：
+
+      - **按真实类型路由**：用户把 .doc 改名成 .docx、把图片改名成 .pdf 是常态，要看文件头（magic bytes），而不是只信扩展名。
+      - **质量检查 + 降级**：解析出空文本、乱码比例高时，不能「成功入库」，要么自动切到 OCR，要么进入人工复核。**解析失败必须可见**，否则就是「入库成功但永远搜不到」。
+    scenarios: |
+      - **知识库批量导入**：几千份历史文档一次性入库，需要按类型路由、记录每份文档的解析状态和质量指标。
+      - **合同审查助手**：合同多为扫描件或盖章后的 PDF，需要 OCR 并保留页码以便引用。
+      - **产品手册问答**：手册中大量参数表格，需要保留表格结构。
+      - **增量更新**：通过文件哈希判断文档是否变化，只重新解析变化的文件。
+    pitfalls: |
+      - **误区：PDF 就是文本文件，读出来就行。** PDF 只有字形和坐标，结构要靠猜。
+      - **只信扩展名**：改了后缀的文件会走错解析器，直接报错或输出乱码。
+      - **解析失败静默返回空**：入库任务显示成功，但这份文档永远检索不到。
+      - **丢掉页码和标题信息**：后期做引用和按标题切片时只能返工重新解析。
+      - **混淆**：docx 是结构化的 XML，.doc 是旧版二进制格式，两者解析方式完全不同。
+    interview_asks:
+      - 为什么 PDF 比 Word 难解析？
+      - 你们的文档解析模块输出什么结构？为什么这样设计？
+      - 如何发现解析质量有问题的文档？
+    project_example: |
+      某集团知识库项目首批导入 8000 份文档，最初用一个脚本统一「读出文字」就入库。
+      上线后发现大量问题检索不到，抽查发现：约 15% 的 PDF 是扫描件，解析结果为空；部分双栏技术规范被读成交错的句子；部分 .docx 其实是改了后缀的 .doc。
+      重构后解析层按文件头路由，每页检查文本层并自动走 OCR，输出统一的 Block 结构，并记录每份文档的空页率和乱码率；不合格的进入人工复核队列。重新入库后，检索命中率明显提升。
+  - id: d22-k2
+    name: PDF 四大难点：扫描件 OCR、表格、页眉页脚、多栏排版
+    level: P0
+    summary: 扫描件要先判断再 OCR，表格要保住行列关系，页眉页脚要去重，多栏要还原阅读顺序
+    why: |
+      企业 PDF 里扫描件、表格、页眉页脚、多栏排版几乎无处不在。它们不会让程序报错，而是**悄悄污染知识库**：检索命中无关的页眉、表格数字张冠李戴、句子前后错乱。
+      面试中「扫描件怎么处理」「表格怎么入库」是文档处理方向的高频追问。
+    problem: |
+      简单的文本提取只能处理「单栏、纯文字、有文本层」的理想 PDF。
+      真实文档需要回答四个问题：这一页有没有文字？表格的行列关系怎么保留？每页重复的页眉页脚怎么去掉？多栏页面怎么按正确顺序读？
+    principle: |
+      **一、扫描件与 OCR**
+
+      扫描件的每一页只是一张图片，没有文本层，普通提取得到空字符串。
+
+      **如何判断一页需要 OCR**（逐页判断，因为一份 PDF 可能部分页是扫描的）：
+
+      - 提取出的字数明显少于正常页（例如少于几十个字），但页面上有大图片。
+      - 提取出的文本**乱码比例高**（大量无法识别的符号、私有区字符），说明字体缺少 Unicode 映射，这种「有文本层但不可用」的页也要走 OCR。
+
+      **OCR 的代价与风险**：
+
+      - **慢且贵**：比直接提取慢一到两个数量级，通常需要 GPU 或独立服务，要放在异步任务里。
+      - **会识别错**：「0」和「O」、「1」和「l」、相近汉字混淆，印章、手写、低分辨率扫描更差。金额、编号这类关键信息出错代价很大。
+      - **要保存置信度**：低置信度页面进入人工复核，而不是直接入库。
+
+      **二、表格**
+
+      PDF 里的表格只是「一些线条 + 按坐标排列的文字」，普通提取会把它拍平成一串数字：
+
+      > 2023 2024 营业收入 120 150 净利润 8 12
+
+      模型看到这串文字，无法判断 150 是哪一年的哪个指标。处理思路：
+
+      - **用能识别表格结构的工具**提取单元格，再序列化为 Markdown 表格或 HTML。
+      - **大表格按行转成自然语言**，每行带上表头：「2024 年 营业收入：150 亿元」，这样每个 chunk 都自带上下文。
+      - **表格整体作为一个 Block**，切片时不要从表格中间切断（Day 23）；超长表格按行分组，每组重复表头。
+      - **数值类问题**（求和、同比）更适合把表格同时存入结构化表，用 SQL 计算，而不是让模型从文本里算。
+
+      **三、页眉页脚**
+
+      每页重复出现的「公司名称 / 文档编号 / 第 X 页 共 Y 页 / 机密」会混进每一页的正文：
+
+      - 切片后每个 chunk 都带着同样的页眉，**向量被这些噪声拉近**，检索「公司」相关问题时命中一堆无关页。
+      - 页码数字混进正文，句子被打断。
+
+      **处理思路**：统计每页**顶部和底部几行**的内容，把数字归一化（「第 3 页」→「第 # 页」）后，在大多数页面都重复出现的行判定为页眉页脚并删除。也可以按坐标裁掉页面上下边缘区域。版面分析模型可以直接识别 header/footer 区块。
+
+      **四、多栏排版**
+
+      论文、期刊、宣传册常见双栏甚至三栏。按「从上到下、从左到右」的坐标顺序读，会把左右两栏的同一行拼成一句话，语义完全错乱。
+
+      ```mermaid
+      flowchart TD
+        P["PDF 页面"] --> L{"有文本层吗"}
+        L -->|"无或乱码多"| O["OCR 并记录置信度"]
+        L -->|"有"| A["版面分析 识别栏 标题 表格 页眉页脚"]
+        O --> A
+        A --> H["去除页眉页脚和页码"]
+        A --> TB["表格区域 提取单元格 转 Markdown 或逐行文本"]
+        A --> RO["正文区域 按栏还原阅读顺序"]
+        H --> M["合并为有序 Block 列表 保留页码"]
+        TB --> M
+        RO --> M
+      ```
+
+      **处理思路**：先做**版面分析**（Layout Analysis），识别出每个文本块的位置和栏，再按「先左栏从上到下，再右栏从上到下」排序。简单场景可以按文本块的 x 坐标分栏；复杂场景用版面分析模型（PyMuPDF 2.x 的 Layout、docling、MinerU 都内置了这类能力）。
+
+      **五、其他常见坑**
+
+      - **断字连字符**：英文行尾「infor-」「mation」需要合并。
+      - **水印**：斜着铺满页面的「内部资料」会插进正文。
+      - **页面旋转**：横向页面提取顺序可能错乱。
+
+      **核心原则**：**逐页检测、按区域处理、保留页码、质量可见**。
+    scenarios: |
+      - **合同和发票**：大量扫描件，需要 OCR，金额编号要做校验或人工复核。
+      - **上市公司年报**：大量财务表格，需要保留行列关系，数值问题走结构化查询。
+      - **技术规范和论文**：双栏排版，需要版面分析还原阅读顺序。
+      - **企业制度文件**：每页都有「文件编号 + 密级」页眉，需要去除。
+    pitfalls: |
+      - **整份文档判断是否扫描件**：很多 PDF 是混合的，前几页是电子版，后面附件是扫描件，必须逐页判断。
+      - **只看字数不看乱码率**：有文本层但字体缺映射的页，提取出的是乱码，同样要 OCR。
+      - **表格直接拍平入库**：数字和表头的对应关系丢失，模型张冠李戴。
+      - **去页眉页脚时误删正文**：阈值太低会把正文中重复出现的短句（如「注：」）也删掉，要限定只看页面首尾几行。
+      - **OCR 结果直接信任**：关键数字要校验或保留原图供人工核对。
+    interview_asks:
+      - 扫描件 PDF 你们怎么处理？怎么判断一页需不需要 OCR？
+      - 表格类文档怎么入库，才能让模型正确回答表格里的数字？
+      - 页眉页脚不处理会有什么影响？
+    project_example: |
+      在一个「年报问答」项目中，用户问「2024 年净利润同比增长多少」，系统经常答错。
+      排查发现财务报表被拍平成一串数字，模型把营业收入当成了净利润。
+      改造方案：用版面分析工具识别表格，转成 Markdown 表格作为独立 Block 入库；同时把核心财务指标抽取到 PostgreSQL 结构化表，问题涉及计算时走 SQL。
+      另外统计发现每页都有「XX 股份有限公司 2024 年年度报告」页眉，去除后，与公司名称相关的无关命中明显减少。
+  - id: d22-k3
+    name: Word、TXT 解析与编码问题
+    level: P1
+    summary: docx 要同时遍历段落和表格并利用标题样式；TXT 要先检测编码，解码失败不能静默忽略
+    why: |
+      Word 和 TXT 看起来简单，反而最容易「写错了也不报错」：漏掉表格内容、丢失标题层级、GBK 文件被当成 UTF-8 读出乱码。
+      国内企业大量历史文档是 GBK/GB18030 编码，或者是旧版 .doc，这些是交付现场常见的问题。
+    problem: |
+      docx 的结构信息很丰富，但常见写法只遍历段落，表格里的内容全部丢失，标题样式也没有被利用。
+      TXT 文件不记录自己的编码，用错误编码解码要么报错，要么（加了忽略错误参数后）悄悄产生乱码进入知识库。
+    principle: |
+      **一、docx 解析要点**
+
+      - docx 是一个 zip 包，正文在 `word/document.xml` 中，由段落（`w:p`）和表格（`w:tbl`）按顺序组成。
+      - 常用库 `python-docx` 中，`document.paragraphs` **只包含正文段落，不包含表格里的文字**；表格要通过 `document.tables` 单独读取。如果需要保持原文顺序，要按 XML 中段落和表格的出现顺序一起遍历。
+      - 段落的 `style.name`（如 `Heading 1`、`标题 1`）可以用来还原标题层级，生成 `heading_path`，这对按标题切片非常重要。注意：很多用户不用标题样式，而是「加粗 + 大字号」当标题，这时只能用启发式规则判断。
+      - 页眉页脚在 `section.header` / `section.footer` 中，**不会混进正文**，这一点比 PDF 友好。
+      - 旧版 `.doc` 是二进制格式，`python-docx` 不能读，通常先用 LibreOffice 无界面模式转成 docx 再解析。
+
+      **二、TXT 与编码**
+
+      计算机只存字节，**编码**决定字节如何映射成字符。同一个「中」字：UTF-8 是 3 个字节，GBK 是 2 个字节。用错编码解码就会出现乱码。
+
+      常见编码：
+
+      - **UTF-8**：现在的主流；Windows 记事本保存的 UTF-8 可能带 **BOM**（文件开头 3 个字节 EF BB BF），用 `utf-8-sig` 解码可以去掉。
+      - **GBK / GB18030**：国内 Windows 系统和老系统的历史文档常见，GB18030 是 GBK 的超集。
+      - **UTF-16**：部分系统导出的文件，开头有 BOM。
+
+      **检测与解码策略**：
+
+      1. 先看 BOM，有 BOM 直接确定编码。
+      2. 尝试 UTF-8 严格解码，成功就用 UTF-8（UTF-8 有严格的字节规则，误判概率低）。
+      3. 失败时用 `charset-normalizer` 之类的库检测，或按业务经验尝试 GB18030。
+      4. **记录检测结果和置信度**；无法确定时标记为待复核，而不是 `errors="ignore"` 硬解。
+
+      ```mermaid
+      flowchart TD
+        B["读取原始字节"] --> BOM{"有 BOM 吗"}
+        BOM -->|"有"| D1["按 BOM 对应编码解码"]
+        BOM -->|"无"| U{"UTF-8 严格解码成功吗"}
+        U -->|"成功"| D2["使用 UTF-8"]
+        U -->|"失败"| DET["编码检测库给出候选和置信度"]
+        DET -->|"置信度高"| D3["按候选编码解码"]
+        DET -->|"置信度低"| R["标记待复核 不入库"]
+      ```
+
+      **三、解码后的规范化**
+
+      - **换行统一**：`\r\n`、`\r` 统一成 `\n`。
+      - **Unicode 规范化**：全角字母数字转半角（NFKC），避免「ＡＢＣ１２３」和「ABC123」被当成不同的词。
+      - **清理不可见字符**：零宽空格、软连字符、控制字符。
+      - 这些规则**离线和在线要保持一致**（Day 21 的「契约」）。
+    scenarios: |
+      - **历史制度文档迁移**：老 OA 系统导出的 TXT 多为 GBK 编码。
+      - **员工手册 docx**：使用了标题样式，可以直接生成章节路径用于切片和引用。
+      - **报价单 docx**：核心信息全在表格里，漏读表格等于没解析。
+      - **日志、导出数据**：可能是 UTF-16 编码，需要识别 BOM。
+    pitfalls: |
+      - **只遍历 `document.paragraphs`**：表格内容全部丢失，而且不会报错。
+      - **`errors="ignore"` 或 `errors="replace"` 一把梭**：乱码静默进入知识库，检索永远命中不了。
+      - **用 GB18030 兜底就以为万事大吉**：GB18030 能解码很多本不是它编码的字节序列，结果是「没报错的乱码」，仍需检查。
+      - **把 .doc 当 .docx 读**：直接报错，或者被误判为损坏文件。
+      - **规范化只在离线做**：在线问题没做同样处理，导致全角半角不匹配。
+    interview_asks:
+      - 用 python-docx 解析 Word 有哪些容易漏掉的内容？
+      - TXT 文件出现乱码，你怎么排查和处理？
+      - 文本规范化包括哪些步骤？为什么离线和在线要一致？
+    project_example: |
+      某政务知识库迁移了 2 万份历史 TXT 公文，初版代码统一按 UTF-8 读取并忽略错误，入库后发现大量公文检索不到。
+      抽样发现约三成文件是 GBK 编码，被忽略错误后只剩零散的英文和数字。
+      修复：先检测 BOM，再严格 UTF-8 解码，失败后用编码检测库给出候选，并统计「中文字符占比」做二次校验；低置信度文件进入复核清单。重新入库后，这批公文的检索恢复正常。
+  - id: d22-k4
+    name: 文档解析工具选型：pypdf、PyMuPDF、unstructured、docling、MinerU
+    level: P1
+    summary: 轻量提取用 pypdf 或 PyMuPDF，复杂版面和表格用 docling、MinerU 等版面分析工具，按质量与成本分级处理
+    why: |
+      工具选错，要么解析质量不够（表格、扫描件处理不了），要么成本过高（全量跑 GPU 模型），要么踩到许可证问题。
+      面试和方案评审中经常会问「你们用什么解析 PDF，为什么」，需要能讲出取舍而不是只报一个名字。
+    problem: |
+      解析工具从「纯 Python 轻量提取」到「深度学习版面分析 + OCR + VLM」跨度很大，速度可能相差几十倍，部署依赖、许可证、对中文和表格的支持也差别明显。
+      需要根据文档类型、质量要求、部署环境（是否有 GPU、是否允许数据出网）来选择和组合。
+    principle: |
+      **一、工具分层**
+
+      | 工具 | 定位 | 优点 | 注意点 |
+      |---|---|---|---|
+      | **pypdf** | 纯 Python PDF 库 | 依赖少、易部署，适合文本层良好的 PDF | 无版面分析和 OCR，复杂排版、表格效果有限 |
+      | **PyMuPDF** | 基于 MuPDF 引擎 | 速度快，可取文本块和坐标；2.x 内置面向 LLM 的 Markdown 输出和版面分析 | AGPL 与商业双许可，商用闭源需评估许可证 |
+      | **unstructured** | 多格式统一分区 | 一个 `partition` 接口处理多种格式，输出带类型的元素 | PDF 有 fast、hi_res、ocr_only、auto 策略，hi_res 依赖较重 |
+      | **docling** | 文档转换与结构化 | 版面、表格、阅读顺序识别，输出结构化文档，可导出 Markdown，自带面向 RAG 的切片器 | 依赖深度学习模型，首次加载模型较慢 |
+      | **MinerU** | 面向复杂 PDF 的高质量解析 | 版面、公式、表格、OCR，4.x 提供 flash 到 advanced 多档质量 | 高档位需要 VLM 推理资源 |
+
+      **二、选型思路：按质量分级，而不是一刀切**
+
+      ```mermaid
+      flowchart TD
+        D["待解析文档"] --> T{"格式"}
+        T -->|"docx 或 txt"| S["专用轻量解析 python-docx 或编码检测"]
+        T -->|"PDF"| Q{"文本层良好 且版面简单"}
+        Q -->|"是"| F["轻量提取 pypdf 或 PyMuPDF"]
+        Q -->|"否 多栏 表格多 扫描件"| H["版面分析工具 docling 或 MinerU 或 unstructured hi_res"]
+        F --> C["质量检查"]
+        H --> C
+        S --> C
+        C -->|"不合格"| U["升级到更高档解析或人工复核"]
+      ```
+
+      核心原则：
+
+      - **大部分文档走便宜的路径**，只有检测到扫描件、多表格、多栏的页面才走重型解析，控制整体成本。
+      - **私有化部署**时优先选可本地运行的工具，确认不会把文档上传到外部服务（例如 MinerU 4.x 默认本地解析，只有显式传 `--remote` 才上传）。
+      - **许可证**：开源不等于可以随意商用闭源，PyMuPDF 是 AGPL 与商业双许可，选型时要和法务确认。
+      - **用自己的文档做对比测试**：选 20~50 份有代表性的难文档（扫描件、双栏、复杂表格），比较输出质量和速度，而不是只看榜单。
+
+      **三、解析输出要统一**
+
+      不管用哪个工具，都在外面包一层适配器，输出 Day 22 第一个知识点里的统一 `Block` 结构。这样以后换工具或按页混用工具，切片和入库代码都不用改。
+    scenarios: |
+      - **POC 阶段**：先用 PyMuPDF 或 pypdf 快速打通链路，再针对效果差的文档引入版面分析工具。
+      - **年报、论文、技术规范**：表格和多栏多，直接上 docling 或 MinerU 这类版面分析工具。
+      - **私有化交付**：选可本地部署的工具，核对许可证，关闭远程调用。
+      - **混合文档库**：按页特征路由，大部分页走轻量提取，少数难页走重型解析。
+    code: |
+      ```python
+      # 依赖：pip install pymupdf docling（版本见 freshness）
+      import pymupdf
+      from docling.document_converter import DocumentConverter
+
+      # 轻量路径：逐页取文本，sort=True 按坐标排序（单栏文档足够）
+      with pymupdf.open("policy.pdf") as doc:
+          pages = [page.get_text("text", sort=True) for page in doc]
+
+      # 重型路径：版面分析 + 表格识别，导出 Markdown（表格转为 Markdown 表格）
+      converter = DocumentConverter()          # 模型在首次 convert 时加载，应复用该对象
+      result = converter.convert("annual_report.pdf")
+      markdown = result.document.export_to_markdown()
+      ```
+    pitfalls: |
+      - **只看演示效果选工具**：要用自己的「难文档」做对比。
+      - **所有文档都走最重的解析**：成本和耗时失控，大部分简单文档没必要。
+      - **忽略许可证和数据出网**：AGPL 组件、调用云端解析服务都可能违反客户要求。
+      - **每次请求都新建解析器对象**：深度学习工具的模型加载很慢，应在进程内复用。
+      - **使用过时写法**：如 PyMuPDF 旧的 `import fitz`（2.x 中会给出弃用警告），应改为 `import pymupdf`。
+    interview_asks:
+      - 你们用什么工具解析 PDF？为什么选它？
+      - 如何在解析质量和成本之间做平衡？
+      - 私有化部署的项目，文档解析选型要注意什么？
+    project_example: |
+      某律所的合同知识库：5 万份电子版 Word/PDF 和约 3000 份扫描版历史合同，要求完全内网部署。
+      方案：docx 用 python-docx 解析；文本层良好的 PDF 用 PyMuPDF 轻量提取（已采购商业许可）；检测为扫描件或多表格的页面，送入内网 GPU 服务器上的版面分析 + OCR 工具处理。
+      质量检查不合格的文档进入律师助理复核队列。整体约九成文档走轻量路径，解析成本和耗时都控制在可接受范围。
+    freshness: |
+      核对于 2026-11（PyPI 与官方文档）：
+      - **pypdf 7.0.1**（2026-11-10）。7.0.0 移除了 Python 3.9 支持并清理了一批已弃用 API，升级大版本前要跑回归。
+      - **PyMuPDF 2.1**。2.0（2026-10-19）把 PyMuPDF4LLM 和 PyMuPDF Layout 合并进主包，可直接 `pymupdf.open(path).to_markdown()`；旧写法是安装三个包并注意导入顺序。推荐 `import pymupdf`，旧的 `import fitz` 会给出 FutureWarning。许可证仍为 AGPL 与商业双许可。
+      - **unstructured 0.27.x**：`partition_pdf` 的 strategy 为 `auto`（默认）、`fast`、`hi_res`、`ocr_only`；auto 在需要表格结构时选 hi_res，文本可提取时选 fast，否则选 ocr_only。
+      - **docling 2.150.0**（2026-11-10）：`DocumentConverter().convert(...)` 返回结果的 `.document` 可 `export_to_markdown()`；原生切片器 `HybridChunker` 位于 `docling.chunking`。
+      - **MinerU 4.2.1**。4.0（2026-09-16）用 `flash / basic / standard / advanced` 四档质量取代了 3.x 的 `pipeline / vlm / hybrid` 后端选择；默认本地解析，显式 `--remote` 才上传。
+      - 具体参数和默认值以各自官方文档为准，大版本升级前务必用自己的样本文档回归。
+    sources:
+      - {title: "pypdf CHANGELOG", url: "https://pypdf.readthedocs.io/en/stable/meta/CHANGELOG.html"}
+      - {title: "PyMuPDF 2.0 发布说明（官方博客）", url: "https://pymupdf.io/blog/pymupdf-2-0"}
+      - {title: "PyMuPDF Changelog", url: "https://pymupdf.io/changelog"}
+      - {title: "Unstructured - Partitioning", url: "https://docs.unstructured.io/open-source/core-functionality/partitioning"}
+      - {title: "Docling - Chunking", url: "https://docling-project.github.io/docling/concepts/chunking/"}
+      - {title: "MinerU 4.0.0 Release", url: "https://github.com/opendatalab/MinerU/releases/tag/mineru-4.0.0-released"}
+      - {title: "MinerU Migration to 4.0", url: "https://opendatalab.github.io/MinerU/reference/migration_4/"}
+quiz:
+  - id: d22-q1
+    kp: d22-k2
+    type: single
+    question: 用 pypdf 提取一份合同 PDF，每页都得到空字符串，程序没有报错。最可能的原因是？
+    options:
+      - PDF 文件被加密，需要输入密码
+      - 这份 PDF 是扫描件，每页只是图片，没有文本层
+      - pypdf 不支持中文，需要换成 PyMuPDF
+      - 文件编码是 GBK，需要指定 encoding 参数
+    answer: [1]
+    explain: |
+      扫描件每页只是一张图片，没有可提取的文字，任何纯文本提取工具都只能得到空字符串，需要 OCR。
+      A：加密且无密码时通常会报错或需要先解密，而不是静默返回空；C：pypdf 能提取中文，换工具也解决不了没有文本层的问题；D：PDF 内部用字体映射表示字符，不存在「文件编码」参数，编码问题属于 TXT。
+  - id: d22-q2
+    kp: d22-k2
+    type: multi
+    question: 以下哪些解析问题会直接降低 RAG 的检索或回答质量？
+    options:
+      - 每页的「公司名称 + 第 X 页」页眉混进了每个 chunk
+      - 双栏论文被按行读成左右两栏交错的句子
+      - 财务表格被拍平成一串数字，行列关系丢失
+      - OCR 把合同编号中的数字 0 识别成字母 O
+      - 文件名中包含中文字符
+    answer: [0, 1, 2, 3]
+    explain: |
+      页眉噪声会让大量 chunk 的向量彼此靠近，导致无关命中；多栏错序破坏语义；表格拍平导致数字与表头对应关系丢失；OCR 错字会让精确编号检索失败、答案出错。
+      文件名包含中文只要存储和编码处理正确，不影响内容解析质量，属于干扰项。
+  - id: d22-q3
+    kp: d22-k3
+    type: judge
+    question: 使用 python-docx 时，遍历 document.paragraphs 就能拿到 Word 文档中的全部文字，包括表格单元格里的内容。
+    answer: false
+    explain: |
+      错误。`document.paragraphs` 只包含正文中的段落，表格是独立的 `w:tbl` 节点，要通过 `document.tables` 遍历行和单元格读取。
+      很多报价单、参数表的核心信息都在表格里，只遍历段落会悄悄丢失这些内容且不报错。需要保持原文顺序时，应按 XML 中段落和表格的出现顺序一起遍历。
+  - id: d22-q4
+    kp: d22-k2
+    type: scenario
+    question: 年报问答系统中，用户问「2024 年净利润是多少」，系统回答的却是营业收入的数字，引用的页码是正确的。请分析原因并给出改进方案。
+    key_points:
+      - {text: "指出表格被拍平成文本，数字与表头、行名的对应关系丢失", dim: principle}
+      - {text: "提出用能识别表格结构的工具提取，序列化为 Markdown 表格或逐行带表头的文本", dim: engineering}
+      - {text: "提出表格作为整体 Block，切片时不从中间切断，超长表格分组并重复表头", dim: engineering}
+      - {text: "提出数值计算类问题把指标存入结构化表，用 SQL 计算", dim: project}
+    reference: |
+      **原因**：引用页码正确，说明检索找对了页面，问题出在**解析阶段的表格处理**。普通文本提取把表格拍平成「营业收入 120 150 净利润 8 12」这样的序列，模型无法判断哪个数字对应哪一行哪一列，于是张冠李戴。
+      **改进**：
+      1. 用支持表格结构识别的工具（版面分析类工具）提取表格单元格，转成 Markdown 表格；或者逐行转写为「2024 年 净利润：12 亿元」这种自带表头的文本。
+      2. 表格作为一个独立的 Block 进入切片，不和前后正文混切，也不从中间切断；超长表格按若干行分组，每组都重复表头。
+      3. 对「同比增长多少」这类需要计算的问题，把核心财务指标同时存入结构化表，用 SQL 计算后再交给模型组织语言。
+      4. 把这类数字问题加入评估集，回归验证。
+  - id: d22-q5
+    kp: d22-k3
+    type: short
+    question: 一批从老系统导出的 TXT 制度文件入库后，检索时完全命中不了，抽查发现入库文本里只有零散的英文和数字。请分析可能原因、排查方法和正确的处理方式。
+    key_points:
+      - {text: "判断是编码问题：GBK 等编码的文件被按 UTF-8 解码且忽略了错误，中文被丢弃", dim: principle}
+      - {text: "排查：查看原始字节、BOM，统计中文字符占比，确认代码里是否使用 errors 参数忽略错误", dim: engineering}
+      - {text: "处理：先看 BOM，再严格 UTF-8 解码，失败后用编码检测并记录置信度", dim: engineering}
+      - {text: "低置信度或解码失败的文件应标记复核，不能静默入库", dim: engineering}
+    reference: |
+      **原因**：老系统导出的文件多为 GBK/GB18030 编码，代码按 UTF-8 读取并使用了 `errors="ignore"`，所有无法解码的中文字节被直接丢弃，只剩 ASCII 范围的英文和数字。程序不报错，入库任务显示成功。
+      **排查**：用十六进制查看文件开头的字节，判断有无 BOM；在代码中搜索 `errors="ignore"` 或 `errors="replace"`；对入库文本统计中文字符占比，异常低的就是可疑文件。
+      **处理**：① 有 BOM 按 BOM 解码；② 尝试 UTF-8 严格解码；③ 失败后用编码检测库得到候选编码和置信度，按候选解码；④ 解码后再做一次「中文字符占比」校验；⑤ 置信度低或校验失败的文件进入复核清单，不入库。最后统一换行和全半角规范化。
+  - id: d22-q6
+    kp: d22-k1
+    type: design
+    question: 请设计一个支持 PDF、docx、TXT 的文档解析服务，要求能处理扫描件，并且「解析失败或质量差的文档不能悄悄入库」。说明模块划分、处理流程和质量监控方式。
+    key_points:
+      - {text: "按文件头识别真实类型并路由到不同解析器，而不是只看扩展名", dim: engineering}
+      - {text: "PDF 逐页检测文本层和乱码率，需要时走 OCR，表格和多栏走版面分析", dim: principle}
+      - {text: "所有解析器输出统一 Block 结构，保留页码、标题路径、块类型", dim: concept}
+      - {text: "记录空页率、乱码率、OCR 置信度等指标，不合格进入人工复核，失败状态可查询和重试", dim: project}
+    reference: |
+      **模块划分**：
+      1. **类型识别**：读取文件头判断真实类型，计算文件哈希用于去重和增量更新。
+      2. **解析器适配层**：PDF、docx、TXT 各一个适配器，统一输出 `ParsedDocument + Block 列表`（块类型、文本、页码、标题路径、坐标）。
+      3. **PDF 处理**：逐页检查文本层字数和乱码率；正常页轻量提取，扫描页或乱码页走 OCR，多栏、表格页走版面分析；去除页眉页脚。
+      4. **docx**：按顺序遍历段落和表格，用标题样式生成标题路径。
+      5. **TXT**：BOM → 严格 UTF-8 → 编码检测，记录置信度。
+      **流程**：上传后写入「待解析」任务，由后台队列异步执行；每一步结果和中间产物存档，失败可以从断点重试。
+      **质量监控**：为每份文档记录空页率、乱码率、OCR 平均置信度、总字数；超过阈值标记为「待复核」，不进入切片；解析异常必须记录错误原因并让任务状态变为失败，管理后台可查询、可重试、可人工修正。定期统计各类型文档的失败率，发现某类文档集中出问题时针对性优化。
+  - id: d22-q7
+    kp: d22-k4
+    type: short
+    question: 项目有 5 万份电子版 Word/PDF 和 3000 份扫描版合同，要求完全内网部署、商用闭源交付。请给出解析工具的选型思路，并说明需要注意的风险。
+    key_points:
+      - {text: "按文档类型和质量分级：大部分走轻量解析，扫描件和复杂版面走版面分析加 OCR", dim: engineering}
+      - {text: "内网部署要选择可本地运行的工具，确认不会上传数据到外部服务", dim: engineering}
+      - {text: "关注许可证，例如 PyMuPDF 是 AGPL 与商业双许可，闭源交付需评估或采购", dim: concept}
+      - {text: "用自己的代表性难文档做对比测试，评估质量和速度，并保留升级与人工复核通道", dim: project}
+    reference: |
+      **选型思路**：
+      - docx 用 python-docx 之类的轻量库直接解析；文本层良好、版面简单的 PDF 用 pypdf 或 PyMuPDF 轻量提取，速度快、资源少。
+      - 扫描件、多栏、复杂表格页面送到版面分析 + OCR 工具（如 docling、MinerU、unstructured 的 hi_res 策略），部署在内网 GPU 服务器上，异步批量处理。
+      - 所有工具外面包统一的适配层，输出相同的 Block 结构，方便替换和混用。
+      **风险**：
+      1. **许可证**：PyMuPDF 是 AGPL 与商业双许可，闭源交付要和法务确认或采购商业许可；其他工具也要逐一核对。
+      2. **数据出网**：确认工具默认本地运行，关闭可能的远程调用和遥测。
+      3. **资源与耗时**：OCR 和版面模型需要 GPU，要估算 3000 份合同的处理时间。
+      4. **质量**：先用 20~50 份代表性难文档对比测试；OCR 低置信度的页面进入人工复核，合同金额、编号等关键字段做校验。
+code_reading:
+  id: d22-c1
+  kp: [d22-k2, d22-k3]
+  title: PDF 与 TXT 解析和页眉页脚清洗
+  scenario: 知识库离线入库任务中的解析模块。后台任务从对象存储下载文件后，按扩展名调用 parse_pdf() 或 read_txt()，结果交给切片模块。任务成功与否只看函数是否抛出异常。
+  language: python
+  code: |
+    import logging
+    import re
+    from collections import Counter
+    from dataclasses import dataclass
+    from pathlib import Path
+
+    import pymupdf
+
+    logger = logging.getLogger(__name__)
+    MIN_CHARS_PER_PAGE = 30
+
+
+    @dataclass
+    class ParsedPage:
+        source: str
+        page: int          # 从 1 开始
+        text: str
+        needs_ocr: bool = False
+
+
+    def _norm(line: str) -> str:
+        return re.sub(r"\d+", "#", line.strip())
+
+
+    def _strip_header_footer(pages: list[list[str]], ratio: float = 0.6) -> list[list[str]]:
+        counter: Counter[str] = Counter()
+        for lines in pages:
+            counter.update({_norm(l) for l in lines[:2] + lines[-2:] if l.strip()})
+        threshold = max(3, int(len(pages) * ratio))
+        noisy = {k for k, v in counter.items() if v >= threshold}
+        cleaned = []
+        for lines in pages:
+            head, body, tail = lines[:2], lines[2:-2], lines[-2:]
+            keep = lambda part: [l for l in part if _norm(l) not in noisy]
+            cleaned.append(keep(head) + body + keep(tail))
+        return cleaned
+
+
+    def parse_pdf(path: Path) -> list[ParsedPage]:
+        try:
+            with pymupdf.open(path) as doc:
+                raw = [page.get_text("text", sort=True).splitlines() for page in doc]
+        except Exception:
+            return []
+        result = []
+        for no, lines in enumerate(_strip_header_footer(raw), start=1):
+            text = "\n".join(l for l in lines if l.strip())
+            result.append(ParsedPage(path.name, no, text, needs_ocr=len(text) < MIN_CHARS_PER_PAGE))
+        logger.info("parsed %s pages=%d ocr=%d", path.name, len(result), sum(p.needs_ocr for p in result))
+        return result
+
+
+    def read_txt(path: Path) -> str:
+        data = path.read_bytes()
+        for enc in ("utf-8-sig", "gb18030"):
+            try:
+                return data.decode(enc)
+            except UnicodeDecodeError:
+                continue
+        return data.decode("utf-8", errors="ignore")
+  walkthrough:
+    function: |
+      把 PDF 逐页解析成带页码的文本，去掉每页首尾重复出现的页眉页脚，并标记文字过少、可能需要 OCR 的页面；把 TXT 文件按编码候选依次尝试解码成字符串。
+    key_functions: |
+      - `_norm()`：把行内所有数字替换成 `#`，让「第 3 页」「第 4 页」归一成同一个模式。
+      - `_strip_header_footer()`：统计每页前两行和后两行的归一化内容，出现页数超过阈值的判定为页眉页脚，只在首尾区域删除，正文不动。
+      - `parse_pdf()`：用 PyMuPDF 打开文件，按坐标排序提取每页文本，清洗后生成 `ParsedPage`，字数不足的页标记 `needs_ocr`。
+      - `read_txt()`：依次尝试 `utf-8-sig`、`gb18030`，最后用忽略错误的 UTF-8 兜底。
+    params: |
+      - `path` 由入库任务传入，是下载到本地的临时文件路径。
+      - `ratio=0.6` 表示至少 60% 的页（且不少于 3 页）首尾都出现才算页眉页脚。
+      - `MIN_CHARS_PER_PAGE=30` 是判断「疑似扫描页」的字数阈值。
+      - `sort=True` 让 PyMuPDF 按坐标从上到下、从左到右排序文本，对单栏文档有效，对多栏文档可能造成交错。
+    data_flow: |
+      ```mermaid
+      flowchart LR
+        F["PDF 文件"] --> R["每页 get_text 后按行切分"]
+        R --> S["统计首尾两行的归一化模式"]
+        S --> N["识别页眉页脚模式集合"]
+        N --> C["每页只在首尾删除命中行"]
+        C --> P["ParsedPage 列表 含页码和 needs_ocr"]
+        T["TXT 文件字节"] --> D["依次尝试 utf-8-sig 和 gb18030"]
+        D --> O["字符串 或 忽略错误的兜底结果"]
+      ```
+      PDF 链路保留了页码，下游切片可以写入 metadata；TXT 链路只返回字符串，没有任何解码方式的记录。
+    failure_points: |
+      - **异常被吞掉（值得审查）**：`except Exception: return []`，文件损坏、加密、下载不完整时都返回空列表。调用方「只看是否抛异常」，于是任务被标记为成功，这份文档永远检索不到，且没有任何日志。
+      - **静默乱码（值得审查）**：GB18030 能把很多并非 GB18030 编码的字节（例如 UTF-16 或 Big5 文件）解码成功，结果是「不报错的乱码」；最后的 `errors="ignore"` 兜底会直接丢弃无法解码的字节。两种情况都不会留下任何记录。
+      - **多栏排版**：`sort=True` 按坐标排序，双栏页面会左右交错。
+      - **页数太少时**：阈值至少 3 页，2 页的短文档不会去页眉页脚，这是有意的保守设计。
+      - **needs_ocr 只是标记**：如果下游没有处理这个标记，扫描页仍会以空文本入库。
+    debugging: |
+      - 复现吞异常：传入一个截断的 PDF 或加密 PDF，观察返回空列表且无错误日志。
+      - 在 `except` 处临时加 `logger.exception` 或打断点，查看真实异常类型。
+      - 查看 `parsed ... pages=N ocr=M` 日志，`ocr` 占比高的文档重点抽查。
+      - 对 `read_txt` 的结果统计中文字符占比和替换字符数量，用一份 UTF-16 文件和一份 GBK 文件分别测试。
+      - 打印 `noisy` 集合，确认没有把正文短句误判为页眉页脚。
+    change_request: |
+      - **要求解析失败可见**：删掉 `except Exception: return []`，改为捕获具体异常后记录 `logger.exception` 并抛出自定义的 `ParseError`，让任务状态变为失败、可重试。
+      - **要求记录 TXT 的编码**：`read_txt` 返回 `(text, encoding, confidence)`，先检查 BOM 和严格 UTF-8，再用编码检测库；低置信度时抛出或标记待复核，去掉 `errors="ignore"`。
+      - **要求支持扫描件**：在 `parse_pdf` 之后增加 OCR 步骤，对 `needs_ocr=True` 的页调用 OCR 服务替换文本，并记录置信度。
+  questions:
+    - id: d22-c1-q1
+      kp: d22-k2
+      type: code
+      question: 按执行顺序说明 `_strip_header_footer()` 如何识别和删除页眉页脚。为什么要用 `_norm()` 把数字替换成 `#`？为什么只在首尾两行删除？
+      key_points:
+        - {text: "先统计每页前两行和后两行的归一化内容，每页内去重后计数", dim: concept}
+        - {text: "出现页数达到 60% 且不少于 3 页的模式判定为页眉页脚", dim: concept}
+        - {text: "数字归一化是为了让页码不同的「第 X 页」归为同一模式", dim: principle}
+        - {text: "只在首尾删除是为了避免误删正文中重复出现的短句或数字", dim: engineering}
+      reference: |
+        1. 遍历每一页，取前两行和后两行，经 `_norm()` 归一化后放进集合（同一页内去重），再累加到 `Counter`。
+        2. 计算阈值 `max(3, int(页数 * 0.6))`，出现次数达到阈值的模式放入 `noisy`。
+        3. 再遍历每一页，把行拆成 head（前两行）、body（中间）、tail（后两行），只对 head 和 tail 过滤命中 `noisy` 的行，body 原样保留。
+        **数字归一化**：页码每页都不同，「第 3 页 共 20 页」和「第 4 页 共 20 页」直接比较不相等，替换成 `#` 后变成同一个模式才能被统计出来。
+        **只在首尾删除**：正文中也可能有重复的短行，比如表格里的数字「100」归一化后是「#」，或者「注：」这类短句，如果全文删除就会误删正文内容。
+    - id: d22-c1-q2
+      kp: d22-k2
+      type: code
+      question: 入库任务的成功与否只看是否抛出异常。如果传入一份下载不完整的损坏 PDF，整个流程会怎样表现？这段代码应该怎么改？
+      key_points:
+        - {text: "pymupdf.open 或提取过程抛异常，被 except Exception 吞掉，返回空列表", dim: concept}
+        - {text: "调用方认为成功，文档以零页入库，永远检索不到且无日志", dim: engineering}
+        - {text: "应捕获具体异常、记录日志并抛出自定义异常，让任务失败可重试", dim: engineering}
+        - {text: "还应对结果做质量检查，例如零页或全部 needs_ocr 时标记异常", dim: project}
+      reference: |
+        **表现**：`pymupdf.open` 或 `get_text` 对损坏文件抛出异常，被 `except Exception: return []` 吞掉，函数返回空列表且没有任何日志。入库任务没有收到异常，于是标记为成功，切片模块收到 0 页，什么也不写入。用户之后搜索这份文档的内容，永远搜不到，运维排查时也找不到任何错误记录。
+        **修改**：
+        1. 去掉宽泛的吞异常，改为捕获具体异常，`logger.exception("parse failed %s", path)` 后抛出自定义 `ParseError(path, reason)`，让任务失败、进入重试或人工处理队列。
+        2. 对加密文件单独处理：检测到需要密码时抛出明确的错误类型，提示上传者。
+        3. 解析成功后再做质量检查：页数为 0、全部页面 `needs_ocr`、总字数过少时，把文档状态标记为「待复核」，而不是直接进入切片。
+    - id: d22-c1-q3
+      kp: d22-k3
+      type: code
+      question: 分析 `read_txt()` 对以下三种文件分别会返回什么：带 BOM 的 UTF-8 文件、GBK 编码文件、UTF-16 编码文件。指出其中的隐患并给出改进方案。
+      key_points:
+        - {text: "带 BOM 的 UTF-8 被 utf-8-sig 正确解码并去掉 BOM", dim: concept}
+        - {text: "GBK 文件 UTF-8 解码失败后由 GB18030 正确解码，因为 GB18030 是 GBK 超集", dim: principle}
+        - {text: "UTF-16 文件可能被 GB18030 解码成不报错的乱码，或落到 errors=ignore 丢字", dim: principle}
+        - {text: "改进：先识别 BOM、严格 UTF-8、再用编码检测并记录置信度，低置信度标记复核", dim: engineering}
+      reference: |
+        - **带 BOM 的 UTF-8**：`utf-8-sig` 成功解码并去掉开头的 BOM，结果正确。
+        - **GBK 文件**：中文字节不符合 UTF-8 规则，`utf-8-sig` 抛出 `UnicodeDecodeError`；接着 `gb18030` 解码成功，因为 GB18030 兼容 GBK，结果正确。
+        - **UTF-16 文件**：`utf-8-sig` 失败后，`gb18030` 很可能「解码成功」但得到一堆乱码（GB18030 能接受的字节组合很多），也可能失败后落到最后的 `errors="ignore"`，把无法解码的字节丢弃。两种结果都不报错。
+        **隐患**：编码判断没有任何校验和记录，乱码会静默入库。
+        **改进**：先检测 BOM（UTF-8、UTF-16 LE/BE 各有固定 BOM）；无 BOM 时严格 UTF-8 解码；失败后用编码检测库获取候选编码和置信度；解码后检查中文字符占比、替换字符数量；返回值带上 `encoding` 和 `confidence` 写入 metadata；置信度低时标记待复核，去掉 `errors="ignore"`。
+interview:
+  - id: d22-i1
+    kp: d22-k1
+    type: oral
+    difficulty: 1
+    question: 为什么 PDF 比 Word 难解析？解析的目标产物应该是什么？
+    key_points:
+      - {text: "说明 PDF 本质是绘制指令，只有字形和坐标，没有段落标题表格等结构", dim: principle}
+      - {text: "说明 docx 是 XML，段落样式和表格节点保留了结构", dim: concept}
+      - {text: "说出阅读顺序、表格、扫描件、字体乱码等 PDF 典型难点", dim: concept}
+      - {text: "说明目标产物是带块类型、页码、标题路径的统一结构，便于切片和引用", dim: engineering}
+    reference: |
+      PDF 的设计目标是在任何设备上「打印效果一致」，它的内容流是一串绘制指令：在某个坐标用某种字体画出某些字形。PDF 里没有段落、标题、表格这些语义概念，解析器只能根据坐标去猜阅读顺序、段落边界和表格结构，所以会出现多栏交错、表格拍平；字体缺少 Unicode 映射时会提取出乱码；扫描件甚至没有文字，只能 OCR。
+      Word 的 docx 本质是 zip 包里的 XML，段落有样式名（可以还原标题层级），表格是独立节点，页眉页脚也单独存放，结构信息完整得多。
+      解析的目标产物不应该只是一大段纯文本，而是统一的结构：文档级的来源、哈希、版本、权限，以及块级的类型（标题、段落、表格）、文本、页码、标题路径。这样后面可以按结构切片、按页码引用、按版本过滤，而且换解析工具时下游不用改。
+    oral: |
+      核心原因是 PDF 是为「打印」设计的，不是为「读懂」设计的。它内部只有「在某个坐标画某个字」的指令，没有段落、标题、表格的概念，解析器只能靠坐标去猜，所以多栏会错序、表格会拍平、扫描件根本没有字。
+      Word 的 docx 是 XML，有段落样式和表格节点，结构完整得多。
+      所以我在项目里会让所有解析器输出统一的结构：块类型、文本、页码、标题路径，再加上文档的来源和版本。这样后面的切片、引用和过滤都依赖这个结构，换解析工具也不影响下游。
+  - id: d22-i2
+    kp: d22-k2
+    type: oral
+    difficulty: 2
+    question: 你们怎么处理扫描件 PDF？怎么判断某一页需要 OCR？OCR 有哪些风险？
+    key_points:
+      - {text: "逐页判断而不是整份判断，因为一份 PDF 可能部分页是扫描件", dim: engineering}
+      - {text: "判断依据：提取字数过少且有大图，或者文本乱码比例高", dim: principle}
+      - {text: "OCR 风险：慢、需要算力、相近字符识别错误、印章手写效果差", dim: concept}
+      - {text: "工程处理：异步执行、记录置信度、低置信度人工复核、关键字段校验", dim: project}
+    reference: |
+      **判断方法**：逐页处理。先尝试直接提取文本，如果字数明显少于正常页面并且页面上有大面积图片，判定为扫描页；另外还要检查乱码比例，有些 PDF 有文本层，但字体缺少 Unicode 映射，提取出来全是乱码，这种页也要走 OCR。
+      **为什么逐页**：很多合同正文是电子版，后面附的营业执照、签字页是扫描件；整份判断会漏掉或浪费。
+      **OCR 的风险**：速度比直接提取慢很多，通常需要 GPU 或独立服务；会出现「0 和 O」「1 和 l」以及形近汉字混淆；印章、手写、低清扫描效果差。
+      **工程处理**：OCR 放在异步任务队列中执行；保存每页的识别置信度，低于阈值的页面进入人工复核；合同编号、金额等关键字段做格式校验；保留原始页面图片，回答引用时可以让用户查看原图核对。
+    oral: |
+      我们是逐页判断的，因为很多合同正文是电子版，附件是扫描件。
+      判断依据有两个：一是提取的字数特别少而页面上有大图；二是提取出来乱码比例高，说明字体没有 Unicode 映射，这种也要 OCR。
+      OCR 本身有两个风险：慢，而且会认错字，比如 0 和 O、形近汉字。所以我们把 OCR 放在异步队列里，记录每页置信度，低置信度的进人工复核，金额和编号做格式校验，还保留原图让用户能核对。
+  - id: d22-i3
+    kp: d22-k2
+    type: oral
+    difficulty: 2
+    question: 产品手册、财报里有大量表格，你们是怎么入库的，才能让模型正确回答表格里的数字？
+    key_points:
+      - {text: "指出直接拍平会丢失行列关系，导致数字张冠李戴", dim: principle}
+      - {text: "使用表格结构识别后转 Markdown 表格或逐行带表头的文本", dim: engineering}
+      - {text: "表格作为整体切片，超长表格按行分组并重复表头", dim: engineering}
+      - {text: "数值计算类问题走结构化存储和 SQL，结合项目举例", dim: project}
+    reference: |
+      **问题**：PDF 里的表格只是线条和按坐标排列的文字，普通提取会拍平成一串数字，模型无法知道某个数字对应哪一行哪一列，经常把营业收入当成净利润。
+      **处理方式**：
+      1. 用支持表格结构识别的版面分析工具提取单元格。
+      2. 小表格序列化为 Markdown 表格，作为一个独立的块入库；大表格逐行转写成「表名 + 行名 + 列名：值」的文本，每个 chunk 自带完整上下文。
+      3. 切片时不从表格中间切断，超长表格按若干行分组，每组重复表头，并记录表格标题和页码。
+      4. 涉及求和、同比等计算的问题，把指标同时写入结构化表，由 SQL 计算，模型只负责理解问题和组织回答。
+      5. 把表格类问题放进评估集持续回归。
+    oral: |
+      表格是 RAG 里最容易翻车的地方，直接提取会拍平成一串数字，模型会张冠李戴。
+      我们的做法是先用版面分析工具识别表格结构，小表转成 Markdown 表格整体入库，大表逐行转成「年份、指标、数值」这种自带表头的文本，并且切片时每组都重复表头。
+      如果问题需要计算，比如同比增长，我们会把指标同时存进数据库表，用 SQL 算，模型只负责组织语言。
+      在年报问答项目里，这样改完以后数字类问题的准确率明显提升。
+  - id: d22-i4
+    kp: d22-k4
+    type: oral
+    difficulty: 3
+    question: 常见的 PDF 解析工具有哪些？你会怎么选型？
+    key_points:
+      - {text: "能说出 pypdf、PyMuPDF 轻量提取与 docling、MinerU、unstructured 版面分析类工具的区别", dim: concept}
+      - {text: "提出按文档质量分级处理，大部分走轻量路径，难文档走重型解析", dim: engineering}
+      - {text: "考虑部署约束：是否有 GPU、是否允许数据出网、许可证", dim: engineering}
+      - {text: "强调用自己的代表性难文档做对比测试，并用适配层统一输出", dim: project}
+    reference: |
+      **工具分两类**：
+      - 轻量提取：pypdf（纯 Python，依赖少）、PyMuPDF（MuPDF 引擎，速度快、可取坐标，2.x 起内置面向 LLM 的 Markdown 输出和版面分析，AGPL 与商业双许可）。适合文本层良好、版面简单的文档。
+      - 版面分析类：docling（版面、表格、阅读顺序，输出结构化文档并自带切片器）、MinerU（面向复杂 PDF，4.x 提供 flash 到 advanced 多档质量）、unstructured（多格式统一 partition，PDF 有 fast、hi_res、ocr_only、auto 策略）。适合扫描件、多栏、表格多的文档，但需要更多算力。
+      **选型方法**：
+      1. 按质量分级：先检测每份文档或每页的特征，简单的走轻量路径，难的走版面分析，控制整体成本。
+      2. 看部署约束：有没有 GPU；是否必须内网，工具是否默认本地运行；许可证是否允许闭源商用。
+      3. 用自己的 20~50 份代表性难文档做对比，评估文本准确度、表格还原度、阅读顺序和速度。
+      4. 外面包统一的适配层，输出相同的块结构，方便替换和混用。
+    oral: |
+      我会把工具分成两类：pypdf、PyMuPDF 是轻量提取，快、依赖少；docling、MinerU、unstructured 的高精度模式是版面分析类，能处理表格、多栏和扫描件，但要算力。
+      选型上我不会一刀切，而是按质量分级：大部分简单文档走轻量路径，检测到扫描件或复杂表格的页再走重型解析。
+      然后看部署约束，比如必须内网、有没有 GPU、许可证能不能闭源商用，像 PyMuPDF 是 AGPL 和商业双许可，要和法务确认。
+      最后一定用客户自己的难文档做对比测试，并在外面包一层适配器，换工具不影响下游。
+  - id: d22-i5
+    kp: d22-k1
+    type: oral
+    difficulty: 4
+    question: 请设计一个生产级的文档解析流水线，需要支持每天上千份文档的增量入库，并保证解析质量可监控、失败可追溯。
+    key_points:
+      - {text: "上传后异步任务化处理，按文件头路由，文件哈希去重与增量更新", dim: engineering}
+      - {text: "逐页检测、按区域处理，扫描页 OCR，表格和多栏走版面分析，输出统一块结构", dim: principle}
+      - {text: "每步中间产物存档，失败有明确状态、错误原因、可重试", dim: engineering}
+      - {text: "质量指标监控与人工复核闭环，并能结合项目说明效果", dim: project}
+    reference: |
+      **整体流程**：上传 → 写入文档记录（状态：待解析）→ 消息队列 → 解析 Worker → 质量检查 → 切片入库。
+      **关键设计**：
+      1. **增量与去重**：计算文件哈希，内容未变化则跳过；内容变化则生成新版本，旧版本的 chunk 在新版本入库成功后再下线，保证切换期间可用。
+      2. **路由与分级**：按文件头识别真实类型；PDF 逐页检测文本层和乱码率，正常页轻量提取，扫描页 OCR，表格和多栏页走版面分析；所有解析器输出统一的块结构（类型、文本、页码、标题路径）。
+      3. **可追溯**：每一步的中间产物（原始文本、清洗后文本、块列表）存到对象存储，日志带文档 ID；异常不能吞掉，任务状态明确为失败并记录原因，支持按文档重试。
+      4. **资源隔离**：OCR 和版面模型的 Worker 单独部署在 GPU 机器上，与轻量解析分开排队，避免大文件阻塞小文件。
+      5. **质量监控**：每份文档记录页数、空页率、乱码率、OCR 置信度、总字数；超过阈值标记为待复核，不进入切片；看板统计每日成功率、失败原因分布、各类型平均耗时；人工复核结果回流用于调整阈值。
+    oral: |
+      我会把它设计成一条异步、可追溯的流水线。
+      文件上传后先算哈希，没变化就跳过，变了就生成新版本，新版本入库成功后再下线旧版本。
+      然后按文件头路由，PDF 逐页检测，正常页轻量提取，扫描页走 OCR，表格多栏走版面分析，最后都输出统一的块结构。
+      每一步的中间产物都存档，失败绝不吞异常，任务状态和原因都能查，能单独重试。OCR 这类重任务放在 GPU Worker 单独排队。
+      最后是质量监控：空页率、乱码率、OCR 置信度不达标就进人工复核。我们之前就是靠这个发现了一批扫描件和编码错误的文档。
+sources:
+  - {title: "pypdf CHANGELOG", url: "https://pypdf.readthedocs.io/en/stable/meta/CHANGELOG.html"}
+  - {title: "PyMuPDF Changelog", url: "https://pymupdf.io/changelog"}
+  - {title: "Unstructured - Partitioning", url: "https://docs.unstructured.io/open-source/core-functionality/partitioning"}
+  - {title: "Docling CHANGELOG", url: "https://github.com/docling-project/docling/blob/main/CHANGELOG.md"}
+  - {title: "MinerU 4.x Parsing Tiers 讨论", url: "https://github.com/opendatalab/MinerU/discussions/5709"}

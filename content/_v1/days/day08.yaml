@@ -1,0 +1,747 @@
+day: 8
+phase: 1
+title: HTTP 与 API：方法、状态码、请求响应、JSON 与 RESTful
+goals:
+  - 能说清一次 HTTP 请求和响应由哪些部分组成，以及各个方法的语义（安全、幂等）
+  - 能准确解释常见状态码，尤其是 LLM 网关中 429、502、503、504 的含义与处理方式
+  - 能解释幂等性，并为「创建对话 / 发起生成 / 扣费」这类非幂等接口设计安全的重试方案
+  - 能按 RESTful 原则设计一组 AI 对话 API，包括资源路径、错误格式、分页与版本
+knowledge_points:
+  - id: d08-k1
+    name: HTTP 请求响应结构与方法语义
+    level: P0
+    summary: 一次 HTTP 交互 = 请求（方法、路径、头、体）+ 响应（状态码、头、体）；方法表达意图，安全和幂等是方法的契约
+    why: |
+      AI 应用开发本质上是「调 API + 提供 API」：调用 LLM、Embedding、向量库、MCP 服务，同时对前端和其他系统暴露接口。
+      学员有前端经验，会用 fetch/axios，但往往只关心「能不能拿到数据」。后端开发需要从协议层理解每个字段的含义，才能正确设计接口、排查 4xx/5xx、配置网关与重试。
+    problem: |
+      HTTP 解决的是「**不同系统之间如何用统一格式交换请求和结果**」的问题。
+      方法语义解决的是「**中间环节（浏览器、代理、网关、SDK）如何在不了解业务的情况下做正确决策**」：哪些请求可以缓存、哪些失败后可以自动重试、哪些重试会造成重复扣费。
+    principle: |
+      **一、请求和响应长什么样**
+
+      以 HTTP/1.1 的文本格式为例（HTTP/2、HTTP/3 改成了二进制帧传输，但语义完全相同）：
+
+      ```text
+      POST /v1/chat/completions HTTP/1.1          ← 请求行：方法 路径 协议版本
+      Host: api.example.com                        ← 请求头
+      Authorization: Bearer sk-xxx
+      Content-Type: application/json
+      Idempotency-Key: 7f3c...
+
+      {"model": "chat-pro", "messages": [...]}     ← 请求体
+
+      HTTP/1.1 200 OK                              ← 状态行：版本 状态码 原因短语
+      Content-Type: application/json
+      x-request-id: req_abc123
+
+      {"id": "cmpl_1", "choices": [...]}           ← 响应体
+      ```
+
+      - **请求行**：方法 + 目标路径（含查询字符串 `?page=2`）。
+      - **请求头**：元数据。常见的有 `Authorization`（凭证）、`Content-Type`（请求体格式）、`Accept`（期望的响应格式）、`User-Agent`、自定义的 `X-Request-ID`。
+      - **请求体**：POST/PUT/PATCH 携带的数据，AI 接口几乎都是 JSON。GET 请求按惯例不带请求体。
+      - **响应**：状态码 + 响应头 + 响应体。流式输出时响应头是 `Content-Type: text/event-stream`，响应体分块持续发送（SSE，Day 17 / Day 43 展开）。
+
+      ```mermaid
+      sequenceDiagram
+        participant B as 前端
+        participant API as 你的 FastAPI 服务
+        participant GW as LLM 网关
+        B->>API: POST /v1/conversations/42/messages 携带 JSON 与 Bearer Token
+        API->>API: 鉴权 解析 JSON 校验参数
+        API->>GW: POST /v1/chat/completions
+        GW-->>API: 200 OK 与 JSON 结果
+        API-->>B: 201 Created 与消息 JSON
+      ```
+
+      **二、方法的语义**
+
+      | 方法 | 含义 | 安全 | 幂等 | AI 后端例子 |
+      |---|---|---|---|---|
+      | GET | 读取资源 | 是 | 是 | 获取对话列表、查询任务进度 |
+      | POST | 创建资源或触发处理 | 否 | 否 | 发送消息并生成回答、创建入库任务 |
+      | PUT | 整体替换资源 | 否 | 是 | 覆盖保存 Prompt 模板 |
+      | PATCH | 部分修改资源 | 否 | 不保证 | 修改对话标题 |
+      | DELETE | 删除资源 | 否 | 是 | 删除对话 |
+      | HEAD / OPTIONS | 只取头部 / 查询支持的方法（CORS 预检） | 是 | 是 | 浏览器跨域预检 |
+
+      - **安全（safe）**：语义上只读，不改变服务器状态。爬虫、预取、缓存可以放心地调用。
+      - **幂等（idempotent）**：同样的请求执行一次和执行多次，**对服务器的预期效果相同**。RFC 9110 规定 PUT、DELETE 和所有安全方法是幂等的。幂等的意义在于：**网络失败时可以自动重试**（详见 d08-k3）。
+
+      **三、参数放在哪里**
+
+      - **路径参数**：标识资源，`/conversations/42`。
+      - **查询参数**：过滤、排序、分页，`?limit=20&cursor=abc`。注意 URL 会出现在访问日志和浏览器历史里，**不要放敏感信息**（Token、手机号）。
+      - **请求头**：认证、内容协商、追踪 ID、幂等键。
+      - **请求体**：复杂数据，例如对话消息、工具参数。
+
+      **四、HTTP 是无状态的**
+
+      每个请求都要自带完成处理所需的全部信息（例如 Token），服务器不依赖「上一次请求」的内存状态。这让任意一个 worker、任意一台机器都能处理请求，便于横向扩容。多轮对话的上下文要么由客户端每次带上，要么由服务器存在数据库/Redis 中按 conversation_id 取回。
+
+      **五、和前端经验的连接**
+
+      你用 `fetch(url, {method: "POST", headers, body: JSON.stringify(data)})` 时，就是在组装上面的请求；`response.ok` 本质是判断状态码是否在 200~299；浏览器 DevTools 的 Network 面板展示的就是这些字段——后端排查时同样要看这些。
+    scenarios: |
+      - **调用 LLM API**：POST + JSON 请求体 + `Authorization: Bearer`；从响应头读取 `x-request-id` 用于向供应商报障，读取限流相关头部判断剩余额度（具体头部名以各供应商文档为准）。
+      - **设计对话接口**：GET 读取历史、POST 发送消息、PATCH 改标题、DELETE 删除对话。
+      - **排查前端跨域报错**：浏览器先发 OPTIONS 预检，后端没正确返回 CORS 头部时，真正的 POST 根本不会发出。
+    code: |
+      ```python
+      import os
+
+      import httpx
+
+      async def ask(question: str) -> str:
+          headers = {
+              "Authorization": f"Bearer {os.environ['LLM_API_KEY']}",  # 凭证放请求头
+              "X-Request-ID": "trace-123",                             # 追踪 ID，便于串联日志
+          }
+          async with httpx.AsyncClient(base_url=os.environ["LLM_BASE_URL"], timeout=30.0) as client:
+              resp = await client.post(
+                  "/v1/chat/completions",
+                  headers=headers,
+                  json={"model": "chat-pro", "messages": [{"role": "user", "content": question}]},
+              )  # json= 会自动序列化并设置 Content-Type: application/json
+              print(resp.status_code, resp.headers.get("content-type"))
+              resp.raise_for_status()  # 4xx/5xx 抛出 httpx.HTTPStatusError
+              return resp.json()["choices"][0]["message"]["content"]
+      ```
+    pitfalls: |
+      - **误区：GET 用于查询、POST 用于提交，仅此而已。** 方法真正重要的是安全和幂等的契约，它决定了网关、SDK、浏览器会不会自动重试或缓存。
+      - **用 GET 执行有副作用的操作**（如 `GET /delete?id=1`）：会被爬虫、预取、浏览器重放意外触发。
+      - **把 Token、API Key 放进 URL 查询参数**：会写进 Nginx 访问日志、代理日志和浏览器历史。
+      - **忘记 Content-Type**：手动拼字符串发送 JSON 却没设置 `application/json`，后端框架无法正确解析请求体，返回 422 或 415。
+      - **混淆：幂等 ≠ 返回结果相同。** DELETE 第一次返回 204、第二次返回 404，但服务器状态（资源不存在）一样，仍然是幂等的。
+    interview_asks:
+      - GET 和 POST 有什么区别？
+      - 什么是安全方法、什么是幂等方法？PUT 和 PATCH 的区别是什么？
+      - HTTP 是无状态的，那多轮对话的上下文怎么维持？
+    project_example: |
+      在一个对话系统中，前端最初用 `GET /api/chat?question=...&token=...` 发起问答。
+      问题很快暴露：长问题超过 URL 长度限制被截断；Token 和用户问题明文出现在 Nginx 访问日志里，触发了安全审计；浏览器预取偶尔重复触发生成，导致 Token 费用异常。
+      改造后：`POST /v1/conversations/{id}/messages`，问题放 JSON 请求体，Token 放 `Authorization` 头，日志中间件对请求体做脱敏，并为每个请求生成 `X-Request-ID` 串联前端、后端、LLM 网关三方日志。
+  - id: d08-k2
+    name: 状态码与 LLM 网关中的错误语义
+    level: P0
+    summary: 状态码第一位决定类别：2xx 成功、4xx 调用方的问题、5xx 服务端或上游的问题；429/502/503/504 决定是否重试和怎么重试
+    why: |
+      状态码是系统之间沟通「发生了什么」的第一信号。监控告警、重试策略、前端提示、网关熔断全都依据它来决策。
+      AI 应用尤其依赖外部模型服务，429（限流）、502/503/504（上游故障或超时）是每天都会遇到的情况，处理不当就会出现「重试风暴」「错误提示误导用户」「告警全是噪音」。
+    problem: |
+      解决「**如何用统一、机器可读的方式表达请求结果**」的问题。
+      正确的状态码让调用方不用解析错误文本就能决定下一步：改参数（4xx）、等待重试（429/503）、换路由或降级（502/504）、报警（500）。
+      状态码乱用（所有错误都返回 200 + `{"code": -1}`，或所有错误都返回 500）会让监控、重试和排查全部失灵。
+    principle: |
+      **一、五个类别**
+
+      - **1xx 信息**：如 101 协议切换（WebSocket 握手）。
+      - **2xx 成功**：200 OK；**201 Created**（创建成功，通常带 `Location` 头）；**202 Accepted**（已接收、异步处理中，适合文档入库任务）；204 No Content（成功但无响应体，如删除）。
+      - **3xx 重定向**：301/302 跳转；304 Not Modified（缓存仍有效）。
+      - **4xx 客户端错误**：**请求本身有问题，原样重试没有意义**（429 例外）。
+      - **5xx 服务端错误**：服务端或其上游出了问题，**可能是暂时的**。
+
+      **二、必须分清的 4xx**
+
+      | 状态码 | 含义 | 典型场景 |
+      |---|---|---|
+      | 400 Bad Request | 请求格式错误，无法理解 | JSON 语法错误 |
+      | 401 Unauthorized | **未认证**：没带凭证或凭证无效 | Token 过期、API Key 错误 |
+      | 403 Forbidden | **已认证但无权限** | 普通用户访问管理接口、访问别人的对话 |
+      | 404 Not Found | 资源不存在（也常用于隐藏无权访问的资源） | 对话 ID 不存在 |
+      | 409 Conflict | 与当前状态冲突 | 重复创建、版本冲突、同一幂等键的请求仍在处理中 |
+      | 413 Content Too Large | 请求体太大 | 上传超过限制的文件 |
+      | 422 Unprocessable Content | 格式正确但**语义校验失败** | FastAPI 中参数类型或约束不满足（Day 09） |
+      | 429 Too Many Requests | **被限流** | 超出每分钟请求数或 Token 配额 |
+
+      **三、LLM 网关场景下的 429 / 5xx**
+
+      假设链路是「前端 → 你的服务 → LLM 网关 / 供应商」：
+
+      - **429 Too Many Requests**（RFC 6585）：调用方发得太快或配额不足。响应**可以**带 `Retry-After` 头（秒数或 HTTP 日期）告诉你多久后再试，规范要求 429 响应不能被缓存。处理：**遵守 Retry-After**，没有就指数退避 + 随机抖动；同时排查是突发流量（可重试）还是月度配额耗尽（重试无用，应告警）——两者有时都返回 429，需要看响应体中的错误类型。
+      - **500 Internal Server Error**：服务内部未处理的异常。对你自己的服务来说，这意味着有 bug，应该报警而不是让客户端反复重试。
+      - **502 Bad Gateway**：**网关或代理**从上游收到了**无效响应**（上游崩溃、连接被重置、返回了不合法的数据）。在 Nginx 后面的 FastAPI 进程挂了，用户看到的就是 502。
+      - **503 Service Unavailable**：服务暂时无法处理（过载、维护中），可以带 `Retry-After`。模型供应商过载时常见。
+      - **504 Gateway Timeout**：网关等上游**超时**。注意：上游**可能仍在处理**，甚至已经处理成功（生成已完成、已计费），只是响应没在时限内回来。
+
+      ```mermaid
+      flowchart TD
+        A["收到上游响应或异常"] --> B{"状态码类别"}
+        B -- "2xx" --> C["成功 解析结果"]
+        B -- "400 401 403 404 422" --> D["不重试 记录并转换为对用户的明确错误"]
+        B -- "429" --> E{"是配额耗尽吗"}
+        E -- "是" --> F["不重试 告警 切换备用模型"]
+        E -- "否 突发限流" --> G["按 Retry-After 或指数退避重试"]
+        B -- "500" --> H["上游 bug 有限重试或降级"]
+        B -- "502 503" --> I["退避重试 或切换备用路由"]
+        B -- "504 或客户端超时" --> J{"请求是否幂等或带幂等键"}
+        J -- "是" --> I
+        J -- "否" --> K["不要盲目重试 先查询结果或返回明确错误"]
+      ```
+
+      **四、你的服务对外该返回什么**
+
+      - **不要把上游状态码原样透传**：上游 401 说明是**你的** API Key 有问题，不是用户没登录，对用户应返回 502 或 503 并告警，而不是 401（否则前端会把用户踢回登录页）。
+      - 上游 429：可以对用户返回 429 或 503，并给出 `Retry-After`，提示「当前排队人数较多」。
+      - 上游超时：对用户返回 504，并在响应体中给出可追踪的 request_id。
+      - 你自己的未处理异常：返回 500，**响应体不要包含堆栈、SQL、上游原始报错**，细节写日志。
+
+      **五、错误响应体也要规范**
+
+      推荐统一结构，例如 RFC 9457 Problem Details（`application/problem+json`，字段 `type`、`title`、`status`、`detail`、`instance`），或团队约定的 `{"error": {"code": "rate_limited", "message": "...", "request_id": "..."}}`。前端根据机器可读的 `code` 决定提示文案，而不是解析英文 message。
+    scenarios: |
+      - **LLM 调用重试策略**：429/503 退避重试，502 有限重试后切换备用模型，400/401 直接失败并告警。
+      - **监控告警分级**：5xx 比例告警（服务问题），4xx 只做趋势监控（大量 401 可能是前端 Token 刷新 bug，大量 422 可能是客户端版本不兼容）。
+      - **前端提示**：根据 401 跳转登录、403 提示无权限、429 提示稍后再试、504 提示「生成超时，可重新生成」。
+    pitfalls: |
+      - **所有错误都返回 200 + 业务错误码**：监控看不到失败率，网关和 SDK 无法按状态码重试，排查只能翻日志。
+      - **把上游 401/403 透传给前端**：用户被莫名其妙踢下线，真正的问题（你的 API Key 失效）却没人知道。
+      - **对 4xx 进行重试**：400、422 原样重试永远失败，只是在浪费配额和时间。
+      - **混淆 502 和 504**：502 是「上游回了无效响应或连接断了」，504 是「上游没在时限内回复」；排查方向不同（进程崩溃 vs 处理太慢）。
+      - **忽视 Retry-After**：固定间隔快速重试，在限流期间形成重试风暴，让限流持续更久。
+    interview_asks:
+      - 401 和 403 有什么区别？400 和 422 呢？
+      - 调用大模型 API 时遇到 429、502、504 分别意味着什么？你怎么处理？
+      - 上游模型服务返回 401，你的接口应该给前端返回什么状态码？为什么？
+    sources:
+      - {title: "RFC 9110 - HTTP Semantics", url: "https://www.rfc-editor.org/rfc/rfc9110.pdf"}
+      - {title: "RFC 6585 - Additional HTTP Status Codes (429)", url: "https://datatracker.ietf.org/doc/html/rfc6585.html"}
+    project_example: |
+      某对话产品上线初期，后端把 LLM 供应商的错误统一包装成 500 返回，并把供应商原始报错放进响应体。
+      一次供应商限流高峰期间：前端对 500 自动重试 3 次，请求量翻倍，限流更严重；监控 5xx 告警刷屏但无法区分是自身 bug 还是上游问题；用户还在页面上看到了包含内部模型名的英文报错。
+      改造后：上游 429/503 映射为对用户的 503 + `Retry-After` + 错误码 `upstream_busy`，上游超时映射为 504，上游 401 映射为 502 并立即触发「API Key 异常」告警；前端只对 503 按 Retry-After 重试一次。高峰期请求放大消失，告警可以明确区分「我们的 bug」和「上游问题」。
+  - id: d08-k3
+    name: 幂等性与安全重试
+    level: P0
+    summary: 能被安全重试的前提是幂等；POST 这类非幂等请求要靠幂等键让「重复的请求只生效一次」
+    why: |
+      网络不可靠，超时和重试是常态：客户端超时重发、网关自动重试、用户狂点按钮、消息队列重复投递。
+      在 AI 应用中，一次重复就可能意味着重复扣用户额度、重复生成（双倍 Token 费用）、重复创建入库任务、Agent 重复执行「发邮件 / 下单」这类有副作用的工具。面试中「如何保证接口幂等」是后端高频题。
+    problem: |
+      解决「**客户端不知道上一次请求到底成功了没有**」时如何安全重试的问题。
+      超时或连接断开后，请求可能：没到服务器、到了但处理失败、处理成功但响应丢了。对幂等操作，重试无害；对非幂等操作，盲目重试可能造成重复副作用，不重试又可能丢失请求。
+    principle: |
+      **一、幂等的精确定义**
+
+      RFC 9110：如果同一个请求执行多次对服务器的**预期效果**与执行一次相同，这个方法就是幂等的。
+
+      - `DELETE /conversations/42` 执行 3 次，结果都是「42 号对话不存在」→ 幂等（响应码可以不同）。
+      - `PUT /prompts/7` 用同样的内容覆盖 3 次，结果相同 → 幂等。
+      - `POST /conversations/42/messages` 执行 3 次，会产生 3 条消息、3 次生成、扣 3 次额度 → **不幂等**。
+      - 「把余额设为 100」是幂等的；「余额减 10」不是。
+
+      RFC 9110 还规定：客户端**不应该**自动重试非幂等请求，除非有办法知道请求语义实际上是幂等的；**代理不得**自动重试非幂等请求。
+
+      **二、为什么超时最危险**
+
+      收到 400 时你确定没成功；收到 200 时你确定成功；只有**超时 / 连接断开 / 504** 时你不知道结果。LLM 调用耗时长，超时概率高，504 时上游很可能已经生成完毕并计费。
+
+      **三、幂等键（Idempotency Key）方案**
+
+      业界通用做法（支付类 API 普遍采用，IETF 也有 `Idempotency-Key` 请求头的标准化草案，最终状态以官方为准）：
+
+      1. 客户端为每个**业务操作**生成唯一键（UUID），放在请求头 `Idempotency-Key`；**重试时复用同一个键**，新操作才生成新键。
+      2. 服务端收到请求后，以 `(用户, 幂等键)` 为唯一约束写入记录，状态为「处理中」。
+      3. 如果插入成功 → 正常处理，完成后保存响应结果，状态改为「已完成」。
+      4. 如果键已存在：
+         - 状态「已完成」→ 直接返回保存的响应，不再执行；
+         - 状态「处理中」→ 返回 409（或让客户端稍后查询），避免并发重复执行；
+         - 同一个键但请求体不同 → 返回 422，说明客户端误用了键。
+      5. 记录设置过期时间（如 24 小时）。
+
+      ```mermaid
+      sequenceDiagram
+        participant C as 客户端
+        participant S as 对话服务
+        participant DB as 数据库
+        participant L as LLM
+        C->>S: POST messages 携带 Idempotency-Key k1
+        S->>DB: INSERT 幂等记录 k1 状态处理中
+        DB-->>S: 插入成功
+        S->>L: 生成回答
+        L-->>S: 回答
+        S->>DB: 保存消息 和 k1 的响应 状态已完成
+        S--xC: 响应在网络中丢失 客户端超时
+        C->>S: 重试 POST 仍携带 k1
+        S->>DB: INSERT k1
+        DB-->>S: 唯一约束冲突 读取已保存响应
+        S-->>C: 返回同一条消息 不再调用 LLM 不再扣费
+      ```
+
+      **四、其他实现幂等的手段**
+
+      - **天然幂等的设计**：用 PUT 代替 POST，由客户端生成资源 ID（`PUT /tasks/{client_generated_id}`）。
+      - **数据库唯一约束**：例如「每个文档每个版本只能有一个入库任务」，`UNIQUE(doc_id, version)`，重复插入直接失败。
+      - **状态机 + 条件更新**：`UPDATE orders SET status='paid' WHERE id=? AND status='pending'`，第二次更新影响 0 行。
+      - **去重表 / 消息 ID**：消息队列消费时记录已处理的消息 ID（Day 42）。
+
+      **五、Agent 场景的特别提醒**
+
+      Agent 调用的工具（发邮件、建工单、调用支付）同样需要幂等设计：LangGraph 等框架从检查点恢复时可能重放某个节点（Day 36），如果工具没有幂等保护，就会重复执行副作用。
+    scenarios: |
+      - **发送消息接口**：前端每次点击发送生成一个 UUID 作为幂等键，网络重试复用，避免重复生成和重复扣额度。
+      - **文档入库任务**：用 `(doc_id, content_hash)` 唯一约束，重复上传同一份内容直接返回已有任务。
+      - **调用支持幂等键的外部 API**：重试时携带同一个键，让对方去重。
+    code: |
+      ```python
+      import uuid
+
+      import httpx
+
+      async def send_message(client: httpx.AsyncClient, conv_id: int, text: str) -> dict:
+          key = str(uuid.uuid4())                  # 每个业务操作生成一次
+          for attempt in range(3):
+              try:
+                  resp = await client.post(
+                      f"/v1/conversations/{conv_id}/messages",
+                      json={"content": text},
+                      headers={"Idempotency-Key": key},  # 重试复用同一个键
+                  )
+              except httpx.TimeoutException:
+                  continue                           # 服务端按键去重，重试是安全的
+              if resp.status_code == 409:            # 同一键的请求仍在处理中
+                  continue
+              resp.raise_for_status()
+              return resp.json()
+          raise RuntimeError("send_message failed after retries")
+      ```
+      实际使用时，409 与超时后的重试之间应加入退避等待，这里省略。
+    pitfalls: |
+      - **每次重试都生成新的幂等键**：等于没有幂等键，服务端会把重试当作新请求。
+      - **先检查再插入（check-then-insert）**：两个并发请求同时查到「不存在」，都去执行。必须依赖数据库唯一约束或原子操作。
+      - **只在处理完成后才写幂等记录**：处理期间的重试仍会重复执行，应该先占位（处理中），再处理。
+      - **误区：PUT 一定幂等。** HTTP 语义上 PUT 应该幂等，但如果你的实现里 PUT 做的是「计数加一」，那就违反了语义，网关的自动重试会出问题。
+      - **网关/SDK 默认重试 POST**：一些 HTTP 客户端或代理配置了「超时重试」，要确认它们对非幂等请求的行为。
+    interview_asks:
+      - 什么是幂等？哪些 HTTP 方法是幂等的？
+      - 如何保证「发送消息并扣费」这个 POST 接口在重试时不会重复扣费？
+      - 调用 LLM 超时后，你会直接重试吗？为什么？
+    freshness: |
+      核对于 2026-11：幂等方法的定义与「客户端不应自动重试非幂等请求、代理不得自动重试非幂等请求」出自 RFC 9110 第 9.2.2 节（2022 年发布的 HTTP 语义标准，取代 RFC 7231）。`Idempotency-Key` 请求头在业界广泛使用，IETF HTTPAPI 工作组有对应的标准化草案，但截至本课程编写时请以 IETF 官方状态为准，不要把它说成已发布的 RFC。
+    sources:
+      - {title: "RFC 9110 - HTTP Semantics (9.2.2 Idempotent Methods)", url: "https://www.rfc-editor.org/rfc/rfc9110.pdf"}
+    project_example: |
+      一个按次计费的 AI 写作产品，用户反馈「点了一次生成，被扣了两次额度」。
+      排查：前端 axios 配置了超时 30 秒自动重试；长文生成常常要 35 秒，第一次请求其实成功了，只是前端超时后又发了一次。
+      修复：前端在用户点击时生成 UUID 作为 `Idempotency-Key`，重试复用；后端新增 `idempotency_records` 表，`UNIQUE(user_id, key)`，先插入「处理中」记录再生成，完成后保存响应；重复键返回已保存结果或 409。同时把生成接口改为「202 + 任务 ID + 轮询或流式」，从根源上减少超时。重复扣费投诉降为零。
+  - id: d08-k4
+    name: JSON 与 RESTful API 设计
+    level: P1
+    summary: RESTful 用「名词资源 + HTTP 方法 + 状态码」表达操作；JSON 是事实上的数据格式，但有数字精度、日期、编码等坑
+    why: |
+      后端工程师的产出物之一就是 API。接口设计得好，前端、第三方、Agent 工具调用都能「看路径就懂」；设计得乱，联调成本高、版本难演进。
+      AI 应用里的 API 还会被 LLM 当作工具调用（Function Calling、MCP），清晰的资源和字段命名直接影响模型能否正确调用。
+    problem: |
+      解决「**接口如何组织才能一致、可预测、易演进**」的问题，以及「**数据如何在不同语言之间无损传递**」的问题（Python 的 int、datetime、Decimal 与 JavaScript 的 Number、Date 并不一一对应）。
+    principle: |
+      **一、RESTful 的核心思想**
+
+      REST 把系统看作一组**资源**，用 URL 标识资源，用 HTTP 方法表达操作，用状态码表达结果，并且每个请求自包含（无状态）。
+
+      | 操作 | RESTful 写法 | 反例 |
+      |---|---|---|
+      | 列出对话 | `GET /v1/conversations?limit=20&cursor=xxx` | `POST /getConversationList` |
+      | 创建对话 | `POST /v1/conversations` → 201 | `GET /createConversation` |
+      | 获取对话 | `GET /v1/conversations/42` | `GET /conversation?id=42&action=get` |
+      | 发送消息 | `POST /v1/conversations/42/messages` | `POST /chat` 塞所有参数 |
+      | 删除对话 | `DELETE /v1/conversations/42` → 204 | `POST /deleteConversation` |
+      | 查询入库任务 | `GET /v1/ingest-jobs/9` | — |
+
+      规则：路径用**名词复数**、小写加连字符；层级表达从属关系（消息属于对话）；动作由方法表达；不适合 CRUD 的操作可以用子资源表达，例如 `POST /v1/conversations/42/messages/7/regenerate`（务实做法，团队统一即可）。
+
+      **二、分页、过滤与版本**
+
+      - **分页**：offset 分页（`?page=3&size=20`）简单，但数据量大时深分页慢，且插入新数据会导致重复或遗漏；**游标分页**（`?cursor=<上一页最后一条的排序键>`）稳定高效，适合消息流。
+      - **过滤和排序**：`?status=done&sort=-created_at`。
+      - **版本**：路径前缀 `/v1/` 最直观；有破坏性变更时发布 `/v2/`，旧版本保留一段时间。新增可选字段不算破坏性变更，删除或改名字段才算。
+
+      **三、JSON 的工程细节**
+
+      - JSON 只有字符串、数字、布尔、null、对象、数组六种类型。**没有日期、没有整数与浮点之分、没有注释**。
+      - **大整数精度**：JavaScript 的 Number 只能精确表示 2 的 53 次方以内的整数，雪花算法生成的 64 位 ID 传给前端会被悄悄改掉末几位。做法：ID 用字符串传输。
+      - **日期时间**：统一用 ISO 8601 字符串并带时区，如 `2026-11-12T08:30:00Z`；不要传本地时间字符串。
+      - **金额 / 计费**：避免浮点误差，用整数最小单位（分、千分之一 Token 单价）或字符串表示的 Decimal。
+      - **编码**：系统间交换的 JSON 应使用 UTF-8（RFC 8259 要求）。Python 的 `json.dumps` 默认把中文转义成 `\uXXXX`，需要原样输出时用 `ensure_ascii=False`。
+      - **字段命名**：团队统一 snake_case 或 camelCase；Pydantic 可以用别名在两者之间转换（Day 09）。
+
+      **四、统一的响应与错误格式**
+
+      ```mermaid
+      flowchart LR
+        A["请求"] --> B{"处理结果"}
+        B -- "成功" --> C["2xx 与资源 JSON 不额外包裹"]
+        B -- "失败" --> D["4xx 或 5xx 与统一错误体"]
+        D --> E["error.code 机器可读"]
+        D --> F["error.message 给人看"]
+        D --> G["error.request_id 用于追踪"]
+      ```
+
+      成功时直接返回资源（或列表 + 分页信息）；失败时用正确的状态码 + 统一错误体，不要「200 + code 字段」。
+    scenarios: |
+      - **对话系统 API**：`/v1/conversations`、`/v1/conversations/{id}/messages`，游标分页加载历史消息。
+      - **知识库管理 API**：`/v1/knowledge-bases/{kb_id}/documents`，上传返回 202 与 `ingest-job` 资源地址。
+      - **作为 Agent 工具暴露**：清晰的路径、字段描述和错误码，可以直接转换成 OpenAPI，再被 MCP Server 或 Function Calling 使用。
+    pitfalls: |
+      - **动词式路径**：`/getUser`、`/doChat`，方法语义丢失，缓存和重试策略无法统一。
+      - **64 位 ID 用数字传给前端**：前端拿到的 ID 末位被改变，导致「查不到刚创建的对话」。
+      - **日期不带时区**：服务器在 UTC、用户在 UTC+8，前端显示的时间差 8 小时。
+      - **用浮点数表示金额和计费**：累加后出现 0.30000000000000004 之类的误差。
+      - **无版本直接改字段名**：老版本 App 全部报错；破坏性变更必须走新版本。
+    interview_asks:
+      - 什么是 RESTful？你会怎么设计对话系统的 API 路径？
+      - offset 分页和游标分页有什么区别？聊天记录适合哪种？
+      - 为什么 64 位整数 ID 建议用字符串传给前端？
+    project_example: |
+      一个企业 AI 助手的第一版接口是 `/api/chat`、`/api/getHistory`、`/api/del`，参数都放在 POST body 里，返回统一 200 + `{"code": 0}`。
+      对接第二个前端团队和一个外部系统时，问题集中爆发：无法按状态码监控错误率、历史记录用 offset 分页在新消息插入时出现重复、雪花 ID 在前端精度丢失。
+      重构为 `/v1/conversations` 资源体系：游标分页、ID 字符串化、ISO 8601 时间、Problem Details 风格错误体；同时自动生成 OpenAPI 文档。外部系统的对接时间从两周缩短到三天。
+quiz:
+  - id: d08-q1
+    kp: d08-k2
+    type: single
+    question: 你的服务通过 Nginx 反向代理对外提供接口。某次发布后，FastAPI 进程启动失败、端口没有在监听，此时用户访问接口最可能收到哪个状态码？
+    options:
+      - 500 Internal Server Error
+      - 502 Bad Gateway
+      - 503 Service Unavailable
+      - 404 Not Found
+    answer: [1]
+    explain: |
+      Nginx 作为网关去连接上游（FastAPI）时连接被拒绝或断开，属于「网关从上游拿不到有效响应」，Nginx 返回 502 Bad Gateway。
+      A 错：500 需要应用进程本身在运行并抛出未处理异常；进程都没起来，不可能由它返回 500。C 是常见误解：503 通常由服务主动声明不可用（过载或维护）返回，Nginx 也可在特定配置下返回，但默认的上游连接失败是 502。D 错：路由不存在才是 404。
+  - id: d08-q2
+    kp: d08-k3
+    type: judge
+    question: DELETE /conversations/42 第一次返回 204、第二次返回 404，说明这个 DELETE 接口不是幂等的。
+    answer: false
+    explain: |
+      幂等关注的是对服务器的预期效果，而不是每次的响应是否一样。删除一次和删除多次之后，服务器状态都是「42 号对话不存在」，效果相同，所以仍然是幂等的。
+      RFC 9110 也明确说明重复执行幂等请求时「响应可能不同」。真正不幂等的是 POST 创建消息这类每次执行都会新增数据或产生副作用的操作。
+  - id: d08-q3
+    kp: d08-k2
+    type: multi
+    question: 你的对话服务调用外部 LLM 供应商，以下哪些处理方式是合理的？
+    options:
+      - 上游返回 429 且带有 Retry-After 头时，按该时间等待后再重试
+      - 上游返回 401 时，把 401 原样返回给前端，让用户重新登录
+      - 上游返回 400（请求参数非法）时，记录日志并直接失败，不做重试
+      - 上游返回 504 时，对未携带幂等键的生成请求立即自动重试 3 次
+      - 上游持续 503 时，在有限重试后切换到备用模型或返回降级提示
+    answer: [0, 2, 4]
+    explain: |
+      A 正确：RFC 6585 允许 429 携带 Retry-After，遵守它能避免重试风暴。C 正确：400 是请求本身的问题，原样重试不会成功。E 正确：503 是暂时不可用，有限重试加降级是标准做法。
+      B 错：上游 401 说明的是你服务端的 API Key 有问题，与用户登录无关，应该告警并给用户返回 502/503。D 错：504 时上游可能已经生成并计费，非幂等请求在没有幂等键的情况下盲目重试会导致重复生成和重复扣费。
+  - id: d08-q4
+    kp: d08-k1
+    type: short
+    question: 前端同事说「GET 和 POST 的区别就是 GET 参数在 URL 上、POST 参数在请求体里」。这个说法遗漏了哪些更重要的区别？请从语义、安全幂等、缓存与重试、敏感信息四个角度补充。
+    key_points:
+      - {text: "说明 GET 语义是读取资源，POST 是创建资源或触发处理", dim: concept}
+      - {text: "指出 GET 是安全且幂等的方法，POST 既不安全也不幂等", dim: principle}
+      - {text: "说明安全幂等决定了缓存、预取和自动重试行为，GET 可被缓存和重试，POST 不应被自动重试", dim: principle}
+      - {text: "指出 URL 会出现在访问日志和浏览器历史中，敏感信息不能放在查询参数", dim: engineering}
+    reference: |
+      参数位置只是表象，更重要的区别有四点。
+      **语义：** GET 用于读取资源，不应产生副作用；POST 用于创建资源或触发处理（如生成回答、创建任务）。
+      **安全与幂等：** 按 RFC 9110，GET 是安全方法（只读）且幂等；POST 既不安全也不幂等，重复执行可能产生多条记录、多次扣费。
+      **缓存与重试：** 因为 GET 安全幂等，浏览器、CDN、代理可以缓存它，网络失败时客户端和代理可以自动重试，浏览器还会预取链接；POST 默认不被缓存，代理不得自动重试，客户端重试需要幂等键之类的机制保证安全。所以用 GET 做删除、生成这种有副作用的操作是危险的。
+      **敏感信息：** URL（包括查询参数）会被写入 Nginx 访问日志、代理日志、浏览器历史和 Referer 头，Token、手机号、用户问题都不应放在 URL 上；放在请求头或请求体中，并在日志中脱敏。
+  - id: d08-q5
+    kp: d08-k3
+    type: scenario
+    question: |
+      一个按次计费的 AI 生成服务，接口是 `POST /v1/generations`，生成平均耗时 25 秒。前端 axios 设置了 30 秒超时并自动重试 2 次，Nginx 的 proxy_read_timeout 是 60 秒。
+      最近用户投诉「只点了一次，却被扣了 2~3 次费用」。请分析可能的原因链路，并给出至少两层的修复方案。
+    key_points:
+      - {text: "指出长尾请求超过 30 秒时前端超时并重试，而第一次请求在服务端仍继续执行并扣费", dim: principle}
+      - {text: "指出 POST 不幂等，超时时客户端无法知道结果，盲目重试导致重复执行", dim: concept}
+      - {text: "提出幂等键方案：客户端生成键并在重试时复用，服务端用唯一约束先占位再处理并保存结果", dim: engineering}
+      - {text: "提出架构层改进：改为 202 加任务 ID 轮询或流式输出，缩短单次请求时长", dim: engineering}
+      - {text: "提出前端层改进：按钮防重复点击，并去掉对非幂等请求的自动重试或仅在有幂等键时重试", dim: engineering}
+    reference: |
+      **原因链路：** 生成平均 25 秒，长尾超过 30 秒很常见。前端在 30 秒时超时，但这只是浏览器放弃等待，请求已经到达服务端并在继续执行（Nginx 60 秒才超时，后端也不知道客户端已放弃）。axios 自动重试发出第二个 POST，服务端把它当作新请求再生成、再扣费；如果第二次也超时，还会有第三次。POST 不幂等，而超时是「结果未知」的状态，盲目重试就会重复执行。
+
+      **修复（多层）：**
+      1. **接口层幂等**：前端在用户点击时生成 UUID 作为 `Idempotency-Key`，自动重试时复用。服务端建表 `UNIQUE(user_id, idempotency_key)`，收到请求先插入「处理中」记录（依赖唯一约束而不是先查后插），成功后执行生成、保存结果并标记完成；重复键时返回已保存结果，处理中则返回 409 让客户端稍后查询。扣费与生成结果在同一事务中记账。
+      2. **架构层**：长耗时生成改为 `POST` 返回 `202 Accepted` + 任务 ID，前端轮询 `GET /v1/generations/{id}`，或改为流式输出让首字节尽快返回，彻底避免长时间挂起的请求。
+      3. **前端层**：按钮点击后禁用直到返回；对非幂等请求关闭默认的自动重试，只在携带幂等键时才允许重试。
+      4. **对账与补偿**：按幂等键和生成记录核对历史重复扣费并退款。
+    followup:
+      question: 如果第一个请求还在处理中，第二个带着相同幂等键的请求到了，服务端应该怎么做？为什么不能简单地再执行一次？
+      key_points:
+        - 唯一约束冲突后读到处理中状态
+        - 返回 409 或让客户端轮询结果
+        - 再执行一次会导致重复生成和扣费
+      reference: 第二个请求插入幂等记录时会触发唯一约束冲突，读取到状态为「处理中」，此时应该返回 409 Conflict（或 202 加查询地址），告诉客户端稍后用同一个键重试或查询结果。不能再执行一次，因为第一个请求很可能马上就会成功，再执行就会重复生成并重复扣费，幂等键就失去了意义。
+  - id: d08-q6
+    kp: d08-k4
+    type: design
+    question: |
+      为一个「企业知识库问答」系统设计 RESTful API，至少覆盖：知识库的增删查、上传文档（解析耗时可能几分钟）、查询入库进度、在某个知识库下创建对话并发送问题、分页获取历史消息。请给出路径、方法、主要状态码，并说明分页方式和错误格式。
+    key_points:
+      - {text: "使用名词复数资源路径并体现从属关系，如 knowledge-bases 下的 documents 与 conversations 下的 messages", dim: concept}
+      - {text: "方法与状态码匹配：创建返回 201，删除返回 204，耗时入库返回 202 并提供任务资源", dim: principle}
+      - {text: "历史消息使用游标分页并说明原因", dim: engineering}
+      - {text: "给出统一错误格式与机器可读错误码，并带 request_id", dim: engineering}
+      - {text: "提到版本前缀、ID 字符串化、发送消息接口的幂等键等工程细节", dim: engineering}
+    reference: |
+      **资源与路径（统一前缀 /v1）：**
+      - `GET /v1/knowledge-bases`（列表）、`POST /v1/knowledge-bases`（创建，201 + Location）、`GET /v1/knowledge-bases/{kb_id}`、`DELETE /v1/knowledge-bases/{kb_id}`（204）。
+      - `POST /v1/knowledge-bases/{kb_id}/documents`：上传文档，保存文件后立即返回 **202 Accepted**，响应体包含 `ingest_job` 的 ID 和地址；文件过大返回 413，格式不支持返回 415。
+      - `GET /v1/ingest-jobs/{job_id}`：查询进度（pending / running / succeeded / failed、已处理页数、错误信息）。
+      - `POST /v1/knowledge-bases/{kb_id}/conversations`：创建对话，201。
+      - `POST /v1/conversations/{conv_id}/messages`：发送问题并生成回答，返回 201 和消息（或流式响应）；要求携带 `Idempotency-Key` 头。
+      - `GET /v1/conversations/{conv_id}/messages?limit=20&cursor=...`：历史消息。
+
+      **分页：** 历史消息用**游标分页**，游标是上一页最后一条消息的 `(created_at, id)` 编码。原因是消息持续新增，offset 分页在新消息插入时会出现重复或遗漏，而且深分页需要数据库扫描并丢弃大量行。响应格式：`{"items": [...], "next_cursor": "..."}`。
+
+      **错误格式：** 统一 `{"error": {"code": "kb_not_found", "message": "知识库不存在", "request_id": "req_xxx"}}`（或 RFC 9457 Problem Details）。401 未登录、403 无权访问该知识库、404 不存在、422 参数校验失败、429 限流（带 Retry-After）、503/504 上游模型问题。
+
+      **其他细节：** ID 全部用字符串；时间用带时区的 ISO 8601；破坏性变更走 `/v2`。
+interview:
+  - id: d08-i1
+    kp: d08-k1
+    type: oral
+    difficulty: 1
+    question: GET 和 POST 有什么区别？什么是幂等？
+    key_points:
+      - {text: "说明 GET 读取资源、POST 创建资源或触发处理的语义区别", dim: concept}
+      - {text: "说明 GET 安全且幂等，POST 不安全不幂等，并给出幂等的定义", dim: principle}
+      - {text: "说明幂等性影响缓存与自动重试策略", dim: principle}
+      - {text: "结合 AI 场景说明 POST 生成接口重试的风险与幂等键方案", dim: project}
+    reference: |
+      语义上，GET 用来读取资源，不应改变服务器状态；POST 用来创建资源或触发处理。表面上 GET 的参数在 URL、POST 的参数在请求体，但更重要的是方法的契约：按 RFC 9110，GET 是安全且幂等的方法，POST 既不安全也不幂等。
+      幂等指同一个请求执行一次和执行多次，对服务器的预期效果相同。GET、HEAD、PUT、DELETE 都是幂等的。DELETE 第二次可能返回 404，但服务器状态一样，仍是幂等。
+      这个区别直接影响中间环节的行为：GET 可以被缓存、可以被浏览器预取、网络失败时可以自动重试；POST 不能被代理自动重试，客户端重试也要有额外保障。
+      在 AI 应用里，「发送消息并生成回答」是 POST，生成耗时长、超时概率高，如果超时后盲目重试，就会重复生成、重复扣费。所以我会让客户端带 Idempotency-Key，服务端用唯一约束去重。另外 URL 会进日志，敏感信息不能放 GET 的查询参数里。
+    oral: |
+      我觉得 GET 和 POST 最本质的区别不是参数放哪，而是语义和契约。GET 是读，按规范它是安全并且幂等的；POST 是创建或者触发处理，不安全也不幂等。
+      幂等就是同一个请求执行一次和执行多次，对服务器的效果一样。这个特性很关键，因为它决定了能不能缓存、能不能自动重试。
+      举个我们项目的例子：发消息生成回答是 POST，生成要二十多秒，前端超时重试导致用户被扣了两次费。后来我们让前端带幂等键，服务端用唯一约束去重，重复请求直接返回第一次的结果，问题就解决了。
+  - id: d08-i2
+    kp: d08-k2
+    type: oral
+    difficulty: 2
+    question: 说说你常用的 HTTP 状态码。400、401、403、404、422 分别在什么情况下返回？
+    key_points:
+      - {text: "按类别说明 2xx 3xx 4xx 5xx 的含义，并举出 201 202 204 等成功码的用途", dim: concept}
+      - {text: "准确区分 401 未认证与 403 已认证无权限", dim: concept}
+      - {text: "准确区分 400 格式错误与 422 语义校验失败，并联系 FastAPI 默认行为", dim: principle}
+      - {text: "说明 404 可用于隐藏无权访问的资源，以及不要所有错误都返回 200 或 500", dim: engineering}
+      - {text: "结合项目说明状态码与监控或前端处理的配合", dim: project}
+    reference: |
+      状态码按第一位分类：2xx 成功，3xx 重定向，4xx 调用方的问题，5xx 服务端或上游的问题。成功码里我常用 200 返回数据、201 表示创建成功、202 表示已接收并异步处理（比如文档入库任务）、204 表示删除成功无响应体。
+      4xx 中：400 是请求本身无法解析，比如 JSON 语法错误；401 是未认证，没带 Token 或 Token 过期；403 是已经认证了但没有权限，比如普通员工访问管理员接口；404 是资源不存在，访问别人的私有对话时也常返回 404，避免泄露资源是否存在；422 是格式能解析但语义校验不通过，比如字段类型不对、超出取值范围，FastAPI 的参数校验失败默认返回 422；另外 409 表示状态冲突，429 表示限流。
+      工程上，正确的状态码让监控能按 4xx/5xx 区分问题来源，前端能统一处理（401 跳登录、403 提示无权限、429 稍后重试）。不要所有错误都返回 200 加业务码，也不要把所有错误都包成 500。
+    oral: |
+      我一般先按类别说：2 开头成功，4 开头是调用方的问题，5 开头是服务端或上游的问题。成功里我常用 201 表示创建、202 表示异步任务已接收、204 表示删除成功。
+      几个容易混的：401 是没认证，比如 Token 过期；403 是认证了但没权限；400 是请求都解析不了，比如 JSON 写错了；422 是能解析但校验不过，FastAPI 参数不合法默认就是 422；404 是资源不存在，访问别人的对话我们也返回 404，不暴露它存在。
+      我们项目里前端是按状态码统一处理的，401 跳登录，429 提示稍后再试；监控也按 4xx 和 5xx 分开告警，这样一眼就知道是客户端问题还是我们自己的问题。
+  - id: d08-i3
+    kp: d08-k2
+    type: oral
+    difficulty: 3
+    question: 你的服务调用大模型 API 时经常遇到 429、502、503、504，这些状态码分别意味着什么？你的重试和降级策略是怎样的？
+    key_points:
+      - {text: "准确解释 429 限流及 Retry-After，区分突发限流与配额耗尽", dim: concept}
+      - {text: "准确区分 502 上游无效响应、503 暂时不可用、504 网关等待上游超时", dim: concept}
+      - {text: "指出 504 或超时时上游可能已完成并计费，非幂等请求不能盲目重试", dim: principle}
+      - {text: "给出重试策略：只对可重试错误、遵守 Retry-After、指数退避加抖动、有限次数与总时间预算", dim: engineering}
+      - {text: "给出降级与对外映射：切换备用模型、对用户返回 503 或 504 而非透传，并配套告警", dim: engineering}
+      - {text: "结合项目说明策略上线前后的效果", dim: project}
+    reference: |
+      429 表示被限流（RFC 6585），可能是每分钟请求数或 Token 数超限，也可能是账户配额耗尽；响应可能带 Retry-After。502 表示网关从上游收到无效响应或连接被断开，通常是上游实例崩溃或重启。503 表示服务暂时不可用，常见于供应商过载，也可能带 Retry-After。504 表示网关等待上游超时，此时上游可能仍在处理，甚至已经生成完成并计费。
+      我的重试策略：只重试 429（非配额耗尽）、502、503，以及在请求幂等或带幂等键时重试 504 和网络超时；400、401、403、422 不重试。429 和 503 优先遵守 Retry-After，否则使用指数退避加随机抖动；最多重试 2~3 次，并且受整个请求的时间预算约束，比如总共不超过 20 秒，避免用户等待过久。
+      降级策略：主模型连续失败时切换到备用模型或备用区域，并在响应中标记降级；对于配额耗尽这类重试无用的 429，立即告警。对外映射时不透传上游状态码：上游 401 说明我们的 Key 有问题，对用户返回 502 并告警；上游限流对用户返回 503 加 Retry-After；超时返回 504 并附上 request_id。此外对每种状态码打点，配合熔断，在上游大面积故障时快速失败，避免请求堆积。
+    oral: |
+      我先分别说含义：429 是限流，要区分是瞬时超速还是配额用完；502 是上游给了无效响应或者连接断了，一般是实例挂了；503 是暂时不可用，供应商过载最常见；504 是等上游超时，这个要特别小心，上游可能已经生成完、已经扣费了。
+      我的策略是：400、401 这些不重试；429 和 503 优先按 Retry-After 等待，否则指数退避加抖动；502 有限重试；504 只有在幂等或者带幂等键的时候才重试。所有重试都放在一个总时间预算里，比如二十秒。
+      降级的话，主模型连续失败就切备用模型，响应里标记降级。对用户我不会透传上游状态码，比如上游 401 是我们 Key 的问题，给用户返回 502 并告警。我们上线这套策略后，高峰期的请求放大没有了，报错率也明显下降。
+  - id: d08-i4
+    kp: d08-k3
+    type: oral
+    difficulty: 3
+    question: 如何设计一个幂等的「发送消息并扣费」接口？在高并发下有哪些需要注意的细节？
+    key_points:
+      - {text: "说明非幂等 POST 在超时重试下的重复执行风险，以及超时意味着结果未知", dim: principle}
+      - {text: "给出幂等键流程：客户端生成并复用，服务端唯一约束先占位，完成后保存响应", dim: engineering}
+      - {text: "说明并发下必须依赖数据库唯一约束或原子操作，而不是先查后插", dim: principle}
+      - {text: "处理处理中、请求体不一致、记录过期等边界情况", dim: engineering}
+      - {text: "说明扣费与结果写入需要在同一事务或具备补偿机制", dim: engineering}
+    reference: |
+      问题根源是 POST 不幂等，而网络超时让客户端无法判断上次请求是否成功，重试就可能重复生成、重复扣费。
+      设计：客户端在用户每次点击发送时生成一个 UUID 作为 Idempotency-Key，自动重试时复用同一个键。服务端建立幂等记录表，字段包括 user_id、key、请求体哈希、状态、响应内容、过期时间，并建立 `UNIQUE(user_id, key)`。处理流程：先 INSERT 一条「处理中」记录；插入成功才执行生成和扣费；完成后在同一个数据库事务里写入消息、扣减额度、把幂等记录更新为「已完成」并保存响应。
+      并发细节：必须依赖唯一约束（或 `INSERT ... ON CONFLICT DO NOTHING` 并检查影响行数）来判断谁是第一个请求，而不是先 SELECT 再 INSERT，否则两个并发请求会同时认为自己是第一个。唯一约束冲突时读取记录：已完成直接返回保存的响应；处理中返回 409 让客户端稍后重试；请求体哈希不一致返回 422，说明客户端误用了键。
+      其他：处理失败时要把记录标记为失败或删除，允许客户端用同一个键重试；记录设置 24 小时左右的过期清理；扣费本身也可以用条件更新 `remaining >= cost` 防止扣成负数；LLM 调用耗时长，不要在调用期间一直持有数据库事务（Day 10）。
+    oral: |
+      我会从「为什么需要」和「怎么做」两部分讲。为什么：发消息是 POST，不幂等，生成又慢，超时之后客户端不知道成没成功，一重试就可能扣两次费。
+      怎么做：客户端每次点击生成一个幂等键，重试复用；服务端有一张幂等记录表，用户加键做唯一约束。请求进来先插入一条处理中的记录，插成功才去生成，生成完在一个事务里写消息、扣额度、把记录改成已完成并存下响应。
+      并发上最关键的是靠唯一约束判定谁是第一个，不能先查再插。冲突的时候，已完成就返回存好的响应，处理中返回 409，请求体对不上返回 422。还有一点，调模型那几十秒不要占着数据库事务，生成完再开事务写库。
+  - id: d08-i5
+    kp: d08-k4
+    type: design
+    difficulty: 4
+    question: 请为一个对外开放的 AI 对话 API（给第三方开发者使用）做整体设计：资源与路径、认证、错误格式、限流、幂等、版本演进、长耗时与流式响应。
+    key_points:
+      - {text: "资源设计：对话与消息资源化，路径名词复数、层级清晰、ID 字符串化", dim: concept}
+      - {text: "认证与限流：API Key 放请求头，按 Key 限流并返回 429 与 Retry-After 及配额信息", dim: engineering}
+      - {text: "错误格式统一且机器可读，状态码语义正确，不泄露内部细节", dim: principle}
+      - {text: "幂等：创建类接口支持 Idempotency-Key 并说明服务端实现", dim: engineering}
+      - {text: "版本与兼容：路径版本前缀，新增字段不破坏，破坏性变更走新版本并保留过渡期", dim: engineering}
+      - {text: "长耗时与流式：流式输出采用 SSE，超长任务采用 202 加任务查询，并说明超时设置", dim: project}
+    reference: |
+      **资源与路径：** `/v1/conversations`（创建、列表）、`/v1/conversations/{id}`（查询、删除）、`/v1/conversations/{id}/messages`（发送、分页获取，游标分页）。所有 ID 用带前缀的字符串（如 `conv_xxx`），时间用 ISO 8601 UTC。提供 OpenAPI 文档。
+
+      **认证：** `Authorization: Bearer <api_key>`，Key 在服务端只存哈希；支持多 Key 和吊销。不接受 URL 中携带 Key。
+
+      **限流与配额：** 按 Key 做请求数和 Token 数两个维度的限流；超限返回 429 + Retry-After，并在响应头中返回剩余额度信息，便于开发者自行控速；配额耗尽用不同的错误码（如 `quota_exceeded`），说明重试无用。
+
+      **错误格式：** 统一 `{"error": {"type": "...", "code": "...", "message": "...", "request_id": "..."}}`，4xx 给出可操作的说明（哪个字段不合法），5xx 只给 request_id 不暴露内部信息；上游模型错误映射为 502/503/504，而不是透传。
+
+      **幂等：** `POST .../messages` 支持 `Idempotency-Key`，服务端以 `(api_key, key)` 唯一约束先占位再处理，保存响应 24 小时，重复请求返回同一结果，并发请求返回 409。
+
+      **版本演进：** 路径 `/v1`；新增可选字段和新的枚举值视为兼容变更（文档提醒客户端忽略未知字段）；删除或改名字段、改变语义视为破坏性变更，发布 `/v2` 并给 `/v1` 至少 6~12 个月过渡期，响应头提示弃用。
+
+      **长耗时与流式：** 对话生成支持 `stream: true`，以 SSE（`text/event-stream`）逐段返回，降低首字节延迟并避免网关超时（细节见 Day 17 / Day 43）；非流式请求设置合理的服务端超时；批量或超长任务使用 `202 Accepted` + `/v1/jobs/{id}` 轮询或 webhook 回调。网关层的读超时要大于业务超时，并统一由业务层返回 504 及 request_id。
+    oral: |
+      我会按开发者接入的顺序来设计。首先是资源：对话和消息两层资源，路径用名词复数，ID 用带前缀的字符串，时间统一 UTC。
+      认证用 Bearer 头传 API Key，服务端只存哈希。限流按 Key 做请求数和 Token 数两个维度，超了返回 429 带 Retry-After，配额用完用单独的错误码，告诉开发者别重试了。
+      错误格式统一成 type、code、message、request_id，5xx 不暴露内部细节，上游模型的错误我们自己映射成 502、503、504。
+      发消息接口支持幂等键，服务端唯一约束去重。版本走路径 v1，新增字段算兼容，删字段改语义就上 v2，并且给老版本过渡期。
+      最后是长耗时：生成默认支持 SSE 流式，首字节快也不怕网关超时；更长的批量任务用 202 加任务查询。
+code_reading:
+  id: d08-c1
+  kp: [d08-k2, d08-k3]
+  title: LLM 网关客户端与对话路由的错误处理
+  scenario: |
+    这是对话服务调用公司内部 LLM 网关的封装。`create_completion` 负责发请求和重试，`/v1/chat` 路由把结果返回给前端。
+    网关按次计费，响应慢时可能超过 30 秒。财务反馈网关账单比实际对话数多出约 20%，前端反馈用户偶尔看到「gateway error」以及一大段看不懂的英文报错。
+  language: python
+  code: |
+    import asyncio
+    import logging
+    import os
+    import random
+
+    import httpx
+    from fastapi import APIRouter, HTTPException, Request
+
+    logger = logging.getLogger(__name__)
+    router = APIRouter()
+
+    GATEWAY_URL = os.environ["LLM_GATEWAY_URL"]
+    API_KEY = os.environ["LLM_GATEWAY_KEY"]
+    RETRYABLE = {429, 500, 502, 503, 504}
+
+
+    class GatewayError(Exception):
+        def __init__(self, status: int, body: str):
+            super().__init__(f"gateway error {status}")
+            self.status = status
+            self.body = body
+
+
+    async def create_completion(client: httpx.AsyncClient, user_id: str, messages: list[dict]) -> dict:
+        payload = {"model": "chat-pro", "messages": messages, "user": user_id}
+        headers = {"Authorization": f"Bearer {API_KEY}"}
+        for attempt in range(4):
+            try:
+                resp = await client.post(f"{GATEWAY_URL}/v1/completions",
+                                         json=payload, headers=headers, timeout=30.0)
+            except httpx.TimeoutException:
+                logger.warning("timeout attempt=%d payload=%s", attempt, payload)
+                continue
+            if resp.status_code == 200:
+                return resp.json()
+            if resp.status_code in RETRYABLE:
+                await asyncio.sleep(2 ** attempt + random.random())
+                continue
+            raise GatewayError(resp.status_code, resp.text)
+        raise GatewayError(504, "retries exhausted")
+
+
+    @router.post("/v1/chat")
+    async def chat(body: dict, request: Request) -> dict:
+        client: httpx.AsyncClient = request.app.state.http
+        try:
+            data = await create_completion(client, body["user_id"], body["messages"])
+        except GatewayError as e:
+            raise HTTPException(status_code=500, detail=e.body)
+        return {"reply": data["choices"][0]["message"]["content"]}
+  walkthrough:
+    function: |
+      对话路由接收用户 ID 和消息列表，调用内部 LLM 网关生成回答。`create_completion` 封装了请求发送、超时处理和对可重试状态码的退避重试；路由把成功结果中的回复文本返回给前端，失败时转换为 HTTP 错误。
+    key_functions: |
+      - `GatewayError`：携带上游状态码和原始响应体的自定义异常。
+      - `create_completion`：最多尝试 4 次。超时直接进入下一次；200 返回 JSON；状态码在 `RETRYABLE` 中则指数退避加抖动后重试；其他状态码立即抛出 `GatewayError`；全部失败抛出状态码为 504 的 `GatewayError`。
+      - `chat`：从 `app.state.http` 取共享客户端（在 lifespan 中创建），调用封装函数，捕获 `GatewayError` 后统一转换为 500。
+    params: |
+      - 前端请求体 `body` 中的 `user_id` 和 `messages` 被直接取出传给 `create_completion`（没有校验，也没有从认证信息中取用户 ID）。
+      - `payload` 中的 `user` 字段把用户 ID 传给网关，用于网关侧的统计和滥用检测。
+      - API Key 从环境变量读取，放在 `Authorization` 请求头中；单次请求超时 30 秒通过 `timeout=30.0` 传入。
+    data_flow: |
+      ```mermaid
+      flowchart TD
+        A["POST /v1/chat 请求体 user_id 与 messages"] --> B["create_completion 第 N 次尝试"]
+        B --> C["POST 网关 completions 超时 30 秒"]
+        C -- "超时异常" --> D["记录完整 payload 立即重试 无退避"]
+        D --> B
+        C -- "200" --> E["返回 JSON"]
+        C -- "429 500 502 503 504" --> F["指数退避 忽略 Retry-After"]
+        F --> B
+        C -- "其他状态码" --> G["抛出 GatewayError"]
+        B -- "4 次都失败" --> H["GatewayError 504"]
+        G --> I["路由统一转换为 500 并返回上游原始报错"]
+        H --> I
+        E --> J["返回 reply 文本"]
+      ```
+    failure_points: |
+      - **问题 1：对非幂等的生成请求在超时和 5xx 时盲目重试**。超时或 504 时网关可能已经生成并计费，重试又生成一次；最多 4 次尝试意味着一次对话最坏被计费 4 次——这就是账单多出约 20% 的原因。超时重试还没有任何退避，最坏情况下用户要等待 4 × 30 秒以上，没有总时间预算。
+      - **问题 2：所有上游错误统一映射为 500，并把上游原始响应体 `e.body` 返回给前端**。上游 400（请求太长）、401（网关 Key 失效）、429（限流）都变成 500，前端无法区分「改参数」「稍后重试」「系统故障」；而且原始报错可能包含模型名、内部地址等信息，直接展示给用户既难懂又泄露内部细节——对应「看到一大段英文报错」。
+      - 429/503 忽略了 `Retry-After` 头，固定的指数退避可能比上游要求的等待更短，加剧限流。
+      - 超时日志打印完整 `payload`，包含用户对话内容，违反隐私与日志脱敏要求。
+      - `user_id` 来自请求体，任何人都可以冒充其他用户（应来自认证信息）；`body` 没有校验，缺字段时 KeyError 返回 500 而不是 422。
+    debugging: |
+      - 核对账单：在每次实际发出请求时记录 `request_id`、尝试次数和对话 ID，对比网关账单中同一对话的调用次数，确认重复计费来自重试。
+      - 复现：用 mock 网关让第一次请求在 35 秒后才返回成功，观察客户端是否在 30 秒时发起第二次请求，以及网关侧是否收到两次。
+      - 对状态码打点：统计上游每种状态码的次数与我们返回给前端的状态码，发现「上游 400 变成我们的 500」这类错配。
+      - 检查日志：搜索 `timeout attempt=` 日志，确认其中是否包含用户原文（隐私问题）。
+    change_request: |
+      **需求：保证一次用户操作最多计费一次，并让前端能根据错误类型给出准确提示。**
+      - 前端或路由为每次用户操作生成 `Idempotency-Key`，`create_completion` 在每次重试中携带同一个键（前提是网关支持按键去重；不支持时对超时和 504 不做自动重试）。
+      - 重试只针对 429/502/503；429/503 优先读取 `Retry-After`；超时与 504 仅在有幂等键时重试；增加整体时间预算（如 `asyncio.timeout(45)`）。
+      - `GatewayError` 映射：上游 400 → 422 或 400 并给出可理解的提示；上游 401/403 → 502 并告警；上游 429/503 → 503 + Retry-After；超时 → 504。响应体使用统一错误格式，只包含错误码、友好文案和 request_id，原始报错只写日志。
+      - 日志中只记录消息条数和长度，不记录原文；`user_id` 改为从认证依赖中获取（Day 09）。
+  questions:
+    - id: d08-c1-q1
+      kp: d08-k3
+      type: code
+      question: 假设网关处理某个请求需要 40 秒（最终成功），按时间顺序描述 `create_completion` 的执行过程、网关一共收到几次请求、可能被计费几次，以及用户最终等待了多久。
+      key_points:
+        - {text: "说明每次请求在 30 秒时触发 TimeoutException，记录日志后立即进入下一次尝试", dim: concept}
+        - {text: "指出超时只是客户端放弃等待，网关仍在处理，因此 4 次请求都可能完成生成并计费", dim: principle}
+        - {text: "得出用户约等待 120 秒后收到 GatewayError 504，最终路由返回 500", dim: concept}
+        - {text: "提出修复：幂等键、超时不盲目重试、整体时间预算或改为流式与异步任务", dim: engineering}
+      reference: |
+        执行过程：第 0 秒发出第一次请求；第 30 秒客户端触发 `httpx.TimeoutException`，记录包含完整 payload 的 warning，`continue` 立刻发出第二次请求（没有退避）；第 60 秒第二次超时，发出第三次；第 90 秒第三次超时，发出第四次；第 120 秒第四次超时，循环结束，抛出 `GatewayError(504, "retries exhausted")`，路由将其转换为 500 返回给前端。
+        网关一共收到 4 次请求。客户端超时只是自己放弃等待并断开连接，网关并不一定感知或中止处理；每个请求都需要 40 秒，很可能 4 次都在网关侧完整生成并计费。用户等待约 120 秒后看到错误，而账单上多了 4 次调用——这就是「非幂等请求 + 超时重试」的典型后果。
+        修复：一是让单次超时与业务耗时匹配（或改为流式输出、202 + 任务查询）；二是携带幂等键，在网关支持去重的前提下才对超时进行重试；三是设置整体时间预算，超出后直接返回 504 而不是继续尝试；四是超时日志不记录用户原文。
+    - id: d08-c1-q2
+      kp: d08-k2
+      type: code
+      question: 分别说明当网关返回 400（消息过长）、401（网关 API Key 失效）、429（带 Retry-After 20）时，这段代码的执行路径和前端收到的响应，并给出你认为正确的处理与对外状态码。
+      key_points:
+        - {text: "400 与 401 不在 RETRYABLE 中，立即抛出 GatewayError，路由返回 500 和上游原始报错", dim: concept}
+        - {text: "429 会被退避重试，但等待 1 到 3 秒左右，忽略 Retry-After 20 秒，重试大概率仍被限流", dim: principle}
+        - {text: "正确处理：400 对用户返回 400 或 422 并提示缩短内容，401 返回 502 并告警，429 遵守 Retry-After 或返回 503", dim: engineering}
+        - {text: "指出不应透传上游原始报错，应返回统一错误格式与 request_id", dim: engineering}
+      reference: |
+        **400（消息过长）：** 不在 `RETRYABLE` 中，立即抛出 `GatewayError(400, 原始报错)`，路由捕获后返回 500，`detail` 是网关原始响应体。前端只能显示「服务器错误」或那段英文报错，用户不知道是自己的输入太长。正确做法：映射为 400 或 422，错误码如 `message_too_long`，提示用户缩短内容或开启新对话，不重试。
+        **401（网关 Key 失效）：** 同样立即抛出并被转换为 500，用户看到原始报错。真正的问题是服务端配置失效，所有用户都会失败。正确做法：对用户返回 502（或 503），错误码 `upstream_auth_failed` 只用于内部，文案为「服务暂时不可用」；同时立即触发高优先级告警。绝不能把 401 透传给前端，否则前端会把用户踢回登录页。
+        **429（Retry-After: 20）：** 在 `RETRYABLE` 中，代码按 `2 ** attempt + random()` 退避，分别等待约 1、2、4 秒，完全忽略上游要求的 20 秒，重试几乎必然再次 429，最终抛出 504 被转换为 500。正确做法：读取 Retry-After；如果等待时间超出本次请求的时间预算，就不在请求内等待，直接对用户返回 503 + `Retry-After: 20`，或者切换到备用模型。
+        所有情况下返回统一错误格式，只包含错误码、友好文案和 request_id，上游原始报错只写入日志。
+sources:
+  - {title: "RFC 9110 - HTTP Semantics", url: "https://www.rfc-editor.org/rfc/rfc9110.pdf"}
+  - {title: "RFC 6585 - Additional HTTP Status Codes", url: "https://datatracker.ietf.org/doc/html/rfc6585.html"}
+  - {title: "FastAPI - Handling Errors", url: "https://fastapi.tiangolo.com/tutorial/handling-errors/"}

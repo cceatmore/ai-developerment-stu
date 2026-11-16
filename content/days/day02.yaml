@@ -1,0 +1,875 @@
+day: 2
+phase: 1
+title: 数据结构
+goals:
+  - 能按「要不要顺序、要不要去重、要不要按键查找」在 list / tuple / dict / set 之间做出选择，并说清和 Array / Object / Map / Set 的差异
+  - 能判断一个对象是否可变、是否可哈希，解释为什么 list 不能做 dict 的键
+  - 能读懂切片和推导式，预判 `msgs[-3:]`、字典推导式重复键等写法的结果
+  - 能判断什么时候浅拷贝就够、什么时候必须深拷贝，并定位「改了副本却影响原数据」的 bug
+minutes: 60
+resources:
+  - title: "Python 官方教程（中文）第 5 章 数据结构"
+    url: "https://docs.python.org/zh-cn/3/tutorial/datastructures.html"
+    kind: doc
+    lang: zh
+    minutes: 25
+    note: "看 5.1 列表（含 5.1.3 列表推导式）、5.3 元组和序列、5.4 集合、5.5 字典，对照今天的选型表和推导式"
+  - title: "廖雪峰 Python 教程 - 使用 dict 和 set"
+    url: "https://liaoxuefeng.com/books/python/basic/dict-set/index.html"
+    kind: article
+    lang: zh
+    minutes: 15
+    note: "看哈希原理（查字典的比喻）和「再议不可变对象」两段，正好解释可哈希；注意文中「dict 顺序与放入顺序无关」已过时，Python 3.7 起保证插入顺序"
+  - title: "Python 文档 - copy 浅层及深层拷贝操作（中文）"
+    url: "https://docs.python.org/zh-cn/3/library/copy.html"
+    kind: doc
+    lang: zh
+    minutes: 10
+    note: "只看开头三段浅拷贝 vs 深拷贝的定义，以及「此模块不会复制文件、套接字」那一句，对应今天的深拷贝陷阱"
+knowledge_points:
+  - id: d02-k1
+    name: list / tuple / dict / set 与选型
+    level: P0
+    summary: list 有序可变、tuple 固定结构、dict 按键查找、set 去重和成员判断；查找用 dict/set 是 O(1)，list 是 O(n)
+    analogy: |
+      **对照前端**：
+
+      | Python | JS/TS | 典型用途 |
+      |---|---|---|
+      | `list` | `Array` | 有序、可重复、可修改的序列 |
+      | `tuple` | TS 元组 `readonly [string, number]` | 固定结构的一条记录、函数多返回值 |
+      | `dict` | `Object` / `Map` | 按键查找、JSON 对象 |
+      | `set` | `Set` | 去重、成员判断、交并差 |
+
+      **不一样的地方**：
+      - dict 的键可以是**任意可哈希对象**（int、tuple…），不会像 JS Object 那样把键转成字符串；在这一点上更像 `Map`。
+      - dict **不能用点语法** `d.key`，只能 `d["key"]` 或 `d.get("key")`；访问不存在的键是 **KeyError**，不会得到 undefined。
+      - Python 没有「类数组对象」「稀疏数组」这些概念；list 索引越界直接 IndexError。
+      - `in` 的含义随类型变化：对 list 是逐个比较（O(n)），对 dict/set 是哈希查找（O(1)）。JS 里你会用 `arr.includes` vs `set.has`，Python 统一写 `in`，**更容易忽略性能差异**。
+    why: |
+      AI 后端每天在处理这四种结构：消息列表是 list、LLM 返回的 JSON 是 dict、去重的文档 ID 是 set、缓存键常是 tuple。**选错结构不会报错，但会让代码在数据量变大后突然变慢，或者出现 KeyError、重复数据这类线上问题**。
+    problem: |
+      帮你根据访问方式选结构：要保持顺序和重复用 list；结构固定、要当键用 tuple；按键查值用 dict；只关心「有没有」用 set。并且能读懂 AI 代码里 `d.get(k, 默认)`、`setdefault`、多重赋值解包这些常见惯用法。
+    principle: |
+      **一、四种结构的本质**
+
+      - **list**：动态数组，存的是**对象引用**。尾部 `append`/`pop` 快；`insert(0, x)`、`pop(0)` 要移动所有元素，慢（需要队列用 `collections.deque`）。
+      - **tuple**：不可变序列。函数 `return a, b` 实际返回一个 tuple，`x, y = f()` 是**解包**。
+      - **dict**：哈希表。**Python 3.7 起保证按插入顺序遍历**；更新已有键的值不改变它的位置。
+      - **set**：只有键没有值的哈希表，自动去重，**无序**。
+
+      **二、怎么选**
+
+      ```mermaid
+      flowchart TB
+        A["要存一组数据"] --> B{"需要按键查找值吗"}
+        B -->|"是"| D["dict"]
+        B -->|"否"| C{"只关心有没有 需要去重吗"}
+        C -->|"是"| S["set"]
+        C -->|"否"| E{"结构固定 或要当 dict 的键"}
+        E -->|"是"| T["tuple"]
+        E -->|"否"| L["list"]
+      ```
+
+      **三、性能直觉：`in` 的代价**
+
+      | 操作 | list | dict / set |
+      |---|---|---|
+      | `x in 容器` | O(n)，逐个比较 | 平均 O(1)，算哈希直接定位 |
+      | 按位置取 `c[i]` | O(1) | 不支持（set）/ 按键取 |
+      | 头部插入删除 | O(n) | — |
+
+      10 万个已处理 ID 放 list 里循环 `in` 判断，就是 10 万 × 10 万次比较；换成 set 只要 10 万次哈希。
+
+      **四、dict 常用惯用法**
+
+      - `d.get("k")` 不存在返回 None，`d.get("k", 默认)` 返回默认值；`d["k"]` 不存在抛 KeyError。**必须存在的字段用 `[]`，让错误尽早暴露；可选字段用 `get`。**
+      - `d.setdefault(k, []).append(v)` 或 `collections.defaultdict(list)`：按键分组。
+      - `{**a, **b}` 或 `a | b`（3.9+）：合并，后者覆盖前者，得到新 dict。
+      - `json.loads` 得到的就是 dict / list / str / int / float / bool / None 的组合。
+
+      **五、3.15 新增 frozendict**
+
+      Python 3.15 新增内置不可变映射 `frozendict`：创建后不能修改，键值都可哈希时自身可哈希。它**不是 dict 的子类**，`isinstance(x, dict)` 为 False。需要兼容 3.15 以前版本时，只读映射仍用 `types.MappingProxyType`。
+
+      **不这样理解会怎样**：用 list 做去重导致入库脚本越跑越慢；用 `d["k"]` 读可选字段导致 LLM 少返回一个字段就 500；以为 set 有顺序，测试偶尔失败。
+    scenarios: |
+      - **对话消息**：`messages: list[dict]`，按顺序追加，发给 LLM。
+      - **工具注册表**：`TOOLS: dict[str, Callable]`，按工具名查找函数（Day 17）。
+      - **入库去重**：`seen: set[str]` 记录已处理的文档哈希。
+      - **复合缓存键**：`cache[(tenant_id, query)] = answer`，tuple 做键。
+      - **按来源分组**：`defaultdict(list)` 把检索结果按文件名归组。
+    code: |
+      ```python
+      from collections import defaultdict
+
+      chunks = [
+          {"id": "c1", "source": "a.pdf", "score": 0.91},
+          {"id": "c2", "source": "b.pdf", "score": 0.72},
+          {"id": "c1", "source": "a.pdf", "score": 0.91},   # 重复
+      ]
+
+      seen: set[str] = set()
+      unique = []
+      for c in chunks:
+          if c["id"] in seen:          # set 的 in 是 O(1)
+              continue
+          seen.add(c["id"])
+          unique.append(c)
+
+      by_source: defaultdict[str, list[str]] = defaultdict(list)
+      for c in unique:
+          by_source[c["source"]].append(c["id"])
+
+      print(dict(by_source))            # {'a.pdf': ['c1'], 'b.pdf': ['c2']}
+      print(unique[0].get("page", 1))   # 可选字段用 get，给默认值
+      ```
+    pitfalls: |
+      - **误区：dict 可以用 `d.key` 访问。** 只能 `d["key"]`；点语法是对象属性。
+      - **误区：set 和 dict 一样有插入顺序。** dict 有序，set 无序，不要依赖 set 的打印顺序。
+      - **误区：用 list 去重或频繁 `in` 判断。** 数据量一大就是 O(n²)。
+      - **误区：所有字段都用 `.get()` 更安全。** 必填字段用 get 会把缺失吞成 None，问题延后到更难排查的地方才暴露。
+      - **混淆：frozendict 是 dict 的子类。** 不是，`isinstance(fd, dict)` 为 False。
+    interview_asks:
+      - question: "list、tuple、dict、set 分别适合什么场景？查找性能有什么差异？"
+        answer: "list 要顺序、要改；tuple 定下来不改，还能当字典的键。dict 按键取，set 只关心在不在。list 里查找是从头扫，数据一大就慢；dict 和 set 按键查找是接近常数时间。"
+      - question: "Python 的 dict 是有序的吗？从哪个版本开始保证？"
+        answer: "从 3.7 起，字典按插入顺序保留，这是语言保证，不只是 CPython 的实现细节。遍历、转 JSON 时顺序稳定。不要依赖 3.6 及更早的行为。"
+      - question: "dict 的 get 和 [] 取值怎么选？"
+        answer: "键一定存在、没有就是 bug，用 []，马上抛 KeyError。键可能没有、缺了要用默认值，用 get。不要用 get 把真正的缺键吞成 None，后面更难查。"
+    project_example: |
+      在 p1 知识库的入库流程里，第一版用 `processed: list[str]` 记录已入库的文档哈希，每个 chunk 都 `if h in processed`。测试时 2000 个文档没问题，客户一次导入 8 万份 PDF 后，入库任务从几分钟变成几小时。改成 `set` 后恢复正常；同时检索结果按 `defaultdict(list)` 以文件名分组，前端引用列表直接按组渲染。
+    freshness: |
+      核对于 2026-11：dict 保持插入顺序自 Python 3.7 起是语言保证。Python 3.15（2026-10-09 发布）新增内置 `frozendict`（PEP 814）：不可变、不是 dict 子类、键值都可哈希时自身可哈希、保持插入顺序但比较时不看顺序。需要兼容 3.14 及以前版本的代码不能使用。
+    sources:
+      - {title: "Python 教程 - 数据结构", url: "https://docs.python.org/zh-cn/3/tutorial/datastructures.html"}
+      - {title: "What's new in Python 3.15 - PEP 814 frozendict", url: "https://docs.python.org/3/whatsnew/3.15.html"}
+
+  - id: d02-k2
+    name: 可变与不可变、可哈希
+    level: P1
+    summary: list/dict/set 可变，int/str/tuple/frozenset 不可变；只有可哈希的对象才能做 dict 键和 set 元素
+    analogy: |
+      **像 JS 的原始值 vs 对象**：JS 的 string/number 不可变，对象和数组可变；Python 类似，str/int 不可变，list/dict 可变。Vue 里你也知道「直接改 props 里的对象会影响父组件」——那就是可变对象共享的问题。
+
+      **不一样的地方**：
+      - Python 多了 **tuple / frozenset** 这样的不可变容器，以及「**可哈希**」的概念：Map 的键在 JS 里可以是任意对象（按引用比较），Python dict 的键必须可哈希（按值比较）。
+      - JS 的 `Object.freeze` 只是浅冻结；Python 的 tuple 也只是**浅不可变**——里面装的 list 照样能改。
+    why: |
+      「可变对象被多处共享然后被改坏」是 Python 后端最常见的一类 bug（Day 01 讲的名字绑定是根源）。**你还需要能看懂 `TypeError: unhashable type: 'list'` 这种报错**，它经常在 AI 代码把 list 当缓存键、把 dict 放进 set 去重时出现。
+    problem: |
+      帮你回答：哪些对象可以放心共享（不可变的），哪些共享时必须小心（可变的）；什么能做 dict 键和 set 元素；为什么字符串拼接要用 join；为什么函数默认参数不能写 `[]`（Day 03 详讲）。
+    principle: |
+      **一、谁可变，谁不可变**
+
+      | 不可变 | 可变 |
+      |---|---|
+      | int、float、bool、str、bytes、tuple、frozenset、None（3.15+ 还有 frozendict） | list、dict、set、bytearray、大多数自定义类的实例 |
+
+      对不可变对象的任何「修改」，都是**创建新对象再重新绑定名字**：`s.replace("a", "A")` 返回新字符串，原字符串不变。
+
+      **二、可哈希（hashable）是什么**
+
+      dict 和 set 都是哈希表：存的时候根据键的哈希值算位置，取的时候再算一次去找。**如果键的内容能变，哈希值就会变，存进去的东西就再也找不到了**。所以：
+      - 可哈希 = 有稳定的 `__hash__`，且值相等的对象哈希相等。
+      - 内置的不可变类型可哈希；list、dict、set 不可哈希。
+      - **tuple 只有在所有元素都可哈希时才可哈希**：`("a", 1)` 可以，`("a", [1])` 不行。
+
+      ```mermaid
+      flowchart LR
+        K["想用 x 做 dict 键或 set 元素"] --> Q{"x 可哈希吗"}
+        Q -->|"str int tuple 内全是不可变"| OK["可以"]
+        Q -->|"list dict set 或含它们的 tuple"| NG["TypeError unhashable type"]
+        NG --> FIX["改成 tuple 或 frozenset 或取一个 id 字段做键"]
+      ```
+
+      **三、浅不可变**
+
+      tuple 不可变指的是「**它里面存的引用不能换**」，但引用指向的 list 自己可以变：`t = ([1], 2); t[0].append(9)` 完全合法。
+
+      **四、字符串不可变带来的性能问题**
+
+      循环里 `s += piece` 每次都可能创建新字符串，拼接 LLM 流式返回的上千个片段时，正确做法是先收集到 list，最后 `"".join(parts)`。
+
+      **不这样理解会怎样**：把 list 做缓存键直接报错；以为 tuple 里的东西绝对安全；共享可变对象导致数据串号。
+    scenarios: |
+      - **缓存键**：`(tenant_id, model, query)` 用 tuple，不能用 list。
+      - **dict 去重**：dict 不可哈希不能放进 set，按 `id` 字段做键去重。
+      - **流式输出拼接**：收集 token 片段，最后 join。
+      - **只读配置**：对外暴露的默认配置用不可变结构，避免被调用方改坏。
+    code: |
+      ```python
+      cache: dict[tuple[str, str], str] = {}
+      cache[("tenant-a", "报销流程")] = "答案..."      # tuple 做键 OK
+
+      try:
+          cache[["tenant-a", "报销流程"]] = "x"        # list 做键
+      except TypeError as e:
+          print(e)                                     # unhashable type: 'list'
+
+      t = (["Observation"], 0.2)
+      t[0].append("###")                              # tuple 浅不可变，内层 list 能改
+      print(t)                                        # (['Observation', '###'], 0.2)
+
+      parts = []
+      for token in ["你", "好", "，", "世界"]:
+          parts.append(token)
+      print("".join(parts))                           # 你好，世界
+      ```
+    pitfalls: |
+      - **误区：tuple 里的内容永远不会变。** tuple 只是浅不可变，内层可变对象照样能改。
+      - **误区：把 dict 转成 str 再放进 set 就能去重。** 键顺序不同字符串就不同，结果不可靠。
+      - **误区：字符串的 replace / upper 会修改原字符串。** 它们都返回新字符串，必须接住返回值。
+      - **混淆：不可变 ≠ 可哈希。** 含 list 的 tuple 不可变但不可哈希。
+    interview_asks:
+      - question: "Python 里哪些类型可变、哪些不可变？为什么 list 不能做 dict 的键？"
+        answer: "数字、字符串、tuple、frozenset 不可变，能做键。list、dict、set 可变，不能做键。键要能算出稳定的哈希；列表内容一改，哈希就变了，字典会找不到它。"
+      - question: "tuple 是不可变的，那 tuple 里的列表能改吗？"
+        answer: "tuple 只保证「里面装的还是原来那些对象」，不保证那些对象自己不能改。tuple 里的 list 仍然可以 append。这种 tuple 也不能做字典的键。"
+    project_example: |
+      在 p2 园区 Agent 里给「设备查询」工具加缓存，AI 生成的代码用 `cache[[park_id, device_type]]` 直接报 `unhashable type: 'list'`。改成 `cache[(park_id, device_type)]` 后正常。后来又发现缓存值是 list，调用方拿到后直接 `append` 了告警信息，导致缓存被污染，最终缓存值改为存 tuple，调用方需要修改时自己 `list(...)` 一份。
+    sources:
+      - {title: "Python 术语对照表 - hashable", url: "https://docs.python.org/zh-cn/3/glossary.html#term-hashable"}
+      - {title: "Python 文档 - 内置类型", url: "https://docs.python.org/3/library/stdtypes.html"}
+
+  - id: d02-k3
+    name: 切片与推导式
+    level: P1
+    summary: 切片 [start:stop:step] 左闭右开且越界不报错，返回新对象；推导式是 map + filter 的简洁写法
+    analogy: |
+      **切片 ≈ `arr.slice(start, end)`**：左闭右开、返回新数组、不修改原数组，Python 和 JS 一样。Python 多了**负索引**（`msgs[-3:]` ≈ `msgs.slice(-3)`）和**步长**（`[::2]`、`[::-1]` 反转）。
+
+      **推导式 ≈ `filter + map`**：`[d["text"] for d in docs if d["score"] > 0.5]` ≈ `docs.filter(d => d.score > 0.5).map(d => d.text)`。字典推导式 ≈ `Object.fromEntries(arr.map(...))`。
+
+      **不一样的地方**：
+      - Python 的 `lst[-1]` 直接取最后一个，JS 要 `arr.at(-1)`；JS 的 `arr[-1]` 是 undefined。
+      - Python 推导式是**一次遍历同时过滤和映射**，不是链式创建中间数组。
+      - Python 写 `if` 的位置有讲究：结尾的 `if` 是过滤，前面的 `a if 条件 else b` 是映射。
+    why: |
+      AI 写的 Python 里大量出现 `messages[-10:]`（保留最近 10 条对话）、`[c.text for c in chunks]`（提取文本）、`{d.id: d for d in docs}`（建索引）。**看不懂它们，就读不懂上下文裁剪、检索结果处理这些 AI 应用的核心代码**。
+    problem: |
+      切片解决「按位置截取一段」：最近 N 条消息、分页、按 token 预算截断。推导式解决「把一个集合变换成另一个集合」：提取字段、过滤低分结果、建索引。理解它们的边界行为，才能预判越界、重复键这类结果。
+    principle: |
+      **一、切片规则**
+
+      `seq[start:stop:step]`：
+      - **左闭右开**，`stop` 位置不包含。
+      - 负数从末尾数：`-1` 是最后一个，`msgs[-3:]` 是最后三条。
+      - 省略 start/stop 表示到头/到尾；`[::-1]` 反转。
+      - **切片越界不报错**，返回能取到的部分或空列表；**索引越界才报 IndexError**。
+      - list 切片返回**新列表**（浅拷贝，元素引用共享）；str、tuple 切片返回新的 str、tuple。
+
+      **二、推导式四兄弟**
+
+      | 写法 | 结果 |
+      |---|---|
+      | `[f(x) for x in xs if cond(x)]` | list |
+      | `{k(x): v(x) for x in xs}` | dict（**重复键后者覆盖**） |
+      | `{f(x) for x in xs}` | set |
+      | `(f(x) for x in xs)` | **生成器**，惰性求值（见 Day 05） |
+
+      ```mermaid
+      flowchart LR
+        A["可迭代对象 xs"] --> B["逐个取 x"]
+        B --> C{"末尾的 if 条件"}
+        C -->|"False"| B
+        C -->|"True"| D["计算表达式 f x"]
+        D --> E["放入新容器"]
+        E --> B
+      ```
+
+      **三、几个要点**
+
+      - Python 3 中推导式有**自己的作用域**，循环变量不会泄漏到外面。
+      - 列表推导式会**立即生成完整列表**。处理几十万条数据只需遍历一次时，改用生成器表达式更省内存，如 `sum(len(c) for c in chunks)`。
+      - 嵌套推导式超过两层就该改回 for 循环，可读性优先。
+      - **3.15 新增推导式解包**：`[*L for L in lists]` 把多个列表展平，`{**d for d in dicts}` 依次合并多个 dict；旧版本写 `[x for L in lists for x in L]`。
+
+      **不这样理解会怎样**：用 `msgs[:1] + msgs[-N:]` 保留 system 消息时，消息数少于 N 会把 system 消息重复一次；用字典推导式建索引时，重复键被悄悄覆盖导致数据丢失。
+    scenarios: |
+      - **上下文裁剪**：`history[-2 * rounds:]` 保留最近几轮对话（Day 20 会讲按 token 裁剪）。
+      - **结果处理**：`[c for c in chunks if c.score >= threshold]` 过滤低分检索结果。
+      - **建索引**：`{doc.id: doc for doc in docs}` 按 id 查文档。
+      - **分批**：`[items[i:i + 100] for i in range(0, len(items), 100)]` 每批 100 条调用 Embedding 接口。
+    code: |
+      ```python
+      messages = [{"role": "system", "content": "你是园区助手"}] + [
+          {"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}"}
+          for i in range(6)
+      ]
+
+      def trim(msgs: list[dict], keep: int) -> list[dict]:
+          system, rest = msgs[0], msgs[1:]
+          return [system] + rest[-keep:]       # 先拆出 system，再切片，避免重复
+
+      print([m["content"] for m in trim(messages, 2)])   # ['你是园区助手', 'm4', 'm5']
+
+      chunks = [{"id": "c1", "score": 0.9}, {"id": "c2", "score": 0.3}]
+      good_ids = [c["id"] for c in chunks if c["score"] >= 0.5]
+      batches = [list(range(7))[i:i + 3] for i in range(0, 7, 3)]
+      print(good_ids, batches)   # ['c1'] [[0, 1, 2], [3, 4, 5], [6]]
+      ```
+    pitfalls: |
+      - **误区：切片越界会报 IndexError。** 只有索引越界报错，切片会安静地返回空列表，可能掩盖 bug。
+      - **误区：字典推导式遇到重复键会报错。** 不会，后面的值覆盖前面的。
+      - **误区：推导式一定比 for 循环快很多。** 有一些优势但不是数量级差别，选择依据首先是可读性。
+      - **混淆：`[x for x in xs if c]` 和 `[a if c else b for x in xs]`。** 前者过滤，后者映射。
+    interview_asks:
+      - question: "lst[-3:] 和 lst[10:] 在列表长度不足时会怎样？"
+        answer: "切片越界不报错。长度不够时 [-3:] 返回全部，[10:] 返回空列表。按下标取单个元素才会 IndexError。"
+      - question: "列表推导式和生成器表达式有什么区别？什么时候用哪个？"
+        answer: "列表推导式立刻做出完整列表，占内存。生成器表达式是圆括号，用到一个才算一个。结果要反复用、或量不大，用列表；只遍历一次、数据可能很大，用生成器。"
+    project_example: |
+      在 p1 知识库的聊天接口里，最早用 `messages[:1] + messages[-8:]` 拼接「system + 最近 8 条」。新会话只有 3 条消息时，system 提示被发送了两次，模型回答风格明显变怪。改成先拆出 system 再对剩余部分切片后修复，并补了「消息数小于 N」的边界测试。检索结果的 Embedding 调用则用切片分批，每批 64 条。
+    freshness: |
+      核对于 2026-11：Python 3.15 新增推导式中的 `*` / `**` 解包（PEP 798），如 `[*L for L in lists]`、`{**d for d in dicts}`，等价于旧写法的双层推导式或 `itertools.chain`。这是 3.15 才有的语法，需要兼容旧版本的项目不能用。
+    sources:
+      - {title: "What's new in Python 3.15 - PEP 798 Unpacking in comprehensions", url: "https://docs.python.org/3/whatsnew/3.15.html"}
+      - {title: "Python 教程 - 列表推导式", url: "https://docs.python.org/zh-cn/3/tutorial/datastructures.html"}
+
+  - id: d02-k4
+    name: 浅拷贝与深拷贝
+    level: P0
+    summary: 浅拷贝只复制外层容器、内层对象仍共享；深拷贝递归复制全部，安全但更慢
+    analogy: |
+      **和 JS 几乎一一对应**：
+      - `{...obj}`、`[...arr]`、`Object.assign` 是浅拷贝 ≈ Python 的 `{**d}`、`d.copy()`、`lst[:]`、`list(lst)`。
+      - `structuredClone(obj)` 是深拷贝 ≈ Python 的 `copy.deepcopy(obj)`。
+      - Vue 里你踩过「表单编辑时直接改了列表里的对象，取消后列表也变了」——同一个问题。
+
+      **不一样的地方**：
+      - `structuredClone` 遇到函数会报错；`copy.deepcopy` 对函数和类**直接返回原对象**（共享），对文件、socket 这类对象**无法复制会报错**。
+      - Python 对象可以自定义 `__deepcopy__`；Pydantic 模型有自己的 `model_copy(deep=True)`。
+    why: |
+      AI 应用里大量「模板 → 每个请求一份」的数据：Prompt 消息模板、默认模型参数、工具 Schema。**拷贝层级没想清楚，就会出现一个请求改了数据、所有请求都受影响的 bug**，而且只在并发或运行一段时间后才出现，很难查。
+    problem: |
+      帮你判断：拷贝一份数据后修改，会不会影响原数据。浅拷贝够用时不必深拷贝（深拷贝更慢、还可能复制不了某些对象）；有嵌套可变结构且要修改内层时，必须深拷贝或只重建要改的那一层。
+    principle: |
+      **一、三种「复制」的区别**
+
+      | 写法 | 外层是新对象吗 | 内层是新对象吗 |
+      |---|---|---|
+      | `b = a` | 否，同一个对象 | 否 |
+      | `b = a.copy()` / `a[:]` / `list(a)` / `{**a}` / `copy.copy(a)` | **是** | 否，**共享** |
+      | `b = copy.deepcopy(a)` | 是 | **是**，递归复制 |
+
+      ```mermaid
+      flowchart TB
+        subgraph SHALLOW["浅拷贝 a.copy"]
+          A1["原 dict"] --> S1["stop 列表"]
+          B1["新 dict"] --> S1
+        end
+        subgraph DEEP["深拷贝 copy.deepcopy"]
+          A2["原 dict"] --> S2["stop 列表"]
+          B2["新 dict"] --> S3["新的 stop 列表"]
+        end
+      ```
+
+      **二、浅拷贝什么时候够用**
+
+      - 内层都是不可变对象（str、int、tuple），比如 `{"model": "qwen", "temperature": 0.7}`。
+      - 只改外层：增删键、替换某个键的值（`b["temperature"] = 0`）。
+      - **只要会修改内层可变对象**（`b["stop"].append(...)`、`b["messages"][0]["content"] += ...`），浅拷贝就不够。
+
+      **三、深拷贝的代价和限制**
+
+      - 递归遍历整个对象图，**大对象（长对话历史、检索结果）每个请求都 deepcopy 会明显耗 CPU**。
+      - 函数、类、模块按原样共享；文件、socket、锁等对象无法复制，会抛 TypeError。
+      - 内部用 memo 字典处理循环引用，不会无限递归。
+
+      **更好的习惯：只重建要改的那一层**：
+
+      ```python
+      new_msgs = [dict(m) for m in BASE_MESSAGES]       # 每条消息复制一层
+      new_msgs[0] = {**new_msgs[0], "content": BASE_MESSAGES[0]["content"] + extra}
+      ```
+
+      **四、经典陷阱：`[[0] * 3] * 3`**
+
+      外层 `* 3` 复制的是**同一个内层列表的引用**三次，改 `grid[0][0]` 三行都变。正确写法：`[[0] * 3 for _ in range(3)]`。
+
+      **五、相关新 API**
+
+      - `copy.replace(obj, **changes)`（3.13+）：对 dataclass、namedtuple 等创建「改了几个字段的新对象」。
+      - Pydantic v2：`model.model_copy(update={...}, deep=True)`（Day 07）。
+
+      **不这样理解会怎样**：以为 `.copy()` 了就安全，结果内层列表被所有请求共享；或者每个请求无脑 deepcopy 大对象，CPU 飙高。
+    scenarios: |
+      - **Prompt 模板**：基础消息列表是嵌套的 list[dict]，每个请求要改 system 内容时，复制到要改的那一层。
+      - **默认参数**：只含 str/数字的平铺 dict，`{**DEFAULT, **overrides}` 浅合并就够。
+      - **缓存返回值**：缓存里的 list 返回给调用方前复制一份，或直接缓存不可变结构。
+      - **测试数据**：每个用例从同一个 fixture 深拷贝一份，避免用例之间互相影响。
+    code: |
+      ```python
+      import copy
+
+      BASE = {"model": "qwen-plus", "stop": ["Observation"]}
+
+      a = BASE.copy()             # 浅拷贝
+      b = copy.deepcopy(BASE)     # 深拷贝
+      a["model"] = "deepseek-chat"       # 改外层：不影响 BASE
+      a["stop"].append("###")            # 改内层：影响 BASE！
+      b["stop"].append("END")            # 深拷贝：不影响 BASE
+      print(BASE)   # {'model': 'qwen-plus', 'stop': ['Observation', '###']}
+
+      grid = [[0] * 3] * 3
+      grid[0][0] = 1
+      print(grid)   # [[1, 0, 0], [1, 0, 0], [1, 0, 0]]
+      grid = [[0] * 3 for _ in range(3)]  # 正确写法
+      ```
+    pitfalls: |
+      - **误区：调用了 `.copy()` 就和原数据完全独立。** 只有外层独立，内层共享。
+      - **误区：深拷贝总是更安全，所以到处用。** 大对象代价高，且文件、连接等对象复制会报错。
+      - **误区：`[[0] * 3] * 3` 创建了三个独立的行。** 是同一个内层列表引用三次。
+      - **混淆：`dict(a)` 和 `copy.deepcopy(a)`。** `dict(a)` 只是浅拷贝。
+    interview_asks:
+      - question: "Python 的浅拷贝和深拷贝有什么区别？分别有哪些写法？"
+        answer: "浅拷贝只复制最外层，里面的列表、字典还是原来的。深拷贝连里面一起复制。浅拷贝：list(a)、a.copy()、a[:]。深拷贝：copy.deepcopy(a)。"
+      - question: "什么场景下浅拷贝就够了？深拷贝有什么代价？"
+        answer: "里面只有数字、字符串这类不可变值时，浅拷贝就够。里面还有列表或字典，改内层会影响到原对象，这时才要深拷贝。深拷贝更慢，也会复制你没打算复制的大对象。"
+      - question: "[[0]*3]*3 有什么问题？"
+        answer: "里面三个「行」其实是同一个列表。改 [0][0] 会把三行一起改掉。要三份独立的行，写成 [[0] * 3 for _ in range(3)]。"
+    project_example: |
+      在 p2 园区 Agent 中，few-shot 模板 `BASE_MESSAGES` 是 list[dict]。每个请求执行 `msgs = BASE_MESSAGES.copy()` 后 `msgs[0]["content"] += f"当前园区：{park}"`。上线后 system 提示越来越长，还混入了其他园区名。原因是 `.copy()` 只复制了外层列表，消息 dict 仍是共享的。修复为按层重建需要修改的那条消息，并加了「连续两个园区请求后 BASE_MESSAGES 不变」的断言测试。
+    freshness: |
+      核对于 2026-11：`copy.replace()` 自 Python 3.13 加入，支持 namedtuple、dataclass 和定义了 `__replace__()` 的类。Python 文档说明 copy 模块不会复制模块、方法、栈帧、文件、套接字等类型。Pydantic 最新为 v2.14.3（2026-11-04），v2 写法 `model_copy(update=..., deep=True)`，v1 的 `.copy()` 为旧写法。
+    sources:
+      - {title: "Python 文档 - copy 浅层及深层拷贝操作", url: "https://docs.python.org/zh-cn/3/library/copy.html"}
+      - {title: "pydantic - PyPI", url: "https://pypi.org/project/pydantic/"}
+
+test:
+  - id: d02-t1
+    kp: d02-k1
+    type: single
+    question: 入库脚本需要在约 10 万个已处理的文档 ID 中，对每个新 chunk 判断「是否已处理」。最合适的数据结构是？
+    options:
+      - "list，用 append 记录，用 in 判断"
+      - "set，用 add 记录，用 in 判断"
+      - "tuple，因为不可变所以查找更快"
+      - "排好序的 list，用 in 判断就是二分查找"
+    answer: [1]
+    explain: set 基于哈希表，in 判断平均 O(1)；list 的 in 是逐个比较 O(n)，数据量大时整体变成 O(n²)。tuple 的 in 同样是逐个比较；排序后的 list 用 in 也不会自动二分，需要 bisect 模块才行。
+
+  - id: d02-t2
+    kp: d02-k1
+    type: single
+    question: 下面代码输出什么？
+    code: |
+      d = {"b": 1, "a": 2}
+      d["c"] = 3
+      d["b"] = 9
+      print(list(d))
+    options:
+      - "['a', 'b', 'c']"
+      - "顺序不确定，每次运行都可能不同"
+      - "['b', 'a', 'c']"
+      - "['a', 'c', 'b']"
+    answer: [2]
+    explain: Python 3.7 起 dict 保证按插入顺序遍历；更新已存在的键只改值，不改变它的位置，所以 b 仍在第一位。按字母排序、更新后挪到末尾、顺序随机都是错误认识（随机的是 set，不是 dict）。
+
+  - id: d02-t3
+    kp: d02-k1
+    type: judge
+    question: 和 JS 访问不存在的属性得到 undefined 一样，Python 用 `d["missing"]` 访问不存在的键会返回 None，不会报错。
+    answer: false
+    explain: Python 用方括号访问不存在的键会抛 KeyError。需要「不存在时返回默认值」应使用 d.get("missing") 或 d.get("missing", 默认值)。必填字段用方括号让错误尽早暴露，可选字段才用 get。
+
+  - id: d02-t4
+    kp: d02-k1
+    type: multi
+    question: 关于 Python dict 和 JS Object / Map 的对比，下列说法正确的是？
+    options:
+      - "dict 的键可以是 int、tuple 等可哈希对象，不会被转成字符串"
+      - "dict 从 Python 3.7 起保证按插入顺序遍历"
+      - "dict 可以用 d.key 这样的点语法访问键"
+      - "json.loads 解析 JSON 对象得到的就是 dict"
+    answer: [0, 1, 3]
+    explain: dict 的键保留原类型（这点更像 Map），自 3.7 起有序，json.loads 把 JSON 对象解析成 dict。dict 不支持点语法访问键，d.key 会被当成属性访问而抛 AttributeError，这是从 JS 转过来常犯的错。
+
+  - id: d02-t5
+    kp: d02-k1
+    type: single
+    question: 函数里写了 `return answer, sources`，调用方写 `result = rag_answer(q)`。result 是什么？
+    options:
+      - "只得到第一个返回值 answer，sources 被丢弃"
+      - "一个 list：[answer, sources]"
+      - "一个 dict：{'answer': ..., 'sources': ...}"
+      - "一个 tuple：(answer, sources)"
+    answer: [3]
+    explain: return a, b 实际上返回一个 tuple，调用方可以用 answer, sources = rag_answer(q) 解包，也可以整体接收为一个 tuple。Python 没有「多返回值丢弃」的行为，也不会自动变成 list 或 dict。
+
+  - id: d02-t6
+    kp: d02-k2
+    type: single
+    question: 下列哪个对象可以作为 dict 的键？
+    options:
+      - "['tenant-a', 'query']"
+      - "('tenant-a', ['query'])"
+      - "('tenant-a', 'query')"
+      - "{'tenant': 'tenant-a'}"
+    answer: [2]
+    explain: 只有可哈希对象能做键。元素全是字符串的 tuple 可哈希；list 和 dict 可变、不可哈希；含有 list 的 tuple 虽然本身不可变，但因为内层不可哈希，整体也不可哈希，会报 unhashable type。
+
+  - id: d02-t7
+    kp: d02-k2
+    type: judge
+    question: tuple 是不可变类型，所以无论 tuple 里装的是什么，它的内容在创建后都不可能发生任何变化。
+    answer: false
+    explain: tuple 只是浅不可变：不能替换它存的引用，但如果某个元素是 list 或 dict，这个元素本身可以被修改，例如 t[0].append(9) 是合法的。所以「不可变」不等于「深度只读」，也不等于可哈希。
+
+  - id: d02-t8
+    kp: d02-k2
+    type: single
+    question: 下面代码的运行结果是？
+    code: |
+      t = ([1, 2], 3)
+      t[0].append(9)
+      print(t)
+      t[1] = 4
+    options:
+      - "第二行就抛 TypeError，tuple 里的东西都不能改"
+      - "打印 ([1, 2], 3)，append 没有效果"
+      - "打印 ([1, 2, 9], 3)，然后最后一行抛 TypeError"
+      - "打印 ([1, 2, 9], 3)，最后一行把 3 改成 4"
+    answer: [2]
+    explain: t[0] 是一个 list，append 修改的是 list 本身，不涉及替换 tuple 的元素，所以合法并打印 ([1, 2, 9], 3)；t[1] = 4 试图替换 tuple 存的引用，抛 TypeError。这正好说明 tuple 是浅不可变。
+
+  - id: d02-t9
+    kp: d02-k2
+    type: multi
+    question: 下列哪些类型是不可变的？
+    options:
+      - "str"
+      - "tuple"
+      - "frozenset"
+      - "list"
+      - "bytes"
+      - "dict"
+    answer: [0, 1, 2, 4]
+    explain: str、tuple、frozenset、bytes 都是不可变类型，对它们的「修改」都是创建新对象；list 和 dict 是可变容器，可以原地增删改。Python 3.15 还新增了不可变的 frozendict，但普通 dict 仍然可变。
+
+  - id: d02-t10
+    kp: d02-k2
+    type: single
+    question: 后端要把 LLM 流式返回的上千个文本片段拼成完整回答，AI 生成的代码在循环里写 `answer += piece`。更推荐的写法是？
+    options:
+      - "先收集到 list，最后用 ''.join(parts) 拼接"
+      - "改成 answer = answer + piece，避免 += 的副作用"
+      - "先把每个片段转成 bytes 再相加，速度更快"
+      - "不用改，字符串是可变的，+= 是原地追加"
+    answer: [0]
+    explain: str 不可变，+= 每次都可能创建新字符串，片段多时会产生大量临时对象；收集到 list 再 join 只分配一次。= + 和 += 对字符串本质一样；bytes 同样不可变；「字符串可变」是错误认识。
+
+  - id: d02-t11
+    kp: d02-k3
+    type: single
+    question: 下面代码输出什么？
+    code: |
+      msgs = ["sys", "u1", "a1", "u2", "a2", "u3"]
+      print(msgs[-3:])
+      print(msgs[1:-1:2])
+      print(msgs[10:])
+    options:
+      - "['u2', 'a2', 'u3']、['u1', 'u2']、[]"
+      - "['u2', 'a2', 'u3']、['u1', 'a1', 'u2']、[]"
+      - "['a2', 'u3']、['u1', 'u2']、然后抛 IndexError"
+      - "['u2', 'a2', 'u3']、['u1', 'u2', 'u3']、[]"
+    answer: [0]
+    explain: msgs[-3:] 取最后三个；msgs[1:-1:2] 从下标 1 开始、到倒数第一个之前（不含）、步长 2，取到下标 1 和 3，即 u1、u2；切片越界不会报错，msgs[10:] 返回空列表。左闭右开和「切片不报错」是两个关键点。
+
+  - id: d02-t12
+    kp: d02-k3
+    type: judge
+    question: 和索引越界一样，对 list 做切片时如果下标超出范围，也会抛出 IndexError。
+    answer: false
+    explain: 只有按索引取单个元素（如 lst[10]）越界才抛 IndexError；切片会被自动裁剪到有效范围，越界时返回能取到的部分或空列表。这个「安静」的行为有时会掩盖 bug，比如分页参数算错时接口返回空列表而不是报错。
+
+  - id: d02-t13
+    kp: d02-k3
+    type: single
+    question: 下面代码输出什么？
+    code: |
+      docs = [
+          {"source": "a.pdf", "score": 0.9},
+          {"source": "b.pdf", "score": 0.7},
+          {"source": "a.pdf", "score": 0.4},
+      ]
+      best = {d["source"]: d["score"] for d in docs}
+      print(best)
+    options:
+      - "{'a.pdf': 0.9, 'b.pdf': 0.7}"
+      - "抛出 KeyError，提示键重复"
+      - "{'a.pdf': [0.9, 0.4], 'b.pdf': [0.7]}"
+      - "{'a.pdf': 0.4, 'b.pdf': 0.7}"
+    answer: [3]
+    explain: 字典推导式按顺序写入，重复的键会被后面的值覆盖，所以 a.pdf 最终是 0.4，并且不会报错。不会自动保留最大值，也不会自动聚合成列表；想保留最高分要显式比较，想分组要用 defaultdict(list)。
+
+  - id: d02-t14
+    kp: d02-k3
+    type: multi
+    question: 关于推导式，下列说法正确的是？
+    options:
+      - "Python 3 中推导式的循环变量不会泄漏到推导式外部"
+      - "列表推导式会立即生成完整列表，数据量大且只遍历一次时可改用生成器表达式"
+      - "末尾的 if 用于过滤，表达式里的 a if 条件 else b 用于映射"
+      - "推导式一定比等价的 for 循环快一个数量级以上"
+    answer: [0, 1, 2]
+    explain: 推导式有独立作用域，循环变量不会泄漏；列表推导式是立即求值的，生成器表达式是惰性的，更省内存；两种 if 的位置和含义不同。推导式比手写 append 循环略快，但没有数量级差异，选用的主要依据是可读性。
+
+  - id: d02-t15
+    kp: d02-k4
+    type: single
+    question: 下面代码最后打印什么？
+    code: |
+      import copy
+      cfg = {"model": "qwen", "stop": ["Observation"]}
+      a = cfg.copy()
+      b = copy.deepcopy(cfg)
+      a["stop"].append("###")
+      b["stop"].append("END")
+      print(cfg["stop"])
+    options:
+      - "['Observation']"
+      - "['Observation', '###']"
+      - "['Observation', '###', 'END']"
+      - "['Observation', 'END']"
+    answer: [1]
+    explain: |
+      cfg.copy() 是浅拷贝，a 和 cfg 共享同一个 stop 列表，所以 a 追加的 ### 会出现在 cfg 中；deepcopy 复制了内层列表，b 的修改不影响 cfg。认为 .copy() 完全独立、或深拷贝也共享内层，都是常见误解。
+
+  - id: d02-t16
+    kp: d02-k4
+    type: single
+    question: 下面代码输出什么？
+    code: |
+      grid = [[0] * 3] * 3
+      grid[0][0] = 1
+      print(grid)
+      print(grid[0] is grid[2])
+    options:
+      - "[[1, 0, 0], [0, 0, 0], [0, 0, 0]] 和 False"
+      - "[[1, 1, 1], [0, 0, 0], [0, 0, 0]] 和 False"
+      - "[[1, 0, 0], [0, 0, 0], [0, 0, 0]] 和 True"
+      - "[[1, 0, 0], [1, 0, 0], [1, 0, 0]] 和 True"
+    answer: [3]
+    explain: 外层的 * 3 把同一个内层列表的引用复制了三次，三行其实是同一个对象，改一处三行都变，is 判断也为 True。要创建三个独立的行，应写 [[0] * 3 for _ in range(3)]，每次循环都创建新列表。
+
+  - id: d02-t17
+    kp: d02-k4
+    type: judge
+    question: JS 的对象展开 `{...obj}` 和 Python 的 `{**d}` 都是浅拷贝，内层的对象或列表在新旧对象之间是共享的。
+    answer: true
+    explain: 两者都只创建新的外层对象，内层值复制的是引用。如果内层是数组、列表、对象、dict，修改它们会同时影响新旧两份。需要完全独立时，JS 用 structuredClone，Python 用 copy.deepcopy，或只重建需要修改的那一层。
+
+  - id: d02-t18
+    kp: d02-k4
+    type: multi
+    question: 已知 `lst = [[1], [2]]`。下列哪些写法得到的是浅拷贝（外层是新列表，内层子列表仍与 lst 共享）？
+    options:
+      - "lst[:]"
+      - "list(lst)"
+      - "lst.copy()"
+      - "copy.deepcopy(lst)"
+      - "new = lst"
+    answer: [0, 1, 2]
+    explain: 切片、list() 构造、.copy() 都会创建新的外层列表，但元素是同样的子列表引用，属于浅拷贝。deepcopy 会连子列表一起复制，是深拷贝；new = lst 根本没有复制，只是多了一个名字指向同一个列表。
+
+  - id: d02-t19
+    kp: d02-k4
+    type: single
+    question: 下列哪个场景最需要深拷贝（或按层重建）？
+    options:
+      - "从一个只含字符串和数字的平铺默认参数 dict 生成每个请求的参数"
+      - "从嵌套的消息模板 list[dict] 生成每个请求的消息，并修改其中某条的 content"
+      - "把一个 str 传给函数，函数内部做 upper 处理"
+      - "复制一个只包含 int 的 tuple 用于只读遍历"
+    answer: [1]
+    explain: 模板是嵌套结构，且要修改内层 dict 的 content，浅拷贝会让修改落到共享的模板上，必须深拷贝或至少重建那一层。平铺的不可变值用浅合并就够；str 和全是 int 的 tuple 不可变，不存在被改坏的问题。
+
+exam:
+  - id: d02-e1
+    kp: d02-k1
+    type: single
+    question: |
+      Agent 框架用 `TOOLS: dict[str, Callable]` 按名字注册工具。两个插件都注册了名为 `search` 的工具，后加载的插件覆盖了前一个，线上调用到了错误的实现。最合理的防御措施是？
+    options:
+      - "改用 list 存工具，按顺序查找第一个名字匹配的工具"
+      - "注册函数里先判断名字是否已在 dict 中，重复就报错或要求带命名空间"
+      - "改用 set 存工具，set 会自动去掉重名的工具"
+      - "把工具名统一转成小写后再存入 dict"
+    answer: [1]
+    explain: dict 对重复键是静默覆盖，不会报错，所以要在注册时显式检查冲突并失败，或用「插件名.工具名」做命名空间。换成 list 只是把「后者覆盖」变成「前者优先」，问题仍在；set 存函数对象无法按名字去重；转小写反而可能制造更多冲突。
+
+  - id: d02-e2
+    kp: d02-k3
+    type: single
+    question: 为了「保留 system 消息 + 最近 N 条对话」，代码写成 `msgs[:1] + msgs[-N:]`，其中 `msgs[0]` 是 system 消息。这段代码的问题是？
+    options:
+      - "没有问题，任何长度下都只保留一条 system 消息"
+      - "消息总数不超过 N 时，切片越界会抛出 IndexError"
+      - "会丢掉最后一条用户消息，因为切片是左闭右开"
+      - "消息总数不超过 N 时，system 消息会出现两次"
+    answer: [3]
+    explain: 当 len(msgs) 不超过 N 时，msgs[-N:] 会取到包括 msgs[0] 在内的全部消息，再拼上 msgs[:1]，system 消息就重复了。切片越界不会报错；msgs[-N:] 一直取到末尾，不会丢最后一条。正确做法是先拆出 system，再对剩余部分切片。
+
+  - id: d02-e3
+    kp: d02-k4
+    type: single
+    question: 检索服务把 Top-K 结果（list[dict]）放进进程内缓存。接口层拿到缓存结果后，直接给每个 dict 加了 `highlight` 字段再返回。随后出现「同一个问题第二次请求时，返回里的高亮混乱」。最合理的修复是？
+    options:
+      - "给缓存读写加线程锁，避免并发修改"
+      - "每次请求结束后调用 gc.collect() 清理被修改的对象"
+      - "接口层在副本上加工（至少复制每个 dict），或缓存不可变结构"
+      - "把缓存从 dict 改成 list，按顺序查找命中项"
+    answer: [2]
+    explain: 根因是缓存返回的是共享的可变对象，调用方的原地修改直接污染了缓存，即使单线程也会出现，加锁解决不了。正确做法是不修改缓存里的对象：接口层先复制一层（如 [dict(d) for d in hits]）再加工，或缓存不可变结构。gc 与此无关，换容器类型也不改变共享引用。
+
+  - id: d02-e4
+    kp: d02-k2
+    type: single
+    question: |
+      需要对检索得到的 `docs: list[dict]`（每个 dict 都有唯一的 id 字段）去重，并保留每个 id 最后出现的那条。下面哪种写法最合适？
+    options:
+      - "list({d['id']: d for d in docs}.values())"
+      - "list(set(docs))"
+      - "list({str(d) for d in docs})"
+      - "sorted(docs) 之后再逐个比较相邻元素"
+    answer: [0]
+    explain: 以 id 为键的字典推导式会让后出现的覆盖前面的，再取 values 就得到去重结果，且保持首次出现位置的顺序。dict 不可哈希，set(docs) 直接报错；转成 str 依赖键顺序且得到的是字符串而不是原对象；dict 之间不能比较大小，sorted 会报 TypeError。
+
+  - id: d02-e5
+    kp: d02-k1
+    type: multi
+    question: 关于 tuple 的使用，下列说法正确的是？
+    options:
+      - "元素全是可哈希对象时，tuple 可作为复合缓存键，如 (tenant_id, query)"
+      - "函数 return a, b 本质上返回的是一个 tuple"
+      - "tuple 适合表达「位置固定、含义固定」的一条记录"
+      - "tuple 比 list 省内存，所以任何场景都应优先使用 tuple"
+    answer: [0, 1, 2]
+    explain: tuple 可哈希时能做 dict 键；多返回值本质是 tuple；固定结构的记录适合用 tuple（或 namedtuple / dataclass）。但选型依据是语义：需要追加、修改的序列就该用 list，用 tuple 反而要不停创建新对象，「任何场景优先 tuple」是错误的。
+
+  - id: d02-e6
+    kp: d02-k3
+    type: multi
+    question: 关于切片，下列说法正确的是？
+    options:
+      - "lst[:] 创建新列表，但元素是与原列表共享的引用"
+      - "对切片结果执行 append，不会影响原列表的长度"
+      - "lst[::-1] 返回反转后的新列表，不修改原列表"
+      - "切片赋值 lst[0:2] = [] 会原地删除前两个元素"
+      - "字符串也能通过 s[0] = 'X' 修改第一个字符"
+    answer: [0, 1, 2, 3]
+    explain: 切片取值返回新列表（浅拷贝），对它 append 不影响原列表；[::-1] 也是返回新列表；切片出现在等号左边时是原地替换，可以用来删除或插入。字符串不可变，s[0] = 'X' 会抛 TypeError，要用 'X' + s[1:] 构造新字符串。
+
+  - id: d02-e7
+    kp: d02-k4
+    type: judge
+    question: copy.deepcopy 会递归复制对象里的所有内容，包括对象持有的打开的文件和网络连接，复制后两份对象各有一个独立的连接。
+    answer: false
+    explain: 官方文档说明 copy 模块不会复制文件、套接字、栈帧等类型；实际对打开的文件做 deepcopy 会抛 TypeError。函数和类则会原样共享。所以持有连接、文件句柄的对象不要深拷贝，应该复制纯数据部分，资源单独管理。
+
+  - id: d02-e8
+    kp: d02-k3
+    type: judge
+    question: 在 Python 3.15 中，`{**d for d in dicts}` 是合法写法，效果是按顺序合并所有 dict，重复的键以后出现的为准。
+    answer: true
+    explain: |
+      Python 3.15 引入推导式中的解包（PEP 798），dict 推导式里可以用 ** 依次合并，语义与 {k: v for d in dicts for k, v in d.items()} 相同，后出现的键覆盖前面的。这是 3.15 新语法，在 3.14 及以前会报 SyntaxError。
+
+  - id: d02-e9
+    kp: d02-k4
+    type: case
+    question: |
+      园区 Agent 的 few-shot 模板定义在模块顶层：`BASE_MESSAGES = [{"role": "system", "content": "你是园区运营助手"}, ...]`。每个请求执行 `msgs = BASE_MESSAGES.copy()`，然后 `msgs[0]["content"] += f"\n当前园区：{park_name}"`。上线一天后，运营发现 Agent 的回答里偶尔提到别的园区名，日志显示 system 提示越来越长。最准确的根因和修复是？
+    options:
+      - "LLM 的上下文缓存串了，应关闭模型侧的 prompt caching"
+      - ".copy() 只复制外层列表，消息 dict 仍共享；应重建要改的那条消息或深拷贝"
+      - "多线程并发写同一个列表，应给 BASE_MESSAGES 加锁"
+      - "字符串 += 是原地修改，应改成 content = content + 新内容"
+    answer: [1]
+    explain: list.copy() 是浅拷贝，msgs[0] 和 BASE_MESSAGES[0] 是同一个 dict，+= 给 content 重新赋值后写回的正是这个共享 dict，于是每个请求都在模板上追加园区名，单线程也会出现。修复是 msgs = [dict(m) for m in BASE_MESSAGES] 后再改，或 copy.deepcopy。加锁只能避免并发冲突，不能阻止污染；字符串本身不可变，改写法无效；与模型侧缓存无关。
+
+interview:
+  - id: d02-i1
+    kp: d02-k1
+    type: short
+    difficulty: 2
+    question: 你熟悉 JS 的 Array、Object、Map、Set，说说它们和 Python 的 list、dict、tuple、set 怎么对应，选型时你会考虑什么？
+    key_points:
+      - {text: "给出对应关系：list 对 Array、dict 对 Object 或 Map、set 对 Set、tuple 对 TS 只读元组", dim: concept}
+      - {text: "指出 dict 键必须可哈希但保留原类型、3.7 起有序、不支持点语法、缺键抛 KeyError", dim: concept}
+      - {text: "说明 in 在 list 上是 O(n)、在 dict 和 set 上平均 O(1)，频繁成员判断要用 set", dim: principle}
+      - {text: "结合项目说选型，如消息用 list、工具注册表用 dict、去重用 set、缓存键用 tuple", dim: project}
+    reference: |
+      **对应关系**：list ≈ Array（有序可变）；dict ≈ Object/Map（按键查找）；set ≈ Set（去重）；tuple ≈ TS 的只读元组（固定结构）。
+
+      **关键差异**：
+      - dict 的键要**可哈希**，但保留原类型（int、tuple 都行），这点像 Map；不能用点语法，缺键抛 KeyError 而不是 undefined。
+      - dict 自 3.7 起保证插入顺序；set 无序。
+      - Python 统一用 `in` 做成员判断，但 list 是 O(n)、dict/set 是 O(1)，JS 里 `includes` 和 `has` 的区分在 Python 里不明显，更容易写出慢代码。
+
+      **选型思路**：先看访问方式——按位置顺序处理用 list；按键查值用 dict；只关心有没有、要去重用 set；结构固定或要做 dict 键用 tuple。
+
+      **项目例子**：对话消息用 `list[dict]`；工具注册表用 `dict[str, Callable]`；入库去重用 `set`；缓存键用 `(tenant_id, query)`。之前入库脚本用 list 记录已处理 ID，8 万份文档时慢到几小时，换成 set 后恢复正常。
+    oral: |
+      对应关系很直接：list 对 Array，dict 对 Object 或者 Map，set 对 Set，tuple 有点像 TS 的只读元组。差异上我最在意两点：一是 dict 的键必须可哈希，不能用点语法，缺键会抛 KeyError；二是 Python 统一用 in 判断成员，但 list 是线性查找，dict 和 set 是哈希查找。选型我就看访问方式：按顺序用 list，按键查用 dict，去重和判断有没有用 set，要当缓存键的复合值用 tuple。我们入库脚本以前用 list 记已处理的文档，数据一多慢到几小时，换成 set 就好了。
+
+  - id: d02-i2
+    kp: d02-k4
+    type: scenario
+    difficulty: 3
+    question: 线上检索接口出现诡异现象：同一个问题第一次请求返回正常，第二次请求返回的文档里多了上一次请求才加上的 highlight 字段，而且越请求越乱。服务用了进程内缓存。你怎么排查和修复？
+    key_points:
+      - {text: "推断是缓存返回了共享的可变对象，调用方原地修改污染了缓存，而不是缓存过期或并发问题", dim: principle}
+      - {text: "通过打印 id() 或写「连续两次请求」的测试复现，确认两次拿到的是同一批对象", dim: engineering}
+      - {text: "区分浅拷贝和深拷贝：只加顶层字段时复制一层即可，修改嵌套结构时才需要深拷贝", dim: principle}
+      - {text: "修复：在副本上加工或缓存不可变结构，并约定读缓存的代码不能原地修改", dim: engineering}
+      - {text: "说明深拷贝的性能代价，大结果集不要无脑 deepcopy", dim: engineering}
+    reference: |
+      **判断**：第一次正常、之后越来越乱，且和缓存有关，最可能是**缓存返回了共享的可变对象**。Python 赋值和返回都不复制对象，接口层给 dict 加 highlight，改的就是缓存里那份。这个问题单线程也会出现，所以不是并发问题，加锁没用。
+
+      **排查**：
+      1. 在缓存读取处和接口层打印 `id(hits[0])`，两次请求如果相同，说明共享。
+      2. 写测试：同一 query 连续请求两次，断言第二次结果和第一次一致、缓存内容未被修改。
+      3. 搜索接口层对检索结果的原地修改：`d["highlight"] = ...`、`d.update(...)`、`list.append`。
+
+      **修复**：
+      - 接口层在副本上加工：只加顶层字段时 `[{**d, "highlight": ...} for d in hits]` 复制一层就够；要改嵌套结构才用 `copy.deepcopy`。
+      - 或者缓存不可变结构（tuple、frozendict、Pydantic frozen 模型），误改时直接报错。
+      - 约定：读缓存的代码不能原地修改返回值，写进代码评审清单。
+
+      **注意性能**：Top-K 结果可能带长文本，每次 deepcopy 会耗 CPU，优先「只复制要改的那一层」。
+
+      **收尾**：补回归测试，评估缓存污染期间受影响的请求。
+    oral: |
+      我会先判断这是共享可变对象的问题，因为第一次正常、后面越来越乱，而且和缓存相关。Python 返回对象不会复制，接口层给结果加 highlight，其实是在改缓存里那份。我会打印两次请求拿到的对象 id 确认是不是同一个，再写个连续请求两次的测试复现。修复的话，只加顶层字段就复制一层，用解包生成新 dict 再加工；如果要改嵌套结构才用 deepcopy，因为检索结果带长文本，无脑深拷贝很耗 CPU。另一个思路是缓存不可变结构，误改直接报错。最后把「不要原地修改缓存返回值」加进评审清单，并补回归测试。
+
+  - id: d02-i3
+    kp: d02-k3
+    type: scenario
+    difficulty: 3
+    question: 你接手一个文档入库脚本：读取 50 万个 chunk、去重、调用 Embedding 接口、写入向量库。现在跑到一半内存爆掉，而且越跑越慢。只从 Python 数据结构和写法的角度，你会重点检查哪些地方、怎么改？
+    key_points:
+      - {text: "检查用 list 做去重或成员判断的地方，O(n²) 导致越跑越慢，改成 set", dim: principle}
+      - {text: "检查一次性用列表推导式或 readlines 把全部数据读进内存，改成生成器或分批处理", dim: engineering}
+      - {text: "用切片或 itertools.batched 按批调用 Embedding 并按批写入，控制峰值内存", dim: engineering}
+      - {text: "检查循环中的字符串 += 拼接和无谓的 deepcopy，改成 join 或按层复制", dim: principle}
+      - {text: "给出验证方法，如用小样本对比耗时和内存、记录每批处理时间", dim: project}
+    reference: |
+      **越跑越慢 → 先查算法复杂度**：
+      - 去重用 `if h in processed_list` 是 O(n)，总体 O(n²)，数据越多越慢。改成 `set`，平均 O(1)。
+      - 在 list 头部 `insert(0, ...)` 或 `pop(0)` 做队列，每次移动所有元素，改用 `collections.deque`。
+
+      **内存爆 → 查「一次性全部加载」**：
+      - `chunks = [parse(f) for f in files]` 一次性生成 50 万个对象，再 `vectors = [embed(c) for c in chunks]` 又一份。改成**生成器表达式或生成器函数**逐个产出（Day 05），按批处理。
+      - 按批调用 Embedding：`for i in range(0, n, 64): batch = items[i:i + 64]`，或 Python 3.12+ 的 `itertools.batched`；每批写完向量库就释放。
+      - 检查是否在每个 chunk 上 `copy.deepcopy` 了大模板对象。
+
+      **其他写法问题**：
+      - 拼接长文本用 `"".join(parts)` 而不是循环 `+=`。
+      - 只需要统计时用 `sum(len(c) for c in chunks)`，不要先建列表。
+
+      **验证**：先用 1 万条样本记录总耗时和峰值内存，改完再对比；生产跑时每批打日志记录耗时，观察是否随批次增加而变慢。
+    oral: |
+      我会把问题拆成两个。越跑越慢，第一个怀疑是用 list 做去重，每个 chunk 都 in 一遍，整体是平方级，改成 set 就是常数级查找。内存爆，多半是用列表推导式一次性把 50 万个 chunk 和向量都放进内存了，我会改成生成器逐个产出，再按 64 条一批调用 Embedding、一批写完向量库就释放。顺便看有没有循环里字符串加等于拼接、或者对大对象 deepcopy 的写法。验证上我会先拿 1 万条样本对比改前改后的耗时和峰值内存，正式跑的时候每批打一条耗时日志，确认不会随着批次变慢。

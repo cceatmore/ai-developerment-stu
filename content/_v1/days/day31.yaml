@@ -1,0 +1,697 @@
+day: 31
+phase: 4
+title: Agent 基础
+goals:
+  - 能用「LLM + 工具 + 循环 + 状态」四要素解释什么是 Agent，并判断一个系统算不算 Agent
+  - 能说清 Agent 与单次 LLM 调用、固定流程 RAG 的本质区别：控制流由谁决定
+  - 能按步骤可预测性、成本、延迟、容错要求，在 workflow 和 agent 之间做取舍
+  - 能列出不该用 Agent 的典型场景，并给出更简单的替代方案
+knowledge_points:
+  - id: d31-k1
+    name: Agent 的定义与四要素
+    level: P0
+    summary: Agent = LLM 当决策者 + 工具当手脚 + 循环让它多步行动 + 状态记住做过什么
+    why: |
+      「Agent」是目前 AI 应用岗位面试出现频率最高的词之一，但很多人只会说「能调工具的大模型」。
+      面试官真正想听的是：**你能不能拆出它的组成部分，并说清每部分缺了会怎样**。后面 Day 32~40 的 ReAct、Tool Calling、LangGraph、MCP、多 Agent、Agent 安全，全部建立在这四要素上。
+    problem: |
+      单次 LLM 调用只能「说」，不能「做」，也不能根据结果调整：
+      - 它不知道实时数据（订单状态、库存、日志），只能编；
+      - 一个任务需要多步（先查订单、再查物流、再判断是否超时），一次调用做不完；
+      - 每步该做什么取决于上一步的结果，没法提前写死。
+      Agent 用「让模型在循环里自己决定下一步、并从环境拿到真实反馈」来解决这个问题。
+    principle: |
+      **一、一句话定义**
+
+      - Anthropic《Building effective agents》：Agent 是 **LLM 动态指挥自己的流程和工具使用**、自己掌控如何完成任务的系统。
+      - LangChain v1 文档：**a model calling tools in a loop until a given task is complete**（模型在循环里调用工具，直到任务完成）。
+
+      两种说法的共同点：**下一步做什么，是模型在运行时决定的，不是代码写死的。**
+
+      **二、四要素（缺一个就不是完整的 Agent）**
+
+      | 要素 | 作用 | 缺了会怎样 |
+      |---|---|---|
+      | **LLM（决策者）** | 读当前上下文，决定「调用哪个工具 / 直接回答」 | 没有决策者，就只是普通程序 |
+      | **工具（手脚）** | 查数据、调接口、执行代码，拿到真实结果（ground truth） | 只能凭训练数据「说」，无法行动，容易幻觉 |
+      | **循环（多步）** | 把工具结果交回模型，让它继续决定下一步 | 只能调一次工具，结果不对也没法修正 |
+      | **状态 / 记忆** | 记录已做过的动作和结果（消息历史、中间变量） | 每轮都像失忆，重复调用同一个工具，甚至死循环 |
+
+      **三、一次运行的内部流程**
+
+      ```mermaid
+      flowchart TD
+        A["用户任务"] --> B["组装上下文：系统提示 + 历史消息 + 工具清单"]
+        B --> C["LLM 决策"]
+        C --> D{"输出里有工具调用吗"}
+        D -- "有" --> E["运行时执行工具"]
+        E --> F["把工具结果追加到状态"]
+        F --> G{"达到停止条件了吗"}
+        G -- "否" --> B
+        G -- "是：步数或预算用完" --> H["返回兜底回答"]
+        D -- "没有" --> I["输出最终回答"]
+      ```
+
+      关键点：**模型本身不会执行任何工具**。模型只输出「我想调用 get_order，参数是 SO12345678」（Day 18 讲过的 Function Calling），真正执行的是你的运行时代码。所以 Agent 的可靠性，一半在模型，一半在你写的循环、执行器和停止条件。
+
+      **四、用前端经验类比**
+
+      把 Agent 想成一个 Redux 风格的事件循环：
+
+      - state = 消息历史；
+      - LLM = 根据 state 产出 action 的「决策函数」；
+      - 工具执行 = 有副作用的 effect；
+      - 工具结果 = 新的 action，被 reduce 回 state。
+
+      区别在于：Redux 的 reducer 是确定的，而 LLM 这个决策函数是**概率性的**，同样输入可能走出不同路径。这正是 Agent 难测试、要加停止条件的根本原因。
+
+      **五、自主度是一条光谱**
+
+      ```mermaid
+      flowchart LR
+        L1["单次调用：问答 / 抽取"] --> L2["路由：模型选分支"]
+        L2 --> L3["单次工具调用"]
+        L3 --> L4["多步工具循环：典型 Agent"]
+        L4 --> L5["多 Agent 协作"]
+      ```
+
+      越往右越灵活，也越贵、越慢、越难控。工程上**不是越往右越高级**，而是够用即止（见 d31-k4）。
+
+      **六、状态与记忆的两层**
+
+      - **短期状态**：本次任务的消息历史、工具结果，随循环增长（Day 32 会讲它导致的上下文膨胀）；
+      - **长期记忆**：跨会话保存的用户偏好、历史结论，一般存数据库或向量库，按需检索回来（类似 Day 21 的 RAG）。
+      面试时说清「Agent 的记忆本质上是你管理的上下文」，比说「Agent 有记忆」更专业。
+    scenarios: |
+      - **电商客服**：用户问「我的快递为什么还没到」，Agent 先查订单、再按物流单号查轨迹、发现卡在中转站，最后生成解释和补偿建议。
+      - **运维助手**：根据告警先查监控指标，再查最近发布记录，再查错误日志，逐步缩小范围。
+      - **数据分析助手**：先查表结构，再写 SQL，执行失败就根据报错修改 SQL 再执行。
+      共同点：**步骤数和顺序取决于中间结果**，无法提前写死。
+    code: |
+      最小 Agent 骨架（伪代码风格，完整可运行版本见今天的代码阅读）：
+
+      ```python
+      def run_agent(task: str, max_steps: int = 8) -> str:
+          state = [{"role": "user", "content": task}]      # 状态
+          for _ in range(max_steps):                        # 循环 + 停止条件
+              decision = llm(state, tools=TOOLS)            # LLM 决策
+              if not decision.tool_calls:
+                  return decision.text                      # 不再调用工具 = 任务完成
+              for call in decision.tool_calls:
+                  result = execute(call)                    # 工具由运行时执行
+                  state.append(tool_result(call, result))   # 结果写回状态
+          return "步骤已用完，已转人工处理"                     # 兜底
+      ```
+    pitfalls: |
+      - **误区：用了 Function Calling 就是 Agent。** 只调一次工具、调用顺序由代码写死的，是「带工具的 LLM 调用」，没有循环和模型主导的控制流。
+      - **误区：模型会执行工具。** 模型只生成调用意图和参数，执行、鉴权、超时、异常处理都在你的代码里。
+      - **误区：Agent 有记忆。** 模型本身无状态，所谓记忆是你每轮重新塞进上下文的消息历史或检索结果。
+      - **忘记停止条件**：循环没有最大步数，模型反复调用同一工具，账单和延迟一起失控。
+    interview_asks:
+      - 什么是 AI Agent？它由哪些部分组成？
+      - Agent 和一个能调用工具的聊天机器人有什么区别？
+      - Agent 的「记忆」是怎么实现的？
+    project_example: |
+      在电商售后助手项目里，第一版只是「意图分类 + 一次查订单接口」，用户问物流问题时只能回答订单状态。
+      改成 Agent 后，注册了 get_order、get_logistics、create_ticket 三个工具，模型会先查订单拿到物流单号，再查轨迹，发现超时 48 小时才调用 create_ticket。
+      上线时我们设置了**最多 6 步**、单次会话 Token 上限，以及 create_ticket 前必须用户确认，避免模型误建工单。
+    freshness: |
+      核对于 2026-11：定义引用自 Anthropic《Building effective agents》（2024-12 发布，文中已注明部分工具生态已变化，但 workflow / agent 的划分仍被广泛引用）和 LangChain v1 Agents 文档（create_agent 页面原文 a model calling tools in a loop until a given task is complete）。
+    sources:
+      - {title: "Anthropic - Building effective agents", url: "https://www.anthropic.com/engineering/building-effective-agents"}
+      - {title: "LangChain Docs - Agents", url: "https://docs.langchain.com/oss/python/langchain/agents"}
+
+  - id: d31-k2
+    name: Agent 与普通 LLM 应用的区别
+    level: P0
+    summary: 普通 LLM 应用由代码决定调用顺序；Agent 由模型在运行时决定下一步做什么、做几次、何时停
+    why: |
+      面试里「Agent 和 RAG / 普通 LLM 应用有什么区别」几乎必问。答「Agent 更智能」是零分答案。
+      能答出**控制流归属**以及由此带来的成本、测试、可观测性差异，才能证明你做过真实项目，而不是只跑过 Demo。
+    problem: |
+      很多团队把所有 AI 功能都叫 Agent，导致两个问题：
+      - 本来固定流程就能做的事被做成 Agent，延迟和成本翻几倍，结果还不稳定；
+      - 真正需要 Agent 的地方却没有设计停止条件、步骤日志和权限控制，出了问题无法排查。
+      分清两者，才能决定该用什么架构、该补哪些工程能力。
+    principle: |
+      **一、核心区别：谁决定下一步**
+
+      判断方法只有一个问题：**「下一步调用什么」是写在代码里的，还是模型在运行时选的？**
+
+      | 类型 | 控制流 | LLM 调用次数 | 例子 |
+      |---|---|---|---|
+      | 单次调用 | 代码 | 1 次 | 摘要、翻译、结构化抽取（Day 19） |
+      | 固定流程 RAG | 代码：检索 → 拼 Prompt → 生成 | 1~2 次 | Day 21~30 的企业知识库问答 |
+      | Workflow | 代码编排多次 LLM 调用 | 固定 N 次 | 先写大纲 → 校验 → 再写正文 |
+      | **Agent** | **模型** | **不确定** | 运维排障、数据分析、复杂客服 |
+
+      **二、对比两种执行时序**
+
+      ```mermaid
+      sequenceDiagram
+        participant U as 用户
+        participant C as 应用代码
+        participant L as LLM
+        participant T as 工具
+        Note over C: 固定流程 RAG：顺序写死在代码里
+        U->>C: 提问
+        C->>T: 检索 Top-K
+        T-->>C: 文档片段
+        C->>L: 问题 + 片段
+        L-->>C: 回答
+        C-->>U: 返回
+        Note over C: Agent：每一步由 LLM 决定
+        U->>C: 提问
+        loop 直到不再调用工具或达到上限
+          C->>L: 历史消息 + 工具清单
+          L-->>C: 调用某个工具及参数
+          C->>T: 执行
+          T-->>C: 结果
+        end
+        C-->>U: 最终回答
+      ```
+
+      **三、控制流转移带来的五个工程差异**
+
+      1. **成本和延迟不确定**：同一个问题可能 2 步完成，也可能 9 步，需要预算上限和超时（Day 37 详讲）。
+      2. **测试方式不同**：普通应用可以写确定性单测；Agent 要用评估集看「任务成功率、平均步数、工具调用正确率」（Day 48）。
+      3. **错误会累积**：前一步拿错数据，后面每一步都建立在错误上（compounding errors）。
+      4. **可观测性要求更高**：必须记录每一步的模型输出、工具参数、工具结果、耗时，否则无法复盘（trace）。
+      5. **安全面更大**：模型能自主调用工具，意味着 Prompt Injection 可能变成真实操作（Day 40、47）。
+
+      **四、中间形态：Agentic RAG**
+
+      固定 RAG 每次都检索一次；Agentic RAG 把「检索」做成工具，让模型决定**要不要检索、检索什么关键词、结果不够要不要换个词再检索**。它是从 RAG 走向 Agent 最常见的第一步。
+
+      **五、不这样区分会怎样**
+
+      如果把 Agent 当普通接口对待：没有步数上限、没有逐步日志、没有工具权限，线上一出现死循环或误操作，你只能看到「请求超时」或「用户投诉」，完全不知道模型在第几步做了什么。
+    scenarios: |
+      - **知识库问答**：问题集中、文档固定 → 固定 RAG 足够；用户问题跨多个系统（制度 + 个人假期余额 + 审批状态）→ 需要 Agentic RAG 或 Agent。
+      - **报表生成**：字段和查询固定 → 代码直接查数据库再让 LLM 写总结；用户用自然语言提任意分析需求 → Agent 写 SQL、执行、修正。
+      - **技术评审时**：用「谁决定下一步」这一问，快速判断方案是否被过度设计。
+    pitfalls: |
+      - **误区：多次调用 LLM 就是 Agent。** 代码里固定调用 3 次（分类 → 检索 → 生成）仍然是 workflow。
+      - **误区：Agent 一定比 RAG 效果好。** 对文档问答类任务，Agent 多出来的步骤常常只增加延迟和出错点。
+      - **误区：Agent 的测试和普通接口一样。** 输出路径不确定，必须用评估集统计成功率，而不是只断言一次输出。
+      - **混淆**：「Agentic」是形容系统带有模型自主决策的成分，程度可以很低，不等于完全自主。
+    interview_asks:
+      - Agent 和 RAG 有什么区别？你的项目为什么用（或不用）Agent？
+      - 一个应用里调用了三次大模型，它是 Agent 吗？
+      - 从普通 LLM 应用改造成 Agent，工程上要额外补哪些能力？
+    project_example: |
+      公司 HR 助手第一版是固定 RAG：所有问题都检索制度文档。用户问「我今年还剩几天年假」时，检索到的是年假制度原文，模型只能回答规则，答不出个人余额。
+      第二版把「检索制度」和「查询个人假期余额」都做成工具，由模型决定调用哪个、是否两个都调。为此我们额外加了：每步 trace 日志、最多 5 步、个人数据工具只能查当前登录用户（user_id 由后端注入，不让模型传）。
+    sources:
+      - {title: "Anthropic - Building effective agents", url: "https://www.anthropic.com/engineering/building-effective-agents"}
+
+  - id: d31-k3
+    name: Workflow 与 Agent 的取舍
+    level: P1
+    summary: 步骤能提前写清就用 workflow 换可预测性；步骤无法预知才把控制权交给模型
+    why: |
+      实际项目里，纯 Agent 很少，大多是「外层 workflow、局部 agent」的混合架构。
+      能说出几种常见 workflow 模式并按场景选择，是区分「会用框架」和「会做架构」的关键，也是 Day 35 学 LangGraph 时设计图结构的基础。
+    problem: |
+      没有取舍框架时，团队通常走两个极端：
+      - 所有逻辑塞进一个大 Prompt 让模型自由发挥，结果不可控；
+      - 所有逻辑用 if/else 写死，用户换个说法就走不通。
+      需要一套判断标准，决定哪些步骤写死、哪些交给模型。
+    principle: |
+      **一、Anthropic 总结的五种 workflow 模式**
+
+      | 模式 | 做法 | 适合 |
+      |---|---|---|
+      | Prompt chaining | 任务拆成固定顺序的多步，中间可加程序校验（gate） | 先写大纲再写正文 |
+      | Routing | 先分类，再走专门的 Prompt / 模型 / 工具 | 客服分流：退款、技术、咨询 |
+      | Parallelization | 拆成独立子任务并行，或同一任务多次投票 | 内容审核多维度并行检查 |
+      | Orchestrator-workers | 中心 LLM 动态拆任务分给 worker，再汇总 | 子任务数量事先不确定 |
+      | Evaluator-optimizer | 一个生成、一个评估，循环改进 | 翻译润色、代码修复 |
+
+      这些模式里，**路径的骨架是代码定的**，LLM 只在节点内部工作；Agent 则是连骨架都交给模型。
+
+      **二、选择决策树**
+
+      ```mermaid
+      flowchart TD
+        A["新需求"] --> B{"一次 LLM 调用加检索能解决吗"}
+        B -- "能" --> C["单次调用或 RAG"]
+        B -- "不能" --> D{"步骤和顺序能提前列出来吗"}
+        D -- "能" --> E["Workflow：chaining、routing、parallel"]
+        D -- "不能" --> F{"有可靠工具、可验证结果、可接受成本吗"}
+        F -- "是" --> G["Agent，并加步数上限和日志"]
+        F -- "否" --> H["先补工具和评估集，或改为人工加辅助"]
+      ```
+
+      **三、取舍维度**
+
+      - **可预测性**：workflow 每次走同样路径，易测试、易审计；agent 路径可变。
+      - **灵活性**：agent 能处理没预料到的输入组合。
+      - **成本和延迟**：agent 步数不定，通常更贵更慢。
+      - **调试难度**：workflow 出错能定位到具体节点；agent 要看完整 trace。
+
+      **四、混合架构最常见**
+
+      外层用 routing 把请求分流：高频且固定的（查订单、改地址）走 workflow；长尾、开放的才进入 agent。这样 80% 的流量便宜可控，20% 的复杂问题获得灵活性。
+    scenarios: |
+      - **合同审核**：条款抽取 → 风险规则比对 → 生成报告，步骤固定，用 prompt chaining。
+      - **客服**：routing 分流，退款走固定 workflow（需要强校验），开放咨询走 agent。
+      - **代码修复**：evaluator-optimizer 或 agent，因为需要「改 → 跑测试 → 再改」的反馈循环。
+    pitfalls: |
+      - **误区：workflow 是低级方案。** Anthropic 明确建议先找最简单的方案，只在能证明效果提升时才增加复杂度。
+      - **误区：orchestrator-workers 就是多 Agent。** 它的 worker 可以只是普通 LLM 调用，不一定各自有循环和工具。
+      - **混淆**：evaluator-optimizer 也有循环，但循环的结构是代码定的（生成 → 评估 → 生成），模型不能决定去调别的工具。
+    interview_asks:
+      - workflow 和 agent 的区别是什么？你在项目中怎么选的？
+      - 说几种常见的 LLM workflow 模式，各适合什么场景？
+    project_example: |
+      做内部周报生成工具时，最初设计成 agent 自由调用 Jira、Git、日历工具，平均 7 步、耗时 40 秒，而且每次漏掉的内容不同。
+      后来发现数据源是固定的三个，改成 parallelization：三个查询并行，再一次 LLM 汇总，耗时降到 8 秒，输出结构也稳定了。只有「解释某个任务为什么延期」这种开放追问才保留 agent。
+    sources:
+      - {title: "Anthropic - Building effective agents", url: "https://www.anthropic.com/engineering/building-effective-agents"}
+
+  - id: d31-k4
+    name: 什么时候不该用 Agent
+    level: P1
+    summary: 任务固定、延迟敏感、强合规、高危操作或无法评估时，用更简单的方案
+    why: |
+      会用 Agent 是基本功，**知道什么时候不用**才是高级工程师的判断力。
+      面试官常用「你们为什么不用 Agent」或「这个需求你会用 Agent 吗」来考察你是否有成本意识和风险意识。
+    problem: |
+      Agent 用延迟、成本和不确定性换灵活性。如果任务本身不需要灵活性，就是纯亏：
+      - 用户等待时间从 1 秒变 15 秒；
+      - Token 成本翻几倍；
+      - 结果不稳定，合规审计无法复现；
+      - 多了误操作工具的风险。
+    principle: |
+      **一、错误累积的直觉**
+
+      Agent 的每一步都可能出错，而且错误会传递。假设每步成功率 95%：
+
+      - 3 步任务：0.95 的 3 次方约 86%；
+      - 10 步任务：0.95 的 10 次方约 60%。
+
+      步骤越多，整体成功率越低。这就是为什么**能少一步就少一步**，能写死的步骤就别交给模型。
+
+      **二、不该用 Agent 的六类场景**
+
+      | 场景 | 原因 | 替代方案 |
+      |---|---|---|
+      | 简单问答、分类、抽取 | 一次调用就够 | 单次调用 + 结构化输出（Day 19） |
+      | 步骤固定的业务流程 | 不需要模型决定路径 | workflow 或普通代码 |
+      | 延迟敏感（1 秒内响应） | 多轮调用延迟叠加 | 单次调用、缓存、小模型 |
+      | 强合规、需可复现审计 | 路径不确定难以复现 | 规则引擎 + LLM 辅助 |
+      | 高危操作无人工确认 | 误调用代价大 | 只生成建议，人工执行 |
+      | 没有评估集 | 无法证明效果更好 | 先建评估集再决定 |
+
+      **三、渐进式演进路径**
+
+      ```mermaid
+      flowchart LR
+        A["单次调用加好的 Prompt"] --> B["加检索 RAG"]
+        B --> C["固定 workflow"]
+        C --> D["局部 Agent"]
+        D --> E["多 Agent"]
+        A -. "每一步都用评估集验证收益" .-> E
+      ```
+
+      每往右走一步，都要回答：**评估集上的指标提升了多少？多付出的延迟和成本值不值？**
+    scenarios: |
+      - 发票字段抽取：单次调用 + JSON Schema 即可，不需要 Agent。
+      - 银行转账：可以让 LLM 解析意图，但执行必须走固定流程 + 二次确认，不能让 Agent 自主转账。
+      - 搜索联想、输入补全：延迟要求在几百毫秒内，Agent 完全不适用。
+    pitfalls: |
+      - **误区：上 Agent 能体现技术含量。** 面试官更看重你能否用评估数据证明架构选择。
+      - **误区：Agent 不稳定就换更强的模型。** 很多时候问题在于任务本身不该交给模型决策，把固定步骤写死比换模型更有效。
+      - **忽略隐性成本**：Agent 需要 trace、评估集、权限控制、人工兜底，这些开发和运维成本常被低估。
+    interview_asks:
+      - 什么场景下你不会用 Agent？
+      - 如果 Agent 的任务成功率只有 60%，你会怎么排查和改进？
+    project_example: |
+      有个需求是「根据用户描述自动填写报修单」。产品最初想做成 Agent，能自己查设备、查历史工单、提交报修。
+      评估后发现报修单只有 6 个字段，信息全在用户描述里，于是改成单次调用 + 结构化输出抽取字段，前端让用户确认后提交。延迟从约 12 秒降到 2 秒，字段准确率反而更高，也不存在 Agent 误提交工单的风险。
+    sources:
+      - {title: "Anthropic - Building effective agents", url: "https://www.anthropic.com/engineering/building-effective-agents"}
+
+quiz:
+  - id: d31-q1
+    kp: d31-k2
+    type: single
+    question: 以下哪个系统最符合 Agent 的定义？
+    options:
+      - "用户提问后，代码固定执行：向量检索 Top-5 → 拼接 Prompt → 调用 LLM 生成回答"
+      - "代码依次调用 LLM 三次：先分类意图、再抽取参数、最后生成回复"
+      - "LLM 根据工具结果自行决定是否继续调用查询工具、调用哪个工具，直到它认为可以回答为止"
+      - "LLM 生成一段 SQL，代码执行后直接把结果表格返回给用户"
+    answer: [2]
+    explain: |
+      Agent 的关键是**控制流由模型决定**：调用哪个工具、调用几次、何时停止都在运行时由 LLM 选择，C 符合。
+      A 是固定流程 RAG；B 虽然调用三次 LLM，但顺序写死，属于 prompt chaining 类 workflow；D 只有一次工具使用且没有把结果反馈给模型继续决策，没有循环。
+  - id: d31-q2
+    kp: d31-k1
+    type: judge
+    question: 应用里只要使用了 Function Calling（模型返回工具调用并由代码执行），这个应用就已经是一个 Agent。
+    answer: false
+    explain: |
+      Function Calling 只是「模型表达调用意图」的接口能力。如果只调用一次、调用后不把结果交回模型继续决策，或者调用顺序由代码写死，就缺少**循环**和**模型主导的控制流**，只是带工具的单次 LLM 调用。Agent 至少需要 LLM、工具、循环、状态四要素。
+  - id: d31-q3
+    kp: d31-k4
+    type: multi
+    question: 以下哪些场景通常**不适合**直接做成自主 Agent？
+    options:
+      - "从上传的发票图片文字中抽取发票号、金额、日期 6 个固定字段"
+      - "输入框搜索联想，要求 300 毫秒内返回"
+      - "运维排障：根据告警逐步查看指标、日志、发布记录定位原因"
+      - "根据用户一句话直接执行银行转账，没有任何人工确认"
+    answer: [0, 1, 3]
+    explain: |
+      A 字段固定，单次调用 + 结构化输出即可；B 延迟要求极高，多轮调用不可能满足；D 是高危不可逆操作，不能让模型自主执行，至少要人工确认。
+      C 的排查步骤取决于中间结果（看到指标异常才去查对应服务日志），步骤无法提前写死，正是 Agent 的典型适用场景。
+  - id: d31-q4
+    kp: d31-k1
+    type: short
+    question: 请说出 Agent 的四个组成要素，并分别说明缺少每个要素时系统会出现什么问题。
+    key_points:
+      - {text: "说出四要素：LLM 决策、工具、循环、状态或记忆", dim: concept}
+      - {text: "指出缺少工具时模型只能依赖训练数据，无法获取实时数据或执行操作，容易幻觉", dim: principle}
+      - {text: "指出缺少循环时只能调用一次工具，无法根据结果调整下一步", dim: principle}
+      - {text: "指出缺少状态时每轮都看不到已做过的动作，会重复调用甚至死循环", dim: principle}
+      - {text: "提到模型本身不执行工具，执行和停止条件由运行时代码负责", dim: engineering}
+    reference: |
+      Agent 由四部分组成：
+      1. **LLM**：决策者，读上下文决定调用哪个工具或直接回答。没有它就只是普通程序。
+      2. **工具**：查数据、调接口、执行代码，拿到真实结果。没有工具，模型只能凭训练数据回答，无法获取订单状态这类实时信息，也无法执行操作，容易编造。
+      3. **循环**：把工具结果交回模型继续决策。没有循环只能调一次工具，结果不符合预期也无法修正，多步任务做不完。
+      4. **状态 / 记忆**：保存已经做过的动作和结果，通常就是消息历史。没有状态，模型每轮都看不到之前查过什么，会重复调用同一工具，甚至陷入死循环。
+      另外要强调：模型只输出调用意图，真正执行工具、做鉴权、设置最大步数的是运行时代码。
+    followup:
+      question: 模型本身是无状态的，那 Agent 的「记忆」具体存在哪里？
+      key_points: [短期记忆是每轮重新发送的消息历史, 长期记忆存数据库或向量库按需检索, 本质是应用管理上下文]
+      reference: 模型每次调用都是无状态的。短期记忆就是应用保存的消息历史，每轮完整或裁剪后重新发给模型；长期记忆存在数据库或向量库，需要时检索出来注入上下文。所以记忆本质上是应用层的上下文管理。
+  - id: d31-q5
+    kp: d31-k3
+    type: scenario
+    question: |
+      公司要做「费用报销智能审核」：员工提交报销单后，系统需要核对发票真伪（调用税务接口）、检查金额是否超过职级标准（查制度表）、检查是否重复报销（查历史记录），最后给出通过 / 驳回建议。
+      产品经理希望「做成一个 Agent，让模型自己决定查什么」。你会怎么设计？请说明理由。
+    key_points:
+      - {text: "判断三项检查步骤固定且可枚举，适合用 workflow 而不是自主 Agent", dim: concept}
+      - {text: "提出三项检查互相独立，可以并行执行（parallelization）以降低延迟", dim: engineering}
+      - {text: "指出金额比对、重复检测应由确定性代码完成，LLM 只负责解释或处理模糊情况", dim: principle}
+      - {text: "考虑合规审计需要可复现路径，自主 Agent 路径不确定不利于审计", dim: project}
+      - {text: "给出可保留模型决策的局部，例如异常说明的生成或对模糊发票内容的判断", dim: engineering}
+    reference: |
+      我不会做成自主 Agent，而是用 **workflow**：
+      1. 三项检查（发票真伪、金额标准、重复报销）是**固定且可枚举**的，不需要模型决定「查什么」。
+      2. 三项检查互相独立，用**并行**执行，延迟取最慢的那个，而不是 Agent 一步步串行调用。
+      3. 金额比较、重复检测这类规则判断用**确定性代码**做，准确率 100%、可单测；LLM 只用在需要理解的地方，比如解析发票上模糊的商品描述是否属于可报销类目，或者把检查结果整理成给员工看的驳回理由。
+      4. 报销属于财务合规场景，审计要求每次审核路径可复现，自主 Agent 路径不确定，不利于审计和追责。
+      最终建议由规则结果决定，LLM 生成说明，人工可复核。只有当以后出现大量「无法归类的特殊报销」时，才考虑在这一个分支里引入 Agent。
+    followup:
+      question: 如果产品坚持说「以后可能会增加新的检查项」，这能成为用 Agent 的理由吗？
+      key_points: [新增检查项是需求变更可以加 workflow 节点, 不确定的是检查项数量而不是运行时路径, 可用配置化规则表扩展]
+      reference: 不能。新增检查项是开发期的需求变化，在 workflow 里加一个节点或在规则表里加一条配置即可；Agent 解决的是运行时路径不确定的问题，两者不是一回事。
+  - id: d31-q6
+    kp: d31-k2
+    type: design
+    question: |
+      你负责把一个已上线的电商 FAQ 机器人（固定 RAG）升级为能处理「查订单、查物流、申请售后」的智能客服。
+      请设计整体架构：哪些部分保持固定流程、哪些交给 Agent，以及升级为 Agent 后需要额外补齐哪些工程能力。
+    key_points:
+      - {text: "提出入口 routing：FAQ 类继续走固定 RAG，需要查个人数据或多步操作的才进入 Agent", dim: engineering}
+      - {text: "将查订单、查物流、售后申请封装为工具，售后申请这类写操作需要用户确认", dim: engineering}
+      - {text: "设置最大步数、超时和 Token 预算等停止条件", dim: engineering}
+      - {text: "记录每一步模型输出、工具参数、结果和耗时的 trace 日志", dim: engineering}
+      - {text: "说明用户身份由后端注入工具而不是让模型传入，防止越权查询他人订单", dim: project}
+      - {text: "提出用评估集对比升级前后的解决率、平均步数、延迟和成本", dim: engineering}
+    reference: |
+      **架构**：入口先做意图路由。
+      - 「退货政策是什么」这类 FAQ：继续走原来的固定 RAG，快且便宜。
+      - 「我的订单到哪了」「帮我申请退货」：进入 Agent，注册 get_order、get_logistics、create_after_sale 三个工具。
+      - 退款金额计算等强规则逻辑仍在工具内部用代码实现，不交给模型。
+
+      **升级为 Agent 后要补的工程能力**：
+      1. **停止条件**：最多 6 步、整体 30 秒超时、单会话 Token 上限，超限转人工。
+      2. **工具权限**：user_id 从登录态由后端注入，模型只能传订单号，工具内部校验订单归属，防止越权。
+      3. **写操作确认**：create_after_sale 先返回待确认的草稿，用户点确认才真正提交。
+      4. **可观测性**：每步记录模型输出、工具名、参数、结果摘要、耗时，按会话 ID 串成 trace。
+      5. **评估**：准备 200 条真实对话做评估集，对比解决率、平均步数、P95 延迟和单次成本，确认升级收益。
+    followup:
+      question: 如果上线后发现 Agent 经常对同一订单连续调用 get_order 三四次，你会从哪些方向排查？
+      key_points: [检查工具结果是否正确写回消息历史, 检查工具返回是否信息不足或报错导致模型重试, 检查工具描述是否让模型误解]
+      reference: 先看 trace 中工具结果是否真的追加进了下一轮的消息历史（状态丢失最常见）；再看 get_order 是否返回了错误或缺字段，导致模型以为没查到而重试；最后检查工具描述是否说明了返回内容，必要时在结果里明确写出「已查询成功」。
+code_reading:
+  id: d31-c1
+  kp: [d31-k1, d31-k2, d31-k3]
+  title: 客服入口：固定 workflow 与 Agent 兜底
+  scenario: |
+    电商客服后端的入口函数。上游意图分类服务已经识别出 intent 和订单号：退款类请求走预定义的退款 workflow，其余开放问题交给一个最小 Agent 循环，由模型自己决定调用订单和物流工具。
+  language: python
+  code: |
+    import json
+    import logging
+    import os
+
+    from openai import OpenAI
+
+    logger = logging.getLogger("support")
+    client = OpenAI()  # 从环境变量 OPENAI_API_KEY 读取密钥
+    MODEL = os.environ["OPENAI_MODEL"]
+
+    TOOLS = [
+        {"type": "function", "name": "get_order", "strict": True,
+         "description": "按订单号查询订单状态、金额和物流单号。订单号为 SO 加 8 位数字。",
+         "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}},
+                        "required": ["order_id"], "additionalProperties": False}},
+        {"type": "function", "name": "get_logistics", "strict": True,
+         "description": "按物流单号查询最新物流轨迹，物流单号来自 get_order 的结果。",
+         "parameters": {"type": "object", "properties": {"tracking_no": {"type": "string"}},
+                        "required": ["tracking_no"], "additionalProperties": False}},
+    ]
+
+    def get_order(order_id: str) -> dict: ...         # 调用订单服务，省略实现
+    def get_logistics(tracking_no: str) -> dict: ...  # 调用物流服务，省略实现
+    TOOL_IMPLS = {"get_order": get_order, "get_logistics": get_logistics}
+
+    def refund_workflow(order_id: str) -> str:
+        """预定义路径：查订单 → 校验状态 → 生成答复，每一步由代码决定。"""
+        order = get_order(order_id)
+        if order["status"] not in ("paid", "shipped"):
+            return f"订单 {order_id} 当前状态为 {order['status']}，暂不支持退款。"
+        return f"订单 {order_id} 可申请退款，金额 {order['amount']} 元，请在 App 内提交。"
+
+    def run_agent(question: str) -> str:
+        """开放问题：由模型决定调用哪个工具、调用几次、何时结束。"""
+        items: list = [{"role": "user", "content": question}]
+        while True:
+            resp = client.responses.create(
+                model=MODEL, tools=TOOLS, input=items,
+                instructions="你是电商客服，只能依据工具结果回答，不确定就说明需要转人工。",
+            )
+            calls = [it for it in resp.output if it.type == "function_call"]
+            if not calls:
+                return resp.output_text
+            items += resp.output
+            for call in calls:
+                args = json.loads(call.arguments)
+                result = TOOL_IMPLS[call.name](**args)
+                logger.info("tool=%s args=%s", call.name, args)
+                items.append({"type": "function_call_output", "call_id": call.call_id,
+                              "output": json.dumps(result, ensure_ascii=False)})
+
+    def handle(question: str, intent: str, order_id: str | None) -> str:
+        if intent == "refund" and order_id:
+            return refund_workflow(order_id)
+        return run_agent(question)
+  walkthrough:
+    function: |
+      实现客服请求的分流：明确的退款请求走固定 workflow（代码决定步骤），其他开放问题走最小 Agent 循环（模型决定步骤）。它同时演示了 d31-k2 的「控制流归属」和 d31-k3 的「混合架构」。
+    key_functions: |
+      - `handle`：入口路由，根据上游给出的 intent 和 order_id 选择 workflow 或 agent。
+      - `refund_workflow`：固定两步——查订单、判断状态，模型完全不参与。
+      - `run_agent`：Agent 循环，每轮把消息历史和工具清单发给模型，执行模型请求的工具，再把结果追加进 `items`。
+      - `TOOLS` / `TOOL_IMPLS`：前者是给模型看的工具说明（名称、描述、参数 Schema），后者是真正执行的 Python 函数，两者靠 name 对应。
+    params: |
+      `handle` 接收用户原文、意图和订单号；退款分支只传 order_id。Agent 分支只传原始问题，订单号要靠模型从问题中自己识别并作为 `get_order` 的参数。
+      模型返回的 `call.arguments` 是 **JSON 字符串**，需要 `json.loads` 后用 `**args` 展开传给函数；工具结果再用 `json.dumps` 转成字符串，并通过 `call_id` 与对应的调用配对。
+    data_flow: |
+      ```mermaid
+      flowchart TD
+        A["handle 入口"] --> B{"intent 为 refund 且有订单号"}
+        B -- "是" --> C["refund_workflow：查订单后判断状态"]
+        C --> D["返回固定模板答复"]
+        B -- "否" --> E["run_agent：items 初始化为用户消息"]
+        E --> F["responses.create 携带 items 和 TOOLS"]
+        F --> G{"输出中有 function_call 吗"}
+        G -- "没有" --> H["返回 output_text"]
+        G -- "有" --> I["items 追加模型输出"]
+        I --> J["逐个执行工具并追加 function_call_output"]
+        J --> F
+      ```
+      `items` 就是 Agent 的状态：每轮都包含之前所有的模型输出和工具结果，所以模型能看到「已经查过订单、拿到了物流单号」。
+    failure_points: |
+      - **没有最大步数**：`while True` 只靠模型「不再调用工具」来结束。如果工具一直返回模型不满意的结果，循环不会停，Token 和延迟无限增长。
+      - **工具异常直接抛出**：`TOOL_IMPLS[call.name]` 遇到未注册的工具名会 KeyError；`json.loads` 可能因参数格式异常报错；订单服务超时会抛异常。任何一个都会让整个请求 500，而不是把错误告诉模型让它换个做法。
+      - 日志在工具执行**之后**才打印，工具抛异常时连调用参数都没记录下来，排查困难。
+      - `refund_workflow` 中 `get_order` 返回 None 或缺少 status 字段时会 TypeError / KeyError。
+      - 没有校验订单是否属于当前用户，模型可以查任意订单号（越权问题，Day 40 详讲）。
+    debugging: |
+      - 在循环内记录**轮次编号**、每轮模型输出的工具名和参数、工具结果长度、耗时，按请求 ID 串起来，就能看到模型在第几步开始绕圈。
+      - 复现死循环：让 `get_logistics` 的 mock 固定返回空轨迹，观察模型是否反复调用。
+      - 复现异常：mock 订单服务抛 TimeoutError，确认请求是否整体失败。
+      - 断点打在 `calls = ...` 之后，检查 `resp.output` 里同时有几个 function_call（模型可能一次请求多个工具）。
+    change_request: |
+      如果需求改成「最多调用 5 轮工具，超出就转人工」：把 `while True` 改成 `for step in range(5)`，循环结束后返回转人工话术并记录告警日志。
+      如果要求「工具失败时让模型知道并换个说法回复」：在执行工具处 try/except，把异常信息作为 `function_call_output` 的内容回传，而不是直接抛出（Day 33 详讲执行器设计）。
+  questions:
+    - id: d31-c1-q1
+      kp: d31-k2
+      type: code
+      question: 用户分别发来「SO12345678 申请退款」（上游识别为 refund）和「我的 SO12345678 怎么还没到」，请按执行顺序说明两条请求各自经过哪些函数，以及模型在其中分别起什么作用。
+      key_points:
+        - {text: "第一条进入 refund_workflow，按代码固定顺序查订单并判断状态，全程不调用模型", dim: concept}
+        - {text: "第二条进入 run_agent，由模型决定先调用 get_order，再根据结果中的物流单号调用 get_logistics", dim: principle}
+        - {text: "说明每轮工具结果通过 function_call_output 和 call_id 追加到 items，模型下一轮才能看到", dim: principle}
+        - {text: "指出模型不再返回 function_call 时以 output_text 作为最终回答结束循环", dim: concept}
+      reference: |
+        **退款请求**：`handle` 判断 intent 为 refund 且有订单号，调用 `refund_workflow`。代码先调 `get_order`，再判断 status 是否为 paid 或 shipped，用模板返回结果。整个过程**没有调用模型**，路径完全由代码决定。
+
+        **物流请求**：intent 不是 refund，进入 `run_agent`。
+        1. items 只有用户消息，第一次调用模型，模型返回 function_call：get_order(order_id=SO12345678)。
+        2. 代码把模型输出追加到 items，执行 get_order，把结果作为 function_call_output（带 call_id）追加。
+        3. 第二次调用模型，模型看到结果里的物流单号，返回 get_logistics 调用。
+        4. 执行并回传后第三次调用模型，模型认为信息足够，不再请求工具，返回 output_text，循环结束。
+        这里**调用哪个工具、调用几次、什么时候停，都是模型决定的**。
+    - id: d31-c1-q2
+      kp: d31-k1
+      type: code
+      question: 这段代码有两个会在线上造成严重问题的设计缺陷，请找出来，说明触发条件和后果，并给出修改方案。
+      key_points:
+        - {text: "指出 while True 没有最大步数，模型持续调用工具时循环不会结束", dim: engineering}
+        - {text: "说明死循环的后果是 Token 成本和延迟无限增长，请求最终超时", dim: engineering}
+        - {text: "指出工具执行没有 try/except，未知工具名、参数解析失败或外部服务超时会让整个请求失败", dim: engineering}
+        - {text: "提出用 for 循环限制步数并兜底转人工，以及把工具异常作为 function_call_output 回传给模型", dim: engineering}
+      reference: |
+        **缺陷一：没有最大步数。** `while True` 只靠模型自己停止。如果物流接口一直返回空轨迹，模型可能反复调用 get_logistics；或者模型在两个工具之间来回切换。后果是请求一直不返回、Token 费用持续累积，最后被网关超时切断，用户看到的是报错。
+        修改：改为 `for step in range(MAX_STEPS)`，超出后返回「已为您转人工」并打告警日志。
+
+        **缺陷二：工具异常直接抛出。** 三种情况都会让整个请求 500：模型给出未注册的工具名导致 `TOOL_IMPLS[call.name]` KeyError；`json.loads` 解析失败；订单服务超时抛异常。
+        修改：执行工具时 try/except，把「工具不存在」「参数错误」「服务超时，请稍后重试」作为 `function_call_output` 回传给模型，让模型决定换参数、换工具或告知用户；同时在执行前先记录工具名和参数日志。
+interview:
+  - id: d31-i1
+    kp: d31-k1
+    type: oral
+    difficulty: 1
+    question: 什么是 AI Agent？它由哪些部分组成？
+    key_points:
+      - {text: "给出定义：模型在循环中调用工具，根据环境反馈自行决定下一步，直到完成任务", dim: concept}
+      - {text: "说出 LLM、工具、循环、状态或记忆四个要素及各自作用", dim: concept}
+      - {text: "说明模型只输出调用意图，工具由运行时执行", dim: principle}
+      - {text: "结合项目举例说明 Agent 如何多步完成任务", dim: project}
+      - {text: "提到停止条件或最大步数是必须的工程约束", dim: engineering}
+    reference: |
+      **定义**：Agent 是让大模型在一个循环中，根据工具返回的真实结果，自己决定下一步做什么，直到完成任务的系统。LangChain 文档的说法是「a model calling tools in a loop until a given task is complete」。
+
+      **四要素**：
+      - LLM：决策者，决定调用哪个工具或直接回答；
+      - 工具：查数据、调接口，提供真实信息并执行操作；
+      - 循环：把工具结果交回模型，支持多步任务；
+      - 状态 / 记忆：消息历史和中间结果，让模型知道已经做过什么。
+
+      **关键机制**：模型本身不会执行工具，它只输出调用意图和参数，执行、鉴权、超时、最大步数都由应用代码负责。
+
+      **项目例子**：售后客服 Agent 会先查订单拿到物流单号，再查物流轨迹，发现超时才创建工单，整个顺序是模型根据中间结果决定的；我们限制最多 6 步，超出转人工。
+    oral: |
+      我理解的 Agent，是让大模型在一个循环里根据工具返回的真实结果，自己决定下一步做什么，直到任务完成。
+      它有四个要素：LLM 负责决策，工具负责查数据和执行操作，循环让它能多步执行，状态也就是消息历史让它记得做过什么。要注意模型本身不执行工具，只给出调用意图，执行和停止条件都在我们的代码里。
+      比如我做的售后客服，用户问快递为什么没到，Agent 会先查订单拿物流单号，再查轨迹，发现超时才建工单。我们给它设置了最多 6 步，超出就转人工。
+  - id: d31-i2
+    kp: d31-k2
+    type: oral
+    difficulty: 2
+    question: Agent 和 RAG、普通 LLM 应用有什么区别？你在项目里怎么判断该不该用 Agent？
+    key_points:
+      - {text: "指出核心区别是控制流归属：普通应用由代码决定调用顺序，Agent 由模型运行时决定", dim: concept}
+      - {text: "说明 RAG 是固定的检索加生成流程，Agentic RAG 才让模型决定是否检索和检索什么", dim: principle}
+      - {text: "说出控制流转移带来的成本延迟不确定、测试需评估集、错误累积等差异", dim: engineering}
+      - {text: "给出判断依据：步骤能否提前列出、是否有可靠工具、成本延迟能否接受", dim: engineering}
+      - {text: "用自己项目说明一个选择或放弃 Agent 的例子", dim: project}
+    reference: |
+      **核心区别是谁决定下一步。** 普通 LLM 应用和 RAG 的调用顺序写在代码里，比如 RAG 永远是「检索 → 拼 Prompt → 生成」；Agent 则由模型在运行时决定调用哪个工具、调用几次、何时结束。中间形态是 Agentic RAG，把检索做成工具，让模型决定要不要检索、用什么关键词、要不要再检索一次。
+
+      **控制流转移带来的工程差异**：调用次数不确定，所以成本和延迟不确定；输出路径不确定，测试要靠评估集统计成功率；前一步错误会被后面放大；需要逐步 trace 和工具权限控制。
+
+      **判断方法**：先问一次调用加检索能不能解决；再问步骤能不能提前列出来，能就用 workflow；只有步骤依赖中间结果、又有可靠工具且成本可接受时才用 Agent。
+
+      **例子**：HR 助手的制度问答用固定 RAG；但「我还剩几天年假」需要查个人数据，「能不能调休到周五」要先查余额再查排班，这部分才交给 Agent。
+    oral: |
+      我认为最本质的区别是控制流归谁。普通 LLM 应用和 RAG，调用顺序是代码写死的，比如 RAG 永远是检索、拼 Prompt、生成；Agent 是模型在运行时决定调用哪个工具、调几次、什么时候停。
+      控制流交给模型后，成本延迟变得不确定，测试要靠评估集，还要做逐步日志和权限控制。
+      我判断的方法是：一次调用加检索能解决就不用 Agent；步骤能提前列出来就用 workflow；只有步骤依赖中间结果时才用 Agent。比如我们 HR 助手，制度问答用固定 RAG，查个人假期并判断能否调休这种多步问题才走 Agent。
+  - id: d31-i3
+    kp: d31-k4
+    type: oral
+    difficulty: 3
+    question: 你们的 Agent 在评估集上任务成功率只有 60% 左右，而且平均要走 9 步。你会怎么分析和改进？
+    key_points:
+      - {text: "用错误累积解释步数多导致成功率低，例如每步 95% 时 10 步约 60%", dim: principle}
+      - {text: "提出按 trace 统计失败发生在哪一步、哪个工具、哪类错误", dim: engineering}
+      - {text: "提出把固定步骤从 Agent 中拿出来写成 workflow 或合并工具以减少步数", dim: engineering}
+      - {text: "提出改进工具描述和工具返回内容，减少模型误用和重试", dim: engineering}
+      - {text: "提出用评估集对比每次改动前后的成功率、步数、延迟和成本", dim: project}
+    reference: |
+      **先理解原因**：Agent 的错误会累积。每步 95% 成功率，10 步后整体只有约 60%（0.95 的 10 次方）。所以平均 9 步本身就是问题，减少步数往往比换模型更有效。
+
+      **分析步骤**：
+      1. 用 trace 把失败用例按「失败在第几步、哪个工具、什么原因」分类：选错工具、参数错、工具报错、结果没看懂、重复调用。
+      2. 找出高频的固定路径，比如 80% 的任务都是「查用户 → 查订单 → 查物流」。
+
+      **改进方向**：
+      - **固定路径写成 workflow**：高频固定步骤直接用代码串起来，或合并成一个「查询订单全貌」的工具，一步返回模型需要的信息。
+      - **优化工具**：描述写清用途、参数格式和与其他工具的边界；返回结果只给模型需要的字段，错误信息要可操作。
+      - **限制和兜底**：最大步数、重复调用检测，超限转人工。
+      - **用评估集验证**：每次改动都对比成功率、平均步数、P95 延迟和单次成本。
+
+      我们在客服项目中把三个查询合并为一个聚合工具后，平均步数从 7 降到 3，成功率提升了约 20 个百分点。
+    oral: |
+      我会先从错误累积的角度看：每步 95% 成功率，走 10 步整体只剩 60% 左右，所以 9 步本身就是主要问题。
+      第一步看 trace，把失败用例按失败在哪一步、哪个工具、什么原因分类。第二步找高频固定路径，比如大部分任务都是查用户、查订单、查物流，那就写成 workflow 或合并成一个聚合工具。第三步优化工具描述和返回内容，减少模型选错和重试。同时加最大步数和重复调用检测。
+      每次改动都用评估集对比成功率、步数和成本。我们客服项目合并查询工具后，平均步数从 7 降到 3，成功率明显提升。
+  - id: d31-i4
+    kp: d31-k3
+    type: design
+    difficulty: 4
+    question: 请为公司设计一个内部 IT 服务助手：员工可以咨询 IT 制度、查询自己的设备和工单、申请软件安装、报告故障。说明哪些部分用 workflow、哪些用 Agent，以及如何控制成本和风险。
+    key_points:
+      - {text: "入口路由：制度咨询走 RAG，查询类和故障排查按复杂度分流", dim: engineering}
+      - {text: "软件安装申请这类审批流程用固定 workflow，并接入审批系统，不让 Agent 自主审批", dim: engineering}
+      - {text: "故障排查这类步骤依赖中间结果的任务才使用 Agent", dim: concept}
+      - {text: "工具按读写分级，写操作需用户确认，身份由后端注入并在工具内鉴权", dim: engineering}
+      - {text: "设定最大步数、超时、Token 预算，超限转人工，并记录完整 trace", dim: engineering}
+      - {text: "用评估集和线上指标衡量解决率、转人工率、延迟和成本，驱动迭代", dim: project}
+    reference: |
+      **整体架构：外层路由 + 局部 Agent。**
+
+      1. **意图路由**（小模型或分类器）：分为制度咨询、个人查询、软件申请、故障报告四类。
+      2. **制度咨询**：固定 RAG，检索 IT 制度文档并带引用回答，便宜稳定。
+      3. **个人查询**（我的设备、我的工单）：参数明确，直接用 workflow：抽取查询条件 → 调接口 → 生成回答。
+      4. **软件安装申请**：固定 workflow，抽取软件名和理由 → 校验是否在白名单 → 提交审批系统。**审批由人完成**，Agent 不能自主批准。
+      5. **故障报告**：这是唯一用 Agent 的地方。排查步骤依赖中间结果（先看设备状态，再看网络、账号、最近变更），模型决定下一步；排查不出时创建工单并附排查记录。
+
+      **风险控制**：
+      - 工具分级：只读工具（查设备、查日志）可自主调用；写操作（建工单、重置密码）必须用户确认。
+      - 身份由后端从登录态注入，工具内部校验数据归属，不让模型传 user_id。
+      - 最多 8 步、60 秒超时、单会话 Token 预算，超限转人工。
+
+      **成本控制**：路由用小模型；80% 流量走 RAG 和 workflow；Agent 只覆盖故障排查。
+
+      **可观测与迭代**：完整 trace；评估集覆盖四类意图；线上看解决率、转人工率、P95 延迟、单次成本，每次改动先在评估集回归。
+    oral: |
+      我的设计是外层路由加局部 Agent。先用小模型把请求分成制度咨询、个人查询、软件申请、故障报告四类。
+      制度咨询走 RAG；个人查询参数明确，用固定 workflow 调接口；软件申请也是 workflow，校验白名单后提交审批系统，审批一定由人来做。只有故障排查用 Agent，因为下一步查什么取决于上一步的结果。
+      风险上，只读工具可以自主调用，建工单、重置密码这种写操作要用户确认；身份由后端注入，工具内部鉴权；限制最多 8 步、60 秒超时，超限转人工。
+      这样大部分流量走便宜稳定的路径，再用评估集和线上的解决率、转人工率、成本持续迭代。
+sources:
+  - {title: "Anthropic - Building effective agents", url: "https://www.anthropic.com/engineering/building-effective-agents"}
+  - {title: "LangChain Docs - Agents", url: "https://docs.langchain.com/oss/python/langchain/agents"}
+  - {title: "OpenAI Docs - Function calling", url: "https://platform.openai.com/docs/guides/function-calling"}

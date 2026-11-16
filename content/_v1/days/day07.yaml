@@ -1,0 +1,689 @@
+day: 7
+phase: 1
+title: Python 运行机制：GIL、线程、进程、协程与适用场景
+goals:
+  - 能解释 GIL 是什么、为什么存在、什么时候会被释放，以及它对多线程性能的真实影响
+  - 能从内存、切换成本、通信方式、故障隔离四个维度对比线程、进程、协程
+  - 能判断一个任务是 I/O 密集还是 CPU 密集，并为 AI 后端中的典型任务选择合适的并发模型
+  - 能说清 free-threaded CPython 当前（2026-11）的状态，以及是否值得在项目中采用
+knowledge_points:
+  - id: d07-k1
+    name: GIL（全局解释器锁）
+    level: P0
+    summary: GIL 让同一进程内同一时刻只有一个线程执行 Python 字节码；I/O 等待时会释放，所以多线程适合 I/O 不适合纯 Python 计算
+    why: |
+      「Python 多线程是假的吗？」是 Python 后端面试的必考题。
+      在 AI 后端里，它直接决定架构选择：PDF 解析、文本切片、本地 Embedding 推理该用线程还是进程？为什么 uvicorn 要开多个 worker？为什么 FastAPI 的同步路由放线程池不会卡死？这些都要从 GIL 讲起。
+    problem: |
+      GIL 解决的是 **CPython 解释器内部状态的线程安全** 问题。
+      CPython 用引用计数管理内存，每个对象都有一个计数器，多个线程同时增减计数器会出错（对象被提前释放或永远不释放）。
+      与其给成千上万个对象各加一把细粒度锁（慢且容易死锁），CPython 选择了一把大锁：谁拿到 GIL 谁执行字节码。代价是纯 Python 代码无法利用多核。
+    principle: |
+      **一、GIL 到底锁住了什么**
+
+      - GIL 是 **CPython 解释器**的一个互斥锁（不是 Python 语言规范的一部分，PyPy 早期也有类似机制，Jython 没有）。
+      - 线程想执行 Python 字节码，必须先持有 GIL。同一进程内，**同一时刻只有一个线程在执行 Python 字节码**。
+      - 它保护的是解释器内部数据结构（引用计数、对象分配器、模块状态等），**不保护你的业务数据**。
+
+      **二、GIL 什么时候释放**
+
+      1. **阻塞式 I/O**：读写 socket、文件、`time.sleep()` 时，C 层代码会先释放 GIL 再进入系统调用，等待期间其他线程可以执行。这就是**多线程对 I/O 密集任务有效**的原因。
+      2. **定时切换**：持有 GIL 的线程运行一段时间后会被要求让出，默认间隔 5 毫秒（`sys.getswitchinterval()` 返回 0.005），避免一个线程饿死其他线程。
+      3. **C 扩展主动释放**：NumPy 的大矩阵运算、`hashlib` 处理较大数据、`zlib` 压缩、很多模型推理库的底层计算，会在纯 C 计算期间释放 GIL，这时多线程可以真正并行。
+
+      ```mermaid
+      sequenceDiagram
+        participant T1 as 线程 1
+        participant G as GIL
+        participant T2 as 线程 2
+        T1->>G: 获取 GIL
+        Note over T1: 执行 Python 字节码
+        T1->>G: 发起网络请求 释放 GIL
+        T2->>G: 获取 GIL
+        Note over T2: 执行 Python 字节码
+        Note over T1: 在内核中等待响应 不占 GIL
+        T2->>G: 运行满 5 毫秒 被要求让出
+        T1->>G: 响应到达 重新获取 GIL
+        Note over T1: 处理响应
+      ```
+
+      **三、对性能的真实影响**
+
+      | 任务类型 | 多线程效果 | 原因 |
+      |---|---|---|
+      | I/O 密集（HTTP、数据库、文件） | **有效** | 等待期间释放 GIL，多个线程的等待时间重叠 |
+      | 纯 Python CPU 密集（循环、字符串处理、JSON 解析） | **几乎无提升，甚至更慢** | 同一时刻只有一个线程在算，还多了切换开销 |
+      | C 扩展计算（NumPy、部分推理库） | **可能有效** | 取决于扩展是否在计算时释放 GIL |
+
+      **四、GIL ≠ 线程安全**
+
+      这是最常见的误解。GIL 只保证「单条字节码」执行期间不被打断，但 `counter += 1` 会被编译成「读取、加一、写回」多条字节码，线程可能在中间被切换，两个线程各加一次结果只加了一次（**竞态条件**）。CPython 3.10 之后切换点变少，这类问题在本地很难复现，但**没有任何保证**；在 free-threaded 构建下更容易暴露。共享可变状态仍然需要 `threading.Lock`，或者干脆避免共享（用队列传消息）。
+
+      **五、为什么不直接去掉 GIL**
+
+      历史上多次尝试去掉 GIL，都因为单线程性能下降明显、C 扩展生态大量依赖 GIL 语义而失败。直到 PEP 703 提出了可行方案（偏向引用计数、延迟引用计数、对象级锁等），才有了 3.13 起的 free-threaded 构建（见本日 d07-k4）。
+    scenarios: |
+      - **同步 SDK 并发调用**：用 `ThreadPoolExecutor` 同时调用 10 次只有同步版本的 OCR 接口，耗时接近单次，因为等待网络时 GIL 被释放。
+      - **FastAPI 同步路由**：`def` 路由在线程池中运行，多个请求同时等数据库时互不阻塞。
+      - **反例**：在线程池里并行做纯 Python 文本清洗，8 个线程总耗时和 1 个线程差不多，这时需要进程池。
+    code: |
+      ```python
+      import sys
+      import threading
+      import time
+
+      print(sys.getswitchinterval())  # 0.005，即默认每 5ms 请求切换
+
+      def cpu_work(n: int) -> int:
+          total = 0
+          for i in range(n):          # 纯 Python 计算，执行期间一直持有 GIL
+              total += i * i
+          return total
+
+      start = time.perf_counter()
+      threads = [threading.Thread(target=cpu_work, args=(5_000_000,)) for _ in range(4)]
+      for t in threads:
+          t.start()
+      for t in threads:
+          t.join()
+      # 在标准（带 GIL）构建上，耗时约等于串行跑 4 次，不会因为 4 个线程变快
+      print("4 threads:", round(time.perf_counter() - start, 2))
+      ```
+    pitfalls: |
+      - **误区：Python 多线程是假的、没用。** 对 I/O 密集任务多线程非常有效；只是对纯 Python CPU 计算无法并行。
+      - **误区：有 GIL 就不用加锁。** GIL 保护的是解释器，不是你的数据；`+=`、「先检查再写入」这类复合操作在多线程下都可能出错。
+      - **误区：GIL 是 Python 语言的特性。** 它是 CPython 实现的特性；free-threaded CPython 构建可以没有 GIL。
+      - **混淆：asyncio 和 GIL 无关。** asyncio 本来就是单线程，GIL 对它没有额外限制；它的限制来自「单线程」本身。
+      - **容易忽略：C 扩展会释放 GIL。** 测试「多线程有没有用」时要区分纯 Python 和调用了 NumPy 等扩展的代码，结论可能完全相反。
+    interview_asks:
+      - 什么是 GIL？为什么 CPython 需要它？
+      - 有 GIL 为什么还需要加锁？
+      - Python 多线程适合什么场景？什么时候会释放 GIL？
+    project_example: |
+      在文档入库服务中，最初用 `ThreadPoolExecutor(max_workers=8)` 并行处理上传的 Markdown 文档（正则清洗、切片、去重，都是纯 Python）。
+      8 核机器上 CPU 使用率始终只有约 100%（一个核），处理 2000 篇文档要 6 分钟，和单线程几乎一样。
+      用 `py-spy top` 观察发现线程大部分时间在等 GIL。改成 `ProcessPoolExecutor(max_workers=7)` 后 CPU 打满到约 700%，耗时降到 1 分钟左右；而调用远程 Embedding API 的环节仍保留异步并发，因为那是 I/O 等待。
+  - id: d07-k2
+    name: 线程、进程、协程的本质区别
+    level: P0
+    summary: 进程隔离资源、线程共享内存由操作系统调度、协程在用户态由事件循环协作切换，三者成本和适用场景完全不同
+    why: |
+      AI 后端是三者的混合体：uvicorn/gunicorn 用**多进程**部署，FastAPI 同步路由跑在**线程池**里，异步路由和 LLM 调用跑在**协程**上，CPU 密集任务交给**进程池**。
+      只有理解它们的本质差别，才能读懂部署配置（workers 数量）、判断内存为什么暴涨、为什么全局变量在不同请求间「不同步」。
+    problem: |
+      解决的是「**如何让程序同时做多件事**」时的选型问题。
+      三种方式在隔离性、资源成本、通信难度、调度方式上各有取舍：进程最安全但最重，线程轻但要处理共享数据，协程最轻但要求代码全链路异步且不能阻塞。
+      选错会导致：内存爆炸、数据竞争、CPU 吃不满或者整个服务被一个阻塞调用拖死。
+    principle: |
+      **一、三者的层级关系**
+
+      ```mermaid
+      flowchart TD
+        OS["操作系统"] --> P1["进程 1 uvicorn worker"]
+        OS --> P2["进程 2 uvicorn worker"]
+        P1 --> M1["独立内存空间 独立 GIL"]
+        P1 --> T1["主线程 运行事件循环"]
+        P1 --> T2["线程池 线程 1 到 N 运行 def 路由"]
+        T1 --> C1["协程 请求 A"]
+        T1 --> C2["协程 请求 B"]
+        T1 --> C3["协程 请求 C"]
+        P2 --> M2["独立内存空间 独立 GIL"]
+      ```
+
+      - **进程（process）**：操作系统分配资源的单位。每个进程有独立的内存空间、独立的 Python 解释器和 **独立的 GIL**。
+      - **线程（thread）**：操作系统调度的单位，属于某个进程，**共享**进程的内存。由操作系统**抢占式**调度（随时可能被切走）。
+      - **协程（coroutine）**：用户态的「轻量任务」，运行在某个线程的事件循环里，**协作式**调度（只在 await 处主动让出）。
+
+      **二、四个维度对比**
+
+      | 维度 | 进程 | 线程 | 协程 |
+      |---|---|---|---|
+      | 内存 | 每个进程完整一份解释器和数据，几十到几百 MB | 共享进程内存，每个线程栈通常为 MB 级（虚拟内存） | 一个协程只是一个对象，KB 级 |
+      | 切换成本 | 最高（内核切换地址空间） | 中（内核切换线程上下文） | 最低（用户态函数挂起和恢复） |
+      | 通信 | 需要 IPC：队列、管道、共享内存、外部存储；数据要序列化（pickle） | 直接读写共享变量，但要加锁 | 同一线程内直接共享，协作式调度下竞争少，但跨 await 仍可能交错 |
+      | 故障隔离 | 一个进程崩溃不影响其他进程 | 一个线程触发段错误整个进程崩溃 | 一个协程阻塞，整个事件循环卡住 |
+      | 利用多核 | **能**（每个进程独立 GIL） | 带 GIL 构建下纯 Python 计算不能 | 不能（单线程） |
+      | 典型规模 | 几个到几十个 | 几十到几百个 | 成千上万个 |
+
+      **三、调度方式的差异决定了编程风险**
+
+      - **抢占式（线程）**：任何两条字节码之间都可能被切走，所以共享数据必须加锁，否则出现竞态。
+      - **协作式（协程）**：只在 `await` 处切换，两个 await 之间的代码不会被其他协程打断，竞态少很多；但跨 await 的「读-改-写」仍会交错（比如先读余额、await 调用外部服务、再写余额）。
+
+      **四、进程的特有坑**
+
+      - 进程之间**不共享全局变量**。多 worker 部署时，内存里的计数器、缓存、限流状态在每个 worker 里各有一份，需要 Redis 等外部存储统一（Day 41）。
+      - 进程启动方式：Windows 和 macOS 默认 `spawn`（启动全新解释器、重新导入主模块），所以入口代码必须放在 `if __name__ == "__main__":` 下；**Python 3.14 起** Linux 等非 macOS 的 Unix 平台默认也从 `fork` 改为 `forkserver`。传给子进程的函数和参数必须能被 pickle（不能是 lambda、本地函数、数据库连接）。
+      - 每个进程都会加载一份模型或大字典，本地加载 2GB 的模型开 8 个进程就是 16GB 内存。
+
+      **五、组合使用才是常态**
+
+      生产环境的 FastAPI 服务通常是：**多进程**（N 个 uvicorn worker，用满多核 + 故障隔离）× **每进程一个事件循环**（大量协程处理 I/O）+ **线程池**（兜底同步代码）+ 必要时的**进程池或独立 worker 服务**（CPU 密集任务）。
+    scenarios: |
+      - **部署**：`uvicorn app:app --workers 4` 或 gunicorn + uvicorn worker，4 个进程各自有事件循环，用满 4 核。
+      - **线程**：调用只有同步 API 的 SDK、读写本地文件、FastAPI 的 def 路由和同步依赖。
+      - **协程**：所有 LLM API、向量库、数据库、Redis 的网络调用。
+      - **进程池 / 独立服务**：PDF 解析、OCR 后处理、本地 Embedding 或 Rerank 模型推理。
+    code: |
+      ```python
+      import asyncio
+      from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+
+      def cpu_heavy(text: str) -> int:          # 纯 Python 计算：适合进程池
+          return sum(ord(c) for c in text * 2000)
+
+      def blocking_io(path: str) -> int:         # 阻塞 I/O：适合线程池
+          with open(path, "rb") as f:
+              return len(f.read())
+
+      async def main() -> None:
+          loop = asyncio.get_running_loop()
+          with ProcessPoolExecutor(max_workers=4) as procs, ThreadPoolExecutor(max_workers=8) as threads:
+              cpu_results = await asyncio.gather(
+                  *(loop.run_in_executor(procs, cpu_heavy, t) for t in ["a" * 1000] * 8)
+              )
+              io_result = await loop.run_in_executor(threads, blocking_io, __file__)
+          print(len(cpu_results), io_result)
+
+      if __name__ == "__main__":   # spawn / forkserver 启动方式下必须有这个保护
+          asyncio.run(main())
+      ```
+    pitfalls: |
+      - **误区：多 worker 下全局变量是共享的。** 每个 worker 是独立进程，内存里的限流计数器、本地缓存各算各的，用户在不同 worker 上会看到不一致的结果。
+      - **误区：协程不需要考虑并发安全。** 跨 await 的读-改-写仍会交错，比如两个请求同时「读配额 → await 调模型 → 扣配额」。
+      - **进程池传递不可序列化的对象**：把数据库连接、httpx 客户端、lambda 传给子进程会报 pickle 错误；应该传 ID 或纯数据，让子进程自己创建连接。
+      - **Windows 上忘记 `if __name__ == "__main__":`**：spawn 会重新导入主模块，导致无限创建子进程或报错。
+      - **worker 数量盲目设大**：每个进程都要加载应用、模型和连接池，内存与数据库连接数成倍增长。
+    interview_asks:
+      - 线程、进程、协程有什么区别？
+      - uvicorn 开 4 个 worker 和单进程异步有什么区别？
+      - 为什么多 worker 部署时，内存里做的限流不准？
+    project_example: |
+      一个 RAG 服务用 `--workers 4` 部署，内存里用字典做「每用户每分钟 20 次」的限流。上线后用户反馈有时被限流、有时能连发 60 次。
+      原因：4 个 worker 各有一份字典，请求被随机分到不同进程，实际上限变成了约 80 次/分钟，且表现随机。
+      改为 Redis 计数（INCR + EXPIRE）后限流准确。同时发现每个 worker 都加载了一份 1.2GB 的本地 Rerank 模型，总内存接近 5GB；后来把 Rerank 拆成独立服务，Web worker 内存降到每个 300MB。
+  - id: d07-k3
+    name: I/O 密集与 CPU 密集：AI 后端的并发选型
+    level: P0
+    summary: 等外部就用协程（或线程），算得多就用进程或独立服务；先判断瓶颈类型，再选并发模型
+    why: |
+      选型错误是 AI 后端性能问题的主要来源：把 CPU 密集任务放进事件循环导致全站卡顿，把 I/O 任务放进进程池浪费内存，把本地模型推理塞进 Web 进程导致扩容困难。
+      面试中「你的服务瓶颈在哪？怎么优化？」几乎都要从这个判断开始。
+    problem: |
+      解决「**一个任务应该用哪种并发方式执行**」的决策问题。
+      同样是「慢」，等网络的慢和算不完的慢需要完全不同的解法：前者需要更多并发等待能力（协程），后者需要更多 CPU 核（进程、更多机器或 GPU）。
+    principle: |
+      **一、如何判断任务类型**
+
+      - **I/O 密集**：大部分时间在**等外部**——网络、磁盘、数据库、其他服务。特征：CPU 使用率低，耗时取决于对方。
+      - **CPU 密集**：大部分时间在**本地计算**。特征：运行时 CPU 单核打满，耗时随数据量线性或更快增长。
+      - **简单测量**：对比函数的 wall time（墙上时间）和 CPU time（`time.process_time()`）。两者接近 → CPU 密集；wall 远大于 CPU → I/O 密集。线上可以用 `py-spy top` 看函数耗时分布。
+
+      **二、AI 后端常见任务分类**
+
+      | 任务 | 类型 | 推荐方式 |
+      |---|---|---|
+      | 调用 LLM / Embedding API | I/O 密集 | 协程（httpx.AsyncClient），配合并发上限 |
+      | 查 PostgreSQL / Redis / 向量库 | I/O 密集 | 协程（异步驱动） |
+      | 读取用户上传文件 | I/O 为主 | `asyncio.to_thread` 或异步文件库 |
+      | PDF / Word 解析、OCR 后处理 | CPU 密集 | 进程池，或异步任务队列中的独立 worker |
+      | 本地 tokenizer 统计 Token | 轻量 CPU | 短文本直接算；批量长文本放进程池 |
+      | 本地 Embedding / Rerank 模型推理 | CPU 或 GPU 密集 | 独立推理服务（批处理），Web 进程通过 HTTP 调用 |
+      | 大 JSON 序列化、正则批处理 | CPU 密集 | 控制数据量；必要时放进程池或用更快的库 |
+
+      **三、决策流程**
+
+      ```mermaid
+      flowchart TD
+        A["新任务"] --> B{"主要时间花在等待外部吗"}
+        B -- "是 IO 密集" --> C{"有异步版本的库吗"}
+        C -- "有" --> D["协程 await 加并发上限"]
+        C -- "没有" --> E["asyncio.to_thread 或 def 路由进线程池"]
+        B -- "否 CPU 密集" --> F{"单次耗时和频率"}
+        F -- "毫秒级 偶尔" --> G["直接执行 可接受"]
+        F -- "百毫秒以上 或批量" --> H{"需要在请求内同步返回吗"}
+        H -- "是" --> I["进程池 run_in_executor"]
+        H -- "否" --> J["任务队列 独立 worker 或推理服务"]
+      ```
+
+      **四、为什么 CPU 密集任务最好移出 Web 进程**
+
+      1. **隔离**：重计算不会拖慢正在处理的其他请求。
+      2. **独立扩容**：Web 层按并发连接数扩容，计算层按 CPU/GPU 扩容，互不绑定。
+      3. **资源控制**：模型只在推理服务中加载一份，可以做批处理（batching）提升 GPU 利用率。
+      4. **超时与重试**：长任务放队列可以异步通知结果，不受 HTTP 超时限制。
+
+      **五、并发数怎么定**
+
+      - 协程并发上限主要受**下游**限制（LLM 供应商限流、数据库连接池大小），不是本机 CPU。
+      - 进程池大小通常设为 **CPU 核数或核数减一**，再多只会增加切换开销。
+      - 线程池大小取决于阻塞调用的并发量和下游承受能力，FastAPI 默认线程令牌为 40 个。
+    scenarios: |
+      - **用户上传 50MB PDF 并提问**：文件落盘（线程）→ 解析与切片（进程池或后台任务）→ Embedding（协程并发调用 API）→ 写向量库（协程）→ 问答（协程）。
+      - **实时对话接口**：几乎全是 I/O，单进程异步即可支撑高并发，扩容时主要看 LLM 限流。
+      - **离线评估脚本**：调用模型打分用异步并发；结果统计（pandas）是 CPU 计算，在最后一步集中处理即可。
+    pitfalls: |
+      - **误区：任务慢就开更多线程。** CPU 密集任务开多线程不会更快；I/O 密集任务的瓶颈往往在下游限流，盲目加并发只会换来更多 429。
+      - **误区：进程池什么都能放。** 进程间传递大对象要 pickle 序列化，传 100MB 的文本过去，序列化本身就可能比计算更慢；应传文件路径或对象存储地址。
+      - **把本地模型加载在每个 Web worker 里**：内存成倍增长、启动变慢、无法单独扩容 GPU。
+      - **混淆：GPU 推理是 CPU 密集吗？** 对 Web 进程来说它是「重计算」，应该交给独立推理服务；GPU 内部的并行与 GIL 无关。
+    interview_asks:
+      - 如何判断一个任务是 I/O 密集还是 CPU 密集？
+      - 用户上传 PDF 后需要解析、切片、向量化，你会怎么安排并发模型？
+      - 为什么建议把本地 Embedding 模型单独部署成服务？
+    project_example: |
+      企业知识库的「上传即问」功能，第一版在 async 路由里同步完成解析、切片、向量化，上传一个 200 页 PDF 时接口 40 秒才返回，期间其他用户的问答也明显变慢。
+      重构后：上传接口只负责保存文件并创建入库任务，立即返回 task_id；后台 worker 进程用进程池解析 PDF，再用协程并发（Semaphore=8）调用 Embedding API，写入 pgvector；前端轮询进度。
+      结果：上传接口 300ms 返回，问答接口 P99 不再受上传影响，入库吞吐提升约 5 倍。
+  - id: d07-k4
+    name: free-threaded CPython（无 GIL 构建）的现状
+    level: P1
+    summary: PEP 703 让 GIL 变为可选；3.13 实验、3.14 起官方支持但非默认，生产采用要先看依赖兼容性
+    why: |
+      面试官常问「Python 不是要去掉 GIL 了吗？」。如果只记得「Python 有 GIL」而不知道最新进展，会显得知识陈旧；如果夸大说「GIL 已经没了」，又会暴露理解不准确。
+      对 AI 后端来说，它关系到未来 CPU 密集任务能否直接用多线程，以及依赖库（NumPy、tokenizer、数据库驱动）是否兼容。
+    problem: |
+      解决「纯 Python 代码无法利用多核」的历史限制。
+      多进程虽然能绕开 GIL，但内存占用高、进程间通信要序列化、共享大对象困难。free-threaded 构建让多个线程可以真正并行执行 Python 字节码，同时共享内存。
+    principle: |
+      **一、时间线（核对于 2026-11）**
+
+      - **PEP 703**（被指导委员会接受）：让 GIL 在 CPython 中变为可选，分三个阶段推进。
+      - **Python 3.13（2024）**：第一阶段，提供 free-threaded 构建，**明确标记为实验性**。
+      - **Python 3.14（2025-10）**：**PEP 779** 定义的第二阶段，free-threaded 构建**正式受支持，但仍是可选项、不是默认构建**。官方称单线程性能损失降到约 5%~10%（取决于平台和编译器）。asyncio 也在 3.14 起对 free-threaded 提供一等支持。
+      - **Python 3.15（2026-10）**：保持「受支持但可选」；新增面向 free-threaded 的稳定 ABI（`abi3t`，PEP 803），C 扩展作者可以一次编译适配多个版本；官方 macOS 安装包默认安装 free-threading 支持。
+      - **第三阶段（默认无 GIL）**：**尚未决定**，取决于社区生态与实际收益，需要未来单独的 PEP。
+
+      **二、怎么用、怎么判断**
+
+      - 它是**单独的构建**，通常以 `python3.14t` / `python3.15t` 这类带 `t` 后缀的可执行文件出现；Windows/macOS 官方安装包可选安装，uv 等工具也能安装。
+      - 判断：`python -VV` 或 `sys.version` 中包含 free-threading build；`sysconfig.get_config_var("Py_GIL_DISABLED")` 为 1 表示构建支持无 GIL；`sys._is_gil_enabled()` 查看**运行时** GIL 是否真的关闭。
+      - free-threaded 构建在运行时仍可通过环境变量 `PYTHON_GIL` 或 `-X gil` 重新开启 GIL。
+      - **关键坑**：导入一个**未声明支持 free-threading 的 C 扩展**时，解释器会自动重新启用 GIL 并打印警告——你以为在无 GIL 模式下跑，实际上 GIL 又回来了。
+
+      **三、对 AI 后端意味着什么**
+
+      - **I/O 密集服务**（大部分 LLM 应用）：收益有限，异步 + 多进程已经够用。
+      - **CPU 密集的纯 Python 处理**（文本清洗、切片、规则引擎）：未来可以用线程池代替进程池，省去序列化和多份内存。
+      - **风险**：你的代码和依赖中「靠 GIL 碰巧正确」的线程不安全代码会暴露出来；需要检查关键依赖（NumPy、pydantic-core、数据库驱动、tokenizer 等）是否发布了 free-threaded wheel。
+      - **当前建议**：生产默认仍使用标准构建；可以在 CI 中增加 free-threaded 构建的测试任务，评估兼容性和收益后再决定。
+
+      **四、另一个选项：子解释器**
+
+      Python 3.14 新增 `concurrent.futures.InterpreterPoolExecutor`（PEP 734），在同一进程内运行多个相互隔离的解释器，每个有自己的 GIL，介于线程与进程之间。生态仍在早期，了解即可。
+    scenarios: |
+      - **技术选型评估**：在 CI 中用 free-threaded Python 跑一遍测试与基准，检查依赖是否触发「重新启用 GIL」的警告。
+      - **CPU 密集的内部工具**：例如离线文档清洗脚本，依赖简单、可控，适合先行试用线程并行。
+      - **面试表达**：准确说出「3.13 实验、3.14 起官方支持但非默认、默认化尚未决定」。
+    pitfalls: |
+      - **误区：Python 3.14/3.15 已经没有 GIL 了。** 默认构建仍然有 GIL，free-threaded 是需要单独安装的可选构建。
+      - **误区：装了 free-threaded 版本就一定无 GIL。** 导入不兼容的 C 扩展会自动重新启用 GIL，要用 `sys._is_gil_enabled()` 确认。
+      - **误区：去掉 GIL 后所有程序都更快。** 单线程有约 5%~10% 的损失；I/O 密集程序几乎没有收益。
+      - **忽视线程安全**：原来侥幸没出问题的共享状态，在真正并行时会频繁出错。
+    interview_asks:
+      - Python 现在还有 GIL 吗？free-threaded Python 是什么状态？
+      - 如果升级到无 GIL 的 Python，你的 AI 服务会有什么收益和风险？
+    freshness: |
+      核对于 2026-11：
+      - Python 3.13：free-threaded 构建为实验性（PEP 703 第一阶段）。
+      - Python 3.14（2025-10-07 发布）：PEP 779 生效，free-threaded 构建「officially supported but still optional」，单线程性能损失约 5%~10%；新增 `InterpreterPoolExecutor`；`multiprocessing` / `ProcessPoolExecutor` 在 macOS 以外的 Unix 平台默认启动方式由 fork 改为 forkserver。
+      - Python 3.15（2026-10-09 发布）：新增 free-threaded 稳定 ABI `abi3t`（PEP 803 等），官方 macOS 安装包默认安装 free-threading 支持；默认构建仍带 GIL，是否进入第三阶段（默认无 GIL）尚未决定。
+      - 各第三方库对 free-threaded 的支持情况变化快，以 py-free-threading.github.io 与各库发布说明为准。
+    sources:
+      - {title: "PEP 779 - Criteria for supported status for free-threaded Python", url: "https://peps.python.org/pep-0779/"}
+      - {title: "Python HOWTO - Python support for free threading", url: "https://docs.python.org/3/howto/free-threading-python.html"}
+      - {title: "What's New in Python 3.14", url: "https://docs.python.org/3/whatsnew/3.14.html"}
+      - {title: "What's New in Python 3.15", url: "https://docs.python.org/3/whatsnew/3.15.html"}
+      - {title: "Python Free-Threading Guide", url: "https://py-free-threading.github.io/"}
+    project_example: |
+      团队想把文档清洗服务（纯 Python 正则与切片，目前用 8 进程的进程池，内存约 3GB）迁到 free-threaded Python 3.14 用线程池代替。
+      评估步骤：在 CI 中新增 `3.14t` 测试任务；启动时打印 `sys._is_gil_enabled()`；发现导入某个 PDF 解析 C 扩展后 GIL 被自动重新启用。最终方案：清洗环节（只依赖标准库）先迁移到 free-threaded 线程池，内存降到约 900MB；PDF 解析仍留在标准构建的进程池中，等待上游发布兼容 wheel。
+quiz:
+  - id: d07-q1
+    kp: d07-k1
+    type: single
+    question: 在标准（带 GIL）的 CPython 中，用 8 个线程并发执行下列哪类任务，最可能获得接近 8 倍的吞吐提升？
+    options:
+      - 用纯 Python for 循环对 8 份大文本做正则清洗和切片
+      - 同时调用 8 次远程 LLM API，每次约等待 3 秒
+      - 用纯 Python 实现的算法计算 8 组余弦相似度
+      - 对 8 个大 JSON 字符串调用 json.loads 并遍历字段
+    answer: [1]
+    explain: |
+      远程 API 调用期间线程在等待网络，阻塞 I/O 会释放 GIL，8 个线程的等待时间可以重叠，总耗时接近单次，因此吞吐接近 8 倍。
+      A、C、D 都是在本进程中持续执行 Python 字节码的 CPU 工作，同一时刻只有一个线程持有 GIL，多线程几乎无提升，甚至因切换开销更慢。C 是常见误解：只有用 NumPy 这类会释放 GIL 的 C 扩展做矩阵运算时，线程才可能并行。
+  - id: d07-q2
+    kp: d07-k1
+    type: judge
+    question: 因为 CPython 有 GIL，所以多个线程同时对一个共享字典执行 stats["count"] += 1 是线程安全的，不需要加锁。
+    answer: false
+    explain: |
+      GIL 只保证单条字节码执行期间不被打断，并且保护的是解释器内部状态而不是业务数据。`stats["count"] += 1` 会被拆成读取、相加、写回多条字节码，线程可能在中间被切换，造成更新丢失。
+      虽然 CPython 3.10 之后切换点变少，本地很难复现，但这没有任何语言层面的保证，在 free-threaded 构建下更容易暴露。正确做法是用 threading.Lock 保护，或避免共享可变状态。
+  - id: d07-q3
+    kp: d07-k2
+    type: multi
+    question: 一个 FastAPI 服务用 uvicorn --workers 4 部署在 4 核机器上，下列说法正确的有：
+    options:
+      - 4 个 worker 是 4 个独立进程，各自有独立的内存空间和 GIL
+      - 在模块级定义的全局字典缓存，4 个 worker 之间会自动同步
+      - 每个 worker 内部有自己的事件循环，可以并发处理多个 async 请求
+      - 某个 worker 因为一个阻塞调用卡住时，其他 worker 仍然可以正常处理请求
+      - 因为有 GIL，4 个 worker 同一时刻总共只能有一个在执行 Python 代码
+    answer: [0, 2, 3]
+    explain: |
+      worker 是独立进程，有独立内存和独立 GIL（A 对），所以多进程能用满多核，E 错在把 GIL 理解成跨进程的锁。每个 worker 运行自己的事件循环（C 对），一个进程卡住不影响其他进程（D 对），这也是多进程部署的故障隔离优势。
+      B 错：进程之间不共享内存，模块级全局变量每个 worker 各有一份，需要 Redis 等外部存储才能共享。
+  - id: d07-q4
+    kp: d07-k3
+    type: scenario
+    question: |
+      知识库服务提供「上传文档并立即可问」功能。当前实现：async def 路由里依次执行 pypdf 解析（约 8 秒）、纯 Python 切片去重（约 3 秒）、逐块同步调用 Embedding API（每块 200ms，共 300 块）、写入数据库。
+      上传一个大文件时接口要 70 秒以上，期间其他用户的问答也明显变慢。请指出每一步属于什么类型的任务，说明问题根源，并给出改造方案。
+    key_points:
+      - {text: "判断 PDF 解析与切片去重是 CPU 密集，Embedding 调用与写库是 IO 密集", dim: concept}
+      - {text: "指出在 async 路由中同步执行 CPU 任务与同步网络调用会阻塞事件循环，拖慢同进程所有请求", dim: principle}
+      - {text: "指出逐块串行调用 Embedding 浪费了等待时间，应批量并发并设置并发上限", dim: principle}
+      - {text: "提出把入库改为后台任务，接口立即返回任务 ID 并提供进度查询", dim: engineering}
+      - {text: "提出 CPU 部分用进程池或独立 worker，IO 部分用协程并发", dim: engineering}
+    reference: |
+      **任务分类：** pypdf 解析和纯 Python 切片去重是 CPU 密集；Embedding API 调用和写数据库是 I/O 密集。
+
+      **问题根源：**
+      1. 所有步骤都在 async 路由里同步执行。8 秒解析 + 3 秒切片期间事件循环无法调度其他协程，同进程其他用户的问答被卡住；同步调用 Embedding（如 requests）同样会阻塞事件循环。
+      2. 300 块逐个串行调用，每块 200ms，单这一步就要 60 秒，而这 60 秒 CPU 几乎都在等。
+      3. 长耗时操作放在 HTTP 请求内，容易超过网关超时，用户体验也差。
+
+      **改造方案：**
+      - 上传接口只做校验和保存文件（大文件写盘用 `asyncio.to_thread`），创建入库任务并立即返回 task_id。
+      - 后台 worker（任务队列或独立进程）执行入库：PDF 解析与切片放进 `ProcessPoolExecutor`，利用多核且不影响 Web 进程。
+      - Embedding 改用异步客户端，按供应商允许的批量大小分批（例如每批 64 块），用 `asyncio.Semaphore` 控制并发并处理 429 退避。
+      - 写库用异步驱动批量插入。
+      - 前端轮询或订阅进度，完成后才允许针对该文档提问。
+
+      预期效果：上传接口亚秒级返回；入库总时长由「60 秒等待 + 11 秒计算」降到「数秒等待 + 计算并行」；问答接口不再受上传影响。
+    followup:
+      question: 如果老板要求「必须在上传请求里同步返回可问状态」，你会如何折中？
+      key_points:
+        - 设置文件大小上限并说明超出时转为异步
+        - CPU 部分进程池执行，Embedding 并发批量
+        - 设置整体超时并给出降级提示
+      reference: 可以限定同步模式只支持较小文件（如 20 页以内），超出则自动转为后台任务；同步模式下 CPU 部分仍用进程池执行，Embedding 批量并发，整体设置超时（例如 15 秒），超时则返回「已转为后台处理」的状态而不是让请求一直挂着。
+  - id: d07-q5
+    kp: d07-k2
+    type: short
+    question: 从内存、切换成本、通信方式、故障隔离四个维度，对比线程、进程、协程，并各举一个 AI 后端中的适用场景。
+    key_points:
+      - {text: "内存：进程最大，线程共享进程内存，协程只是对象最轻", dim: concept}
+      - {text: "切换：进程与线程由操作系统抢占式调度，协程在用户态协作式切换成本最低", dim: principle}
+      - {text: "通信与隔离：进程需 IPC 和序列化但隔离最好，线程共享内存需加锁，协程阻塞会拖垮整个事件循环", dim: principle}
+      - {text: "分别给出合理场景：进程用于部署 worker 或 CPU 密集，线程用于同步 SDK，协程用于 LLM 与数据库调用", dim: project}
+    reference: |
+      **内存：** 进程最重，每个进程都有完整的解释器、已导入模块和数据，加载模型时成倍增长；线程共享所属进程的内存，只需要额外的线程栈；协程只是一个 Python 对象，可以轻松创建成千上万个。
+      **切换成本：** 进程切换需要内核切换地址空间，最贵；线程切换由内核完成，较轻但仍需上下文切换；协程在用户态通过挂起和恢复函数实现，成本最低。进程和线程是抢占式调度，协程是协作式调度，只在 await 处让出。
+      **通信方式：** 进程之间不共享内存，需要队列、管道或 Redis 等外部存储，数据要 pickle 序列化；线程直接读写共享变量，但必须加锁避免竞态；协程在同一线程内共享数据，竞态较少，但跨 await 的读改写仍可能交错。
+      **故障隔离：** 进程崩溃不影响其他进程；线程触发底层崩溃会带走整个进程；一个协程阻塞会卡住整个事件循环。
+      **场景：** 进程用于 uvicorn 多 worker 部署和 PDF 解析等 CPU 密集任务；线程用于调用只有同步版本的 OCR SDK 或 FastAPI 的 def 路由；协程用于调用 LLM、Embedding API、PostgreSQL 与 Redis。
+  - id: d07-q6
+    kp: d07-k4
+    type: judge
+    question: 截至 2026 年 11 月，Python 3.14 和 3.15 的默认构建都已经移除了 GIL，只要升级 Python 版本，纯 Python 多线程代码就能自动利用多核。
+    answer: false
+    explain: |
+      PEP 779 让 free-threaded 构建在 3.14 起成为「官方支持但可选」的构建，默认构建仍然带 GIL；需要单独安装带 t 后缀的 free-threaded 版本才能关闭 GIL，而且导入未声明兼容的 C 扩展时 GIL 会被自动重新启用。
+      是否把无 GIL 作为默认构建（第三阶段）尚未决定。即使使用 free-threaded 构建，单线程也有约 5%~10% 的性能损失，代码还必须是线程安全的。
+  - id: d07-q7
+    kp: d07-k4
+    type: short
+    question: 运维说「我们已经部署了 Python 3.14 的 free-threaded 版本，GIL 已经关了」。你会如何验证这句话？为什么即使安装的是 free-threaded 构建，运行时 GIL 也可能是开启的？
+    key_points:
+      - {text: "区分构建是否支持无 GIL 与运行时 GIL 是否真的关闭两个层面", dim: concept}
+      - {text: "给出验证方法：python -VV 或 sys.version 含 free-threading，sysconfig 的 Py_GIL_DISABLED，sys._is_gil_enabled", dim: engineering}
+      - {text: "指出导入未声明支持 free-threading 的 C 扩展会自动重新启用 GIL 并打印警告", dim: principle}
+      - {text: "指出 PYTHON_GIL 环境变量或 -X gil 参数也可以在运行时重新开启 GIL", dim: principle}
+    reference: |
+      需要分两层验证。第一层是「构建是否支持无 GIL」：执行 `python -VV` 或查看 `sys.version`，free-threaded 构建会包含 free-threading build 字样；`sysconfig.get_config_var("Py_GIL_DISABLED")` 返回 1 说明是支持无 GIL 的构建。第二层是「运行时 GIL 是否真的关闭」：在应用完成所有导入之后调用 `sys._is_gil_enabled()`，返回 False 才说明当前进程确实在无 GIL 模式下运行。
+      即使是 free-threaded 构建，运行时 GIL 也可能被打开：一是导入了没有声明支持 free-threading 的 C 扩展模块，解释器会自动重新启用 GIL 并打印警告，这在依赖众多的 AI 项目里很常见；二是部署配置里设置了环境变量 `PYTHON_GIL=1` 或启动参数 `-X gil`。
+      所以我会在应用启动完成后把 `sys._is_gil_enabled()` 的结果写入日志和健康检查信息，并在日志中监控 GIL 重新启用的警告。
+interview:
+  - id: d07-i1
+    kp: d07-k1
+    type: oral
+    difficulty: 1
+    question: 什么是 GIL？它对 Python 多线程有什么影响？
+    key_points:
+      - {text: "说明 GIL 是 CPython 的全局解释器锁，同一进程同一时刻只有一个线程执行字节码", dim: concept}
+      - {text: "说明 GIL 存在的原因是保护引用计数等解释器内部状态", dim: principle}
+      - {text: "说明阻塞 IO 和部分 C 扩展会释放 GIL，因此多线程适合 IO 密集", dim: principle}
+      - {text: "指出纯 Python CPU 密集任务应使用多进程，并举出项目中的选择", dim: project}
+    reference: |
+      GIL 是 CPython 解释器中的全局互斥锁，线程必须持有它才能执行 Python 字节码，所以同一进程内同一时刻只有一个线程在执行 Python 代码。
+      它存在的主要原因是 CPython 使用引用计数管理内存，多个线程同时修改对象的引用计数会导致内存错误。用一把大锁保护解释器内部状态，实现简单、单线程性能好，也让 C 扩展更容易编写。
+      影响分两种情况：线程在做阻塞 I/O（网络、文件、sleep）时会释放 GIL，其他线程可以运行，所以多线程对 I/O 密集任务有效；纯 Python 的 CPU 计算一直持有 GIL（每 5 毫秒左右被要求切换一次），多线程无法并行，甚至因为切换更慢。NumPy 等 C 扩展在底层计算时可能释放 GIL，这时线程能并行。
+      在项目中，调用远程 API 我用异步或线程，文档解析这类纯 Python 计算我用进程池或独立 worker。
+    oral: |
+      GIL 是 CPython 的全局解释器锁，简单说就是同一个进程里同一时刻只有一个线程能执行 Python 字节码。它主要是为了保护引用计数这些解释器内部状态，换来实现简单和单线程性能。
+      它的影响要分场景说：线程在等网络、等文件的时候会释放 GIL，所以 I/O 密集任务用多线程是有效的；但纯 Python 的计算一直占着 GIL，开多少线程也只用一个核。
+      我在项目里就遇到过：文档清洗用八个线程，CPU 只跑到一个核，换成进程池以后耗时从六分钟降到一分钟。调用 LLM 这种等网络的，我还是用异步。
+  - id: d07-i2
+    kp: d07-k2
+    type: oral
+    difficulty: 2
+    question: 线程、进程、协程有什么区别？在你的 FastAPI 服务里它们分别出现在哪里？
+    key_points:
+      - {text: "说明进程是资源分配单位有独立内存和 GIL，线程共享内存由操作系统调度，协程在用户态由事件循环调度", dim: concept}
+      - {text: "对比抢占式与协作式调度带来的并发安全差异", dim: principle}
+      - {text: "对比内存与切换成本、故障隔离", dim: principle}
+      - {text: "结合 FastAPI 说明多 worker 进程、def 路由线程池、async 路由协程的分工", dim: project}
+      - {text: "指出多进程下内存状态不共享，需要外部存储", dim: engineering}
+    reference: |
+      进程是操作系统分配资源的单位，有独立的内存空间、独立的解释器和 GIL，隔离性最好但最重，通信需要 IPC 和序列化。线程属于进程，共享进程内存，由操作系统抢占式调度，任何时候都可能被切换，所以共享数据要加锁。协程是用户态的轻量任务，在一个线程的事件循环中协作式调度，只在 await 处让出，切换成本最低，可以有成千上万个，但一个阻塞会卡住整个循环。
+      在 FastAPI 服务中：部署时 uvicorn 或 gunicorn 启动多个 worker 进程，用满多核并做故障隔离；每个 worker 主线程运行一个事件循环，async def 路由以协程方式运行，处理 LLM、数据库等 I/O；def 路由和同步依赖被放到线程池中执行；CPU 密集的解析任务交给进程池或独立 worker。
+      工程上要注意多 worker 之间不共享内存，限流计数、会话缓存要放 Redis；每个 worker 各自加载模型和连接池，资源要按 worker 数量乘算。
+    oral: |
+      我从调度和资源两个角度说。进程是资源单位，有独立内存和独立 GIL，最重但隔离最好；线程共享进程内存，由操作系统抢占调度，要注意加锁；协程是用户态的，由事件循环协作调度，只在 await 时切换，最轻但怕阻塞。
+      在我的 FastAPI 服务里三个都有：部署用 uvicorn 开四个 worker 进程；每个进程里一个事件循环，async 路由都是协程，负责调 LLM 和查库；少量同步 SDK 用 def 路由，跑在线程池里；PDF 解析这种重活放到进程池。
+      我踩过一个坑：内存里做限流，四个 worker 各算各的，限额实际放大了四倍，后来改成 Redis 计数才准确。
+  - id: d07-i3
+    kp: d07-k1
+    type: oral
+    difficulty: 3
+    question: 既然有 GIL，为什么 Python 多线程代码还需要加锁？举一个协程场景下也会出现的并发问题。
+    key_points:
+      - {text: "说明 GIL 保护解释器内部状态而非业务数据，只保证单条字节码原子", dim: principle}
+      - {text: "用 += 或先检查后写入说明复合操作会被拆成多条字节码导致竞态", dim: principle}
+      - {text: "指出 3.10 后不易复现但无保证，free-threaded 下更明显", dim: concept}
+      - {text: "给出协程跨 await 读改写交错的例子，如配额扣减", dim: project}
+      - {text: "给出解决方案：线程锁、asyncio.Lock、数据库原子更新或行锁", dim: engineering}
+    reference: |
+      GIL 保护的是解释器内部数据结构，保证的是单条字节码执行不被打断，而不是业务逻辑的原子性。像 `count += 1` 会被拆成读取、加法、写回多条字节码，线程在中间被切换就会丢失更新；「先检查 key 是否存在再写入」这种检查后操作同样存在竞态。CPython 3.10 之后线程切换只发生在特定位置，这类问题在本地很难复现，但语言层面没有任何保证，在 free-threaded 构建下会更频繁地暴露。所以共享可变状态仍然要用 threading.Lock，或者通过 queue 传递消息避免共享。
+      协程虽然是单线程、只在 await 处切换，但跨 await 的读改写同样会交错。例如扣减用户配额：请求 A 读取剩余 1 次，await 调用 LLM；期间请求 B 也读取到剩余 1 次，也去调用；两者都成功后各自写回 0，用户实际用了 2 次。
+      解决方式：单进程内可以用 asyncio.Lock 包住读改写；但多 worker 部署时进程内的锁无效，应依赖数据库原子操作，例如 `UPDATE quota SET remaining = remaining - 1 WHERE user_id = ? AND remaining > 0`，或使用行锁和 Redis 原子操作（Day 10、Day 41）。
+    oral: |
+      我的回答是：GIL 锁的是解释器，不是你的数据。它只保证一条字节码不被打断，但像 count 加等于一，其实是读、加、写三步，中间被切走就会丢更新。3.10 之后这种问题本地很难复现，但没有保证，换成无 GIL 的构建会更明显。
+      协程也有类似问题，只不过切换点在 await。比如扣配额：两个请求都先读到剩一次，都去 await 调模型，回来各自写零，用户就多用了一次。
+      我的做法是不在内存里做这种判断，因为多 worker 下内存锁也没用，直接用数据库的条件更新，remaining 大于零才减一，靠数据库保证原子性。
+  - id: d07-i4
+    kp: d07-k3
+    type: oral
+    difficulty: 3
+    question: 你的 AI 服务里有哪些任务是 CPU 密集的？你怎么处理它们，为什么不直接放在 FastAPI 的路由里？
+    key_points:
+      - {text: "列举 AI 后端中的 CPU 密集任务，如文档解析、切片、本地模型推理、大批量 Token 统计", dim: concept}
+      - {text: "说明 CPU 任务放在 async 路由会阻塞事件循环，放在 def 路由也受 GIL 限制且占用线程池", dim: principle}
+      - {text: "给出处理方式：进程池、后台任务队列、独立推理服务，并说明选择依据", dim: engineering}
+      - {text: "说明独立部署带来的隔离、独立扩容与批处理优势", dim: engineering}
+      - {text: "结合项目说明改造前后的指标变化", dim: project}
+    reference: |
+      AI 服务中典型的 CPU 密集任务有：PDF、Word 等文档解析，文本清洗、切片与去重，本地 tokenizer 对长文档批量统计 Token，本地 Embedding 或 Rerank 模型推理，以及大 JSON 的序列化。
+      不能直接放在路由里：放在 async 路由会阻塞事件循环，整个 worker 的所有请求都会变慢；放在 def 路由虽然不阻塞事件循环，但受 GIL 限制无法利用多核，还会占用默认只有 40 个令牌的线程池，同时让 Web 进程的资源需求变得不可预测。
+      处理方式按耗时和是否需要同步返回来选：单次百毫秒级且需要同步返回的，用进程池 `run_in_executor`；秒级以上或批量任务，放进后台任务队列，由独立 worker 处理，接口返回任务 ID；本地模型推理部署成独立的推理服务，Web 层通过 HTTP 调用，推理服务可以做批处理并按 GPU 独立扩容。
+      独立部署的好处是故障与资源隔离、各层独立扩容、模型只加载一份，以及长任务不受 HTTP 超时限制。
+    oral: |
+      我服务里的 CPU 密集任务主要是三类：文档解析和切片、长文档批量算 Token、本地 Rerank 模型推理。
+      它们不能直接放路由里。放 async 路由会卡住事件循环，所有人一起慢；放 def 路由虽然不卡循环，但有 GIL 吃不满多核，还占线程池。
+      所以我是按耗时分层处理的：百毫秒级、必须同步返回的，用进程池；入库这种分钟级的，丢后台任务队列，接口只返回任务 ID；Rerank 模型单独部署成推理服务，可以做批处理，也能单独扩 GPU。改完之后上传接口从四十秒降到三百毫秒返回，问答的 P99 也不再受上传影响。
+  - id: d07-i5
+    kp: d07-k4
+    type: oral
+    difficulty: 4
+    question: Python 3.14 之后 free-threaded 构建已经官方支持了，你会在生产的 AI 服务中采用吗？说说你的评估思路。
+    key_points:
+      - {text: "准确说明现状：3.13 实验，3.14 起官方支持但可选，默认仍带 GIL，第三阶段未定", dim: concept}
+      - {text: "说明收益集中在纯 Python CPU 密集多线程场景，IO 密集服务收益有限，且单线程有损耗", dim: principle}
+      - {text: "指出风险：C 扩展不兼容会自动重新启用 GIL，线程不安全代码暴露", dim: principle}
+      - {text: "给出评估步骤：CI 增加 free-threaded 测试、检查 sys._is_gil_enabled、基准测试、灰度", dim: engineering}
+      - {text: "给出针对自身项目的结论与适用范围", dim: project}
+    reference: |
+      先说现状：PEP 703 让 GIL 变为可选。3.13 的 free-threaded 构建是实验性的；3.14 按 PEP 779 进入第二阶段，官方支持但仍是可选构建，默认构建依然有 GIL；3.15 增加了面向 free-threaded 的稳定 ABI，方便 C 扩展适配。是否默认去掉 GIL 还没有决定。
+      收益分析：我的 AI 服务主体是 I/O 密集（LLM、数据库、向量库），已经用异步加多进程，free-threaded 带来的收益很有限，反而有约 5%~10% 的单线程损耗。真正可能受益的是纯 Python 的 CPU 密集环节，比如文档清洗和切片，可以用线程池替代进程池，省掉序列化和多份内存。
+      风险：第一，依赖的 C 扩展如果没有声明支持 free-threading，导入时 GIL 会被自动重新启用，等于白升级；第二，过去「靠 GIL 碰巧正确」的线程不安全代码会暴露；第三，部分库的 free-threaded wheel 可能还不完善。
+      评估步骤：在 CI 中增加 free-threaded 版本的测试矩阵；启动时记录 sys._is_gil_enabled() 并监控 GIL 重新启用的警告；对目标环节做基准测试对比进程池方案；先在离线任务或独立的 CPU 型服务中灰度。结论是：Web 主服务暂不切换，CPU 型的离线清洗服务可以先试点。
+    oral: |
+      我的结论是：主服务暂时不会切，但会在 CPU 型的离线服务里试点。
+      先说现状，3.13 是实验，3.14 起官方支持但还是可选构建，默认 Python 依然有 GIL，什么时候默认去掉还没定。
+      然后看收益：我的问答服务基本是 I/O 密集，异步加多进程已经够用，换无 GIL 反而有百分之五到十的单线程损耗。真正有收益的是文档清洗这种纯 Python 计算，可以用线程池替代进程池，省内存。
+      风险主要是两个：C 扩展不兼容会自动把 GIL 打开，还有以前靠 GIL 侥幸正确的线程不安全代码会暴露。所以我会先在 CI 加 free-threaded 测试，启动时检查 GIL 是否真的关闭，做基准对比，再灰度上线。
+code_reading:
+  id: d07-c1
+  kp: [d07-k1, d07-k3]
+  title: 文档批量切片入库接口
+  scenario: |
+    这是知识库后台的入库接口：运营在管理后台选择服务器上已上传的若干文本文件，调用 `/ingest`，服务读取文件、清洗切片、按内容哈希去重，返回切片数量供后续 Embedding 使用。
+    开发者说「已经用了 8 个线程并行，应该很快」，但 8 核服务器上处理 2000 个文件仍然很慢，而且偶尔返回的统计数字对不上。
+  language: python
+  code: |
+    import asyncio
+    import hashlib
+    import logging
+    from concurrent.futures import ThreadPoolExecutor
+    from pathlib import Path
+
+    from fastapi import FastAPI, HTTPException
+
+    logger = logging.getLogger(__name__)
+    app = FastAPI()
+
+    _pool = ThreadPoolExecutor(max_workers=8)
+    stats = {"files": 0, "chunks": 0}
+    CHUNK_SIZE = 800
+
+
+    def parse_and_chunk(path: str) -> list[str]:
+        text = Path(path).read_text(encoding="utf-8")
+        seen: set[str] = set()
+        chunks: list[str] = []
+        for start in range(0, len(text), CHUNK_SIZE):
+            piece = " ".join(text[start:start + CHUNK_SIZE].split())
+            digest = hashlib.sha256(piece.encode("utf-8")).hexdigest()
+            if piece and digest not in seen:
+                seen.add(digest)
+                chunks.append(piece)
+        stats["files"] += 1
+        stats["chunks"] += len(chunks)
+        return chunks
+
+
+    @app.post("/ingest")
+    async def ingest(paths: list[str]) -> dict:
+        loop = asyncio.get_running_loop()
+        futures = [loop.run_in_executor(_pool, parse_and_chunk, p) for p in paths]
+        results = await asyncio.gather(*futures, return_exceptions=True)
+        ok = [r for r in results if isinstance(r, list)]
+        failed = len(results) - len(ok)
+        if failed:
+            logger.warning("ingest: %d files failed", failed)
+        if not ok:
+            raise HTTPException(status_code=422, detail="no file parsed")
+        return {"files": len(ok), "chunks": sum(len(c) for c in ok), "stats": stats}
+  walkthrough:
+    function: |
+      接收一组服务器本地文件路径，并发读取并切片：每个文件按 800 字符切块，压缩空白，按 SHA-256 去掉文件内重复块；汇总成功文件数、切片数，并返回一个全局累计统计 `stats`。
+    key_functions: |
+      - `parse_and_chunk(path)`：在线程池中运行。读文件（I/O）→ 循环切片、`split/join` 清洗空白、计算哈希去重（CPU）→ 更新全局 `stats` → 返回切片列表。
+      - `ingest(paths)`：async 路由。用 `run_in_executor` 把每个文件提交到 8 线程的线程池，`gather(return_exceptions=True)` 等待全部完成，区分成功与失败，返回汇总。
+      - `_pool` 与 `stats` 是模块级全局对象，被所有请求共享。
+    params: |
+      - `paths: list[str]` 没有声明为 Query，FastAPI 会把它当作 JSON 请求体，例如 `["/data/a.txt", "/data/b.txt"]`。
+      - `run_in_executor(_pool, parse_and_chunk, p)` 把函数和位置参数交给线程池，返回 asyncio Future。
+      - `CHUNK_SIZE` 为模块常量，所有文件使用同样的切片大小。
+    data_flow: |
+      ```mermaid
+      flowchart TD
+        A["POST /ingest 请求体 文件路径列表"] --> B["run_in_executor 提交到 8 线程线程池"]
+        B --> C["线程 1 到 8 执行 parse_and_chunk"]
+        C --> D["read_text 读文件 释放 GIL"]
+        D --> E["切片 清洗空白 计算哈希 持有 GIL 纯 Python 计算"]
+        E --> F["stats 全局字典 加等于 多线程同时修改"]
+        F --> G["返回切片列表"]
+        G --> H["gather return_exceptions True 汇总"]
+        H --> I{"有成功文件吗"}
+        I -- "有" --> J["返回 files chunks 和全局 stats"]
+        I -- "没有" --> K["HTTP 422"]
+      ```
+    failure_points: |
+      - **问题 1：CPU 密集任务放进线程池，受 GIL 限制**。读文件阶段会释放 GIL，但切片、`split/join` 清洗、小块哈希都是持有 GIL 的 Python 层计算（800 字符的块很小，hashlib 对小数据不会释放 GIL）。8 个线程实际上轮流执行，CPU 只用满约一个核——这就是「8 线程仍然很慢」的原因。
+      - **问题 2：全局 `stats` 在多线程中做 `+=`，存在竞态**。`stats["files"] += 1` 是读-改-写多步操作，并发时可能丢失更新；而且它是跨请求累计的全局状态，多 worker 部署时每个进程各有一份，返回给调用方的数字天然不一致。
+      - `return_exceptions=True` 后只统计失败数量，没有记录是哪个文件、什么异常（编码错误、文件不存在），排查困难。
+      - **安全问题**：路径直接来自请求体，没有限制在允许的目录内，调用方可以读取服务器任意文件（如 `/etc/passwd`），存在路径穿越风险，必须做目录白名单与权限校验。
+      - 一次传入上万个路径会创建上万个 Future，内存与排队时间不可控，缺少数量上限。
+    debugging: |
+      - 先确认瓶颈类型：用 `time.perf_counter()` 与 `time.process_time()` 对单个文件计时，CPU 时间接近墙上时间说明是 CPU 密集。
+      - 运行时用 `py-spy top --pid <PID>` 观察，热点集中在 `parse_and_chunk` 的切片和 `join` 行；系统监控中进程 CPU 约 100% 而不是 800%。
+      - 复现竞态：写测试用 8 线程对 1000 个小文件调用 `parse_and_chunk`，比较 `stats["files"]` 与实际文件数（可能需要多次运行或在 free-threaded 构建下更容易复现）。
+      - 失败排查：把 `results` 中的异常和对应路径一起记录：`for p, r in zip(paths, results): if isinstance(r, Exception): logger.error(...)`。
+    change_request: |
+      **需求：把 2000 个文件的处理时间缩短到原来的 1/5，并且统计准确。**
+      - 线程池换成 `ProcessPoolExecutor(max_workers=os.cpu_count() - 1)`，`parse_and_chunk` 是模块顶层函数、参数是字符串，可以被 pickle；Windows/macOS 下注意入口保护。
+      - 删除函数内对全局 `stats` 的修改：换成进程池后子进程修改的是自己的副本，父进程看不到。统计改为在父进程根据返回值汇总；需要跨请求累计的数据写入数据库或 Redis。
+      - 增加路径白名单校验（`Path(p).resolve()` 必须位于允许的根目录下）与单次文件数上限。
+      - 对超大批量改为后台任务，接口返回任务 ID。
+  questions:
+    - id: d07-c1-q1
+      kp: d07-k1
+      type: code
+      question: 按执行顺序说明一个文件在线程池里经历的步骤，指出哪些步骤会释放 GIL、哪些步骤持有 GIL，并据此解释为什么 8 个线程在 8 核机器上 CPU 只用满约一个核。
+      key_points:
+        - {text: "说明 read_text 读文件属于阻塞 IO，期间释放 GIL", dim: principle}
+        - {text: "说明切片、split 和 join 清洗、小块 sha256 与集合判断都是持有 GIL 的计算", dim: principle}
+        - {text: "说明计算阶段同一时刻只有一个线程执行字节码，线程轮流运行，因此只用到约一个核", dim: principle}
+        - {text: "给出改为进程池或独立 worker 的方案，并说明进程有独立 GIL", dim: engineering}
+      reference: |
+        执行顺序：线程从线程池队列取到任务 → `Path(path).read_text()` 读取文件 → 按 800 字符循环切片 → 每块 `split()` 再 `" ".join()` 压缩空白 → 编码后计算 SHA-256 → 判断是否在 `seen` 集合中，不在就加入切片列表 → 更新全局 `stats` → 返回列表。
+        读文件是阻塞 I/O，底层系统调用前会释放 GIL，这一段多个线程可以重叠。之后的切片、字符串处理、集合操作都是纯 Python 字节码，必须持有 GIL；hashlib 只在处理较大数据时才释放 GIL，800 字符的小块基本不会释放。
+        由于文本文件读取很快，大部分时间花在计算阶段，而计算阶段同一时刻只有一个线程能执行字节码，其余 7 个线程在等 GIL，所以进程 CPU 只能接近 100%（一个核），总耗时与单线程差不多，还多了切换开销。
+        改进：用 `ProcessPoolExecutor`，每个子进程有独立的解释器和 GIL，可以真正并行用满多核；或者把入库做成后台任务，由多进程 worker 处理。
+    - id: d07-c1-q2
+      kp: d07-k3
+      type: code
+      question: 同事把 `ThreadPoolExecutor` 直接替换成 `ProcessPoolExecutor`，其他代码不变。请说明处理速度、`stats` 返回值、异常处理三方面分别会发生什么变化，以及还需要改哪些地方。
+      key_points:
+        - {text: "说明速度会提升，因为每个子进程有独立 GIL 可以用满多核，但有进程启动与参数结果序列化开销", dim: principle}
+        - {text: "指出子进程修改的是自己的 stats 副本，父进程返回的 stats 始终不变或不准确", dim: principle}
+        - {text: "说明子进程中的异常会被序列化传回父进程，gather 仍能收到，但无法 pickle 的异常或对象会导致新的错误", dim: concept}
+        - {text: "指出需要在父进程汇总统计、注意入口保护与可 pickle 约束、记录失败文件", dim: engineering}
+      reference: |
+        **速度：** 子进程各有独立解释器和 GIL，CPU 密集的切片与清洗可以并行，8 核机器上处理时间会显著下降。代价是首次启动子进程的开销，以及参数（路径字符串）和结果（切片列表）需要 pickle 序列化传输；这里传的是路径而不是大文本，开销可以接受，但返回的切片列表很大时仍有成本。
+        **stats：** 子进程拥有自己的内存，`stats["files"] += 1` 修改的是子进程里的副本，父进程中的 `stats` 不会变化。接口返回的 `stats` 会一直是初始值（或只反映父进程里的旧值），统计彻底失真。
+        **异常：** 子进程中抛出的异常会被 pickle 后在父进程的 Future 上重新抛出，`gather(return_exceptions=True)` 仍能收到；但如果异常对象或返回值无法被 pickle，会出现新的序列化错误。
+        **还需要改：** 删除子进程内对全局变量的修改，在父进程根据返回结果汇总；跨请求的累计统计写入数据库或 Redis；确认 `parse_and_chunk` 是模块顶层函数，入口在 Windows/macOS 的 spawn 模式下有 `if __name__ == "__main__":` 保护（由 uvicorn 启动时通常已满足，但在脚本中测试需注意）；把失败的路径与异常写入日志；进程池在 lifespan 中创建和关闭。
+    - id: d07-c1-q3
+      kp: d07-k1
+      type: code
+      question: 不考虑性能，请从「并发安全」和「安全」两个角度审查这段代码，找出至少两个问题，说明可能的后果和修复方式。
+      key_points:
+        - {text: "指出全局 stats 在多线程中执行加等于是非原子读改写，可能丢失更新", dim: principle}
+        - {text: "指出 stats 跨请求跨 worker 共享且返回给调用方，数据不一致且可能泄露其他请求信息", dim: engineering}
+        - {text: "指出路径来自请求体且未做目录限制，存在任意文件读取或路径穿越风险", dim: engineering}
+        - {text: "给出修复：加锁或改为局部汇总、外部存储计数、路径 resolve 后白名单校验与鉴权", dim: engineering}
+      reference: |
+        **并发安全问题：** `stats["files"] += 1` 和 `stats["chunks"] += len(chunks)` 由 8 个线程同时执行。这是读取、相加、写回的复合操作，GIL 不保证其原子性，线程在中间被切换就会丢失更新，导致统计偏小；在 free-threaded 构建下问题会更频繁。此外，`stats` 是跨请求累计的全局变量，多个请求同时调用时数字互相叠加；多 worker 部署时每个进程各有一份，调用方看到的数字随机变化。修复：函数只返回结果，在请求内汇总；必须全局累计时用 `threading.Lock` 保护，或者更好地写入数据库或 Redis 原子计数。
+        **安全问题：** `paths` 直接来自请求体并传给 `Path(path).read_text()`，没有任何目录限制或权限校验。调用方可以传入 `/etc/passwd`、配置文件或其他租户的数据路径，读取服务器任意文件；虽然接口只返回数量，但切片后续会进入 Embedding 和检索，可能导致敏感内容被问答泄露。修复：只接受文件 ID 而不是路径，由服务端映射到存储位置；如果必须接收路径，先 `resolve()` 再校验必须位于允许的根目录下，同时校验当前用户对该文件有权限。
+        **其他：** 失败只记录数量不记录原因；没有限制单次文件数量，可能被一次性提交上万个路径拖垮服务。
+sources:
+  - {title: "PEP 779 - Criteria for supported status for free-threaded Python", url: "https://peps.python.org/pep-0779/"}
+  - {title: "Python HOWTO - Python support for free threading", url: "https://docs.python.org/3/howto/free-threading-python.html"}
+  - {title: "What's New in Python 3.14", url: "https://docs.python.org/3/whatsnew/3.14.html"}
+  - {title: "What's New in Python 3.15", url: "https://docs.python.org/3/whatsnew/3.15.html"}
+  - {title: "Python Docs - asyncio and free-threaded Python", url: "https://docs.python.org/3/library/asyncio-threading.html"}
+  - {title: "Python Docs - Coroutines and Tasks (to_thread)", url: "https://docs.python.org/3/library/asyncio-task.html"}

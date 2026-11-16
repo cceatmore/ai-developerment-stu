@@ -1,0 +1,950 @@
+day: 36
+phase: 4
+title: LangGraph 基础：State、Node、Edge、Reducer 与条件边，从手写循环迁移到图
+goals:
+  - 能说清 LangGraph 相比 Day 32 手写 while 循环多了什么、什么时候不值得引入
+  - 能设计一个 State 并给每个字段选对 reducer（覆盖、追加、按 ID 合并），解释并行写冲突为什么报错
+  - 能用 StateGraph + 条件边画出 ReAct 循环，并说清 compile、super-step、recursion_limit 的作用
+  - 能判断一个需求该用 create_agent + middleware 还是手写 StateGraph
+minutes: 60
+resources:
+  - title: "LangChain Academy：Introduction to LangGraph（Python）"
+    url: "https://academy.langchain.com/courses/intro-to-langgraph"
+    kind: course
+    lang: en
+    minutes: 90
+    note: "免费官方课。今天只看 Module 1 第 1~7 课（Simple Graph、Router、Agent）和 Module 2 的 State Schema、State Reducers 两课，对应 k2、k3"
+  - title: "Hello-Agents 第六章 6.5 LangGraph"
+    url: "https://github.com/datawhalechina/hello-agents"
+    kind: repo
+    lang: zh
+    minutes: 25
+    note: "中文入门。看 6.5.1 结构梳理和 6.5.2 三步问答助手，用中文把 State、节点、边过一遍；注意书中示例版本可能早于 langgraph 1.x，导入路径以官方文档为准"
+  - title: "LangGraph 官方文档：Graph API overview"
+    url: "https://docs.langchain.com/oss/python/langgraph/graph-api"
+    kind: doc
+    lang: en
+    minutes: 30
+    note: "当字典查。重点读 State 与 Reducers、Working with messages、Conditional edges、Command、Recursion limit 五节，今天的时效信息都以这里为准"
+knowledge_points:
+  - id: d36-k1
+    name: LangGraph 的定位：把手写循环变成可持久化的图
+    level: P1
+    summary: LangGraph 把 Agent 循环拆成节点和边、状态集中管理，换来可持久化、可中断、可观测；它是底层运行时，不替你思考
+    analogy: |
+      **像 Pinia store + XState 状态机的组合。** State 相当于 store，节点相当于 action，边相当于状态机里的 transition（「在哪个状态、满足什么条件、去哪个状态」）。
+
+      **不一样的地方：**
+      - Pinia 的 action 直接改 store；LangGraph 的节点**只返回部分更新**，由框架按 reducer 合并。
+      - Pinia 是响应式、改完立即生效；LangGraph 按 **super-step（一轮）批量合并**，同一轮并行节点看到的是同一份旧状态。
+      - XState 状态机只管流程；LangGraph 每一步之后都可以**存一个快照**（checkpoint，见 Day 37），进程重启后还能接着跑。
+    why: |
+      Day 32 你手写过 ReAct 循环：一个 while，里面调模型、执行工具、拼消息。**20 行就能跑**，但需求一多就开始失控：
+      - 要在派单前**等人审批**，可能等一天，while 循环没法「暂停到明天」；
+      - 要**并行**查设备和告警，再汇总；
+      - 要知道 Agent **卡在哪一步**、每步状态是什么。
+      这些都是「运行时」问题，LangGraph 就是为这些问题准备的底层框架。
+    problem: |
+      解决「**Agent 流程变复杂后，循环代码难以暂停、恢复、并行和观测**」的问题。
+      手写循环把状态散落在局部变量里，进程一挂就全没了；分支逻辑埋在 if/else 里，没人看得懂流程。
+      LangGraph 把**状态**（State）、**步骤**（Node）、**跳转**（Edge）显式化，框架负责调度、合并状态和保存快照。
+    principle: |
+      **一、手写循环 vs 图，对照着看**
+
+      ```mermaid
+      flowchart LR
+        subgraph H["Day 32 手写循环"]
+          H1["while True"] --> H2["调模型"]
+          H2 --> H3{"有 tool_calls"}
+          H3 -- "有" --> H4["执行工具 追加消息"]
+          H4 --> H1
+          H3 -- "没有" --> H5["break 返回"]
+        end
+        subgraph G["LangGraph 图"]
+          G0["START"] --> G1["节点 agent"]
+          G1 --> G2{"条件边 route"}
+          G2 -- "tools" --> G3["节点 tools"]
+          G3 --> G1
+          G2 -- "END" --> G4["END"]
+        end
+      ```
+
+      逻辑完全一样，区别在于**谁掌握控制流**：手写时是你的 while；图里是 LangGraph 运行时。控制流交出去之后，运行时才能在每一步之间**插入能力**：存快照、暂停等人、并行、流式推送、追踪。
+
+      **二、LangGraph 给了什么、没给什么**
+
+      | 给了 | 没给 |
+      |---|---|
+      | 状态管理与合并（reducer） | Prompt 怎么写 |
+      | 持久化与断点恢复（checkpointer） | 工具怎么设计（见 Day 33） |
+      | 人工介入（interrupt） | 模型选择和效果 |
+      | 流式输出、并行、子图 | 业务规则本身 |
+
+      官方的说法是：LangGraph 是**低层编排运行时**，不抽象 Prompt 和架构。
+
+      **三、LangChain 生态的三层**
+
+      - **LangGraph**：运行时，`StateGraph` 手写图，最灵活。
+      - **LangChain `create_agent`**：建在 LangGraph 上的**最小 Agent**，返回的就是一个编译好的图，用 middleware 定制（见 k4）。
+      - **Deep Agents**：建在 `create_agent` 上、自带规划、文件系统、子 Agent 的**重型 harness**（见 Day 40）。
+
+      选择原则：**能用上层就用上层，上层装不下的流程再下沉到 StateGraph。**
+
+      **四、什么时候不值得引入**
+
+      - 固定两三步的流水线（Day 31 的 Workflow），普通函数串起来就够了；
+      - 一次性脚本、不需要暂停和恢复；
+      - 团队不熟 Python 异步，引入框架反而增加排错成本。
+    scenarios: |
+      - **需要人工审批的流程**：派单、退款、发通知前暂停，审批后从断点继续（Day 37 展开）。
+      - **有并行分支的流程**：同时查设备状态、告警、客流，再由汇总节点出结论。
+      - **长任务和多轮会话**：每一步自动存快照，服务重启不丢进度。
+      - **流程需要给非开发同事看**：图可以导出成 Mermaid，评审时一眼看清分支。
+    pitfalls: |
+      - **把 LangGraph 当成「让 Agent 更聪明」的工具**：它不改善模型推理，Prompt 和工具设计差，换框架照样差。
+      - **简单流程也上图**：三步固定流水线画成图，多了一层抽象和依赖，排错更难。
+      - **以为必须用 LangChain 的模型类**：节点就是普通函数，里面直接调 OpenAI SDK 或 httpx 都可以；只是用 LangChain 消息类型时，流式和追踪能力更完整。
+      - **照抄旧教程**：大量博客还在用 `create_react_agent`，langgraph 1.x 已推荐改用 LangChain 的 `create_agent`。
+    interview_asks:
+      - question: "为什么不继续用手写循环，而要引入 LangGraph？它到底解决了什么？"
+        answer: "手写循环在要暂停、恢复、人审批、持久化每一步时会变成一堆状态代码。LangGraph 把步骤画成图，每步自动存档，可以停下来以后再继续。简单的三步调用用不上它。"
+      - question: "LangGraph、LangChain create_agent、Deep Agents 是什么关系？"
+        answer: "LangGraph 是底层的图和状态。create_agent 是在图上面包好的常见 ReAct 代理。Deep Agents 是更上层的产品形态。能用现成代理就不要先手写图；要自定义暂停和状态时再落到 LangGraph。"
+      - question: "什么场景你会选择不用 LangGraph？"
+        answer: "没有暂停恢复、没有人审批、步骤固定的请求。用普通函数更清楚。引入图会多一层状态和版本，不划算。"
+    project_example: |
+      **p2 智慧园区运营 Agent：** Day 32 我们手写了 ReAct 循环，能查设备和告警。今天把它迁移成图：`agent` 节点调模型，`tools` 节点执行查询工具，条件边判断是否还有工具调用。
+
+      迁移本身不改效果，但为 Day 37 铺路：「生成工单」必须等值班长审批，审批可能隔天。手写循环做不到暂停到明天，图 + checkpointer 可以。面试时这样说：**「迁移的动机是审批和断点恢复，而不是框架更先进。」**
+    freshness: |
+      核对日期 2026-11。PyPI 上 langgraph 最新为 1.2.x（本次核对 1.2.20），依赖 langgraph-checkpoint 4.x、langchain-core 1.4+。LangChain 1.x 的 `create_agent` 底层就是 LangGraph 图；旧的 `langgraph.prebuilt.create_react_agent` 属于旧写法，新代码不要再用。Deep Agents（deepagents 0.7.x）建在 create_agent 之上。
+    sources:
+      - title: "LangGraph Graph API overview"
+        url: "https://docs.langchain.com/oss/python/langgraph/graph-api"
+      - title: "langgraph · PyPI"
+        url: "https://pypi.org/project/langgraph/"
+      - title: "Deep Agents overview"
+        url: "https://docs.langchain.com/oss/python/deepagents/overview"
+  - id: d36-k2
+    name: State 与 Reducer：节点只返回更新，框架负责合并
+    level: P0
+    summary: State 是全图共享的数据结构；节点返回部分更新，每个字段由 reducer 决定覆盖、追加还是按 ID 合并
+    analogy: |
+      **像 Pinia 的 `store.$patch({ ... })`。** 你只传要改的字段，没传的保持不变；节点返回 `{"alarms": [...]}` 也一样，其他字段不动。
+
+      **不一样的地方：**
+      - `$patch` 对数组是**直接替换**；LangGraph 可以给字段声明 reducer，让数组**追加**或**按 ID 合并**。
+      - Pinia 里你可以随手 `store.list.push(x)`；LangGraph 节点里**原地修改 state 不会被可靠记录**，必须通过返回值更新。
+      - 同一轮两个并行节点写同一个字段：Pinia 是后写的赢；LangGraph 没有 reducer 时**直接报错**。
+    why: |
+      State 设计决定了 Agent 后面能不能扩展。字段没选对 reducer，常见后果是：
+      - 第二轮对话**消息历史被覆盖**，模型像失忆；
+      - 并行分支一上线就报 **InvalidUpdateError**；
+      - 想清空一个列表却怎么也清不掉。
+      这三类问题都不是模型问题，而是 State 定义问题，面试也爱问。
+    problem: |
+      解决「**多个节点、甚至并行节点都要读写同一份状态时，怎么合并才不丢数据、不打架**」的问题。
+      LangGraph 的答案是：节点**不直接改状态**，只返回「我想改什么」；每个字段配一个 **reducer 函数**，规定新值和旧值怎么合并。这样合并规则集中在 State 定义处，而不是散落在各个节点里。
+    principle: |
+      **一、State 怎么定义**
+
+      最常用 `TypedDict`（就是带类型的字典，类似 TS 的 `interface`）。也可以用 dataclass 或 Pydantic，但 LangChain 的 `create_agent` 自定义状态**只支持 TypedDict**。
+
+      ```python
+      from typing import Annotated
+      from typing_extensions import TypedDict
+      import operator
+      from langchain.messages import AnyMessage
+      from langgraph.graph.message import add_messages
+
+      class State(TypedDict):
+          messages: Annotated[list[AnyMessage], add_messages]  # 按消息 ID 合并
+          alarm_ids: Annotated[list[str], operator.add]        # 追加
+          building: str                                        # 默认：覆盖
+      ```
+
+      `Annotated[类型, reducer]` 是 Python 给类型「贴附加信息」的写法，LangGraph 读这个信息找 reducer。
+
+      **二、三种常用 reducer**
+
+      | 写法 | 行为 | 适合 |
+      |---|---|---|
+      | 不写 | **覆盖**：新值替换旧值 | 当前楼栋、当前步骤、最终答案 |
+      | `operator.add` | **追加**：旧列表 + 新列表 | 日志、已查过的 ID |
+      | `add_messages` | **按消息 ID 合并**：新 ID 追加，同 ID 替换 | 对话消息 |
+
+      `add_messages` 比 `operator.add` 多两个能力：**同 ID 的消息会被替换**（能改写历史消息），还能把 `{"role": "user", "content": "..."}` 这种字典自动转成消息对象。图里只需要消息时，直接用内置的 `MessagesState`。
+
+      **三、一次更新是怎么合并的**
+
+      ```mermaid
+      flowchart LR
+        S0["旧 State"] --> N["节点函数 读取 State"]
+        N --> U["返回部分更新 只含要改的字段"]
+        U --> R{"该字段有 reducer"}
+        R -- "没有" --> W["新值覆盖旧值"]
+        R -- "有" --> M["调用 reducer 合并新旧值"]
+        W --> S1["新 State"]
+        M --> S1
+      ```
+
+      **四、并行写同一个字段**
+
+      两个节点在**同一个 super-step** 并行执行，都返回了 `building`：
+      - 字段**没有 reducer** → 框架不知道听谁的，抛 **`InvalidUpdateError`**；
+      - 字段**有 reducer** → 依次调用 reducer 合并，不报错。
+
+      所以只要一个字段可能被并行分支写，就**必须**给它 reducer。
+
+      **五、想绕过 reducer 怎么办**
+
+      `operator.add` 的字段，你返回空列表 `[]` 只会「加了个空」，**清不掉**。官方提供 `Overwrite`（从 `langgraph.types` 导入）：返回 `{"alarm_ids": Overwrite([])}` 直接替换，跳过 reducer。注意同一轮里**多个节点都 Overwrite 同一字段**也会报 `InvalidUpdateError`。
+
+      **六、输入输出 schema 和私有字段**
+
+      图可以声明 `input_schema` / `output_schema`，只暴露部分字段给调用方；节点之间也可以用私有字段传中间结果。前端类比：组件的 props 和内部 data 分开。
+    scenarios: |
+      - **多轮对话**：`messages` 用 `add_messages`，每轮只返回新消息，历史自动保留。
+      - **并行查询汇总**：设备、告警两个分支都往 `findings` 写结果，用 `operator.add` 追加，汇总节点统一读取。
+      - **改写历史消息**：上下文太长时，用同 ID 的摘要消息替换旧消息（Day 35 记忆压缩的落地方式之一）。
+      - **对外只暴露必要字段**：用 output_schema 只返回 `answer`，不把中间推理泄露给前端。
+    code: |
+      ```python
+      import operator
+      from typing import Annotated
+      from typing_extensions import TypedDict
+      from langgraph.graph import StateGraph, START, END
+      from langgraph.types import Overwrite
+
+
+      class State(TypedDict):
+          building: str                                  # 覆盖
+          findings: Annotated[list[str], operator.add]   # 追加
+
+
+      def check_devices(state: State) -> dict:
+          return {"findings": [f"{state['building']} 有 2 台空调离线"]}
+
+
+      def check_alarms(state: State) -> dict:
+          return {"findings": [f"{state['building']} 有 1 条烟感告警"]}
+
+
+      def reset(state: State) -> dict:
+          # 返回 [] 清不掉追加型字段，要用 Overwrite 跳过 reducer
+          return {"findings": Overwrite([])}
+
+
+      builder = StateGraph(State)
+      builder.add_node("check_devices", check_devices)
+      builder.add_node("check_alarms", check_alarms)
+      builder.add_edge(START, "check_devices")   # 两条边从 START 出发
+      builder.add_edge(START, "check_alarms")    # 两个节点在同一轮并行
+      builder.add_edge("check_devices", END)
+      builder.add_edge("check_alarms", END)
+      graph = builder.compile()
+
+      print(graph.invoke({"building": "3号楼", "findings": []}))
+      # findings 里有两条结果；若去掉 operator.add，会抛 InvalidUpdateError
+      ```
+    pitfalls: |
+      - **messages 字段忘了写 reducer**：每个节点返回新消息都会覆盖整个列表，模型只看到最后一条，表现为「失忆」。
+      - **在节点里原地修改**：`state["findings"].append(x)` 后返回 `None`，这次修改不经过 reducer，也不会被可靠地存进快照。**一律通过返回值更新。**
+      - **用 `[]` 清空追加字段**：`operator.add` 下返回空列表等于没改，要用 `Overwrite([])`。
+      - **消息用 `operator.add`**：能追加但不能按 ID 替换，后续做摘要压缩、修改工具消息时会很别扭。
+      - **State 塞太多大对象**：每一步都会进快照（Day 37），把整份 PDF 原文放进 State 会让存储和恢复都变慢，大数据放外部存储、State 里只放引用。
+    interview_asks:
+      - question: "LangGraph 的 reducer 是什么？add_messages 和 operator.add 有什么区别？"
+        answer: "节点返回的是更新，不是整份新状态。reducer 决定怎么并进旧状态。add_messages 按消息 id 追加或替换消息。operator.add 是把列表接起来。选错会把历史覆盖掉或重复接上。"
+      - question: "两个并行节点写同一个字段会发生什么？怎么解决？"
+        answer: "没有 reducer 时后写的会盖掉先写的，结果不稳定。给这个字段定义 reducer，比如列表追加。或者让它们写不同字段，后面再合并。"
+      - question: "节点里直接修改 state 有什么问题？"
+        answer: "框架按返回值合并，你就地改的对象可能污染检查点或别的分支。节点应返回更新，不改入参。这样重放和并行才可预测。"
+    project_example: |
+      **p2 智慧园区运营 Agent 的 State：**
+
+      - `messages`：`add_messages`，多轮对话历史；
+      - `building`：覆盖，当前讨论的楼栋；
+      - `findings`：`operator.add`，设备、告警、客流三个并行查询分支各自追加结论；
+      - `ticket_draft`：覆盖，待审批的工单草稿（Day 37 用它做审批）。
+
+      第一版我们把 `findings` 写成普通 list，并行分支一上线就报 InvalidUpdateError，加上 `operator.add` 才解决。这是一个可以直接讲给面试官的真实排错故事。
+    freshness: |
+      核对日期 2026-11（langgraph 1.2.x）。默认 reducer 是覆盖；`add_messages` 从 `langgraph.graph.message` 导入，`Overwrite`、`Send`、`Command` 从 `langgraph.types` 导入。消息类型在 LangChain 1.x 推荐 `from langchain.messages import AnyMessage`（旧代码常见 `langchain_core.messages`，仍可用）。create_agent 的自定义 state 只支持 TypedDict。
+    sources:
+      - title: "LangGraph Graph API：State 与 Reducers"
+        url: "https://docs.langchain.com/oss/python/langgraph/graph-api"
+  - id: d36-k3
+    name: Node、Edge 与条件边：把 ReAct 循环画成图并跑起来
+    level: P0
+    summary: 节点是读 State、返回更新的函数；普通边固定跳转，条件边按函数返回值路由；compile 后按 super-step 执行
+    analogy: |
+      **像 Vue Router 的导航守卫 + 路由表。** 普通边是固定路由（A 之后一定去 B），条件边像 `beforeEach` 里根据条件 `return '/login'` 或放行。
+
+      **不一样的地方：**
+      - 路由守卫只决定「去哪」；LangGraph 的节点还会**修改 State**。
+      - 前端路由不会自己无限跳转；Agent 图有环（agent ↔ tools），**必须靠条件边走到 END**，否则会一直转到 recursion_limit 报错。
+    why: |
+      State 定好后，真正决定 Agent 行为的是**图的结构**：哪些步骤由代码固定、哪些由模型决定。
+      面试官常让你在白板上画一个 Agent 的图，并追问「怎么保证它会停下来」「怎么并行」。画得清楚，说明你真懂 Agent 控制流，而不是只会调 API。
+    problem: |
+      解决「**怎么用显式结构表达 Agent 的循环、分支和并行，并保证它能终止**」的问题。
+      手写循环里，跳转逻辑藏在 if/else 和 break 里；图把每个跳转写成边，**条件边**负责「模型说要调工具就去 tools，否则结束」这种动态决策，运行时负责调度和限制最大步数。
+    principle: |
+      **一、节点（Node）**
+
+      节点就是一个普通函数：**读 State，返回部分更新**。可以是同步函数，也可以是 `async def`。签名可选三种参数：
+
+      - `state`：当前状态；
+      - `config`：运行配置（如 `thread_id`）；
+      - `runtime`：运行时上下文，用 `context_schema` 声明，调用时 `graph.invoke(..., context={...})` 传入，适合放用户 ID、数据库连接这类**不该进 State 的依赖**。
+
+      **二、边（Edge）的四种**
+
+      | 写法 | 含义 |
+      |---|---|
+      | `add_edge(START, "a")` | 入口 |
+      | `add_edge("a", "b")` | 普通边：a 之后一定去 b |
+      | `add_conditional_edges("a", route)` | 条件边：调用 `route(state)`，按返回值决定下一步 |
+      | 一个节点多条普通边 | 扇出：下一轮这些节点**并行**执行 |
+
+      条件边的路由函数可以返回：**节点名**、**`END`**、**节点名列表**（并行去多个）、或 `Send` 对象（见第五节）。可以传第三个参数 path map，把返回值映射成节点名，图的可视化会更清楚。
+
+      **三、ReAct 循环的图**
+
+      ```mermaid
+      stateDiagram-v2
+        [*] --> agent
+        agent --> tools: 最后一条消息有 tool_calls
+        agent --> [*]: 没有 tool_calls 直接回答
+        tools --> agent: 工具结果写回 messages
+      ```
+
+      `tools` 节点可以自己写，也可以用 `langgraph.prebuilt` 里的 `ToolNode` 和 `tools_condition`。
+
+      **四、compile 和 super-step**
+
+      - **必须先 `compile()` 才能 `invoke` / `stream`**。compile 会做结构检查（例如有没有孤立节点），也是挂 checkpointer、设置静态断点的地方。
+      - 执行模型来自 Google 的 Pregel：按**一轮一轮（super-step）**推进。同一轮里被激活的节点**并行**执行，它们都读同一份旧 State；本轮结束后统一合并更新，再决定下一轮激活谁。
+      - **recursion_limit** 限制最多执行多少个 super-step，超过抛 `GraphRecursionError`。它是**防死循环的兜底**，不是业务上的「最多调用几次工具」（那个用 Day 34 讲的预算或 k4 的 middleware）。
+
+      **五、两个进阶工具：Command 和 Send**
+
+      - **`Command`**：节点**同时返回更新和跳转**，`return Command(update={...}, goto="tools")`。适合「更新状态的同时决定去哪」，常用于多 Agent handoff（见 Day 39）。
+      - **`Send`**：在条件边里返回 `[Send("worker", {...}) for x in items]`，把**数量运行时才知道**的子任务分发给同一个节点并行处理，即 map-reduce。
+
+      **六、一个官方明确的坑**
+
+      同一个节点**不要同时加普通边和条件边**（或同时返回 Command 跳转）。两条路都会被执行，结果往往是流程被意外分叉，下游节点执行两次。
+    scenarios: |
+      - **ReAct Agent**：agent ↔ tools 循环 + 条件边退出，最常见的形态。
+      - **按意图分流**：第一个节点分类问题，条件边把「查告警」「查客流」「闲聊」送到不同子流程。
+      - **map-reduce**：用户问「所有楼栋本周告警趋势」，用 `Send` 给每栋楼开一个并行任务，最后汇总。
+      - **固定流程中嵌一段 Agent**：校验 → Agent 查询 → 格式化输出，前后由普通边固定。
+    code: |
+      ```python
+      from langchain.chat_models import init_chat_model
+      from langchain.messages import ToolMessage
+      from langchain.tools import tool
+      from langgraph.graph import StateGraph, MessagesState, START, END
+
+
+      @tool
+      def query_alarms(building: str) -> str:
+          """查询指定楼栋当前未处理的告警。"""
+          return f"{building}：烟感告警 1 条，门禁离线 2 条"
+
+
+      tools = {"query_alarms": query_alarms}
+      model = init_chat_model("openai:gpt-5.4-mini").bind_tools(list(tools.values()))
+
+
+      def agent(state: MessagesState) -> dict:
+          return {"messages": [model.invoke(state["messages"])]}
+
+
+      def run_tools(state: MessagesState) -> dict:
+          results = []
+          for call in state["messages"][-1].tool_calls:
+              output = tools[call["name"]].invoke(call["args"])
+              results.append(ToolMessage(content=output, tool_call_id=call["id"]))
+          return {"messages": results}
+
+
+      def route(state: MessagesState) -> str:
+          return "tools" if state["messages"][-1].tool_calls else END
+
+
+      builder = StateGraph(MessagesState)
+      builder.add_node("agent", agent)
+      builder.add_node("tools", run_tools)
+      builder.add_edge(START, "agent")
+      builder.add_conditional_edges("agent", route, ["tools", END])
+      builder.add_edge("tools", "agent")
+      graph = builder.compile()
+
+      result = graph.invoke(
+          {"messages": [{"role": "user", "content": "3号楼现在有什么告警？"}]},
+          {"recursion_limit": 30},  # 顶层配置项，不放在 configurable 里
+      )
+      print(result["messages"][-1].content)
+      ```
+    pitfalls: |
+      - **条件边永远不返回 END**：图会一直绕圈，直到撞上 recursion_limit 抛 GraphRecursionError。路由函数一定要有退出分支。
+      - **同一节点混用普通边和条件边**：两条路都走，下游执行两次，官方文档明确提醒不要这样写。
+      - **把 recursion_limit 当业务限流**：它数的是 super-step，不是工具调用次数；想限制「最多调 5 次模型」用 middleware 或 State 里的计数器。
+      - **以为默认上限是 25**：那是 langgraph 1.0.6 之前的老默认值，老文章仍这么写。现在默认上限很高，**生产上应根据业务显式设置**。
+      - **recursion_limit 写进 configurable**：它是 config 的顶层键，写进 configurable 不生效。
+      - **依赖、连接放进 State**：数据库连接不可序列化，放进 State 会导致快照失败，应走 `context`。
+    interview_asks:
+      - question: "画一下 ReAct Agent 在 LangGraph 里的图，怎么保证它会停？"
+        answer: "一个节点调模型，条件边判断：有工具调用就去工具节点，没有就结束。工具节点执行完回到模型节点。停止靠这条条件边，再加上 recursion_limit，不要依赖默认上限。"
+      - question: "什么是 super-step？并行节点怎么合并结果？"
+        answer: "一轮里同时触发的节点算一个 super-step，都完成后才进入下一轮。它们的更新在这一轮结束时按 reducer 合并。所以并行节点必须能合并，不能假设谁后谁先。"
+      - question: "Command 和条件边有什么区别？Send 用来做什么？"
+        answer: "条件边在图上声明「根据状态去哪」。Command 是节点执行时自己返回下一步去哪。Send 用来动态派出多个并行任务，比如每个子问题一个节点。固定分支用条件边，临时扇出用 Send。"
+    project_example: |
+      **p2 智慧园区运营 Agent 的主图：**
+
+      ```mermaid
+      flowchart TD
+        S["START"] --> C["classify 意图分类"]
+        C -->|"查询类"| A["agent 调模型"]
+        C -->|"闲聊"| R["reply 直接回答"]
+        A --> T{"route 有工具调用"}
+        T -->|"是"| X["tools 执行只读查询"]
+        X --> A
+        T -->|"否"| D["draft 生成结论或工单草稿"]
+        D --> E["END"]
+        R --> E
+      ```
+
+      **哪些由代码决定、哪些由模型决定：** 意图分类后的分流、`tools` 后必回 `agent` 是代码定的；要不要继续调工具由模型的 tool_calls 决定。我们把 recursion_limit 显式设为 30，同时用 middleware 限制单次最多 8 次模型调用，双保险防止成本失控。
+    freshness: |
+      核对日期 2026-11。recursion_limit 默认值变化过三次：langgraph 1.0.6 之前是 **25**，1.0.6~1.1.3 是 10000，**1.1.4 起是 10007**；可用环境变量 `LANGGRAPH_DEFAULT_RECURSION_LIMIT` 改全局默认。节点可接收 `runtime` 参数读取 `context_schema` 声明的上下文（旧代码多用 `config["configurable"]` 传依赖）。示例中的模型名仅作占位，以你实际可用的模型为准。
+    sources:
+      - title: "LangGraph Graph API：Nodes、Edges、Command、Recursion limit"
+        url: "https://docs.langchain.com/oss/python/langgraph/graph-api"
+  - id: d36-k4
+    name: create_agent 与 middleware：上层封装和手写图怎么选
+    level: P1
+    summary: create_agent 是建在 LangGraph 上的最小 Agent，返回编译好的图；用 middleware 在模型和工具调用前后插逻辑
+    analogy: |
+      **像 axios 拦截器 / Koa 洋葱模型。** `before_model` 像请求拦截器，`after_model` 像响应拦截器，`wrap_model_call` / `wrap_tool_call` 像 Koa 的 `await next()`，可以包住调用做重试、降级、计时。
+
+      **不一样的地方：**
+      - middleware 可以**修改 Agent 的 State**，还能直接跳到结束（`jump_to`），axios 拦截器做不到。
+      - middleware 跑在图里，它造成的状态变化也会**进快照**，可以被暂停和恢复。
+    why: |
+      大部分业务 Agent 其实就是「模型 + 工具 + 一些横切逻辑」：限制调用次数、敏感操作审批、上下文太长时摘要、模型挂了切备用。
+      这些用 `create_agent` + 内置 middleware **十几行就能配好**，没必要手写 StateGraph。知道上层能做到什么，才能判断什么时候该下沉。
+    problem: |
+      解决「**横切逻辑（限流、审批、重试、摘要、脱敏）如何不侵入 Agent 主循环地复用**」的问题。
+      手写图时这些逻辑要么塞进节点里，要么加一堆额外节点；middleware 把它们做成可插拔的钩子，按顺序挂在模型调用和工具调用周围。
+    principle: |
+      **一、create_agent 的基本用法**
+
+      ```python
+      from langchain.agents import create_agent
+      from langchain.agents.middleware import ModelCallLimitMiddleware
+
+      agent = create_agent(
+          model="openai:gpt-5.4-mini",
+          tools=[query_alarms, query_devices],
+          system_prompt="你是园区运营助手，只能查询，不能修改数据。",
+          middleware=[ModelCallLimitMiddleware(run_limit=8, exit_behavior="end")],
+      )
+      agent.invoke({"messages": [{"role": "user", "content": "3号楼有告警吗"}]})
+      ```
+
+      返回值就是一个**编译好的 LangGraph 图**，所以 stream、checkpointer、interrupt 都能用。
+
+      **二、钩子的位置**
+
+      ```mermaid
+      flowchart TD
+        BA["before_agent 开始时一次"] --> BM["before_model 每次调模型前"]
+        BM --> WM["wrap_model_call 包住模型调用"]
+        WM --> AM["after_model 每次模型返回后"]
+        AM --> Q{"有工具调用"}
+        Q -- "有" --> WT["wrap_tool_call 包住每次工具调用"]
+        WT --> BM
+        Q -- "没有" --> AA["after_agent 结束时一次"]
+      ```
+
+      - **节点式钩子**（before_* / after_*）：顺序执行，可以返回 State 更新或跳转；
+      - **包裹式钩子**（wrap_*）：拿到 handler，自己决定调用 0 次（短路）、1 次或多次（重试）。
+
+      **三、常用内置 middleware**
+
+      | 名字 | 解决什么 |
+      |---|---|
+      | `ModelCallLimitMiddleware` | 限制模型调用次数（`thread_limit` / `run_limit`），超限结束或报错 |
+      | `ToolCallLimitMiddleware` | 限制工具调用次数 |
+      | `HumanInTheLoopMiddleware` | 指定工具调用前暂停等人审批（**需要 checkpointer**，Day 37） |
+      | `SummarizationMiddleware` | 上下文接近上限时自动摘要旧消息 |
+      | `ModelRetryMiddleware` / `ModelFallbackMiddleware` | 模型失败重试、切备用模型 |
+      | `ToolRetryMiddleware` | 工具失败自动重试 |
+      | `PIIMiddleware` | 识别并脱敏手机号、邮箱等 |
+
+      **四、怎么选**
+
+      - 流程就是「模型自主调工具」，只差横切能力 → **create_agent + middleware**；
+      - 流程有**固定的分支、并行、多阶段**（先分类、再并行查询、再汇总、再审批）→ **手写 StateGraph**，必要时把 create_agent 做成其中一个节点或子图。
+    scenarios: |
+      - **快速做一个只读查询 Agent**：create_agent + 调用次数限制，半天上线。
+      - **写操作审批**：HumanInTheLoopMiddleware 只拦截 `create_ticket`，查询类工具不拦。
+      - **长会话**：SummarizationMiddleware 自动压缩旧消息，替代手写摘要节点。
+      - **主模型限流**：ModelFallbackMiddleware 自动切换到备用模型，前端无感知。
+    pitfalls: |
+      - **把 recursion_limit 当调用次数限制**：要限制模型调用次数，用 ModelCallLimitMiddleware 更准确、行为更可控。
+      - **HITL middleware 不配 checkpointer**：暂停后状态无处保存，无法恢复。
+      - **middleware 顺序随意**：多个 middleware 的 before_* 按列表顺序执行，after_* 反向执行，摘要和脱敏谁先谁后会影响结果。
+      - **还在用 create_react_agent**：langgraph 1.x 已标记为旧写法，新项目用 `langchain.agents.create_agent`。
+      - **硬把复杂流程塞进 middleware**：多阶段、并行流程写成 middleware 会很难读，应该下沉到 StateGraph。
+    interview_asks:
+      - question: "create_agent 和手写 StateGraph 你怎么选？"
+        answer: "标准的调工具循环用 create_agent，少写状态。要自己的步骤、人工节点或特殊状态，再写 StateGraph。不要为了「更可控」一开始就手写整张图。"
+      - question: "LangChain 1.x 的 middleware 有哪些钩子？举一个你用过的场景。"
+        answer: "可以在调模型前、工具前后插入逻辑。例如工具执行前统一做权限和参数校验，或者每步写日志。这样不必改每个工具。具体钩子名以你锁定的版本文档为准。"
+    project_example: |
+      **p2 智慧园区运营 Agent 的分工：**
+
+      - 「运营问答」子功能：用 `create_agent` + `ModelCallLimitMiddleware(run_limit=8)` + `SummarizationMiddleware`，只挂只读工具；
+      - 「告警处置」主流程：手写 StateGraph，因为有固定的分类 → 并行查询 → 生成工单草稿 → 审批四个阶段，问答 Agent 作为其中一个节点嵌进去。
+
+      面试时可以说：**「上层能装下的就用上层，有固定流程骨架的才下沉到图。」**
+    freshness: |
+      核对日期 2026-11。langchain 最新 1.5.x（要求 Python ≥3.11）。`create_agent` 从 `langchain.agents` 导入，middleware 从 `langchain.agents.middleware` 导入；钩子为 before_agent / before_model / after_model / after_agent / wrap_model_call / wrap_tool_call。旧写法 `langgraph.prebuilt.create_react_agent`、更早的 `initialize_agent` 都不要再用。
+    sources:
+      - title: "LangChain Built-in middleware"
+        url: "https://docs.langchain.com/oss/python/langchain/middleware/built-in"
+      - title: "LangChain Custom middleware"
+        url: "https://docs.langchain.com/oss/python/langchain/middleware/custom"
+      - title: "langchain · PyPI"
+        url: "https://pypi.org/project/langchain/"
+test:
+  - id: d36-t1
+    kp: d36-k1
+    type: single
+    question: 团队手写的 ReAct 循环已经稳定运行。新需求是「生成工单前要值班长审批，审批可能隔天才回复」。这时迁移到 LangGraph 最主要的收益是：
+    options:
+      - "模型推理会更准确，工具调错的概率下降"
+      - "能把暂停位置和状态持久化，隔天审批后从断点继续"
+      - "框架会自动压缩上下文，显著降低 Token 成本"
+      - "不再需要自己写工具函数和工具描述"
+    answer: [1]
+    explain: |
+      LangGraph 是运行时框架，核心价值是控制流交给运行时后，能在步骤之间存快照、暂停、恢复。隔天审批正需要「暂停到明天再接着跑」，手写 while 循环做不到。
+      它不改善模型推理，也不会自动替你压缩上下文或写工具，这些仍是 Prompt、middleware 和工具设计的事。
+  - id: d36-t2
+    kp: d36-k1
+    type: judge
+    question: LangGraph 的节点里只能调用 LangChain 的模型类，不能直接调用 OpenAI SDK 或 httpx。
+    answer: false
+    explain: |
+      节点就是普通的 Python 函数，读 State、返回更新，里面调用什么 SDK 都可以。
+      使用 LangChain 的模型和消息类型的好处是流式输出（messages 模式）和追踪集成更完整，但这不是强制要求。
+  - id: d36-t3
+    kp: d36-k1
+    type: multi
+    question: 关于 LangGraph、LangChain create_agent、Deep Agents 三者的关系，哪些说法正确？
+    options:
+      - "create_agent 返回的是一个编译好的 LangGraph 图"
+      - "Deep Agents 建在 create_agent 之上，自带规划、文件系统和子 Agent"
+      - "LangGraph 是 LangChain 的新版本，用了它就不需要 LangChain"
+      - "上层装不下的固定分支流程，可以下沉到手写 StateGraph"
+    answer: [0, 1, 3]
+    explain: |
+      三者是分层关系：LangGraph 是底层编排运行时；create_agent 是建在它上面的最小 Agent，返回编译好的图；Deep Agents 再往上加规划、文件系统、子 Agent 等能力。
+      LangGraph 不是 LangChain 的新版本，两者经常配合使用。流程有固定骨架时，下沉到 StateGraph 是正常选择。
+  - id: d36-t4
+    kp: d36-k1
+    type: single
+    question: 以下哪个需求**最不值得**引入 LangGraph？
+    options:
+      - "客服 Agent 退款前需要人工确认，确认可能在第二天"
+      - "同时查询设备、告警、客流三个系统，再由汇总步骤出结论"
+      - "固定三步：读 Excel、调一次模型生成摘要、写回数据库"
+      - "长任务需要每一步存档，服务重启后能继续"
+    answer: [2]
+    explain: |
+      固定三步、不需要暂停和并行的流水线，用普通函数串起来最简单，引入图只会多一层抽象和依赖。
+      跨天审批需要持久化和中断，并行查询需要扇出与合并，长任务需要断点恢复，这三类正是 LangGraph 的主场。
+  - id: d36-t5
+    kp: d36-k2
+    type: single
+    question: 下面的 State 定义上线后，用户反馈「Agent 第二步就忘了自己第一步查过什么」。最可能的原因是：
+    code: |
+      class State(TypedDict):
+          messages: list[AnyMessage]
+          building: str
+
+      def agent(state: State) -> dict:
+          reply = model.invoke(state["messages"])
+          return {"messages": [reply]}
+    options:
+      - "TypedDict 不能作为 State，必须改用 Pydantic"
+      - "messages 没有 reducer，每次返回都覆盖了整个历史"
+      - "model.invoke 不会读取 State 里的历史消息"
+      - "building 字段缺少默认值，导致状态被重置"
+    answer: [1]
+    explain: |
+      没有声明 reducer 的字段默认是覆盖。节点每次返回只含新回复的列表，整段历史就被替换成这一条，模型下一步只看到自己的回复，表现为失忆。
+      应写成 Annotated[list[AnyMessage], add_messages]，或直接用 MessagesState。TypedDict 完全可以做 State；model.invoke 读的就是传入的消息；building 没有默认值不会重置其他字段。
+  - id: d36-t6
+    kp: d36-k2
+    type: single
+    question: |
+      两个并行节点在同一个 super-step 里都返回了 `{"building": ...}`，而 building 字段没有声明 reducer。会发生什么？
+    options:
+      - "后执行完的节点结果覆盖先执行完的节点结果"
+      - "框架自动把两个字符串值合并成一个列表"
+      - "抛出 InvalidUpdateError，提示同一轮多次写入"
+      - "只保留按节点名字母序排在前面的那个结果"
+    answer: [2]
+    explain: |
+      没有 reducer 的字段在同一轮只能接收一个值。两个并行节点都写它，框架无法判断该听谁的，会抛 InvalidUpdateError。
+      LangGraph 不会按完成先后或字母序悄悄选一个，也不会自动转成列表。可能被并行写的字段必须声明 reducer。
+  - id: d36-t7
+    kp: d36-k2
+    type: judge
+    question: 在节点里写 `state["findings"].append(x)` 然后返回 None，也能可靠地把 x 写进状态并保存到快照里。
+    answer: false
+    explain: |
+      LangGraph 依据节点的返回值来更新状态和写快照，原地修改绕过了 reducer 和状态更新机制，结果不可靠，也可能不会进入 checkpoint。
+      正确写法是 return {"findings": [x]}，让 operator.add 等 reducer 负责合并。
+  - id: d36-t8
+    kp: d36-k2
+    type: multi
+    question: 对比 `add_messages` 和 `operator.add` 作为消息字段的 reducer，哪些说法正确？
+    options:
+      - "add_messages 遇到相同 ID 的消息会替换旧消息"
+      - "add_messages 能把 role/content 字典自动转成消息对象"
+      - "operator.add 也会按消息 ID 去重，二者只是名字不同"
+      - "需要用摘要替换旧消息时，add_messages 更合适"
+    answer: [0, 1, 3]
+    explain: |
+      add_messages 按消息 ID 合并：新 ID 追加、相同 ID 替换，还会把字典格式转成消息对象，所以改写历史、做摘要替换时更方便。
+      operator.add 只是简单的列表拼接，不看 ID，同一条消息重复返回就会重复出现。
+  - id: d36-t9
+    kp: d36-k2
+    type: single
+    question: "`findings: Annotated[list[str], operator.add]` 这个字段需要在新一轮任务开始时清空，正确的做法是："
+    options:
+      - "在节点里返回 {\"findings\": []}"
+      - "在节点里返回 {\"findings\": None}"
+      - "在节点里 state[\"findings\"].clear()"
+      - "返回 {\"findings\": Overwrite([])} 跳过 reducer"
+    answer: [3]
+    explain: |
+      operator.add 下返回空列表等于「旧列表加一个空列表」，内容不变；返回 None 会让 reducer 拼接时出错；原地 clear 不经过状态更新机制，不可靠。
+      Overwrite（从 langgraph.types 导入）专门用来绕过 reducer 直接替换值。
+  - id: d36-t10
+    kp: d36-k3
+    type: single
+    question: 某节点 `agent` 同时配置了 `add_edge("agent", "summary")` 和 `add_conditional_edges("agent", route)`。执行后最可能出现的现象是：
+    options:
+      - "条件边优先级更高，普通边被忽略"
+      - "compile 时直接报错，提示边冲突"
+      - "普通边优先级更高，条件边被忽略"
+      - "两条路都会执行，summary 和路由目标都被激活"
+    answer: [3]
+    explain: |
+      LangGraph 不会在两种边之间挑一个，而是两条都走：summary 和 route 返回的节点都会在下一轮被激活，流程被意外分叉，常见后果是下游执行两次。
+      官方文档明确提醒同一节点不要混用静态边和动态路由（条件边或 Command 跳转）。compile 也不会帮你拦下这种写法。
+  - id: d36-t11
+    kp: d36-k3
+    type: judge
+    question: 在 langgraph 1.2 中，recursion_limit 的默认值是 25，所以稍长的 Agent 任务需要手动调大。
+    answer: false
+    explain: |
+      25 是 langgraph 1.0.6 之前的老默认值。1.0.6 起调到 10000，1.1.4 起是 10007，大量老教程仍写 25。
+      默认值很高意味着它基本不会替你兜底成本，生产上应根据业务显式设置，并配合模型调用次数限制。
+  - id: d36-t12
+    kp: d36-k3
+    type: single
+    question: 下面的路由函数接在 agent 节点后面。这个图运行时最可能出现什么问题？
+    code: |
+      def route(state: MessagesState) -> str:
+          last = state["messages"][-1]
+          if last.tool_calls:
+              return "tools"
+          return "agent"
+
+      builder.add_conditional_edges("agent", route)
+      builder.add_edge("tools", "agent")
+    options:
+      - "没有退出分支，图会一直循环直到 GraphRecursionError"
+      - "tools 节点永远不会被执行到"
+      - "compile 时报错，因为路由函数返回了自身节点名"
+      - "模型无工具调用时会自动走到 END"
+    answer: [0]
+    explain: |
+      模型不调工具时路由仍返回 agent，图没有任何通向 END 的路径，只能一直循环，直到超过 recursion_limit 抛 GraphRecursionError。
+      有工具调用时会去 tools，所以 tools 能执行到；返回自身节点名是合法的，compile 不会报错；LangGraph 不会自动替你走到 END。
+  - id: d36-t13
+    kp: d36-k3
+    type: multi
+    question: 关于 compile 和 super-step，哪些说法正确？
+    options:
+      - "图必须先 compile 才能 invoke 或 stream"
+      - "checkpointer 和静态断点是在 compile 时挂上的"
+      - "同一 super-step 里并行的节点会读到彼此刚返回的更新"
+      - "recursion_limit 限制的是 super-step 的数量"
+    answer: [0, 1, 3]
+    explain: |
+      compile 负责结构检查并挂上 checkpointer、interrupt_before 等运行时选项，不 compile 无法执行。recursion_limit 数的是 super-step。
+      同一轮并行节点都读同一份旧状态，它们的更新要等本轮结束统一合并，彼此看不到对方的返回值。
+  - id: d36-t14
+    kp: d36-k3
+    type: single
+    question: 用户问「所有楼栋本周的告警趋势」，楼栋数量要查询后才知道，每栋楼要并行做同样的分析再汇总。最合适的 LangGraph 写法是：
+    options:
+      - "为每栋楼预先写一个节点，用普通边全部连上"
+      - "在条件边里返回 Send 列表，把每栋楼分发给同一个分析节点"
+      - "在一个节点里 for 循环串行分析所有楼栋"
+      - "把 recursion_limit 调大，让 agent 节点逐栋处理"
+    answer: [1]
+    explain: |
+      Send 用于数量在运行时才确定的 map-reduce：每个 Send 带着各自的输入调用同一个节点，同一轮并行执行，结果通过 reducer 汇总。
+      预先写死节点无法应对数量变化；串行 for 循环失去并行；调大 recursion_limit 只是让循环跑得更久，不解决并行问题。
+  - id: d36-t15
+    kp: d36-k4
+    type: single
+    question: 希望 create_agent 构建的 Agent **单次调用最多调用模型 8 次**，超限时优雅结束而不是抛异常。最合适的做法是：
+    options:
+      - "调用时把 recursion_limit 设为 8，超限后自动结束"
+      - "在 system_prompt 里写明「最多调用模型 8 次」"
+      - "ModelCallLimitMiddleware(run_limit=8, exit_behavior=\"end\")"
+      - "ToolCallLimitMiddleware(run_limit=8, exit_behavior=\"end\")"
+    answer: [2]
+    explain: |
+      ModelCallLimitMiddleware 专门统计模型调用次数，run_limit 管单次调用，exit_behavior 设为 end 时超限会优雅结束。
+      recursion_limit 数的是 super-step，和模型调用次数不对应，超限还会抛错；Prompt 约束不可靠；ToolCallLimitMiddleware 限制的是工具调用而不是模型调用。
+  - id: d36-t16
+    kp: d36-k4
+    type: judge
+    question: HumanInTheLoopMiddleware 在调用敏感工具前暂停等待审批，它不需要配置 checkpointer 也能在审批后恢复执行。
+    answer: false
+    explain: |
+      暂停意味着这次执行要先结束，等审批结果回来再接着跑，中间的状态必须保存在 checkpointer 里，恢复时还要用同一个 thread_id。
+      官方文档明确要求使用 HITL middleware 时配置 checkpointer，生产环境用 Postgres 等持久化实现。
+  - id: d36-t17
+    kp: d36-k4
+    type: multi
+    question: 以下哪些需求适合用 `wrap_tool_call` 这类包裹式 middleware 实现？
+    options:
+      - "工具超时后自动重试最多 2 次"
+      - "记录每次工具调用的耗时和参数用于追踪"
+      - "某些工具在只读模式下直接返回拒绝信息，不真正执行"
+      - "先分类意图，再并行跑三个查询子流程"
+    answer: [0, 1, 2]
+    explain: |
+      包裹式钩子拿到真正的调用 handler，可以调用多次（重试）、前后计时（追踪）、或者不调用直接返回（短路拒绝）。
+      先分类再并行多个子流程属于流程结构，应该用 StateGraph 的节点和边表达，而不是塞进 middleware。
+  - id: d36-t18
+    kp: d36-k4
+    type: single
+    question: p2 告警处置流程是「意图分类 → 并行查设备和告警 → 生成工单草稿 → 值班长审批」。下面哪种实现最合理？
+    options:
+      - "全部用一个 create_agent，靠 Prompt 让模型按顺序执行四个阶段"
+      - "手写 StateGraph 搭骨架，需要自主查询的部分嵌入 create_agent"
+      - "全部写成 middleware，在 before_model 里按阶段切换逻辑"
+      - "不用框架，写四个 while 循环串起来"
+    answer: [1]
+    explain: |
+      流程有固定的阶段、并行和审批点，适合用 StateGraph 显式表达骨架，需要模型自主调工具的环节再嵌入 create_agent 作为节点或子图。
+      全靠 Prompt 排顺序不可控；把阶段逻辑塞进 middleware 难读难测；四个 while 循环失去持久化和中断能力。
+  - id: d36-t19
+    kp: d36-k4
+    type: single
+    question: 你在一篇 2024 年的教程里看到 `from langgraph.prebuilt import create_react_agent`。在 2026 年的新项目里应该怎么做？
+    options:
+      - "照用即可，这是 LangGraph 唯一的预置 Agent"
+      - "换成 langchain.agents 的 initialize_agent"
+      - "改用 Deep Agents，create_react_agent 已被删除"
+      - "改用 langchain.agents 的 create_agent"
+    answer: [3]
+    explain: |
+      LangChain 1.x 推出 create_agent 作为标准的预置 Agent，底层就是 LangGraph 图，并支持 middleware；create_react_agent 属于旧写法，新代码不应再用。
+      initialize_agent 是更早期的 API；Deep Agents 是更重的 harness，并不是 create_react_agent 的直接替代。
+exam:
+  - id: d36-e1
+    kp: d36-k2
+    type: single
+    question: 用「Pinia store」类比 LangGraph 的 State 时，下面哪一点是**类比不成立**的地方？
+    options:
+      - "两者都是多个模块或节点共享读取的一份集中状态"
+      - "两者都支持只提交部分字段，没提交的字段保持不变"
+      - "Pinia 可直接改，LangGraph 节点须返回更新"
+      - "两者都可以把状态拆成多个字段，按字段分别读写"
+    answer: [2]
+    explain: |
+      集中状态、部分更新（类似 $patch）、按字段管理都是两者相似的地方。真正的差异是更新方式：Pinia 允许 action 直接修改 store；LangGraph 节点原地修改不可靠，必须返回更新，由 reducer 合并、再写进快照。
+  - id: d36-e2
+    kp: d36-k3
+    type: single
+    question: |
+      关于 `Command(update={...}, goto="tools")`，下面哪个说法正确？
+    options:
+      - "它只能在条件边的路由函数里返回"
+      - "节点用它同时提交状态更新并指定下一步去哪"
+      - "它会跳过 reducer，直接覆盖所有字段"
+      - "它会让图立刻结束，并把 update 作为最终输出"
+    answer: [1]
+    explain: |
+      Command 由节点返回，把「更新什么」和「去哪里」合在一起，常用于 handoff 等需要边更新边跳转的场景。update 里的字段仍按各自 reducer 合并，不会跳过；它也不会让图结束，除非 goto 指向 END。
+  - id: d36-e3
+    kp: d36-k1
+    type: single
+    question: 面试官问「LangGraph 能让 Agent 变聪明吗」，最准确的回答是：
+    options:
+      - "能，它内置了更好的推理策略和 Prompt 模板"
+      - "能，图结构会让模型更少调错工具"
+      - "不能，它只是可视化工具，对运行没有影响"
+      - "不能直接提升推理，它提供的是持久化、中断、并行等运行时能力"
+    answer: [3]
+    explain: |
+      LangGraph 是低层编排运行时，官方明确不抽象 Prompt 和架构，所以不会直接提升模型推理。但它也不只是可视化：状态合并、断点恢复、人工介入、流式和并行都是实打实的运行时能力。
+  - id: d36-e4
+    kp: d36-k4
+    type: single
+    question: 多个 middleware 按 `[A, B]` 顺序传给 create_agent。关于执行顺序，哪个说法正确？
+    options:
+      - "before_model 先 A 后 B，after_model 先 B 后 A"
+      - "before_model 和 after_model 都是先 A 后 B"
+      - "执行顺序随机，不能依赖"
+      - "只有第一个 middleware 的钩子会生效"
+    answer: [0]
+    explain: |
+      middleware 遵循洋葱模型：进入时按列表顺序，出来时反向。所以 before_* 是 A 再 B，after_* 是 B 再 A，wrap_* 中 A 包在最外层。脱敏和摘要这类相互影响的 middleware 要按这个规则安排顺序。
+  - id: d36-e5
+    kp: d36-k2
+    type: multi
+    question: 设计 p2 园区 Agent 的 State 时，下列哪些做法是合理的？
+    options:
+      - "messages 用 add_messages，多轮对话自动按 ID 合并"
+      - "并行分支都要写的 findings 用 operator.add"
+      - "把数据库连接对象放进 State，方便每个节点使用"
+      - "大段报告原文存外部存储，State 里只放引用 ID"
+    answer: [0, 1, 3]
+    explain: |
+      消息用 add_messages、并行写字段配追加 reducer、大对象只放引用，都是推荐做法。数据库连接不可序列化，放进 State 会让快照失败，应该通过 runtime 的 context 或依赖注入提供给节点。
+  - id: d36-e6
+    kp: d36-k3
+    type: multi
+    question: 条件边的路由函数可以返回哪些值？
+    options:
+      - "一个节点名字符串"
+      - "END"
+      - "多个节点名组成的列表，下一轮并行执行"
+      - "一个 Python 异常对象，用来终止流程"
+      - "Send 对象列表，把不同输入分发给同一节点"
+    answer: [0, 1, 2, 4]
+    explain: |
+      路由函数可以返回单个节点名、END、节点名列表（扇出并行）或 Send 列表（map-reduce）。返回异常对象不是合法的路由值；要终止流程应返回 END，出错应在节点里抛异常或记录到状态。
+  - id: d36-e7
+    kp: d36-k3
+    type: judge
+    question: recursion_limit 写在 `config["configurable"]["recursion_limit"]` 里同样会生效。
+    answer: false
+    explain: |
+      recursion_limit 是运行配置的顶层键，正确写法是 graph.invoke(inputs, {"recursion_limit": 30})。configurable 是放 thread_id 等自定义参数的地方，把 recursion_limit 放进去不会被当作递归上限。
+  - id: d36-e8
+    kp: d36-k4
+    type: judge
+    question: create_agent 返回的对象就是一个编译好的 LangGraph 图，因此可以直接挂 checkpointer、使用 stream 和 interrupt。
+    answer: true
+    explain: |
+      create_agent 是建在 LangGraph 上的封装，返回编译后的图，invoke、stream、checkpointer、interrupt 这些图的能力都能直接用。这也是为什么它可以作为节点或子图嵌进手写的 StateGraph。
+  - id: d36-e9
+    kp: d36-k2
+    type: case
+    question: |
+      p2 园区 Agent 原本串行查询设备和告警，一切正常。为了提速，同事把 START 同时连到 `check_devices` 和 `check_alarms` 两个节点，两个节点都返回 `{"summary": "..."}`，summary 是普通 `str` 字段。上线后每次问「3号楼情况」都报 InvalidUpdateError，而单独测试每个节点都正常。最合理的修复是：
+    options:
+      - "把两个节点改回串行，并行在 LangGraph 里不可靠"
+      - "两个节点各写自己的字段或共写一个带追加 reducer 的列表，由汇总节点生成 summary"
+      - "在两个节点里加锁，保证同一时间只有一个节点写 summary"
+      - "把 recursion_limit 调大，给并行节点更多执行轮次"
+    answer: [1]
+    explain: |
+      两个节点在同一个 super-step 并行，都写没有 reducer 的 summary，框架不知道听谁的，于是报 InvalidUpdateError。正确做法是让并行分支写不冲突的字段，或写入带 operator.add 的列表，再由下游汇总节点生成最终 summary。
+      改回串行放弃了提速目标；加锁解决的是线程竞争，而这里是状态合并规则问题；recursion_limit 与此无关。
+interview:
+  - id: d36-i1
+    kp: d36-k2
+    type: scenario
+    difficulty: 2
+    question: 同事把手写的客服 Agent 迁移到 LangGraph 后，出现两个问题：一是第二步起模型像失忆，二是加了并行查询后偶发 InvalidUpdateError。你会怎么排查和修复？
+    key_points:
+      - {text: "指出失忆是 messages 字段没有 reducer，默认覆盖导致历史丢失", dim: principle}
+      - {text: "指出并行报错是同一 super-step 多个节点写了无 reducer 的字段", dim: principle}
+      - {text: "给出修复：messages 用 add_messages 或 MessagesState，并行字段用 operator.add 或拆字段后汇总", dim: engineering}
+      - {text: "提到检查节点里有没有原地修改 state、用 Overwrite 处理清空需求", dim: engineering}
+      - {text: "结合项目说明排查方式，如打印每步 updates 或看 LangSmith trace", dim: project}
+    reference: |
+      **问题一：失忆。** 先看 State 定义。如果 messages 写成普通 list，没有 reducer 时默认是覆盖，节点每次返回 {"messages": [reply]} 就把整个历史替换成一条。修复是改成 Annotated[list[AnyMessage], add_messages]，或直接用 MessagesState。顺带检查有没有节点在原地 append 却不返回，这种写法绕过了状态更新机制。
+
+      **问题二：InvalidUpdateError。** 加并行后才出现，说明同一个 super-step 有两个节点写了同一个没有 reducer 的字段。框架无法决定听谁的，所以报错。修复有两种：让并行分支各写各的字段，或者共写一个 operator.add 的列表，再由下游汇总节点生成最终结论。
+
+      **排查手段：** 用 stream_mode="updates" 逐步打印每个节点返回了什么，或者在 LangSmith trace 里看每一步的状态变化，能很快定位是哪个节点、哪个字段。
+
+      **预防：** State 定义时逐个字段问一句「会不会被多个节点写、要覆盖还是累积」，把规则写在 State 上，而不是散在节点里。需要清空累积字段时用 Overwrite。
+    oral: |
+      这两个问题其实都是 State 定义的问题，不是模型的问题。
+      失忆是因为 messages 没写 reducer，默认覆盖，每一步都把历史换成了最新一条，改成 add_messages 或者直接用 MessagesState 就好。
+      并行报错是因为两个并行节点在同一轮写了同一个普通字段，框架不知道听谁的。我的做法是让分支各写各的，或者写进一个 operator.add 的列表，再加一个汇总节点。
+      我在园区 Agent 里就踩过第二个坑，当时是用 stream 的 updates 模式逐步打印，一眼就看出是哪个字段。现在我设计 State 时会逐个字段想清楚是覆盖还是累积。
+  - id: d36-i2
+    kp: d36-k4
+    type: short
+    difficulty: 2
+    question: LangChain 的 create_agent 和手写 LangGraph StateGraph，你在项目里怎么选？middleware 适合解决什么问题？
+    key_points:
+      - {text: "说明 create_agent 建在 LangGraph 上，返回编译好的图", dim: concept}
+      - {text: "说明 middleware 的钩子位置：before/after model、wrap model/tool call", dim: principle}
+      - {text: "给出选择标准：模型自主调工具加横切逻辑用 create_agent，有固定阶段、并行、审批骨架用 StateGraph", dim: engineering}
+      - {text: "结合项目给出分工例子，并提到两者可以组合", dim: project}
+    reference: |
+      **关系：** create_agent 是 LangChain 1.x 的标准 Agent，底层就是 LangGraph，返回编译好的图，所以 checkpointer、stream、interrupt 都能用。
+
+      **middleware 解决横切问题：** 限制模型或工具调用次数、敏感工具调用前人工审批、上下文过长自动摘要、模型失败重试或降级、敏感信息脱敏。钩子分两类：before_model、after_model 这类节点式钩子按顺序执行、可以改状态或跳转；wrap_model_call、wrap_tool_call 这类包裹式钩子拿到 handler，能做重试、短路和计时。
+
+      **怎么选：** 如果流程就是「模型自己决定调哪些工具」，只缺一些横切能力，用 create_agent 加 middleware 最快。如果流程有固定骨架，比如先分类、再并行查询、再生成草稿、再审批，就手写 StateGraph，因为这些阶段需要在图上显式表达，便于测试和排错。
+
+      **组合：** 两者不冲突，可以把 create_agent 当作 StateGraph 里的一个节点或子图。
+    oral: |
+      我的原则是上层能装下就用上层。create_agent 底层就是 LangGraph，返回的也是编译好的图，所以持久化、流式这些能力都不丢。
+      流程只是模型自主调工具的话，我用 create_agent，再挂 middleware 解决横切问题，比如用 ModelCallLimitMiddleware 限制调用次数，用 HITL middleware 拦截写操作。
+      流程有固定骨架的，比如园区的告警处置要分类、并行查询、生成工单、审批，我就手写 StateGraph，把问答那段 create_agent 嵌进去当一个节点。
+  - id: d36-i3
+    kp: d36-k3
+    type: design
+    difficulty: 3
+    question: 请用 LangGraph 设计智慧园区「告警处置」Agent：用户报告异常后，Agent 查询相关设备和告警，低风险给出处理建议，高风险生成工单草稿交人审批。说明 State、节点、边，并讲清哪些由代码决定、哪些交给模型，以及如何防止失控。
+    key_points:
+      - {text: "给出 State 字段和各自 reducer，如 messages、building、findings、risk_level、ticket_draft", dim: principle}
+      - {text: "给出节点和边：分类、并行查询、评估风险、条件边分流、生成草稿、审批", dim: principle}
+      - {text: "说明代码决定流程骨架和风险分流规则，模型负责理解问题、选择查询和撰写建议", dim: concept}
+      - {text: "给出防失控手段：条件边必有 END、显式 recursion_limit、模型调用次数限制、写操作只在审批后执行", dim: engineering}
+      - {text: "提到审批节点依赖 checkpointer 和 interrupt，为 Day 37 的断点恢复做准备", dim: project}
+    reference: |
+      **State：** messages 用 add_messages；building 覆盖；findings 用 operator.add，供并行分支追加；risk_level 覆盖；ticket_draft 覆盖。大段原始数据存外部，State 里只放 ID 和摘要。
+
+      **节点与边：**
+      1. classify：理解用户描述，抽取楼栋和异常类型；
+      2. 从 classify 扇出到 check_devices、check_alarms，同一轮并行查询，结果写入 findings；
+      3. assess：汇总 findings 判断风险等级；
+      4. 条件边 by_risk：低风险去 suggest 直接给建议后 END；高风险去 draft_ticket；
+      5. draft_ticket 生成工单草稿，接 approve 节点暂停等待值班长审批；通过后 create_ticket 才真正调用工单系统。
+
+      **分工：** 流程骨架、并行、风险分流阈值由代码决定，这部分要可测、可审计。模型负责理解自然语言、决定查询参数、撰写建议和草稿。风险等级可以让模型给出初判，但最终分流规则建议用代码规则兜底，比如告警类型命中消防类一律高风险。
+
+      **防失控：** 每条条件边都有通向 END 的路径；显式设置 recursion_limit；查询子 Agent 用 ModelCallLimitMiddleware 限制模型调用次数；所有工具在查询阶段只读，写操作只能在审批之后由 create_ticket 节点执行。审批节点依赖 checkpointer 和 interrupt，审批隔天也能恢复。
+    oral: |
+      我会把它设计成骨架固定、局部交给模型的图。
+      State 里 messages 用 add_messages，并行查询的 findings 用 operator.add，楼栋、风险等级、工单草稿用覆盖。
+      流程是：分类节点抽取楼栋和异常类型，然后并行查设备和告警，汇总评估风险，条件边分流，低风险直接给建议，高风险生成工单草稿并暂停等值班长审批，审批通过才真正建工单。
+      分流规则我用代码兜底，比如消防类告警一律高风险，模型只负责理解问题和写建议。防失控有三层：每条条件边都能走到 END，显式设 recursion_limit，再用 middleware 限制模型调用次数；写操作只能在审批之后执行。

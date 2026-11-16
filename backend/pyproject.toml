@@ -1,0 +1,19 @@
+[project]
+name = "stupy-backend"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.162.5",
+    "pydantic>=2.14.3",
+    "pyyaml>=6.0.3",
+    "sqlalchemy>=2.1.8",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[dependency-groups]
+dev = [
+    "freezegun>=1.5.5",
+    "httpx>=0.28.1",
+    "pytest>=9.2.0",
+]

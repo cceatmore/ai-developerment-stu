@@ -1,0 +1,970 @@
+day: 8
+phase: 1
+title: 数据库：PostgreSQL 建模、索引与事务、SQLAlchemy 2 异步 ORM、Alembic 迁移
+goals:
+  - 能为一个 AI 应用设计带约束的表结构（主键、外键、唯一约束、JSONB），并用唯一约束实现幂等写入
+  - 能判断一个查询该建什么索引、复合索引列怎么排，并用 EXPLAIN ANALYZE 验证
+  - 能识别「读-改-写」丢失更新，并用原子 UPDATE、行锁或乐观锁修复；知道为什么不能在事务里等 LLM
+  - 能用 SQLAlchemy 2 异步写法和 Alembic 完成「建模 → 生成迁移 → 审查 → 升级」，避开懒加载和重命名丢数据的坑
+minutes: 60
+resources:
+  - title: "廖雪峰 SQL 教程：事务（含四种隔离级别）"
+    url: "https://liaoxuefeng.com/books/sql/transaction/"
+    kind: article
+    lang: zh
+    minutes: 20
+    note: "看事务和 Read Committed、Repeatable Read 两个子页，理解脏读、不可重复读、幻读。注意教程用的是 MySQL（默认 Repeatable Read），PostgreSQL 默认是 Read Committed"
+  - title: "PostgreSQL 中文文档：11.3 多列索引"
+    url: "http://www.postgres.cn/docs/current/indexes-multicolumn.html"
+    kind: doc
+    lang: zh
+    minutes: 10
+    note: "看第三段「前导列」规则和跳过扫描的例子，对照 k2 的复合索引列顺序；最后一段「多列索引应该较少使用」也值得记住"
+  - title: "SQLAlchemy 2.1 文档：Asynchronous I/O (asyncio)"
+    url: "https://docs.sqlalchemy.org/en/21/orm/extensions/asyncio.html"
+    kind: doc
+    lang: en
+    minutes: 25
+    note: "只看开头的 ORM 完整示例和「Preventing Implicit IO when Using AsyncSession」一节，对应 k3 的 expire_on_commit、selectinload、AsyncAttrs 与「每个并发任务一个会话」"
+  - title: "Alembic 文档：Auto Generating Migrations"
+    url: "https://alembic.sqlalchemy.org/en/latest/autogenerate.html"
+    kind: doc
+    lang: en
+    minutes: 10
+    note: "只看「What does Autogenerate Detect (and what does it not detect?)」列表，记住表名和列名改名会被识别成删除加新增，对应 k4"
+knowledge_points:
+  - id: d08-k1
+    name: SQL 与 PostgreSQL 建模
+    level: P1
+    summary: 表结构就是数据契约：主键、外键、唯一约束、NOT NULL 由数据库强制执行；PostgreSQL 一库兼顾关系数据、JSONB 和向量
+    analogy: |
+      - **表 ≈ 一个 TS interface 的数组**，但约束（NOT NULL、UNIQUE、外键）是**数据库在运行时强制**的，不像 TS 类型只在编译期检查。
+      - **JOIN ≈ 你在前端拿到两个接口的数组后按 id 合并**（`map` + `find`），区别是数据库在服务端用索引高效完成，不用把数据全拉回来。
+      - **游标分页 ≈ 无限滚动列表的 `cursor` 参数**，你在前端对接过。
+
+      **不一样的地方：** 前端状态丢了刷新就好；数据库里的数据是**唯一真相**，约束设计错了，脏数据会一直留着，修数据比修代码难得多。
+    why: |
+      AI 应用照样是「数据 + 业务」：用户、知识库、文档、切片、对话、消息、调用记录都要落库。PostgreSQL 是 AI 应用最常见的选择：关系数据、JSONB 元数据、全文检索、pgvector 向量检索（Day 24）一库搞定。
+      表设计不合理，后面的权限过滤、幂等入库、评测统计都会很痛苦；面试也常让你现场设计表。
+    problem: |
+      解决「**数据怎么组织才能既正确又好查**」的问题。
+      约束让错误数据进不来（重复上传、孤儿切片、非法状态）；合理的拆表和类型选择让常用查询简单、可索引；JSONB 留出弹性，存放不同来源文档各不相同的元数据。
+    principle: |
+      **一、建表时必须想清楚的五件事**
+
+      | 要素 | 作用 | 例子 |
+      |---|---|---|
+      | 主键 | 每行唯一标识 | `id bigint generated always as identity`，或 PG 18 的 `uuidv7()`（按时间有序，对索引友好） |
+      | 外键 | 引用必须存在 | `chunks.document_id → documents.id`，可设 `ON DELETE CASCADE` |
+      | 唯一约束 | 业务上不能重复 | `UNIQUE (kb_id, content_hash)`：同一知识库不重复入库同一文件 |
+      | NOT NULL / CHECK | 字段必填、取值合法 | `status` 只能是 pending/parsing/ready/failed |
+      | 时间戳 | 审计与排序 | `created_at timestamptz default now()` |
+
+      **约束是最后一道防线**：应用层校验（Pydantic）挡住大部分错误，但并发、脚本、手工改库时只有数据库约束靠得住。
+
+      **二、p1 知识库的核心表**
+
+      ```mermaid
+      erDiagram
+        USERS ||--o{ KB_MEMBERS : "加入"
+        KNOWLEDGE_BASES ||--o{ KB_MEMBERS : "拥有成员"
+        KNOWLEDGE_BASES ||--o{ DOCUMENTS : "包含"
+        DOCUMENTS ||--o{ CHUNKS : "切分为"
+        USERS ||--o{ CONVERSATIONS : "发起"
+        CONVERSATIONS ||--o{ MESSAGES : "包含"
+        DOCUMENTS {
+          bigint id PK
+          bigint kb_id FK
+          text title
+          text content_hash
+          text status
+          jsonb meta
+        }
+        CHUNKS {
+          bigint id PK
+          bigint document_id FK
+          int seq
+          text content
+        }
+      ```
+
+      `kb_members(user_id, kb_id, role)` 是多对多关系表，后面做权限过滤（Day 30）就靠它。
+
+      **三、几条高频 SQL**
+
+      ```sql
+      -- 幂等入库：重复上传同一文件不报错、不重复
+      INSERT INTO documents (kb_id, title, content_hash, status)
+      VALUES (1, '员工手册.pdf', 'sha256...', 'pending')
+      ON CONFLICT (kb_id, content_hash) DO NOTHING
+      RETURNING id;
+
+      -- 统计每个知识库的文档数（JOIN + GROUP BY）
+      SELECT kb.id, kb.name, count(d.id) AS doc_count
+      FROM knowledge_bases kb LEFT JOIN documents d ON d.kb_id = kb.id
+      GROUP BY kb.id, kb.name;
+
+      -- 游标分页：比 OFFSET 深分页快得多
+      SELECT id, title FROM documents
+      WHERE kb_id = 1 AND id < 10230   -- 上一页最后一条的 id
+      ORDER BY id DESC LIMIT 20;
+      ```
+
+      **四、JSONB：弹性但不是万能**
+
+      - 适合「各文档来源不同、字段不固定」的元数据：作者、页数、来源 URL；
+      - **经常用来过滤、排序、关联的字段要做成普通列**（如 `kb_id`、`status`、`created_at`），类型明确、约束可加、索引简单；
+      - JSONB 也能建 GIN 索引支持 `meta @> '{"dept": "hr"}'` 这类查询。
+
+      **五、OFFSET 深分页为什么慢**
+
+      `OFFSET 100000 LIMIT 20` 要先扫过并丢弃 10 万行；翻页时有新数据插入还会出现重复或遗漏。游标分页用 `WHERE id < 上一页最后 id`，配合索引直接定位。
+    scenarios: |
+      - **文档幂等入库**：`UNIQUE (kb_id, content_hash)` + `ON CONFLICT DO NOTHING`，用户重复上传同一文件不会产生两份切片。
+      - **消息列表无限滚动**：前端传上一页最后一条消息的 id，后端游标分页。
+      - **多来源元数据**：飞书文档、PDF、网页的元数据结构不同，统一放 `meta jsonb`。
+      - **园区 Agent 的只读查询**：设备、告警、客流表设计清晰，Text2SQL（Day 39）生成的 SQL 才不容易错。
+    pitfalls: |
+      - **误区：有 Pydantic 校验就不需要数据库约束。** 并发插入、后台脚本、手工改库都绕得过应用层。
+      - **先查再插做去重**：两个并发请求都查到「不存在」，然后都插入成功。要用唯一约束。
+      - **什么都往 JSONB 塞**：常用过滤字段放 JSONB，类型不可控、约束加不上、查询写起来也别扭。
+      - **时间用 `timestamp` 不带时区**：跨时区部署时排查日志对不上，统一用 `timestamptz`。
+      - **OFFSET 深分页**：后台导出或列表翻到很后面时越来越慢。
+    interview_asks:
+      - question: "让你设计一个知识库系统的表结构，你会怎么设计？哪些地方加约束？"
+        answer: "文档、切片、向量分开。文档有租户、来源、版本和状态；切片属于文档，记下页码和标题路径；向量和切片一一对应。用外键和唯一约束保住关系，比如同一租户下来源 id 不能重复，不要只靠代码检查。"
+      - question: "怎么保证同一个文件不会被重复入库？为什么「先查再插」不可靠？"
+        answer: "两个请求可能同时查到「没有」，然后都插入。要在数据库上建唯一约束，冲突时捕获唯一冲突再决定跳过或更新。先查再插挡不住并发。"
+      - question: "OFFSET 分页有什么问题？游标分页怎么做？"
+        answer: "OFFSET 越大，数据库越要先扫过再丢掉前面的行，又慢又会在新增数据时漏行或重复。游标分页记下上一页最后一条的排序值和 id，下一页用 WHERE 从它后面接着取。"
+    project_example: |
+      **p1 企业知识库 · Day 08 数据模型模块**：建 users、knowledge_bases、kb_members、documents、chunks、conversations、messages 七张表。
+      documents 上加 `UNIQUE (kb_id, content_hash)` 和 status 的 CHECK 约束，chunks 外键 `ON DELETE CASCADE`，元数据放 `meta jsonb`。
+      验收：同一文件上传两次只产生一条 documents 记录；删除文档后其 chunks 自动删除；插入非法 status 被数据库拒绝。
+    freshness: |
+      核对于 2026-11：PostgreSQL 当前稳定大版本为 **18**（`docs/current` 指向 18）；18 新增内置 `uuidv7()`（按时间有序的 UUID）和 B-tree skip scan。PostgreSQL 19 计划于 2026-11-19 正式发布（RC2 于 11-12 发布），新增 `INSERT ... ON CONFLICT DO SELECT` 等特性，以官方发布为准。
+    sources:
+      - {title: "PostgreSQL 18 Release Notes", url: "https://www.postgresql.org/docs/current/release-18.html"}
+      - {title: "PostgreSQL 19 RC 1 Released", url: "https://www.postgresql.org/about/news/postgresql-19-rc-1-released-3409/"}
+  - id: d08-k2
+    name: 索引与事务：查得快、改得对
+    level: P0
+    summary: 索引用额外的有序结构换查询速度；事务保证一组修改要么全成要么全不成，并发修改同一数据要靠原子更新或锁
+    analogy: |
+      - **索引 ≈ 前端把数组转成 `Map<id, item>`**：查找从遍历变成直接定位，代价是每次增删都要维护这个 Map，而且多占内存。
+      - **事务 ≈ 前端「乐观更新失败就整体回滚 UI 状态」**：要么全部生效，要么像没发生过。
+
+      **不一样的地方：** 前端是单线程，同一时刻只有你在改状态；数据库同时有成百上千个事务在改同一批数据，所以还多了「**隔离与并发冲突**」这一层，这是前端经验里没有的。
+    why: |
+      「接口慢」的第一嫌疑往往是缺索引或索引用不上；「数据不对」的第一嫌疑往往是并发下的读-改-写。AI 应用里的配额扣减、Token 计费、文档状态流转、工单派发都是并发写场景。
+      面试必问：索引原理、复合索引怎么建、事务隔离级别、怎么防超卖或重复扣费。
+    problem: |
+      解决两个问题：
+      1. **查得快**：百万级 documents 表按 `kb_id` 过滤，没有索引就是全表扫描；
+      2. **改得对**：两个请求同时「读余额 → 判断 → 扣减」，结果只扣了一次却放行了两次（丢失更新）；多步写入中途失败，留下半截数据。
+    principle: |
+      **一、B-tree 索引：一本按顺序排好的目录**
+
+      - 默认索引是 B-tree：把列值**有序**组织成树，按值查找、范围查找、排序都能直接走索引（O(log n)）；
+      - 适合建索引的列：`WHERE` 过滤、`JOIN` 关联、`ORDER BY` 排序的列，且**区分度高**；
+      - **代价**：每次 INSERT/UPDATE 都要维护索引（写变慢）、占磁盘；所以不是越多越好。
+
+      **二、复合索引的列顺序**
+
+      查询 `WHERE kb_id = ? AND status = ? ORDER BY created_at DESC LIMIT 20`，最合适的索引是 `(kb_id, status, created_at)`：
+      - **等值条件的列在前，范围或排序的列在后**；
+      - **前导列原则**：`(a, b)` 索引对 `WHERE a = ?` 很有效，对只有 `WHERE b = ?` 的查询通常帮助不大。PG 18 起 B-tree 支持 **skip scan**，前导列取值很少时也能用上，但设计时仍按前导列原则来。
+
+      **三、怎么确认用上了索引：EXPLAIN ANALYZE**
+
+      ```sql
+      EXPLAIN ANALYZE SELECT * FROM documents WHERE kb_id = 1 ORDER BY created_at DESC LIMIT 20;
+      ```
+
+      - 看到 `Seq Scan` + 大量 `Rows Removed by Filter` → 全表扫描，多半缺索引；
+      - 看到 `Index Scan` / `Index Only Scan` → 用上了；
+      - 对列做了函数运算（`WHERE lower(title) = ...`）或类型转换，普通索引用不上，需要表达式索引。
+
+      **四、事务：ACID 与 PostgreSQL 默认隔离级别**
+
+      - **原子性**：转账、「扣配额 + 写调用记录」要么都成功要么都回滚；
+      - **隔离性**：PostgreSQL **默认 READ COMMITTED**：每条语句看到语句开始前已提交的数据，所以同一事务里两次 SELECT 可能看到不同结果；REPEATABLE READ / SERIALIZABLE 更严格，但可能报**序列化失败**，应用要准备重试。
+
+      **五、并发写的经典 bug：丢失更新**
+
+      ```mermaid
+      sequenceDiagram
+        participant A as 请求 A
+        participant DB as 数据库 remaining 为 1
+        participant B as 请求 B
+        A->>DB: SELECT remaining 读到 1
+        B->>DB: SELECT remaining 读到 1
+        A->>DB: 判断大于 0 写回 remaining 为 0
+        B->>DB: 判断大于 0 写回 remaining 为 0
+        Note over A,B: 扣了一次 却放行了两次请求
+      ```
+
+      **三种修法：**
+
+      | 方法 | 写法 | 适用 |
+      |---|---|---|
+      | 原子更新（首选） | `UPDATE quotas SET remaining = remaining - 1 WHERE user_id = ? AND remaining > 0 RETURNING remaining` | 计数、余额、库存 |
+      | 悲观锁 | `SELECT ... FOR UPDATE` 锁住行，事务结束释放 | 逻辑复杂、必须先读后判断 |
+      | 乐观锁 | 加 `version` 列，`UPDATE ... WHERE id = ? AND version = ?`，影响 0 行就重试 | 冲突少的编辑场景 |
+
+      **唯一约束也是并发控制**：幂等键、`content_hash` 去重都靠它，比「先查再插」可靠。
+
+      **六、事务要短**
+
+      **绝对不要在事务里等 LLM**：事务持有连接和行锁，一次 LLM 调用 8 秒，这 8 秒里连接被占、同一行的其他请求全部排队。正确做法：短事务预扣 → 事务外调 LLM → 短事务写结果或退还。
+    scenarios: |
+      - **消息列表慢**：`messages(conversation_id, id)` 复合索引支撑「某对话按时间倒序取 20 条」。
+      - **用户配额扣减**：原子 UPDATE + `remaining > 0` 条件，返回 0 行就是配额不足，直接 429。
+      - **文档状态流转**：`UPDATE documents SET status='parsing' WHERE id=? AND status='pending'`，只有一个 worker 能抢到这个任务。
+      - **园区工单派发**：派单时 `SELECT ... FOR UPDATE` 锁住工单行，防止两个调度员同时派给不同人。
+    code: |
+      ```python
+      from sqlalchemy import update
+      from sqlalchemy.ext.asyncio import AsyncSession
+
+      from app.models import Quota
+
+
+      async def consume_quota(db: AsyncSession, user_id: int) -> bool:
+          """原子扣减：并发安全，不需要先 SELECT。"""
+          stmt = (
+              update(Quota)
+              .where(Quota.user_id == user_id, Quota.remaining > 0)
+              .values(remaining=Quota.remaining - 1)
+              .returning(Quota.remaining)
+          )
+          left = (await db.execute(stmt)).scalar_one_or_none()
+          await db.commit()
+          return left is not None   # None 表示配额不足，调用方返回 429
+      ```
+    pitfalls: |
+      - **误区：索引越多越快。** 每个索引都拖慢写入、占空间；低区分度列（如只有两种取值的布尔列）单独建索引往往没用。
+      - **复合索引列顺序随便排**：把范围条件列放在最前，后面的等值列就帮不上忙。
+      - **在索引列上做函数运算**：`WHERE date(created_at) = ...` 用不上 `created_at` 的普通索引，改成范围条件。
+      - **先读后写不加保护**：配额、余额、库存、状态流转都会出现丢失更新。
+      - **长事务**：在事务里调 LLM、调外部接口、等用户确认，导致锁等待和连接池耗尽。
+      - **用了 SERIALIZABLE 却不重试**：序列化失败（SQLSTATE 40001）是正常现象，应用必须捕获并重试。
+    interview_asks:
+      - question: "索引的原理是什么？为什么不是越多越好？复合索引列顺序怎么定？"
+        answer: "索引是额外的查找结构，按索引列定位，不用全表扫。每多一个索引，写入都要维护它，还占空间。复合索引把最常用来等值过滤、选择性高的列放前面，范围条件放后面。"
+      - question: "怎么判断一个查询有没有用上索引？"
+        answer: "看执行计划，PostgreSQL 用 EXPLAIN ANALYZE。出现 Seq Scan 且行数大，通常没走到索引。也要看实际耗时和返回行数，不能只看有没有建索引。"
+      - question: "两个请求同时扣同一个用户的配额，怎么保证不超扣？"
+        answer: "不能先 SELECT 再在程序里减。用一条 UPDATE ... WHERE remaining >= 需要的量，看更新行数是不是 1。或者对这一行 SELECT FOR UPDATE 锁住再改。判断和扣减必须在同一个事务里。"
+      - question: "PostgreSQL 默认的隔离级别是什么？会出现什么现象？"
+        answer: "默认是读已提交。一个事务里两次同样的查询，可能看到别人刚提交的新行。它不会读到未提交的数据。要同一事务内多次读取一致，再考虑更高隔离级别。"
+    project_example: |
+      **p1 企业知识库**：documents 建 `(kb_id, status, created_at)` 索引支撑后台列表；messages 建 `(conversation_id, id)` 支撑聊天记录分页。
+      用户每日提问配额用原子 UPDATE 扣减；问答流程是「短事务预扣 → 事务外检索和调 LLM → 成功写消息、失败短事务退还配额」，不在事务里等模型。
+      验收：用 50 个并发请求打同一个只剩 10 次配额的用户，恰好 10 个成功、40 个返回 429；EXPLAIN ANALYZE 显示列表查询走 Index Scan。
+    freshness: |
+      核对于 2026-11（PostgreSQL 18 为当前稳定版）：默认隔离级别为 Read Committed；PostgreSQL 的 Repeatable Read 实现不会出现幻读；Repeatable Read 与 Serializable 下应用必须准备重试序列化失败（SQLSTATE 40001）。PG 18 新增 B-tree skip scan，使多列索引在缺少前导列等值条件时也可能被使用。
+    sources:
+      - {title: "PostgreSQL Docs - Transaction Isolation", url: "https://www.postgresql.org/docs/current/transaction-iso.html"}
+      - {title: "PostgreSQL 中文文档 - 多列索引", url: "http://www.postgres.cn/docs/current/indexes-multicolumn.html"}
+      - {title: "PostgreSQL 18 Release Notes", url: "https://www.postgresql.org/docs/current/release-18.html"}
+  - id: d08-k3
+    name: SQLAlchemy 2 异步 ORM
+    level: P0
+    summary: 用 Mapped 类型声明模型、select() 写查询、AsyncSession 按请求隔离；异步下禁止隐式懒加载，关系要预加载
+    analogy: |
+      **≈ Node 里的 Prisma / TypeORM。** `Mapped[int]` 的类型声明 ≈ Prisma schema 生成的 TS 类型；`select(User).where(...)` ≈ Prisma 的 `findMany({ where })`。
+
+      **不一样的地方：**
+      - SQLAlchemy 的 Session 是「**工作单元**」：你改了对象属性，SQL 不会立刻发出，要等 `flush`/`commit` 时统一发送。
+      - Prisma 访问关联要显式 `include`，SQLAlchemy 同步模式下默认会**偷偷懒加载**（访问属性时再查一次库）；**异步模式下这种隐式 IO 不被允许**，会直接报错，所以必须像 Prisma 一样显式预加载。
+    why: |
+      FastAPI 异步服务里，数据库访问必须用异步驱动（Day 06：同步驱动会卡住事件循环）。SQLAlchemy 是 Python 最主流的 ORM，2.x 的写法和 1.x 差别很大，AI 工具经常混着生成 `session.query()` 这类旧写法。
+      异步 ORM 有几个特有的坑（懒加载报错、会话并发共享、提交后属性过期），不懂就会在线上踩到。
+    problem: |
+      解决「**在异步服务里，类型安全地读写数据库，且不卡事件循环、不泄漏连接**」的问题。
+      ORM 让你用 Python 对象和类型描述表结构，查询有类型提示；异步引擎和会话让等待数据库的时间可以让给其他请求。
+    principle: |
+      **一、2.x 声明式模型**
+
+      ```python
+      class Base(AsyncAttrs, DeclarativeBase):
+          pass
+
+      class Document(Base):
+          __tablename__ = "documents"
+          id: Mapped[int] = mapped_column(primary_key=True)
+          kb_id: Mapped[int] = mapped_column(ForeignKey("knowledge_bases.id"), index=True)
+          title: Mapped[str] = mapped_column(String(255))
+          meta: Mapped[dict] = mapped_column(JSONB, default=dict)
+          chunks: Mapped[list["Chunk"]] = relationship(back_populates="document")
+      ```
+
+      `Mapped[str]` 默认 NOT NULL，`Mapped[str | None]` 才可空，类型和约束一致。
+
+      **二、引擎、会话工厂、会话**
+
+      | 对象 | 生命周期 | 说明 |
+      |---|---|---|
+      | `create_async_engine("postgresql+asyncpg://...")` | **进程级**，lifespan 创建（Day 07） | 内含连接池 |
+      | `async_sessionmaker(engine, expire_on_commit=False)` | 进程级 | 会话工厂 |
+      | `AsyncSession` | **请求级 / 任务级** | 一个事务的工作单元 |
+
+      **官方文档明确：** AsyncSession 是有状态的、代表一个进行中的事务，**不能在 `asyncio.gather` 的多个并发任务之间共享**，每个并发任务要用自己的会话。
+
+      **三、查询写法：select() 而不是 session.query()**
+
+      ```python
+      stmt = select(Document).where(Document.kb_id == kb_id).order_by(Document.id.desc()).limit(20)
+      docs = (await db.scalars(stmt)).all()
+      doc = await db.get(Document, doc_id)        # 按主键取
+      ```
+
+      `session.query(...)` 是 1.x 风格（2.x 中为旧版 API），新代码统一用 `select()`。
+
+      **四、异步下的两个关键配置**
+
+      ```mermaid
+      flowchart TD
+        A["访问 doc.chunks 或 commit 后访问 doc.title"] --> B{"数据已经加载在内存里吗"}
+        B -- "是" --> C["直接返回"]
+        B -- "否 需要查库" --> D{"同步 Session"}
+        D -- "是" --> E["隐式发 SQL 懒加载 可能 N 加 1"]
+        D -- "否 AsyncSession" --> F["不允许隐式 IO 抛出错误"]
+        F --> G["修复 selectinload 预加载"]
+        F --> H["修复 await doc.awaitable_attrs.chunks"]
+        F --> I["修复 expire_on_commit 设为 False"]
+      ```
+
+      1. **`expire_on_commit=False`**：默认 commit 后所有属性过期，再访问会触发重新加载（隐式 IO）；异步下通常关掉（官方示例就是这样配的）。
+      2. **关系预加载**：`select(KnowledgeBase).options(selectinload(KnowledgeBase.documents))`，一次额外查询加载所有关联；或在 Base 上混入 `AsyncAttrs`，用 `await kb.awaitable_attrs.documents` 显式加载；也可以给关系设 `lazy="raise"`，谁忘了预加载立刻报错。
+
+      **五、N+1 问题**
+
+      循环里逐个访问关联（或逐个查询），1 次查列表 + N 次查关联。用 `selectinload`、JOIN 或一次 GROUP BY 聚合解决。
+
+      **六、提交与回滚**
+
+      - `db.add(obj)` → `await db.flush()`（发 SQL，拿到自增 id，事务未提交）→ `await db.commit()`；
+      - 也可以 `async with db.begin():` 包一段，正常退出自动提交、异常自动回滚。
+    scenarios: |
+      - **FastAPI 依赖**：yield 依赖从 `async_sessionmaker` 创建会话，每个请求一个（Day 07）。
+      - **知识库详情页**：`selectinload` 一次加载知识库和最近文档，避免 N+1。
+      - **后台入库任务**：每个任务自己创建会话；并发处理多个文档时每个协程各用一个会话。
+      - **统计报表**：复杂聚合直接写 `select(func.count(...)).group_by(...)`，或用 `text()` 写原生 SQL（参数绑定，防注入）。
+    code: |
+      ```python
+      from sqlalchemy import ForeignKey, String, select
+      from sqlalchemy.ext.asyncio import AsyncAttrs, AsyncSession, async_sessionmaker, create_async_engine
+      from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, selectinload
+
+
+      class Base(AsyncAttrs, DeclarativeBase):
+          pass
+
+
+      class KnowledgeBase(Base):
+          __tablename__ = "knowledge_bases"
+          id: Mapped[int] = mapped_column(primary_key=True)
+          name: Mapped[str] = mapped_column(String(100))
+          documents: Mapped[list["Document"]] = relationship(back_populates="kb", lazy="raise")
+
+
+      class Document(Base):
+          __tablename__ = "documents"
+          id: Mapped[int] = mapped_column(primary_key=True)
+          kb_id: Mapped[int] = mapped_column(ForeignKey("knowledge_bases.id"), index=True)
+          title: Mapped[str] = mapped_column(String(255))
+          kb: Mapped[KnowledgeBase] = relationship(back_populates="documents")
+
+
+      engine = create_async_engine("postgresql+asyncpg://app:app@localhost:5432/kb", pool_size=10, pool_pre_ping=True)
+      SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+
+      async def kb_with_docs(db: AsyncSession, kb_id: int) -> KnowledgeBase | None:
+          stmt = select(KnowledgeBase).where(KnowledgeBase.id == kb_id).options(selectinload(KnowledgeBase.documents))
+          return (await db.scalars(stmt)).first()
+      ```
+    pitfalls: |
+      - **异步下访问未加载的关系**：直接报错（常见报错名 `MissingGreenlet`）。用 selectinload、awaitable_attrs 或 `lazy="raise"` 提前暴露。
+      - **一个会话被多个并发任务共享**：`asyncio.gather` 里共用一个 AsyncSession 会报错或数据错乱。
+      - **混用 1.x 写法**：`session.query()`、`declarative_base()` 从 `sqlalchemy.ext.declarative` 导入，都是旧写法。
+      - **连接数没算清**：每个 worker 一个引擎，`(pool_size + max_overflow) × worker 数` 不能超过数据库 `max_connections`。
+      - **用同步驱动**：`postgresql+psycopg2://` 在 async 路由里会卡事件循环，异步要用 `+asyncpg` 或 psycopg 3 的异步模式。
+      - **SQLAlchemy 2.1 漏装 greenlet**：2.1 起 asyncio 依赖不再默认安装，要装 `sqlalchemy[asyncio]`。
+    interview_asks:
+      - question: "SQLAlchemy 的 Session 是什么？为什么每个请求要一个？"
+        answer: "Session 是这一次工作的身份映射和待提交变更，不是连接池本身。跨请求复用会把上一个请求的对象和事务带进来。一个请求一个 Session，请求结束就提交或回滚并关闭。"
+      - question: "异步 SQLAlchemy 里访问关联属性报错是什么原因？怎么解决？"
+        answer: "异步里不能偷偷发查询。你访问没加载的 relationship，它想同步查询，就会报错。查询时用 selectinload 把关联一起取出来，或者在 await 的查询里显式加载。"
+      - question: "什么是 N+1 查询？你怎么发现和解决？"
+        answer: "先查 1 次列表，再对每条记录查 1 次关联，100 条就是 101 次查询。日志里会看到大量相似 SQL。解决是一次查出关联，用 selectinload 或 JOIN，不要在循环里查。"
+    project_example: |
+      **p1 企业知识库 · Day 08 模块**：`app/models.py` 用 2.x 声明式定义七张表，Base 混入 `AsyncAttrs`，所有关系设 `lazy="raise"`；`app/db.py` 在 lifespan 创建引擎和 `async_sessionmaker(expire_on_commit=False)`。
+      知识库详情接口用 `selectinload` 一次加载文档列表。
+      验收：开启 `echo=True` 观察 SQL，详情接口只发 2 条查询而不是 1+N 条；用 `asyncio.gather` 并发跑 5 个入库任务时每个任务各自创建会话，不出现会话冲突报错。
+    freshness: |
+      核对于 2026-11：
+      - **SQLAlchemy 2.1.0** 于 2026-09-24 发布（10 月已到 2.1.6），2.1 要求 Python ≥ 3.11；**greenlet 不再默认安装，使用 asyncio 需 `pip install "sqlalchemy[asyncio]"`**；2.1 新增会话级 `execution_options`、`AsyncSession.binds` 公开等。2.0 系列仍在维护。
+      - 2.x 推荐写法：`DeclarativeBase` + `Mapped` + `mapped_column`，查询用 `select()`；`session.query()` 属于 1.x 风格的旧版 API。
+      - 官方 asyncio 文档：AsyncSession 不应在并发任务间共享；异步下通常设置 `expire_on_commit=False`；用 `AsyncAttrs.awaitable_attrs`、`selectinload` 或 `lazy="raise"` 避免隐式 IO。
+    sources:
+      - {title: "SQLAlchemy 2.1 - Asynchronous I/O (asyncio)", url: "https://docs.sqlalchemy.org/en/21/orm/extensions/asyncio.html"}
+      - {title: "What's New in SQLAlchemy 2.1", url: "https://docs.sqlalchemy.org/en/21/changelog/migration_21.html"}
+      - {title: "SQLAlchemy 2.1.0 Released", url: "https://www.sqlalchemy.org/blog/2026/09/24/sqlalchemy-2.1.0-released/"}
+  - id: d08-k4
+    name: Alembic 数据库迁移
+    level: P1
+    summary: 迁移是「数据库结构的 git 提交」；autogenerate 只给候选脚本，必须人工审查，生产变更要向前兼容、分步上线
+    analogy: |
+      **≈ 数据库的 git commit 序列**：每个迁移文件有 `revision` 和 `down_revision`，像 commit 和 parent，数据库里的 `alembic_version` 表记录「当前在哪个提交」。
+
+      **不一样的地方：**
+      - 前端发版回滚就是换回旧的静态文件；**数据库删掉的列和数据回不来**，downgrade 只能恢复结构不能恢复数据。
+      - 滚动发布期间**新旧两个版本的代码会同时连同一个库**，迁移必须让两个版本都能正常运行。
+    why: |
+      表结构一定会变：加字段、加索引、拆表。没有迁移工具，开发、测试、生产三套库的结构很快对不上；手工在生产执行 SQL 没有记录、无法复现、容易出错。
+      AI 生成的模型改动（比如把字段改个名）如果直接 autogenerate 上线，可能**静默删掉整列数据**。
+    problem: |
+      解决「**数据库结构怎么像代码一样版本化、可评审、可重复执行**」的问题，以及「**生产环境怎么改表不停服、不丢数据**」的问题。
+    principle: |
+      **一、基本流程**
+
+      1. `alembic init -t async migrations`：用异步模板初始化（env.py 里用异步引擎 + `connection.run_sync()` 跑迁移）；
+      2. env.py 里设置 `target_metadata = Base.metadata`，数据库地址从环境变量读；
+      3. 改模型后 `alembic revision --autogenerate -m "add documents.status"`：对比模型和数据库，生成**候选**迁移脚本；
+      4. **人工审查并修改**脚本；
+      5. `alembic upgrade head` 升级；`alembic downgrade -1` 回退一步。
+
+      **二、autogenerate 能发现和不能发现的**
+
+      | 能发现 | 不能发现（要手写） |
+      |---|---|
+      | 增删表、增删列 | **表改名、列改名**：会被识别成「删掉旧的 + 新增一个」，直接执行就**丢数据** |
+      | 列可空性变化、列类型变化 | 没有名字的约束（要配置命名约定 `naming_convention`） |
+      | 索引、具名唯一约束、外键的基本变化 | 部分独立约束、序列等 |
+
+      **所以官方文档原话：autogenerate 不是完美的，生成的候选迁移必须人工审查和修正。**
+
+      **三、生产改表：扩展-收缩（expand / contract）**
+
+      ```mermaid
+      flowchart TD
+        A["第 1 次发布 扩展"] --> B["新增可空列 display_name"]
+        B --> C["新代码同时写新旧两列"]
+        C --> D["后台分批回填历史数据"]
+        D --> E["第 2 次发布 读取切到新列"]
+        E --> F["确认无旧代码在运行"]
+        F --> G["第 3 次发布 收缩 删除旧列 加 NOT NULL"]
+      ```
+
+      - 任何时刻，**线上同时存在的两个代码版本都能在当前表结构上运行**；
+      - 大表直接加 `NOT NULL` 且无默认值的列会失败或长时间锁表，要先加可空列、回填、再加约束；
+      - 大表建索引用 `CREATE INDEX CONCURRENTLY`（不锁写），它不能在事务里执行，Alembic 里要放进 `autocommit_block()`。
+
+      **四、迁移在哪执行**
+
+      - 在部署流水线里、新版本启动之前，**单独执行一次** `alembic upgrade head`（如 Compose 里的一次性 migrate 服务，Day 10）；
+      - **不要**在每个 worker 的 lifespan 里跑迁移（多个进程同时执行会冲突）；
+      - **不要**在生产用 `Base.metadata.create_all()` 代替迁移：它只会建不存在的表，不会改已有表，也没有版本记录。
+    scenarios: |
+      - **新增字段**：给 documents 加 `error_message` 可空列，autogenerate 后审查即可上线。
+      - **改字段名**：`title` 改为 `name`，手动把 drop+add 改成 `op.alter_column("documents", "title", new_column_name="name")`，并评估旧代码兼容。
+      - **加索引**：百万级 messages 表加索引，用 `postgresql_concurrently=True` 并放进 autocommit_block。
+      - **CI 检查**：在 CI 里对空库执行 `alembic upgrade head`，再跑 `alembic check` 确认模型和迁移没有遗漏。
+    code: |
+      ```python
+      """add documents.status
+
+      Revision ID: 3f2a1c9b7d10
+      Revises: 8b1e0d4c2a55
+      """
+      import sqlalchemy as sa
+      from alembic import op
+
+      revision = "3f2a1c9b7d10"
+      down_revision = "8b1e0d4c2a55"
+
+
+      def upgrade() -> None:
+          # 1. 先加可空列，老代码不受影响
+          op.add_column("documents", sa.Column("status", sa.String(20), nullable=True))
+          # 2. 回填历史数据（大表应改为分批脚本）
+          op.execute("UPDATE documents SET status = 'ready' WHERE status IS NULL")
+          # 3. 再加非空约束
+          op.alter_column("documents", "status", nullable=False)
+          # 4. 大表建索引不锁写：CONCURRENTLY 不能在事务内执行
+          with op.get_context().autocommit_block():
+              op.create_index("ix_documents_kb_status", "documents", ["kb_id", "status"],
+                              postgresql_concurrently=True)
+
+
+      def downgrade() -> None:
+          with op.get_context().autocommit_block():
+              op.drop_index("ix_documents_kb_status", table_name="documents", postgresql_concurrently=True)
+          op.drop_column("documents", "status")
+      ```
+    pitfalls: |
+      - **不看就 upgrade**：改名被识别成删列加列，生产数据直接丢失。
+      - **用 create_all 代替迁移**：改不了已有表，各环境结构逐渐不一致。
+      - **每个 worker 启动时跑迁移**：多进程并发执行同一迁移，锁冲突或重复执行。
+      - **一步到位改表**：直接删旧列或加非空列，滚动发布中的旧代码立即报错。
+      - **约束没起名**：autogenerate 无法可靠比对和删除，配置 `MetaData(naming_convention=...)` 统一命名。
+      - **多人并行开发出现多个 head**：要 `alembic merge` 合并，CI 里检查只有一个 head。
+    interview_asks:
+      - question: "你们怎么管理数据库表结构变更？autogenerate 有什么局限？"
+        answer: "改动写成 Alembic 迁移，随代码一起评审和发布。autogenerate 能发现很多表和列的变化，但改名常被看成删了再加，约束、部分索引也可能漏。生成后必须人工看 SQL。"
+      - question: "线上要给一个大表的字段改名，你怎么做才能不停服、不丢数据？"
+        answer: "不要直接改名。先加新列，代码双写新旧列，再把旧数据填到新列，然后读切到新列，最后才删旧列。每一步都能单独发布和回滚。"
+      - question: "迁移应该在什么时候、由谁执行？"
+        answer: "在新版本应用接流量之前，由发布流程执行，不在每个应用进程启动时自动跑。多副本同时迁移会打架。迁移失败就停止发布，不要带着旧代码和新表结构硬上。"
+    project_example: |
+      **p1 企业知识库**：`migrations/` 用异步模板初始化，env.py 从环境变量读 `DATABASE_URL`，Base 配置命名约定。
+      Day 08 首个迁移建七张表；之后每次改模型都走「autogenerate → 人工审查 → PR 评审 → CI 在空库 upgrade head」。
+      Day 10 的 Docker Compose 里加一个一次性的 `migrate` 服务，`api` 服务依赖它成功完成后再启动。
+      验收：删库重建后 `alembic upgrade head` 一次成功；`alembic downgrade base` 能回到空库。
+    freshness: |
+      核对于 2026-11：**Alembic 1.20.1**（2026-10-21）。异步项目用 `alembic init --template async`，env.py 通过 `connection.run_sync()` 执行迁移。autogenerate 默认比较列类型；具名 CHECK 约束检测在 1.19.0 加入、1.19.2 起改为默认关闭需显式开启；表名、列名改名仍无法自动识别。
+    sources:
+      - {title: "Alembic - Auto Generating Migrations", url: "https://alembic.sqlalchemy.org/en/latest/autogenerate.html"}
+      - {title: "Alembic Changelog", url: "https://alembic.sqlalchemy.org/en/latest/changelog.html"}
+      - {title: "Alembic async env.py 模板", url: "https://github.com/sqlalchemy/alembic/blob/main/alembic/templates/async/env.py"}
+test:
+  - id: d08-t1
+    kp: d08-k1
+    type: single
+    question: 后台「文档管理」列表用 `ORDER BY id DESC OFFSET 100000 LIMIT 20` 翻页，越往后越慢，翻页时还偶尔看到重复的文档。最合理的改法是：
+    options:
+      - "把 LIMIT 从 20 调大到 200，减少用户需要翻页的次数"
+      - "给 id 列再额外建一个唯一索引，加快 OFFSET 定位"
+      - "改成游标分页：按上一页最后一条的 id 往后取 20 条"
+      - "把整张表缓存到 Redis 里，直接在内存中切片分页"
+    answer: [2]
+    explain: |
+      OFFSET 要先扫描并丢弃前 10 万行，越往后越慢；翻页期间有新文档插入，原来的第 N 条被挤到下一页，就会重复出现。游标分页用上一页最后一条的 id 直接在主键索引上定位，速度与页码无关，也不受新插入影响。
+      加大 LIMIT 没解决扫描问题；主键本来就有唯一索引；整表缓存到 Redis 成本高且数据一致性难保证。
+  - id: d08-t2
+    kp: d08-k1
+    type: judge
+    question: 文档的元数据（作者、页数、来源、部门）都放进一个 JSONB 列后，就不需要再为 kb_id、status 这类字段建普通列了，查询和约束都一样方便。
+    answer: false
+    explain: |
+      JSONB 适合字段不固定、很少用于过滤的元数据。kb_id、status、created_at 这类经常用于过滤、关联、排序的字段应做成普通列：类型明确、可以加外键和 CHECK 约束、建 B-tree 索引简单，查询写法也直观。
+      JSONB 里的字段无法加外键，也不能直接加 NOT NULL；虽然可以建 GIN 或表达式索引，但设计和维护都更复杂。
+  - id: d08-t3
+    kp: d08-k1
+    type: single
+    question: 用户可能把同一个 PDF 重复上传到同一个知识库，要求只保留一份、且并发上传也不能出现两份。最可靠的实现是：
+    options:
+      - "在 (kb_id, content_hash) 上建唯一约束，插入时 ON CONFLICT DO NOTHING"
+      - "插入前先 SELECT 一下 content_hash，不存在再 INSERT"
+      - "前端上传前计算哈希，发现重复就不调用接口"
+      - "每天定时任务扫描并删除重复记录"
+    answer: [0]
+    explain: |
+      唯一约束由数据库保证，即使两个请求同时插入，也只有一个能成功，另一个走 ON CONFLICT 分支，这是并发下唯一可靠的去重方式。
+      先查再插有竞态：两个请求可能同时查到「不存在」然后都插入；前端检查可以被绕过，且多端上传无法覆盖；定时清理期间重复数据已经被切片入库、参与检索了。
+  - id: d08-t4
+    kp: d08-k1
+    type: multi
+    question: 关于数据库约束，下列说法正确的有：
+    options:
+      - "唯一约束在并发插入时也能保证不重复，应用层先查后插做不到"
+      - "外键可以防止出现指向不存在文档的切片记录"
+      - "接口已经用 Pydantic 校验过必填字段，数据库就不需要 NOT NULL 了"
+      - "CHECK 约束可以限制 status 只能取 pending、ready 等几个值"
+    answer: [0, 1, 3]
+    explain: |
+      唯一约束、外键、CHECK 都由数据库在每次写入时强制执行，不管数据来自 API、后台脚本还是手工改库，是数据正确性的最后一道防线。
+      Pydantic 只保护经过这个接口的数据，批处理脚本、数据迁移、其他服务写库都会绕过它，所以 NOT NULL 仍然需要。
+  - id: d08-t5
+    kp: d08-k2
+    type: single
+    question: 表上有复合索引 `(kb_id, created_at)`。下列哪个查询**最能充分利用**这个索引？
+    options:
+      - "WHERE created_at > '2026-11-01'（没有 kb_id 条件）"
+      - "WHERE kb_id = 7 ORDER BY created_at DESC LIMIT 20"
+      - "WHERE lower(title) = '员工手册'"
+      - "WHERE kb_id::text LIKE '%7%'"
+    answer: [1]
+    explain: |
+      kb_id 等值条件命中前导列，created_at 正好是索引里的第二列且已排序，数据库可以直接按索引顺序取前 20 条，既不用全表扫描也不用额外排序。
+      只按 created_at 过滤缺少前导列条件，PG 18 的 skip scan 在 kb_id 取值很少时也许能用上，但效果远不如前者；对 title 做函数运算与该索引无关；把 kb_id 转成文本再模糊匹配，索引完全用不上。
+  - id: d08-t6
+    kp: d08-k2
+    type: judge
+    question: 给表上的每一列都建索引，所有查询都会变快，而且除了占一点磁盘以外没有别的代价。
+    answer: false
+    explain: |
+      每个索引在 INSERT、UPDATE、DELETE 时都要同步维护，索引越多写入越慢；低区分度的列建索引往往不会被优化器采用；多个单列索引也不能替代一个设计正确的复合索引。
+      索引应该根据真实的查询（WHERE、JOIN、ORDER BY）来设计，并用 EXPLAIN ANALYZE 验证效果，不用的索引要删掉。
+  - id: d08-t7
+    kp: d08-k2
+    type: single
+    question: 用户只剩 1 次提问配额时，两个请求几乎同时到达，都执行了下面的代码。最可能的结果是：
+    code: |
+      async def use_quota(db: AsyncSession, uid: int) -> bool:
+          q = await db.scalar(select(Quota).where(Quota.user_id == uid))
+          if q.remaining > 0:
+              q.remaining -= 1
+              await db.commit()
+              return True
+          return False
+    options:
+      - "一个返回 True、一个返回 False，remaining 变成 0"
+      - "两个都返回 False，因为发生了死锁"
+      - "数据库报唯一约束冲突，其中一个请求 500"
+      - "两个都返回 True，remaining 变成 0，多放行了一次"
+    answer: [3]
+    explain: |
+      两个请求都先读到 remaining=1，都判断通过，都写回 0。这是典型的丢失更新：Read Committed 下普通 SELECT 不加锁，读-改-写之间没有保护。结果是扣了一次却放行了两次。
+      修复首选原子更新 UPDATE ... SET remaining = remaining - 1 WHERE user_id = ? AND remaining > 0 RETURNING，返回 0 行即配额不足；也可以用 SELECT ... FOR UPDATE 锁行。这里不涉及唯一约束，也不会死锁。
+  - id: d08-t8
+    kp: d08-k2
+    type: multi
+    question: 关于事务的使用，下列做法或说法正确的有：
+    options:
+      - "「扣减配额」和「写入调用记录」放在同一个事务里，保证要么都成功要么都失败"
+      - "在事务里等待 LLM 返回结果后再一起提交，数据最一致"
+      - "并发修改同一行余额时，可以用 SELECT ... FOR UPDATE 或原子 UPDATE 防止丢失更新"
+      - "PostgreSQL 默认的 Read Committed 下，同一事务里两次 SELECT 可能看到不同的结果"
+      - "事务越大越安全，应该把整个请求处理过程都包进一个事务"
+    answer: [0, 2, 3]
+    explain: |
+      相关联的多步写入放同一事务保证原子性；FOR UPDATE 和原子 UPDATE 都能防止并发读-改-写丢失更新；Read Committed 下每条语句看到语句开始前已提交的数据，所以两次 SELECT 之间别人提交的修改会被看到。
+      在事务里等 LLM 会长时间占用连接和行锁，高并发时锁等待和连接池耗尽；大事务同理，事务应该尽量短，只包含必须原子完成的数据库操作。
+  - id: d08-t9
+    kp: d08-k2
+    type: single
+    question: |
+      知识库文档列表接口变慢，对它的 SQL 执行 EXPLAIN ANALYZE，看到 `Seq Scan on documents`，`Filter: (kb_id = 12)`，`Rows Removed by Filter: 1980000`，耗时 800ms。最合理的第一步是：
+    options:
+      - "按查询条件给 kb_id 建索引，再用 EXPLAIN ANALYZE 验证"
+      - "把数据库连接池从 10 调到 50，让更多查询同时执行"
+      - "给这个接口的所有响应都加上 Redis 缓存，减少查库"
+      - "把数据库驱动从 psycopg2 换成更快的 asyncpg 驱动"
+    answer: [0]
+    explain: |
+      执行计划已经说明问题：为了找出 kb_id=12 的几千行，扫描并丢弃了近 200 万行，这是缺少合适索引的典型表现。建索引后应再次 EXPLAIN ANALYZE，确认变成 Index Scan 且耗时下降。
+      连接池大小影响的是排队等连接，不改变单条 SQL 的执行方式；缓存可以作为补充但掩盖了根因，且缓存失效时仍然慢；换驱动不会改变数据库内部的执行计划。
+  - id: d08-t10
+    kp: d08-k3
+    type: single
+    question: 在 FastAPI 的 async 路由里执行下面代码（`documents` 关系没有配置预加载），最可能发生什么？
+    code: |
+      @app.get("/kb/{kb_id}/titles")
+      async def titles(kb_id: int, db: DB) -> list[str]:
+          kb = await db.get(KnowledgeBase, kb_id)
+          return [d.title for d in kb.documents]
+    options:
+      - "正常返回，SQLAlchemy 会自动在后台异步加载 documents"
+      - "返回空列表，因为关系默认不加载"
+      - "访问 kb.documents 时报错，异步会话不允许隐式懒加载 IO"
+      - "卡住整个事件循环，因为懒加载是同步执行的"
+    answer: [2]
+    explain: |
+      kb.documents 没有被加载，访问它需要再查一次数据库。同步 Session 会偷偷懒加载，但 AsyncSession 下不允许这种隐式 IO，会直接抛错（常见报错为 MissingGreenlet）。
+      修复是查询时 options(selectinload(KnowledgeBase.documents))，或 await kb.awaitable_attrs.documents。它不会静默返回空列表，也不会自动后台加载。
+  - id: d08-t11
+    kp: d08-k3
+    type: judge
+    question: 为了省事，可以在 `asyncio.gather` 并发执行的多个入库协程之间共享同一个 AsyncSession，SQLAlchemy 会自动处理并发。
+    answer: false
+    explain: |
+      官方文档明确：AsyncSession 是有状态的对象，代表一个进行中的事务，使用 asyncio.gather 等并发 API 时，每个并发任务应使用各自的 AsyncSession。共享会导致报错（如连接正在被另一个操作使用）或数据混乱。
+      正确做法是每个协程用 async with SessionLocal() as db 创建自己的会话，用完自动关闭。
+  - id: d08-t12
+    kp: d08-k3
+    type: single
+    question: 官方 asyncio 示例里创建会话工厂时都写了 `async_sessionmaker(engine, expire_on_commit=False)`。这样配置主要是为了：
+    options:
+      - "让 commit 之后自动关闭会话，避免连接泄漏"
+      - "让 commit 之后访问对象属性不会触发重新加载，避免异步下的隐式 IO"
+      - "让事务永远不过期，可以无限期保持打开"
+      - "让 ORM 对象在多个请求之间共享缓存"
+    answer: [1]
+    explain: |
+      默认 expire_on_commit=True，commit 后对象所有属性被标记为过期，下次访问时会自动重新查询数据库。在 AsyncSession 下这属于隐式 IO，会报错。设为 False 后，commit 之后仍可以直接读取已加载的属性，比如返回给前端。
+      它和会话关闭、事务时长、跨请求缓存都没有关系；会话的关闭仍然由 async with 或 yield 依赖负责。
+  - id: d08-t13
+    kp: d08-k3
+    type: multi
+    question: 下列哪些是 SQLAlchemy 2.x 的**当前推荐**写法？
+    options:
+      - "select(Document).where(Document.kb_id == 1)，再用 session.scalars 执行"
+      - "id: Mapped[int] = mapped_column(primary_key=True)"
+      - "session.query(Document).filter(Document.kb_id == 1).all()"
+      - "async_sessionmaker(engine, expire_on_commit=False) 创建会话工厂"
+      - "from sqlalchemy.ext.declarative import declarative_base"
+    answer: [0, 1, 3]
+    explain: |
+      2.x 统一用 select() 构造查询、Mapped 加 mapped_column 声明列，异步用 async_sessionmaker 创建 AsyncSession。
+      session.query() 是 1.x 风格的旧版 API；从 sqlalchemy.ext.declarative 导入 declarative_base 是更老的写法，2.x 用继承 DeclarativeBase 的方式。AI 工具常把这些混着生成，要统一改掉。
+  - id: d08-t14
+    kp: d08-k3
+    type: single
+    question: 首页要展示 20 个知识库及每个知识库的文档数量。同事的实现是先查出 20 个知识库，再在 for 循环里对每个知识库执行一次 `count` 查询。这个实现的主要问题和改法是：
+    options:
+      - "没有问题，每次 count 都很快"
+      - "应该把 for 循环改成 asyncio.gather 并发执行 20 次 count，共用一个会话"
+      - "应该把 count 结果缓存到浏览器 localStorage"
+      - "这是 N+1 查询，应改为一条 LEFT JOIN 加 GROUP BY 的聚合查询"
+    answer: [3]
+    explain: |
+      1 次列表查询加 20 次 count 查询就是 N+1，每次都有网络往返和数据库开销，列表变长或并发变高时问题会放大。一条 LEFT JOIN documents 并 GROUP BY 知识库 id 的查询即可一次拿到所有计数。
+      用 gather 并发执行而且共用一个会话违反了「每个并发任务一个会话」的规则，且查询次数没变；浏览器缓存解决不了服务端的查询效率问题。
+  - id: d08-t15
+    kp: d08-k4
+    type: single
+    question: 你把模型里的 `Document.title` 改名为 `Document.name`，执行 autogenerate 后生成的迁移里是 `op.drop_column("documents", "title")` 和 `op.add_column("documents", sa.Column("name", ...))`。正确的处理是：
+    options:
+      - "手动改成 op.alter_column 加 new_column_name 改名，并评估旧代码兼容"
+      - "直接执行即可，autogenerate 对比的是真实数据库，生成的脚本可靠"
+      - "先照常执行，上线后再从备份里把 title 列的数据导回 name 列"
+      - "删掉这个迁移文件，改为由 DBA 在生产库手动执行改名 SQL"
+    answer: [0]
+    explain: |
+      Alembic 官方文档列明 autogenerate 无法识别列改名，会把它识别成删一列加一列，直接执行会丢掉整列数据。正确做法是把脚本改成 alter_column 改名；滚动发布期间旧代码仍读 title，必要时用扩展-收缩分步完成。
+      依赖备份恢复风险高且有停机窗口；绕过迁移手工改库会让各环境结构和版本记录不一致。
+  - id: d08-t16
+    kp: d08-k4
+    type: judge
+    question: Alembic autogenerate 会对比模型和数据库自动生成迁移，生成的脚本可以不经审查直接在生产环境执行。
+    answer: false
+    explain: |
+      官方文档原话是 autogenerate 并非完美，生成的是候选迁移，必须人工审查和修正。它识别不了表名和列名改名，对无名约束和部分类型变化也不可靠。
+      规范流程是 autogenerate、人工审查、代码评审、在 CI 中对空库和预发环境执行 upgrade 验证，然后才上生产。
+  - id: d08-t17
+    kp: d08-k4
+    type: multi
+    question: 要给一张有几千万行的线上表新增一个**非空**字段并建索引，而且不能停服。下列步骤合理的有：
+    options:
+      - "先新增可空列，让旧代码不受影响"
+      - "分批回填历史数据，避免一次大事务长时间锁表"
+      - "回填完成后再加上 NOT NULL 约束"
+      - "直接 add_column(nullable=False) 且不给默认值，一步到位"
+      - "用 CREATE INDEX CONCURRENTLY 建索引，放在 autocommit_block 中执行"
+    answer: [0, 1, 2, 4]
+    explain: |
+      扩展-收缩思路：先加可空列保证新旧代码都能跑，分批回填控制每批锁的时间，最后加约束；大表索引用 CONCURRENTLY 不阻塞写入，它不能在事务中执行，所以要放进 Alembic 的 autocommit_block。
+      对已有数据的表直接加不带默认值的非空列会因为历史行没有值而失败，即使能执行也会长时间锁表，影响线上。
+  - id: d08-t18
+    kp: d08-k4
+    type: single
+    question: 服务用 4 个 uvicorn worker 部署，迁移应该在哪里执行最合适？
+    options:
+      - "在每个 worker 的 lifespan 里执行 alembic upgrade head"
+      - "在每个 worker 启动时执行 Base.metadata.create_all()"
+      - "在部署流程中、新版本启动前，单独执行一次 alembic upgrade head"
+      - "由 DBA 在生产库手动执行 SQL，不使用迁移工具"
+    answer: [2]
+    explain: |
+      迁移应该作为部署中的独立一步只执行一次，比如 CI/CD 的一个任务或 Compose 里的一次性 migrate 服务，成功后再启动或滚动更新应用。
+      每个 worker 都执行会出现多个进程同时跑同一迁移的冲突；create_all 只能建新表不能改旧表，也没有版本记录；手工执行 SQL 不可复现、各环境容易不一致。
+exam:
+  - id: d08-e1
+    kp: d08-k2
+    type: single
+    question: 为防止重复下单，服务端实现了「先在数据库查这个 Idempotency-Key 是否存在，不存在就插入订单」。压测时同一个 key 的两个并发请求仍然插入了两条订单。最可靠的修复是：
+    options:
+      - "查询前先 sleep 一个随机时间，错开两个请求"
+      - "给 idempotency_key 加唯一约束，插入时 ON CONFLICT 返回已有订单"
+      - "把隔离级别调成 Read Uncommitted，让请求能看到对方未提交的数据"
+      - "在应用进程里用 asyncio.Lock 包住这段代码"
+    answer: [1]
+    explain: |
+      先查后插天然有竞态窗口，只有数据库的唯一约束能在并发下保证同一个 key 只插入一次，冲突的请求走 ON CONFLICT 分支拿到首次结果。
+      随机 sleep 只是降低概率；PostgreSQL 实际上不支持读未提交（会按读已提交处理），且看到未提交数据也不能消除竞态；asyncio.Lock 只在单个进程内有效，多 worker、多实例部署时完全不起作用。
+  - id: d08-e2
+    kp: d08-k3
+    type: single
+    question: 流式问答接口上线后，高峰期日志出现大量 `QueuePool limit of size 10 overflow 20 reached, connection timed out`，而普通接口的 SQL 都很快。这个接口通过 yield 依赖拿到 AsyncSession，然后开始 SSE 推流，平均推流 40 秒。最可能的根因是：
+    options:
+      - "SQL 没有索引，每条查询都很慢"
+      - "asyncpg 驱动不支持流式响应"
+      - "uvicorn worker 数太少，应该增加到 16 个"
+      - "每个流式请求的会话要到推流结束才关闭，连接被长时间占用"
+    answer: [3]
+    explain: |
+      FastAPI 默认在响应发送完毕后才执行 yield 依赖的退出代码，所以每个流式请求在 40 秒推流期间都占着一个连接，并发一高连接池就被耗尽。修法是在推流前读完所需数据并释放会话，或使用 Depends(get_db, scope="function")，推流结束后再用新会话写入回答。
+      普通接口很快说明不是索引问题；驱动与流式响应无关；盲目加 worker 会让连接总数成倍增加，可能把数据库的 max_connections 也打满。
+  - id: d08-e3
+    kp: d08-k4
+    type: single
+    question: 线上服务采用滚动发布，发布过程中新旧两个版本会同时运行十几分钟。现在要把 `users.name` 改名为 `display_name`。最安全的方案是：
+    options:
+      - "分多次发布：先加新列并双写、回填，再把读取切到新列，最后删除旧列"
+      - "一次发布：迁移里直接 alter_column 改名，新代码同时上线"
+      - "先停服，执行改名迁移，再启动新版本"
+      - "不改数据库，在 ORM 模型里给 name 起个别名就够了"
+    answer: [0]
+    explain: |
+      扩展-收缩保证任何时刻在线的两个版本都能在当前表结构上运行：第一次发布加列和双写，回填后第二次发布切换读取，确认没有旧代码后再删旧列。
+      一次发布直接改名，仍在运行的旧版本立刻找不到 name 列报错；停服能做但违背了不停服的要求；只在 ORM 层起别名没有完成数据库层面的改名需求，长期造成模型与表结构不一致。
+  - id: d08-e4
+    kp: d08-k2
+    type: single
+    question: 多租户 SaaS 里最常见的查询是 `WHERE tenant_id = ? AND status = ? ORDER BY created_at DESC LIMIT 20`。下列索引设计最合适的是：
+    options:
+      - "只在 created_at 上建单列索引"
+      - "在 tenant_id、status、created_at 上各建一个单列索引"
+      - "复合索引 (tenant_id, status, created_at)"
+      - "复合索引 (created_at, status, tenant_id)"
+    answer: [2]
+    explain: |
+      两个等值条件放在前面，排序列放在最后，数据库可以直接定位到某租户某状态的数据段，并按 created_at 有序读取前 20 条，不需要额外排序。
+      只按 created_at 建索引要在大量其他租户的数据里过滤；三个单列索引通常只能用上其一或做位图合并，还要额外排序；把排序列放在最前，等值条件无法缩小扫描范围。
+  - id: d08-e5
+    kp: d08-k3
+    type: multi
+    question: 关于 SQLAlchemy 的 AsyncSession，下列说法正确的有：
+    options:
+      - "应该一个请求或一个并发任务使用一个会话"
+      - "默认 commit 后属性会过期，异步下再访问可能触发隐式 IO 报错，所以通常设 expire_on_commit=False"
+      - "访问关联集合前，可以用 selectinload 预加载，或用 AsyncAttrs 的 awaitable_attrs 显式加载"
+      - "可以在 lifespan 里创建一个全局 AsyncSession 放进 app.state 供所有请求复用"
+      - "SQLAlchemy 2.1 使用 asyncio 功能需要安装 sqlalchemy[asyncio]，因为 greenlet 不再默认安装"
+    answer: [0, 1, 2, 4]
+    explain: |
+      会话是有状态的事务单元，必须按请求或任务隔离；expire_on_commit 和预加载都是为了避免异步下的隐式 IO；2.1 起 greenlet 移到 asyncio 可选依赖中。
+      全局共享一个 AsyncSession 会让并发请求共用同一个事务和连接，导致报错和数据串号，lifespan 里只应创建引擎和会话工厂。
+  - id: d08-e6
+    kp: d08-k2
+    type: multi
+    question: 关于 PostgreSQL 的隔离级别与锁，下列说法正确的有：
+    options:
+      - "默认隔离级别是 Read Committed"
+      - "Repeatable Read 和 Serializable 下可能出现序列化失败，应用需要捕获后重试"
+      - "SELECT ... FOR UPDATE 会锁住选中的行，直到当前事务结束"
+      - "用了 Serializable 级别后，应用就不需要再处理任何并发错误"
+      - "PostgreSQL 的 Repeatable Read 实现不会出现幻读"
+    answer: [0, 1, 2, 4]
+    explain: |
+      PostgreSQL 官方文档说明默认是 Read Committed，其 Repeatable Read 实现比标准更严格、不允许幻读；Repeatable Read 和 Serializable 都要求应用准备重试序列化失败（SQLSTATE 40001）；FOR UPDATE 的行锁持续到事务提交或回滚。
+      Serializable 恰恰是通过让冲突事务失败来保证正确性的，应用必须处理这些失败并重试，而不是不用处理。
+  - id: d08-e7
+    kp: d08-k1
+    type: judge
+    question: 用 OFFSET 分页时，如果用户翻页期间有新数据插入，可能看到重复的条目；改为按唯一且有序的键（如自增 id）做游标分页，可以避免这一问题。
+    answer: true
+    explain: |
+      OFFSET 按位置取数据，新插入的行会把原有数据整体往后推，下一页的开头可能就是上一页看过的最后一条。游标分页按「id 小于上一页最后一个 id」取数，位置由数据本身决定，新插入的数据不会影响已翻过的部分。
+      同时游标分页可以直接走索引定位，深翻页的速度也不会下降。
+  - id: d08-e8
+    kp: d08-k4
+    type: judge
+    question: 在每个 worker 的 lifespan 里执行 `Base.metadata.create_all()`，就可以替代 Alembic 迁移，保证各环境表结构一致。
+    answer: false
+    explain: |
+      create_all 只会创建不存在的表，已有表的加列、改类型、加索引一概不处理，各环境结构会逐渐不一致；它也没有版本记录，无法回退和审查。多个 worker 同时执行还可能产生冲突。
+      生产环境应使用 Alembic 迁移，并在部署流程里单独执行一次 upgrade head；create_all 只适合测试时快速建一个临时库。
+  - id: d08-e9
+    kp: d08-k2
+    type: case
+    question: |
+      问答接口的实现流程是：开启事务 → `SELECT ... FOR UPDATE` 锁住该用户的配额行 → 调用 LLM（平均 8 秒）→ 扣减配额 → 写入消息记录 → 提交。
+      上线后高峰期出现三种现象：大量请求超时；日志出现连接池耗尽；同一用户在两个标签页同时提问时，第二个要等第一个完全回答完才开始。
+      团队希望既不超扣配额，又解决性能问题。最合理的改法是：
+    options:
+      - "把隔离级别调到 Serializable，去掉 FOR UPDATE"
+      - "LLM 调用移出事务：短事务原子预扣配额，事务外调 LLM，失败再短事务退还，成功后短事务写消息"
+      - "把连接池从 10 调到 100，让更多请求能同时持有锁"
+      - "去掉事务和锁，配额扣减改成先查后写，提高并发度"
+    answer: [1]
+    explain: |
+      根因是在持有行锁和连接的事务里等待 8 秒的 LLM：连接被长期占用导致池耗尽，同一用户的请求被行锁串行化。把数据库操作拆成几个毫秒级短事务，原子 UPDATE 预扣保证不超扣，LLM 在事务外执行，失败时补偿退还。
+      Serializable 下长事务依然占连接，还会引入序列化失败重试；加大连接池只是让更多请求一起等锁，还可能超过数据库连接上限；先查后写会重新引入丢失更新。
+interview:
+  - id: d08-i1
+    kp: d08-k2
+    type: short
+    difficulty: 2
+    question: 讲讲数据库索引的原理和设计原则。为什么索引不是越多越好？你怎么确认一个查询用上了索引？
+    key_points:
+      - {text: "说明 B-tree 索引把列值有序组织成树，支持等值、范围和排序查询，复杂度约为 log n", dim: concept}
+      - {text: "说明复合索引列顺序：等值列在前、范围和排序列在后，前导列原则", dim: principle}
+      - {text: "说明索引代价：写入时要维护、占空间，低区分度列效果差", dim: principle}
+      - {text: "说明用 EXPLAIN ANALYZE 区分 Seq Scan 与 Index Scan，并注意函数运算或类型转换导致索引失效", dim: engineering}
+      - {text: "结合项目举例，如按知识库和状态查文档列表的复合索引", dim: project}
+    reference: |
+      **原理：** PostgreSQL 默认的 B-tree 索引把列值按顺序组织成一棵平衡树，叶子节点指向表中的行。查找某个值或某个范围只需从根走到叶子，复杂度约 O(log n)；因为有序，ORDER BY 该列也可以直接按索引顺序读取，免去排序。
+
+      **设计原则：**
+      - 根据真实查询的 WHERE、JOIN、ORDER BY 来建，而不是给每列都建；
+      - 复合索引里等值条件的列放前面，范围或排序列放后面，比如 WHERE kb_id = ? AND status = ? ORDER BY created_at 用 (kb_id, status, created_at)；
+      - 前导列原则：(a, b) 对只查 b 的查询帮助有限（PG 18 的 skip scan 在前导列取值很少时可以缓解，但不能依赖）；
+      - 唯一索引兼做业务约束，如 (kb_id, content_hash)。
+
+      **为什么不是越多越好：** 每次写入都要同步更新所有索引，写多读少的表会明显变慢；索引占磁盘和内存；低区分度的列（比如布尔值）优化器往往不用它。
+
+      **怎么确认：** 用 EXPLAIN ANALYZE 看执行计划，Seq Scan 加大量 Rows Removed by Filter 说明在全表过滤；Index Scan 或 Index Only Scan 说明用上了。还要注意对索引列做函数运算或类型转换会让普通索引失效，需要改写条件或建表达式索引。线上可以用 pg_stat_statements 找出最耗时的 SQL，再逐个分析。
+    oral: |
+      索引我一般这么讲：默认的 B-tree 索引就是把列值按顺序排成一棵树，查一个值或一个范围只要从根走到叶子，排序也能直接按索引顺序读。
+      设计上我按查询来建，复合索引把等值条件放前面、排序和范围放后面，比如知识库项目里文档列表是按知识库和状态过滤、按时间倒序，我就建知识库、状态、创建时间的复合索引。
+      索引不是越多越好，因为每次写入都要维护所有索引，还占空间，区分度低的列建了也不会被用。确认有没有用上，我会跑 EXPLAIN ANALYZE，看是 Seq Scan 还是 Index Scan，再对比耗时；另外注意别在索引列上套函数，那样索引就失效了。
+  - id: d08-i2
+    kp: d08-k3
+    type: scenario
+    difficulty: 3
+    question: 线上「知识库列表」接口的 P95 从 50ms 慢慢涨到了 3 秒，数据量也比上线时多了很多。你会怎么一步步排查？可能的原因有哪些，分别怎么修？
+    key_points:
+      - {text: "先拆分耗时：区分是数据库查询慢、连接池等待还是应用层处理慢，用日志或 Trace 看各段耗时", dim: engineering}
+      - {text: "用 echo 日志或 pg_stat_statements 统计该接口发出的 SQL 条数与耗时，识别 N+1 查询", dim: engineering}
+      - {text: "对慢 SQL 执行 EXPLAIN ANALYZE，识别全表扫描、索引失效、OFFSET 深分页等问题", dim: principle}
+      - {text: "对应修复：selectinload 或聚合查询消除 N+1、按查询建复合索引、游标分页、缩小返回字段", dim: principle}
+      - {text: "修复后用压测和监控验证 P95，并在 CI 或评审中防止 N+1 再次出现", dim: project}
+    reference: |
+      **第一步：定位慢在哪一段。** 看请求日志或 Trace，把耗时拆成：等数据库连接、执行 SQL、应用层处理和序列化。如果主要在等连接，说明连接池被其他请求（比如流式接口、长事务）长期占用；如果主要在执行 SQL，就继续往下查。
+
+      **第二步：看这个接口发了多少条 SQL。** 本地或预发开启 SQLAlchemy 的 echo，或在数据库用 pg_stat_statements 看调用次数。随着数据增长才变慢，常见原因是 N+1：查 20 个知识库，再对每个知识库查文档数、成员数，SQL 条数随列表长度线性增长。
+
+      **第三步：对慢 SQL 做 EXPLAIN ANALYZE。** 常见问题有：缺少索引导致 Seq Scan；在索引列上做了函数或类型转换导致索引失效；用 OFFSET 深分页；SELECT * 带出大字段（如文档全文、JSONB 元数据）。
+
+      **对应修复：**
+      - N+1：改为一条 LEFT JOIN 加 GROUP BY 聚合，或用 selectinload 一次加载关联；
+      - 缺索引：按查询条件建复合索引，如 kb_members(user_id, kb_id)；
+      - 深分页：改游标分页；
+      - 大字段：只查列表需要的列，详情页再查全文；
+      - 连接等待：缩短事务、流式接口提前释放会话。
+
+      **验证与防回归：** 修复后对比 SQL 条数和 P95；压测确认；在测试里断言关键接口的 SQL 条数上限，或给关系设 lazy="raise"，让新的 N+1 在开发阶段就报错。
+    oral: |
+      我会先拆耗时，看日志或 Trace 里这 3 秒是花在等连接、跑 SQL 还是应用处理上。如果是等连接，那多半是别的长事务或者流式接口占着连接。
+      如果是 SQL 慢，我先数这个接口发了多少条 SQL。数据越多越慢，最常见的就是 N+1，列表里每个知识库再查一次文档数。这种我会改成一条 LEFT JOIN 加 GROUP BY，或者用 selectinload。
+      然后对最慢的那条跑 EXPLAIN ANALYZE，看是不是全表扫描、索引失效或者 OFFSET 深分页，对应地建复合索引、改游标分页、只查需要的列。
+      改完我会压测对比 P95，并且给关系配 lazy raise，测试里断言 SQL 条数，防止以后又有人写出 N+1。
+  - id: d08-i3
+    kp: d08-k1
+    type: design
+    difficulty: 4
+    question: 为企业知识库问答系统设计数据库：要支持多知识库、成员权限、文档上传与异步入库、切片、对话与消息、每日提问配额。说说你的表结构、关键约束与索引、并发场景怎么保证正确，以及表结构变更怎么管理。
+    key_points:
+      - {text: "给出核心表与关系：用户、知识库、成员关系表、文档、切片、对话、消息、配额", dim: concept}
+      - {text: "说明关键约束：成员唯一、文档内容哈希唯一实现幂等入库、状态 CHECK、外键级联", dim: principle}
+      - {text: "说明按查询设计的复合索引，以及消息列表的游标分页", dim: principle}
+      - {text: "说明并发正确性：原子 UPDATE 扣配额、条件更新抢占入库任务、不在事务中调用 LLM", dim: engineering}
+      - {text: "说明迁移管理：Alembic 异步模板、autogenerate 后人工审查、扩展收缩、部署时单独执行迁移", dim: engineering}
+      - {text: "提到为后续检索预留：切片表将来加向量列，元数据用 JSONB", dim: project}
+    reference: |
+      **表结构：**
+      - users、knowledge_bases；kb_members(user_id, kb_id, role) 多对多，UNIQUE(user_id, kb_id)；
+      - documents(id, kb_id, title, content_hash, status, error_message, meta jsonb, created_at)，UNIQUE(kb_id, content_hash)，status 加 CHECK 限定 pending/parsing/ready/failed；
+      - chunks(id, document_id, seq, content, meta)，外键 ON DELETE CASCADE，UNIQUE(document_id, seq)；后续 Day 24 加 pgvector 向量列；
+      - conversations(id, user_id, kb_id, title)、messages(id, conversation_id, role, content, citations jsonb, tokens)；
+      - quotas(user_id, day, remaining)，主键 (user_id, day)。
+
+      **索引：** documents(kb_id, status, created_at) 支撑后台列表；messages(conversation_id, id) 支撑聊天记录游标分页；kb_members(user_id) 支撑「我能访问哪些知识库」；JSONB 元数据按需建 GIN 索引。
+
+      **并发正确性：**
+      - 重复上传：INSERT ... ON CONFLICT (kb_id, content_hash) DO NOTHING RETURNING id，没有返回就说明已存在；
+      - 入库任务抢占：UPDATE documents SET status='parsing' WHERE id=? AND status='pending'，影响 1 行的 worker 才处理，避免重复入库；
+      - 配额：原子 UPDATE ... WHERE remaining > 0 RETURNING 扣减；
+      - 问答流程拆成短事务：预扣配额、事务外检索和调 LLM、成功后写消息、失败退还，绝不在事务里等模型。
+
+      **ORM 与迁移：** SQLAlchemy 2 异步模型，关系 lazy="raise" 防 N+1；Alembic 用异步模板，MetaData 配置命名约定；每次改模型 autogenerate 后人工审查（尤其改名），PR 评审，CI 在空库 upgrade head；线上改表用扩展-收缩，大表索引 CONCURRENTLY；部署时用一次性 migrate 任务执行迁移，成功后再启动应用。
+    oral: |
+      我会先把实体理清：用户、知识库、成员关系、文档、切片、对话、消息、配额八张表。成员关系是多对多，用户和知识库组合唯一；文档上按知识库加内容哈希做唯一约束，这样重复上传天然幂等；状态加 CHECK，切片外键级联删除。
+      索引按查询来：文档列表按知识库、状态、时间建复合索引，消息按对话和 id 建索引做游标分页。
+      并发上我最在意三点：上传用 ON CONFLICT 去重，入库任务用「状态等于 pending 才更新成 parsing」的条件更新来抢，配额用原子 UPDATE 扣。而且问答流程拆成短事务，绝不在事务里等 LLM。
+      结构变更用 Alembic，autogenerate 后一定人工看，特别是改名；线上改表走扩展收缩，迁移在部署流程里单独跑一次。切片表后面会加向量列，元数据先用 JSONB 留好弹性。

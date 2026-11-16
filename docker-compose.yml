@@ -1,0 +1,13 @@
+services:
+  study:
+    build: .
+    image: stupy:latest
+    ports:
+      - "127.0.0.1:8765:8765"
+    volumes:
+      - ./data:/app/data
+      - ./content:/app/content:ro
+    environment:
+      # 如需从其他设备访问，把上面的端口改成 "8765:8765" 并设置访问码
+      STUPY_ACCESS_CODE: ${STUPY_ACCESS_CODE:-}
+    restart: unless-stopped

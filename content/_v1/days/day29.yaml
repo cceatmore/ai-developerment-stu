@@ -1,0 +1,696 @@
+day: 29
+phase: 3
+title: RAG 评估：检索指标、生成指标与评估集
+goals:
+  - 能手算 Recall@K、Precision@K、MRR，并用直觉解释 nDCG
+  - 能解释 Faithfulness、Answer Relevancy 的计算方式和各自不能说明什么
+  - 能设计一个分层、可维护的 RAG 评估集，并把评估接入每次改动的回归流程
+  - 能说明 RAGAS 等框架的当前用法和 LLM-as-judge 的局限，并在评估脚本中找出统计错误
+knowledge_points:
+  - id: d29-k1
+    name: 检索评估指标：Recall@K、Precision@K、MRR、nDCG
+    level: P0
+    summary: Recall@K 看「答案进没进候选」，Precision@K 看「候选里有多少有用」，MRR/nDCG 看「有用的排得靠不靠前」
+    why: |
+      「RAG 效果不好」是一句没法行动的话。只有把检索和生成拆开量化，才能知道该改切片、改检索还是改 Prompt。
+      检索指标是其中最便宜、最稳定的一类（不需要调用 LLM 就能算），面试中「怎么判断 RAG 效果」几乎必问。
+    problem: |
+      - 调了 chunk size、换了 Embedding 模型、加了 Rerank，到底是变好还是变坏？凭感觉看几个例子会被个例误导。
+      - 回答错了，不知道是「正确资料没检索到」还是「检索到了但模型没用好」。
+      - 需要一个能在每次改动后自动跑、可比较的数字。
+    principle: |
+      **前提**：每条评估样本都标注了「哪些文档/片段是相关的」（relevant 集合）。系统检索返回一个有序列表。
+
+      **一、四个指标**
+
+      | 指标 | 公式（单个问题） | 回答的问题 |
+      |---|---|---|
+      | **Recall@K** | 前 K 个结果中相关的数量 ÷ 全部相关的数量 | 该找的找到了多少？ |
+      | **Precision@K** | 前 K 个结果中相关的数量 ÷ K | 给出的 K 个里有多少有用？ |
+      | **MRR** | 第一个相关结果名次的倒数（1/rank），多个问题取平均 | 第一个有用的结果排第几？ |
+      | **nDCG@K** | 按位置折扣累加相关度，再除以理想排序的得分 | 整体排序接近理想吗？支持「非常相关/一般相关」分级 |
+
+      另有常用的 **Hit Rate@K**（命中率）：前 K 个里至少有一个相关就记 1，适合「一个片段就能回答」的问题。
+
+      **二、手算一个例子**
+
+      问题的相关文档是 {A, B}，系统返回 [C, A, D, B, E]：
+      - Recall@3 = 1/2 = 0.5（前 3 个里只有 A）；Recall@5 = 2/2 = 1.0
+      - Precision@3 = 1/3 ≈ 0.33；Precision@5 = 2/5 = 0.4
+      - MRR = 1/2 = 0.5（第一个相关的 A 排第 2）
+
+      **nDCG 直觉**：每个结果的「收益」= 相关度 ÷ log2(名次+1)，越靠后打折越多，加起来是 DCG；再除以「把最相关的排在最前时」的 IDCG，得到 0~1 的分数。它比 MRR 多考虑了**所有**相关结果的位置和**相关程度分级**。
+
+      **三、在 RAG 流水线中看哪个 K**
+
+      ```mermaid
+      flowchart LR
+        Q["问题"] --> R["召回 50 条"]
+        R --> RR["Rerank 后前 5 条"]
+        RR --> G["生成回答"]
+        R -.-> M1["Recall@50 答案进候选了吗"]
+        RR -.-> M2["Recall@5 Precision@5 MRR nDCG@5"]
+        G -.-> M3["生成指标 见 d29-k2"]
+      ```
+
+      - **召回阶段**看 Recall@50（大 K）：决定上限，Rerank 救不回没召回的内容。
+      - **送入模型的阶段**看 Recall@5、MRR、nDCG@5（小 K）：决定模型能看到什么。
+      - 只看一个 K 会误判：Recall@50 很高、Recall@5 很低 → 问题在排序，加 Rerank；Recall@50 就很低 → 问题在召回，改切片、Embedding、混合检索。
+
+      **四、标注粒度**
+
+      chunk id 会随重新切片而变化，标注最好落在**文档 + 页码/段落**或「答案原文片段」上，评估时再映射到当前的 chunk（例如 chunk 包含答案原文即算相关）。按文档级计算时，同一文档的多个 chunk 要**去重**，否则 Recall 会超过 1。
+
+      **五、和 Precision 的取舍**：RAG 中召回阶段更看重 Recall（漏了就无法挽回），送入模型阶段更看重 Precision 和排序（噪声会干扰模型）。这也是「召回多、送入少」的量化依据（Day 26）。
+    scenarios: |
+      - **切片参数对比**：chunk 500 vs 800，看 Recall@5 和 MRR。
+      - **是否引入 Rerank**：Recall@50 不变，看 Recall@5、nDCG@5 是否提升。
+      - **混合检索收益验证**：分问题类型（编号类、口语类）分别看 Recall@10。
+    code: |
+      ```python
+      def recall_at_k(ranked: list[str], relevant: set[str], k: int) -> float:
+          return len(set(ranked[:k]) & relevant) / len(relevant)   # 先去重再求交集
+
+      def mrr(ranked: list[str], relevant: set[str]) -> float:
+          return next((1 / i for i, d in enumerate(ranked, 1) if d in relevant), 0.0)
+      ```
+    pitfalls: |
+      - **把 Recall 和 Precision 的分母搞反**：Recall 除以相关总数，Precision 除以 K。
+      - **文档级指标不去重**：同一相关文档的 3 个 chunk 都算命中，Recall 可能大于 1。
+      - **只看平均值**：整体 Recall 0.85，但编号类问题只有 0.4；要按问题类型分层看。
+      - **只评估一个 K**：无法区分召回问题还是排序问题。
+      - **用 chunk id 标注**：重新切片后标注全部失效。
+    interview_asks:
+      - Recall 和 Precision 在 RAG 检索里分别是什么意思？哪个更重要？
+      - MRR 和 nDCG 有什么区别？
+      - 你们怎么判断检索效果是变好还是变坏了？
+    project_example: |
+      在一个制度问答项目里，团队想把 chunk size 从 500 调到 1000。离线评估显示 Recall@5 从 0.78 升到 0.83，看似变好，
+      但按问题类型拆开发现「具体数字类」问题的 MRR 从 0.71 降到 0.58——大块里信息太多，排序变差。
+      最终改为「小块检索、返回所在大段」的父子块方案，两类问题的指标都提升，这个决策完全来自分层指标而不是看几个例子。
+  - id: d29-k2
+    name: 生成评估指标：Faithfulness、Answer Relevancy 与正确性
+    level: P0
+    summary: Faithfulness 看「有没有编」，Answer Relevancy 看「有没有答所问」，二者都不等于「答对了」
+    why: |
+      检索指标只能说明「资料给得对不对」，用户最终看到的是回答。模型可能拿到了正确资料却答错、答偏，或混入资料里没有的内容。
+      生成指标把「幻觉」和「答非所问」量化出来，是 RAG 质量监控的核心。
+    problem: |
+      - 回答是自由文本，没法像分类任务一样直接比对 0/1。
+      - 「回答错了」可能是资料错了、模型编了、或者答偏了，需要不同的指标区分。
+      - 人工逐条打分成本高、标准不一致，需要可自动化的度量。
+    principle: |
+      **一、主要指标（以 RAGAS 的定义为例）**
+
+      | 指标 | 需要的输入 | 怎么算 | 衡量什么 |
+      |---|---|---|---|
+      | **Faithfulness（忠实度）** | 问题、回答、检索到的上下文 | 把回答拆成若干陈述（claims），逐条判断能否从上下文推出；支持的条数 ÷ 总条数 | 回答有没有超出资料「编」内容 |
+      | **Answer Relevancy（回答相关性）** | 问题、回答 | 让 LLM 根据回答反推若干个问题，计算它们与原问题的向量相似度平均值 | 回答是否切题、是否答非所问或冗余 |
+      | **Answer Correctness / Factual Correctness** | 回答、参考答案 | 与人工参考答案比对事实 | 回答是否正确 |
+      | **Context Recall（上下文召回）** | 检索上下文、参考答案 | 参考答案拆成陈述，看多少能在上下文中找到依据 | 用 LLM 评估的检索召回 |
+      | **Context Precision（上下文精确度）** | 检索上下文、参考答案（或回答） | 判断每个片段是否有用，并考虑有用片段是否排在前面 | 用 LLM 评估的检索排序质量 |
+
+      **二、每个指标不能说明什么**
+
+      - **Faithfulness 高 ≠ 回答正确**：如果检索到的是**旧版制度**，模型忠实地复述旧规定，Faithfulness 是 1.0，但答案是错的。
+      - **Answer Relevancy 高 ≠ 正确**：它只看「是否切题」，不检查事实。一个切题但数字错误的回答也能得高分。
+      - **正确性需要参考答案**：只能在离线评估集上算，线上没有参考答案。
+
+      **三、组合起来做诊断**
+
+      ```mermaid
+      flowchart TB
+        S["一条答错的样本"] --> CR{"上下文召回低"}
+        CR -->|是| R1["检索问题 改切片 Embedding 混合检索"]
+        CR -->|否| FA{"Faithfulness 低"}
+        FA -->|是| R2["生成问题 模型编造 改 Prompt 或模型"]
+        FA -->|否| AR{"回答相关性低"}
+        AR -->|是| R3["答偏 改 Prompt 或 Query Rewrite"]
+        AR -->|否| R4["资料本身错误或过期 治理数据与版本"]
+      ```
+
+      **四、RAG 特有的补充指标**
+
+      - **拒答相关**：无答案问题的正确拒答率、有答案问题的误拒率（Day 28）。
+      - **引用相关**：无效引用率、引用支持率（被引用片段是否真的支持该句）。
+      - **工程指标**：P95 延迟、每次问答成本、降级率。效果再好，延迟和成本不达标也上不了线。
+    scenarios: |
+      - **换模型评估**：从大模型换成小模型以降成本，看 Faithfulness 和正确率下降多少是否可接受。
+      - **Prompt 改版**：加了「部分回答」规则后，看误拒率下降的同时 Faithfulness 有没有变差。
+      - **线上抽检**：每天抽样 200 条线上问答，计算 Faithfulness（不需要参考答案）监控幻觉趋势。
+    pitfalls: |
+      - **误区：Faithfulness 高就是答对了。** 资料错或过期时，忠实复述同样是错答。
+      - **只看生成指标不看检索指标**：无法区分问题出在哪一层。
+      - **Answer Relevancy 当作正确性指标**：它不检查事实。
+      - **把拒答样本也算进 Faithfulness 平均值**：拒答没有陈述，分数含义不明，应单独统计拒答指标。
+      - **只看平均分**：少数严重幻觉被平均掉，应同时看低分样本比例。
+    interview_asks:
+      - Faithfulness 是怎么计算的？分数高代表回答正确吗？
+      - 怎么区分 RAG 答错是检索的问题还是生成的问题？
+      - 线上没有参考答案，怎么评估生成质量？
+    project_example: |
+      某政策问答系统离线 Faithfulness 0.93，但业务方抽查正确率只有 0.80。对低正确率样本分析发现，大多数是检索到了已废止的旧政策，
+      模型忠实复述旧内容——Faithfulness 高但答案错误。问题最终在数据层解决：入库时补齐 status 和生效日期并在检索层过滤（Day 27），
+      正确率升到 0.91。之后评估报告固定同时展示「检索指标 + Faithfulness + 正确性」三类数字。
+    freshness: |
+      核对于 2026-11：RAGAS 文档的 RAG 指标包括 Context Precision、Context Recall、Context Entities Recall、Noise Sensitivity、Response Relevancy、Faithfulness 等；
+      Faithfulness = 被上下文支持的陈述数 ÷ 回答中的陈述总数；Answer Relevancy 默认由回答反推 3 个问题（strictness 参数可调）并计算与原问题向量的平均余弦相似度，理论上可能小于 0；
+      Context Recall 需要 reference（参考答案）。指标名称在新旧 API 中略有不同（如旧的 ResponseRelevancy、LLMContextRecall），以官方文档为准。
+    sources:
+      - {title: "RAGAS - List of available metrics", url: "https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/"}
+      - {title: "RAGAS - Faithfulness", url: "https://docs.ragas.io/en/latest/concepts/metrics/available_metrics/faithfulness/"}
+      - {title: "RAGAS - Answer Relevancy", url: "https://docs.ragas.io/en/latest/concepts/metrics/available_metrics/answer_relevance/"}
+      - {title: "RAGAS - Context Recall", url: "https://docs.ragas.io/en/latest/concepts/metrics/available_metrics/context_recall/"}
+      - {title: "RAGAS - Context Precision", url: "https://docs.ragas.io/en/latest/concepts/metrics/available_metrics/context_precision/"}
+  - id: d29-k3
+    name: 评估集构建与回归流程
+    level: P0
+    summary: 评估集 = 真实问题 + 参考答案 + 相关出处 + 问题类型；分层覆盖、持续补充坏例、每次改动都回归
+    why: |
+      没有评估集，所有指标都无从计算，所有优化都只能「感觉变好了」。评估集是 RAG 项目最有价值的资产之一，
+      也是面试中区分「做过 Demo」和「做过生产项目」的关键：面试官会追问「你的评估集从哪来、多少条、怎么标注」。
+    problem: |
+      - 开发者自己编的问题太「标准」，和真实用户的口语、错别字、追问差距很大。
+      - 只覆盖容易的事实问题，没有无答案、多跳、编号类、权限相关问题，上线后才暴露问题。
+      - 文档更新后评估集的参考答案过期，指标失真。
+      - 反复用同一批样本调参，会「过拟合评估集」。
+    principle: |
+      **一、一条评估样本包含什么**
+
+      | 字段 | 说明 |
+      |---|---|
+      | question | 问题（多轮时包含历史） |
+      | reference_answer | 参考答案，由业务专家确认 |
+      | relevant_sources | 相关文档 + 页码/段落或答案原文片段（不要只存 chunk id） |
+      | question_type | 事实类、编号类、多跳/综合类、无答案类、多轮追问、权限相关 |
+      | user_role | 以什么身份提问（用于测试权限过滤） |
+      | expect_refusal | 是否应当拒答 |
+
+      **二、样本从哪来**
+
+      1. **真实日志**（最有价值）：脱敏后的线上/试用问题，保留口语和错别字。
+      2. **业务专家出题**：覆盖关键制度和高风险问题。
+      3. **LLM 合成 + 人工审核**：基于文档片段让 LLM 生成问答对，快速扩充覆盖面；必须人工审核，否则问题过于「照抄原文」，会高估效果。
+      4. **对抗与边界样本**：无答案问题、相似但不同的编号、新旧版本冲突、越权问题、注入文本。
+      5. **线上坏例回流**：用户点踩、投诉的样本，分析后加入。
+
+      **三、规模与分层**
+
+      起步 50~100 条就能发现大问题，逐步扩到 200~500 条；**按问题类型分层**，每类都要有足够样本，报告也按类型分别给出指标。保留一部分**不参与调参的保留集**，防止过拟合。
+
+      **四、评估闭环**
+
+      ```mermaid
+      flowchart LR
+        L["线上日志与反馈"] --> C["筛选 脱敏 标注"]
+        C --> D["评估集 带版本号"]
+        D --> E["离线评估 检索与生成指标"]
+        X["代码 Prompt 模型 切片改动"] --> E
+        E --> B{"相比基线是否退化"}
+        B -->|退化| F["阻止上线 分析坏例"]
+        B -->|未退化| G["上线 更新基线"]
+        G --> L
+        F --> C
+      ```
+
+      - 任何影响效果的改动（切片、Embedding、Rerank、Prompt、模型版本）都要跑评估并和**基线**对比；可以接入 CI（Day 48）。
+      - 评估集要**版本化**：文档更新时同步更新参考答案和出处，否则旧答案会把正确的新回答判为错误。
+      - 评估结果保存每条样本的明细（检索结果、回答、各项分数），便于逐条分析坏例。
+    scenarios: |
+      - **项目启动期**：和业务方一起整理 80 条高频问题与标准答案，作为验收标准。
+      - **迭代期**：每周把点踩样本分析后加入评估集，每次发版前跑全量回归。
+      - **模型升级**：模型供应商发布新版本，先在评估集上对比再切换。
+    pitfalls: |
+      - **全部由 LLM 合成且不审核**：问题和原文高度相似，检索指标虚高。
+      - **没有无答案样本**：上线后才发现系统爱编造。
+      - **只按 chunk id 标注**：重新切片后无法复用。
+      - **评估集不随文档更新**：新制度出来后，正确回答反而被判错。
+      - **反复用同一批样本调参**：指标越来越好，线上效果不变，应保留独立的保留集。
+      - **评估集包含未脱敏的个人信息**：评估数据也要遵守数据安全要求。
+    interview_asks:
+      - 你们的评估集是怎么构建的？有多少条？怎么标注？
+      - 用 LLM 合成评估数据有什么风险？
+      - 怎么保证每次改动不会让效果变差？
+    project_example: |
+      某企业知识库项目启动时，和 HR、财务各 2 名专家用两天整理了 120 条问题（其中 20 条无答案、15 条编号类、15 条多轮追问），
+      标注到「文档 + 页码 + 答案原文」级别。之后每周把用户点踩样本加入，三个月扩到 420 条，并保留 80 条只用于发版前验收。
+      有一次升级 Embedding 模型，整体 Recall@5 提升 4 个点，但编号类下降 11 个点，因为分层报告才被发现，最终配合关键词检索后才上线。
+  - id: d29-k4
+    name: RAGAS 等评估框架与 LLM-as-judge 的局限
+    level: P1
+    summary: 框架帮你把 LLM 当裁判自动打分，但裁判有偏见、会波动、会跟着模型升级漂移，必须用人工标注校准
+    why: |
+      Faithfulness、Context Recall 这类指标需要「理解语义」，靠规则算不出来，于是主流做法是让 LLM 当裁判（LLM-as-judge）。
+      RAGAS 等框架封装了这些流程。会用框架只是第一步，面试更关注你是否知道这些分数**能信到什么程度**。
+    problem: |
+      - 人工评估每条几分钟，几百条样本、每次改动都评一遍不现实。
+      - LLM 裁判的打分可能有系统性偏差，直接当真会得出错误结论。
+      - 框架 API 变化快，按旧教程写的代码可能已经弃用。
+    principle: |
+      **一、RAGAS 当前用法（0.4.x，collections API）**
+
+      ```python
+      from openai import AsyncOpenAI
+      from ragas.llms import llm_factory
+      from ragas.metrics.collections import Faithfulness, ContextRecall
+
+      llm = llm_factory(JUDGE_MODEL, client=AsyncOpenAI())   # 裁判模型名由配置提供
+      faith = await Faithfulness(llm=llm).ascore(
+          user_input=q, response=answer, retrieved_contexts=contexts)
+      recall = await ContextRecall(llm=llm).ascore(
+          user_input=q, retrieved_contexts=contexts, reference=ref)
+      print(faith.value, recall.value)
+      ```
+
+      旧写法是 `SingleTurnSample` + `metric.single_turn_ascore(sample)`（如 `from ragas.metrics import Faithfulness`），官方标注将在 0.4 弃用、1.0 移除。还有不依赖 LLM 的 `NonLLMContextRecall`、`IDBasedContextRecall` 等，适合已有出处标注时低成本计算。
+
+      **二、LLM-as-judge 的局限**
+
+      ```mermaid
+      flowchart TB
+        J["LLM 裁判"] --> B1["位置偏差 先出现的选项更易被选"]
+        J --> B2["冗长偏好 更长的回答更易得高分"]
+        J --> B3["自我偏好 偏爱同家族模型的输出"]
+        J --> B4["不稳定 同一输入多次打分不同"]
+        J --> B5["能力边界 专业领域判断不准"]
+        J --> B6["版本漂移 裁判模型升级后分数变化"]
+      ```
+
+      应对：
+      - **人工校准**：抽取 50~100 条由人工标注，计算裁判与人工的一致率；一致率不够的指标不作为上线门禁。
+      - **固定裁判模型版本**，并与被评估的生成模型**不同家族**，减少自我偏好。
+      - **二元或清单式判断**（这条陈述是否被支持：是/否）比 1~10 分更稳定。
+      - 成对比较时**交换顺序**各评一次；关键指标多次采样取平均。
+      - 记录裁判的理由，抽查低分样本。
+      - 成本：每条样本可能要多次 LLM 调用，评估集大时要控制并发和预算。
+
+      **三、其他框架**：TruLens 的「RAG Triad」（上下文相关性、groundedness、回答相关性）与上述思路一致；DeepEval 等也提供类似指标。不管用哪个框架，**指标定义和裁判质量比框架本身更重要**。
+    scenarios: |
+      - **每次发版回归**：用 RAGAS 计算 Faithfulness、Context Recall，结合人工抽检 30 条。
+      - **模型选型**：同一评估集上比较两个生成模型，裁判使用第三方家族模型。
+    pitfalls: |
+      - **把 LLM 裁判分数当绝对真理**：没做人工校准就据此做上线决策。
+      - **用被评估的同一个模型当裁判**：存在自我偏好。
+      - **裁判模型悄悄升级**：分数变化被误认为系统变化。
+      - **照抄旧教程**：使用将被移除的旧 API，升级时大面积报错。
+      - **只看框架给的平均分**，不看样本明细和裁判理由。
+    interview_asks:
+      - 你们用什么工具评估 RAG？RAGAS 的 Faithfulness 是怎么算的？
+      - LLM-as-judge 可信吗？有哪些偏差？怎么缓解？
+    project_example: |
+      团队用 RAGAS 的 Faithfulness 做发版门禁，先抽 100 条让两名业务专家标注「是否有编造」，发现裁判与人工一致率只有 78%，
+      主要分歧在「合理推断」类陈述（例如资料写「每月 1 日发薪」，回答写「月初发薪」）。调整为以裁判结果筛出低分样本、再由人工复核的流程，
+      并把裁判模型版本固定在配置中，避免供应商升级导致分数漂移。
+    freshness: |
+      核对于 2026-11：PyPI 上 ragas 最新版本为 0.4.3。官方文档推荐 collections API：`from ragas.metrics.collections import Faithfulness, ContextPrecision, ContextRecall, AnswerRelevancy`，
+      用 `llm_factory(model, client=AsyncOpenAI())` 创建裁判，调用 `await metric.ascore(...)`（或同步 `.score(...)`），结果读 `.value`；AnswerRelevancy 还需要 `embeddings`。
+      旧 API（`SingleTurnSample`、`single_turn_ascore`、`LLMContextRecall` 等）文档标注将在 0.4 弃用、1.0 移除。LLM 裁判的偏差参考 Zheng 等 2023（MT-Bench）。
+    sources:
+      - {title: "RAGAS - Faithfulness（含 collections API 示例）", url: "https://docs.ragas.io/en/latest/concepts/metrics/available_metrics/faithfulness/"}
+      - {title: "RAGAS - Context Precision", url: "https://docs.ragas.io/en/latest/concepts/metrics/available_metrics/context_precision/"}
+      - {title: "ragas on PyPI", url: "https://pypi.org/project/ragas/"}
+      - {title: "Zheng et al. 2023 - Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena", url: "https://arxiv.org/abs/2306.05685"}
+quiz:
+  - id: d29-q1
+    kp: d29-k1
+    type: single
+    question: 3 个评估问题中，第一个相关结果的名次分别是 1、3、未出现（前 10 名内都没有）。这 3 个问题的 MRR 是多少？
+    options:
+      - "(1 + 3 + 0) / 3 ≈ 1.33"
+      - "(1 + 1/3 + 0) / 3 ≈ 0.44"
+      - "(1 + 1/3) / 2 ≈ 0.67，未命中的问题不参与计算"
+      - "1/((1 + 3 + 10) / 3) ≈ 0.21"
+    answer: [1]
+    explain: |
+      MRR 是每个问题「第一个相关结果名次的倒数」的平均，未命中记 0：(1/1 + 1/3 + 0) / 3 ≈ 0.44。
+      A 用了名次本身而不是倒数；C 把未命中的问题排除在外，会高估效果——未命中恰恰是最需要暴露的问题；D 是对平均名次取倒数，和 MRR 定义不同。
+  - id: d29-q2
+    kp: d29-k2
+    type: judge
+    question: 某 RAG 系统在评估集上的 Faithfulness 达到 0.95，说明它 95% 左右的回答内容是正确的。
+    answer: false
+    explain: |
+      Faithfulness 衡量的是「回答中的陈述能否被检索到的上下文支持」，不是「是否正确」。如果检索到的是错误或过期的资料，模型忠实复述，Faithfulness 依然很高但答案是错的。
+      判断正确性需要与参考答案比对（Answer/Factual Correctness），同时要结合检索指标看资料本身对不对。
+  - id: d29-q3
+    kp: d29-k1
+    type: multi
+    question: 关于检索评估指标，下列说法正确的有哪些？
+    options:
+      - "Recall@K 的分母是该问题全部相关结果的数量，Precision@K 的分母是 K"
+      - "引入 Rerank 后，Recall@50（召回候选集）通常不变，但 Recall@5 和 MRR 可能提升"
+      - "nDCG 可以利用「非常相关、一般相关」这样的分级相关度，并对靠后的结果打折"
+      - "按文档级计算 Recall 时，同一相关文档的多个 chunk 都应分别计为命中"
+      - "MRR 只关心第一个相关结果的位置"
+    answer: [0, 1, 2, 4]
+    explain: |
+      A、C、E 是指标定义；B 正确，因为 Rerank 只重排候选，不改变候选集合，但能把相关结果提前。
+      D 错误：文档级计算时应先去重，否则同一文档的多个 chunk 重复计数，Recall 甚至会超过 1。
+  - id: d29-q4
+    kp: d29-k4
+    type: single
+    question: 使用 RAGAS 的 ContextRecall（LLM 版本）评估时，必须提供下列哪项输入？
+    options:
+      - "只需要 user_input 和 response"
+      - "user_input、retrieved_contexts 和 reference（参考答案）"
+      - "只需要 retrieved_contexts，不需要问题"
+      - "必须提供 embeddings 模型，否则无法计算"
+    answer: [1]
+    explain: |
+      Context Recall 衡量「回答这个问题所需的信息有多少被检索到了」，它把参考答案拆成陈述，看每条能否在检索上下文中找到依据，所以必须有 reference。
+      A 是 Answer Relevancy 的核心输入；C 没有问题和参考就无法判断什么算「需要的信息」；D 需要 embeddings 的是 Answer Relevancy，而不是 Context Recall。
+  - id: d29-q5
+    kp: d29-k1
+    type: short
+    question: 问题 Q 的相关文档为 {D2, D5, D9}。系统返回前 5 个结果对应的文档依次是 [D5, D1, D5, D9, D3]（第 1、3 个是 D5 的两个不同 chunk）。请按文档级计算 Recall@5、Precision@5（说明你如何处理重复）、MRR，并解释这些数字说明了什么。
+    key_points:
+      - {text: "先去重再计算：前 5 中命中的相关文档为 D5 和 D9，Recall@5 = 2/3", dim: principle}
+      - {text: "说明 Precision@5 的口径：按位置算 3/5，按去重文档算 2/4，需统一口径", dim: principle}
+      - {text: "正确算出 MRR 为 1，第一个结果即相关", dim: principle}
+      - {text: "解读：排序头部好，但漏了 D2，且重复 chunk 占用了名额", dim: engineering}
+    reference: |
+      **Recall@5**：先对前 5 个结果的文档去重得到 {D5, D1, D9, D3}，与相关集合求交集为 {D5, D9}，Recall@5 = 2/3 ≈ 0.67。若不去重直接数命中次数（D5 两次 + D9 一次 = 3），会得到 3/3=1.0 的错误结论。
+      **Precision@5**：需要先定口径。按位置算，5 个结果中有 3 个位置是相关文档，Precision@5 = 3/5 = 0.6；按去重后的文档算，4 个不同文档中 2 个相关，= 0.5。团队内要统一一种口径并在报告中注明。
+      **MRR**：第一个结果 D5 就相关，倒数排名 = 1。
+      **解读**：排序头部很好，但遗漏了 D2；同时 D5 的两个 chunk 占了两个名额，挤掉了其他候选。改进方向：送入模型前对同文档相邻片段去重/合并（Day 28），并检查 D2 为什么没被召回（是否是编号类、切片问题等）。
+  - id: d29-q6
+    kp: d29-k2
+    type: scenario
+    question: |
+      一次迭代后的评估结果（与上一版对比）：Context Recall 0.88 → 0.90，Faithfulness 0.92 → 0.71，Answer Relevancy 0.86 → 0.87，正确率 0.82 → 0.70。
+      这次迭代改了三处：换了更便宜的生成模型、Prompt 删掉了「只能依据资料」这句、Rerank 候选从 30 改为 50。请分析最可能的原因并给出验证方法。
+    key_points:
+      - {text: "指出检索指标稳定，问题不在检索层，排除 Rerank 改动为主因", dim: principle}
+      - {text: "指出 Faithfulness 大幅下降说明回答出现资料外内容，指向生成层", dim: principle}
+      - {text: "怀疑删除只依据资料规则和换模型，二者都可能导致编造", dim: principle}
+      - {text: "提出消融实验：一次只回退一个改动，并抽查低分样本的裁判理由", dim: engineering}
+    reference: |
+      **分析**：Context Recall 基本不变甚至略升，说明检索给模型的资料质量没有变差，Rerank 候选调整不是主因。Faithfulness 从 0.92 降到 0.71，说明回答中有大量陈述无法从资料中推出——模型开始用自身知识或编造；正确率随之下降。Answer Relevancy 不变，说明回答仍然切题，只是内容不忠实。
+      最可疑的是两个生成层改动：删除了「只能依据资料」的约束（模型更自由地补充资料外内容），以及换成了更便宜的生成模型（指令遵循能力可能较弱）。
+      **验证**：做消融实验——保持其他改动，单独恢复 Prompt 那句规则跑一次；再单独换回原模型跑一次，看哪个改动导致 Faithfulness 回升。同时抽取 Faithfulness 低分样本，看裁判标出的「不被支持的陈述」具体是什么，确认是编造还是裁判误判。以后每次迭代尽量一次只改一个变量，或分别评估。
+  - id: d29-q7
+    kp: d29-k3
+    type: design
+    question: 你刚加入一个已上线三个月、但从未做过评估的企业知识库项目（约 5000 份制度文档，每天 2000 次提问）。请设计评估集的构建方案和之后的回归流程。
+    key_points:
+      - {text: "样本来源：脱敏线上日志为主，业务专家补充高风险问题，LLM 合成需人工审核", dim: engineering}
+      - {text: "样本字段：问题、参考答案、文档加页码或原文片段出处、问题类型、用户角色、是否应拒答", dim: concept}
+      - {text: "分层覆盖：事实、编号、多跳、无答案、多轮、权限，并保留独立保留集", dim: principle}
+      - {text: "回归流程：基线、每次改动跑评估、退化阻止上线、坏例回流、评估集版本化", dim: engineering}
+      - {text: "结合线上信号：点踩、拒答率、无效引用率等持续补充样本", dim: project}
+    reference: |
+      **第一步：采样**。从三个月日志中按问题聚类抽样（覆盖高频与长尾），脱敏后得到约 300 个候选问题；用户点踩、投诉记录优先纳入。请 HR、财务、IT 等业务专家补充 30~50 条高风险问题（金额、合规）。可以用 LLM 基于文档合成问答扩充覆盖面，但必须人工审核并改写成真实口吻。
+      **第二步：标注**。每条标注参考答案、相关文档 + 页码/原文片段（不只存 chunk id）、问题类型、提问者角色、是否应拒答。专门构造无答案问题、相近编号、新旧版本冲突、越权问题。
+      **第三步：分层与规模**。首版 150~200 条，按类型分层，每类至少 15~20 条；另留 50 条保留集只在发版前验收用。
+      **第四步：基线**。跑一次全量评估：检索（Recall@50、Recall@5、MRR）、生成（Faithfulness、正确性）、拒答（正确拒答率、误拒率）、工程（P95、成本），按类型出报告，作为基线。
+      **第五步：回归**。任何影响效果的改动都跑评估并与基线对比，关键指标退化超过阈值则阻止上线；评估集版本化，文档更新时同步更新参考答案；每周把线上坏例分析后加入；LLM 裁判定期用人工标注校准。
+  - id: d29-q8
+    kp: d29-k4
+    type: short
+    question: 团队打算完全用 LLM-as-judge 的分数作为上线门禁。请指出至少 4 个风险，并给出对应的缓解措施。
+    key_points:
+      - {text: "指出偏差：位置偏差、冗长偏好、自我偏好", dim: principle}
+      - {text: "指出不稳定和裁判模型版本漂移", dim: principle}
+      - {text: "提出用人工标注样本校准并计算一致率", dim: engineering}
+      - {text: "提出固定裁判版本、换不同家族模型、二元判断、多次采样等措施", dim: engineering}
+    reference: |
+      **风险**：
+      1. 位置偏差：成对比较时倾向于先出现的答案。
+      2. 冗长偏好：更长、更「完整」的回答更容易拿高分，即使有冗余或错误。
+      3. 自我偏好：裁判倾向于给同家族模型的输出打高分。
+      4. 不稳定：同一样本多次打分结果不同。
+      5. 版本漂移：裁判模型升级后分数整体变化，被误认为系统变化。
+      6. 专业领域能力不足：法规、财务细节判断不准；还会增加评估成本。
+      **缓解**：
+      - 抽 50~100 条人工标注，计算裁判与人工的一致率，达标的指标才用作门禁；
+      - 固定裁判模型版本，并选择与生成模型不同家族的模型；
+      - 使用二元/清单式判断（每条陈述是否被支持），少用 1~10 分；
+      - 成对比较交换顺序各评一次，关键样本多次采样取平均；
+      - 门禁使用「指标退化超过阈值」而不是绝对分数，并对低分样本人工复核。
+interview:
+  - id: d29-i1
+    kp: d29-k1
+    type: oral
+    difficulty: 1
+    question: 在 RAG 的检索评估中，Recall 和 Precision 分别是什么意思？哪个更重要？
+    key_points:
+      - {text: "说明 Recall@K 是该找的找到了多少，分母是相关总数", dim: concept}
+      - {text: "说明 Precision@K 是给出的 K 个里有多少有用，分母是 K", dim: concept}
+      - {text: "说明召回阶段更看重 Recall，送入模型阶段更看重 Precision 和排序", dim: principle}
+      - {text: "结合项目说明用不同 K 区分召回问题和排序问题", dim: project}
+    reference: |
+      **Recall@K**：前 K 个结果中相关的数量 ÷ 该问题全部相关的数量，回答「该找的找到了多少」。**Precision@K**：前 K 个结果中相关的数量 ÷ K，回答「给出的结果里有多少有用」。
+      在 RAG 里两者在不同阶段的重要性不同：**召回阶段**更看重 Recall，因为没召回的内容后面无论怎么 Rerank 都救不回来，所以用较大的 K（如 50）；**送入模型阶段**更看重 Precision 和排序（MRR、nDCG），因为无关片段会干扰模型、增加成本。
+      实践中同时看 Recall@50 和 Recall@5：前者低说明召回有问题（切片、Embedding、混合检索），前者高后者低说明排序有问题（加 Rerank）。按文档级计算时要对同一文档的多个 chunk 去重。
+    oral: |
+      Recall 是「该找的找到了多少」，分母是相关文档总数；Precision 是「找出来的里面有多少有用」，分母是 K。
+      在 RAG 里我觉得要分阶段看：召回阶段 Recall 更重要，因为漏了后面救不回来，我们看 Recall@50；送进模型的阶段 Precision 和排序更重要，因为噪声会干扰模型，我们看 Recall@5 和 MRR。
+      我们项目里就是靠这两个 K 定位问题的：Recall@50 有 0.94，但 Recall@5 只有 0.68，说明是排序问题，于是加了 Rerank，而不是去改切片。
+  - id: d29-i2
+    kp: d29-k2
+    type: oral
+    difficulty: 2
+    question: Faithfulness 和 Answer Relevancy 分别怎么计算？它们能说明回答正确吗？
+    key_points:
+      - {text: "Faithfulness：回答拆成陈述，被上下文支持的比例", dim: principle}
+      - {text: "Answer Relevancy：由回答反推问题，与原问题向量相似度平均", dim: principle}
+      - {text: "指出二者都不等于正确：资料过期时忠实也会错，切题不检查事实", dim: principle}
+      - {text: "说明需结合参考答案的正确性指标和检索指标一起诊断", dim: engineering}
+    reference: |
+      **Faithfulness**（以 RAGAS 为例）：用 LLM 把回答拆成若干独立陈述，逐条判断能否从检索上下文推出，得分 = 被支持的陈述数 ÷ 总陈述数。它衡量「有没有超出资料编内容」，不需要参考答案，适合线上抽检。
+      **Answer Relevancy**：让 LLM 根据回答反推若干个可能的问题（默认 3 个），计算它们与原问题的向量余弦相似度平均值。回答越切题、越不冗余，反推的问题越接近原问题。
+      **都不等于正确**：资料本身错误或过期时，忠实复述也会得高分；Answer Relevancy 只看切题，不检查事实。正确性要用参考答案比对（Answer/Factual Correctness），并结合检索指标判断是哪一层出了问题。
+    oral: |
+      Faithfulness 是把回答拆成一条条陈述，看每条能不能在检索到的资料里找到依据，被支持的比例就是分数，它衡量的是有没有编。
+      Answer Relevancy 是让模型根据回答反推几个问题，再算这些问题和原问题的向量相似度，衡量的是有没有答所问。
+      这两个都不能说明答对了。我们遇到过 Faithfulness 0.93 但正确率只有 0.8 的情况，原因是检索到了已废止的旧政策，模型忠实地复述了旧内容。所以我们的报告一定是检索指标、忠实度和正确率三类一起看。
+  - id: d29-i3
+    kp: d29-k3
+    type: oral
+    difficulty: 3
+    question: 你们的 RAG 评估集是怎么构建的？怎么保证它有代表性并且不过时？
+    key_points:
+      - {text: "说明来源：真实日志脱敏、业务专家、LLM 合成加人工审核、坏例回流", dim: engineering}
+      - {text: "说明字段与标注粒度：参考答案、文档加页码或原文、问题类型、角色、是否拒答", dim: concept}
+      - {text: "说明分层覆盖与保留集，防止过拟合", dim: principle}
+      - {text: "说明版本化与随文档更新维护，并接入回归流程", dim: engineering}
+      - {text: "给出具体规模和一次通过评估发现问题的例子", dim: project}
+    reference: |
+      **来源**：以脱敏后的真实用户问题为主（保留口语、错别字、追问），业务专家补充高风险问题，用 LLM 基于文档合成问答扩充覆盖面但必须人工审核，线上点踩样本分析后回流。
+      **字段**：问题（多轮带历史）、参考答案、相关出处（文档 + 页码/原文片段，而不是只存 chunk id，避免重新切片后失效）、问题类型、提问者角色、是否应拒答。
+      **代表性**：按类型分层（事实、编号、多跳综合、无答案、多轮、权限），每类有足够样本，报告分层展示；保留一部分只用于发版验收的保留集，防止反复调参导致过拟合。
+      **不过时**：评估集带版本号；文档更新时通过出处关联找到受影响样本并更新参考答案；每周补充坏例；每次改动跑回归，与基线对比。
+    oral: |
+      我们的评估集一开始是和 HR、财务的专家一起整理的 120 条，其中特意放了 20 条没有答案的、15 条编号类、15 条多轮追问。标注到文档加页码再加答案原文这一级，不存 chunk id，因为重新切片后 chunk id 会变。
+      后面每周把用户点踩的问题分析后加进来，三个月扩到 400 多条，另外留了 80 条只在发版前用，防止调参调过头。
+      文档更新时我们会根据出处找到受影响的样本更新答案。有一次换 Embedding 模型，整体指标涨了，但分层报告显示编号类掉了 11 个点，这就是分层的价值。
+  - id: d29-i4
+    kp: d29-k4
+    type: oral
+    difficulty: 3
+    question: 你们用 LLM-as-judge 做评估吗？它可信吗？你怎么保证评估结果靠谱？
+    key_points:
+      - {text: "说明使用场景：Faithfulness、Context Recall 等语义指标需要 LLM 判断", dim: concept}
+      - {text: "列举偏差：位置、冗长、自我偏好、不稳定、版本漂移", dim: principle}
+      - {text: "说明人工校准一致率，固定裁判版本，选择不同家族模型", dim: engineering}
+      - {text: "说明二元判断、低分样本人工复核、按退化幅度做门禁", dim: engineering}
+    reference: |
+      会用，因为 Faithfulness、Context Recall 这类指标需要理解语义，规则算不出来；我们用 RAGAS 的 collections API（`Faithfulness(llm=...).ascore(...)`）实现。
+      但它不是绝对可信：有位置偏差、冗长偏好、自我偏好；同一样本多次打分可能不同；裁判模型升级后分数会漂移；专业领域判断也可能不准。
+      保证靠谱的做法：抽 100 条做人工标注，计算裁判与人工的一致率，一致率达标的指标才作为门禁；固定裁判模型版本并选择与生成模型不同家族的模型；尽量用「是否被支持」这种二元判断；门禁看相对基线的退化幅度而不是绝对分数；低分样本必须人工复核并查看裁判理由。
+    oral: |
+      会用，因为像 Faithfulness 这种指标必须理解语义才能判断，我们用的是 RAGAS。但我不会把它的分数当真理。
+      LLM 裁判有几种已知偏差：偏好长回答、偏好同家族模型的输出、成对比较时有位置偏差，而且多次打分会波动，裁判模型一升级分数就会漂。
+      我们的做法是先抽 100 条让业务专家标注，算裁判和人工的一致率，当时只有 78%，所以改成用裁判筛出低分样本再人工复核；裁判模型版本固定在配置里，并且和生成模型不是同一家的。
+  - id: d29-i5
+    kp: d29-k3
+    type: design
+    difficulty: 4
+    question: 如何判断一个 RAG 系统的效果好不好？请设计一套从离线到线上的完整评估体系，并说明如何用它指导优化。
+    key_points:
+      - {text: "分层指标：检索、生成、拒答、引用、工程（延迟成本）", dim: concept}
+      - {text: "离线：分层评估集、基线、消融实验、回归门禁", dim: engineering}
+      - {text: "线上：点踩与反馈、拒答率、无效引用率、抽样 Faithfulness、延迟成本监控", dim: engineering}
+      - {text: "诊断路径：先看检索召回，再看排序，再看忠实度，最后看数据质量", dim: principle}
+      - {text: "说明 LLM 裁判需人工校准，坏例回流形成闭环", dim: project}
+    reference: |
+      **指标分层**：
+      - 检索：Recall@50（召回上限）、Recall@5 / MRR / nDCG@5（排序）；
+      - 生成：Faithfulness（有没有编）、Answer Relevancy（是否切题）、正确性（与参考答案比对）；
+      - 拒答：无答案问题正确拒答率、有答案问题误拒率；
+      - 引用：无效引用率、引用支持率；
+      - 工程：P95 延迟、单次成本、降级率。
+      **离线**：分层评估集（真实问题为主、带出处与类型、含无答案和权限样本、有保留集）；建立基线；每次改动做评估，必要时做消融实验确定每个组件的贡献；关键指标退化超过阈值阻止上线。
+      **线上**：用户点赞/点踩、追问率、拒答率、无效引用率；每日抽样计算 Faithfulness；延迟与成本监控；坏例分析后回流评估集。
+      **指导优化的诊断路径**：Recall@50 低 → 召回问题（切片、Embedding、混合检索、Query Rewrite、过滤）；Recall@50 高但 Recall@5 低 → 排序问题（Rerank）；检索好但 Faithfulness 低 → 生成问题（Prompt、模型）；检索、忠实度都好但正确率低 → 数据问题（过期、冲突、版本）。
+      **可信度**：LLM 裁判用人工标注校准，固定版本；报告按问题类型分层。
+    oral: |
+      我会把指标分五层：检索看 Recall@50 和 Recall@5、MRR；生成看 Faithfulness、相关性和正确率；拒答看正确拒答率和误拒率；引用看无效引用率；再加上延迟和成本。
+      离线有一个分层评估集和基线，每次改动都跑，退化超过阈值不让上线；线上看点踩、拒答率、无效引用率，每天抽样算忠实度，坏例回流到评估集，形成闭环。
+      优化的时候按顺序诊断：Recall@50 低就是召回问题，Recall@50 高但前 5 条差就是排序问题，检索都好但忠实度低就是生成问题，都好但还是错，通常就是数据过期或冲突。LLM 裁判的分数我们会用人工标注定期校准。
+code_reading:
+  id: d29-c1
+  kp: [d29-k1, d29-k2, d29-k4]
+  title: RAG 离线评估脚本
+  level: 2
+  scenario: |
+    发版前运行的离线评估脚本。评估集是 JSONL 文件，每行包含 id、question、relevant_doc_ids（相关文档 ID 列表，无答案问题为空列表）和 reference。
+    脚本调用被评估的 RAG 系统 answer_question，计算文档级 Recall@5、MRR，并用 RAGAS 的 Faithfulness 计算忠实度，输出汇总结果给 CI 判断是否退化。
+  language: python
+  code: |
+    import asyncio
+    import json
+    import logging
+    import os
+    import statistics
+    from pathlib import Path
+
+    from openai import AsyncOpenAI
+    from ragas.llms import llm_factory
+    from ragas.metrics.collections import Faithfulness
+
+    from app.rag import answer_question  # 返回 result.answer 和 result.chunks（含 doc_id、text）
+
+    logger = logging.getLogger("rag.eval")
+    K = 5
+
+
+    def recall_at_k(retrieved_docs: list[str], relevant: set[str], k: int) -> float:
+        hits = sum(1 for d in retrieved_docs[:k] if d in relevant)
+        return hits / len(relevant)
+
+
+    def reciprocal_rank(retrieved_docs: list[str], relevant: set[str]) -> float:
+        for i, d in enumerate(retrieved_docs, start=1):
+            if d in relevant:
+                return 1.0 / i
+        return 0.0
+
+
+    async def evaluate(path: Path) -> dict:
+        judge = Faithfulness(llm=llm_factory(os.environ["JUDGE_MODEL"], client=AsyncOpenAI()))
+        recalls, rrs, faiths = [], [], []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            case = json.loads(line)
+            relevant = set(case["relevant_doc_ids"])
+            if not relevant:
+                continue
+            result = await answer_question(case["question"])
+            docs = [c.doc_id for c in result.chunks]
+            recalls.append(recall_at_k(docs, relevant, K))
+            rrs.append(reciprocal_rank(docs, relevant))
+            try:
+                score = await judge.ascore(
+                    user_input=case["question"],
+                    response=result.answer,
+                    retrieved_contexts=[c.text for c in result.chunks],
+                )
+                faiths.append(score.value)
+            except Exception:
+                logger.exception("judge failed: %s", case["id"])
+        return {
+            "n": len(recalls),
+            f"recall@{K}": statistics.mean(recalls),
+            "mrr": statistics.mean(rrs),
+            "faithfulness": statistics.mean(faiths),
+        }
+
+
+    if __name__ == "__main__":
+        print(asyncio.run(evaluate(Path("eval/golden.jsonl"))))
+  walkthrough:
+    function: |
+      逐行读取评估集，对每个有相关文档的问题调用 RAG 系统得到回答和检索片段；把片段映射为文档 ID 列表后计算 Recall@5 和倒数排名；
+      再调用 RAGAS Faithfulness（LLM 裁判）计算忠实度；最后输出样本数和三个指标的平均值，供 CI 与基线对比。
+    key_functions: |
+      - `recall_at_k`：数前 k 个文档 ID 中属于相关集合的次数，除以相关文档总数。
+      - `reciprocal_rank`：找到第一个相关文档的名次，返回其倒数，找不到返回 0。
+      - `evaluate`：主循环——读样本、过滤、调用系统、计算检索指标、调用裁判、汇总平均。
+      - `Faithfulness(llm=...).ascore(...)`：RAGAS collections API，返回带 `.value` 的结果对象；裁判模型名来自环境变量 JUDGE_MODEL。
+    params: |
+      评估集路径通过 Path 传入；K 是模块常量 5；裁判模型名从环境变量读取，OpenAI 客户端从环境变量读取 API Key。
+      每个样本的 question 传给 answer_question，question、answer、片段文本传给 judge.ascore；relevant_doc_ids 转成集合用于检索指标。
+    data_flow: |
+      ```mermaid
+      flowchart TB
+        F["golden.jsonl 逐行"] --> P{"relevant_doc_ids 为空"}
+        P -->|是| S["continue 跳过 无答案样本未被评估"]
+        P -->|否| A["answer_question 得到回答与片段"]
+        A --> D["片段映射为 doc_id 列表 可能重复"]
+        D --> R["recall_at_k 与 reciprocal_rank"]
+        A --> J["Faithfulness 裁判打分"]
+        J -->|异常| X["记录日志 该样本无忠实度"]
+        R --> M["statistics.mean 汇总"]
+        J --> M
+      ```
+    failure_points: |
+      - **Recall 重复计数（统计错误）**：多个 chunk 来自同一相关文档时，`sum(...)` 会重复计数，Recall@5 可能大于 1，平均值被高估。应 `len(set(docs[:k]) & relevant) / len(relevant)`。
+      - **无答案样本被静默跳过（覆盖缺失）**：`relevant_doc_ids` 为空的样本直接 continue，系统在无答案问题上是否会编造完全没有被评估，报告里也看不出被跳过了多少条。
+      - **忠实度分母不一致**：裁判失败的样本没有 Faithfulness，但仍计入 Recall；三个指标的平均基于不同样本集合，n 只反映检索样本数。
+      - **空列表求平均**：所有裁判调用都失败时 `statistics.mean([])` 抛 StatisticsError，整个评估崩溃。
+      - **串行执行慢**：几百条样本逐个调用系统和裁判，耗时很长；需要有并发上限的并发执行。
+      - **拒答回答也算 Faithfulness**：系统拒答时回答没有陈述，分数含义不明，应单独统计。
+    debugging: |
+      - 打印每条样本的 docs、relevant 和单条 recall，搜索大于 1 的值即可复现重复计数问题。
+      - 统计被 continue 跳过的样本数并输出，确认无答案样本占比。
+      - 输出 faiths 的长度与 recalls 对比，查看 `judge failed` 日志的异常类型（超时、限流、解析失败）。
+      - 用 3~5 条手工构造的样本做单元测试，验证指标函数与手算结果一致。
+      - 保存每条样本的明细到文件，便于逐条分析坏例。
+    change_request: |
+      - **修复 Recall**：先去重再求交集；同时计算 Recall@50（召回阶段）需要 answer_question 返回 Rerank 前的候选列表。
+      - **评估无答案样本**：对 relevant 为空的样本，判断系统是否返回固定拒答话术（或结构化输出的 answerable=false），单独统计正确拒答率；有答案样本统计误拒率。
+      - **统一样本口径**：输出每个指标各自的样本数，裁判失败重试 2 次，仍失败则在报告中列出 ID。
+      - **并发**：用 `asyncio.Semaphore(8)` 限制并发，`asyncio.gather` 执行。
+      - **需求：按问题类型分层报告**：评估集增加 question_type 字段，按类型分组计算指标。
+  questions:
+    - id: d29-c1-q1
+      kp: d29-k1
+      type: code
+      question: 某样本 relevant_doc_ids = ["D1", "D2"]，系统返回的 5 个片段对应文档为 ["D1", "D1", "D3", "D1", "D2"]。按代码执行，recall_at_k 和 reciprocal_rank 分别返回多少？正确的 Recall@5 应该是多少？
+      key_points:
+        - {text: "算出代码中 hits 为 4，返回 4 除以 2 等于 2.0", dim: principle}
+        - {text: "算出 reciprocal_rank 返回 1.0", dim: principle}
+        - {text: "指出正确 Recall@5 为 1.0，去重后命中 D1 和 D2", dim: principle}
+        - {text: "说明此 bug 会高估平均 Recall，导致评估结论错误，并给出修复写法", dim: engineering}
+      reference: |
+        recall_at_k：遍历前 5 个文档，D1 出现 3 次、D2 出现 1 次，都在相关集合中，hits = 4；返回 4 / 2 = **2.0**。
+        reciprocal_rank：第 1 个就是 D1，返回 1/1 = **1.0**（这个是对的）。
+        正确的文档级 Recall@5：前 5 个去重后为 {D1, D3, D2}，与相关集合的交集为 {D1, D2}，Recall = 2/2 = **1.0**。
+        影响：同一文档被切成多个 chunk 时，这个 bug 会让 Recall 超过 1，平均值被高估，可能掩盖真实的召回下降。修复：`return len(set(retrieved_docs[:k]) & relevant) / len(relevant)`，并为指标函数加单元测试。
+    - id: d29-c1-q2
+      kp: d29-k2
+      type: code
+      question: 评估集有 200 条样本，其中 30 条是无答案问题；运行中有 12 条样本的裁判调用超时。请说明最终输出中 n、recall@5、faithfulness 分别基于多少条样本，这会导致什么误判？
+      key_points:
+        - {text: "说明 30 条无答案样本被 continue 跳过，n 为 170", dim: principle}
+        - {text: "说明 faithfulness 只基于 158 条，与 recall 的样本集合不同", dim: principle}
+        - {text: "指出系统在无答案问题上是否编造完全没被评估", dim: engineering}
+        - {text: "提出单独统计拒答指标、输出各指标样本数、裁判失败重试并列出", dim: engineering}
+      reference: |
+        30 条 relevant_doc_ids 为空的样本在第一个判断处被 continue 跳过，没有调用系统也没有计入任何指标，所以 n = 170，recall@5 和 mrr 基于 170 条。
+        12 条裁判超时的样本被 except 捕获后没有追加 faithfulness，所以 faithfulness 基于 170 − 12 = 158 条。
+        **误判**：
+        1. 系统在无答案问题上是否编造完全没有被评估，而这恰恰是企业场景风险最高的一类；即使某次改动让编造率大增，报告也看不出来。
+        2. 三个指标的样本集合不同，若超时的恰好是长、难的样本，faithfulness 会被高估。
+        3. 输出中没有显示被跳过和失败的数量，阅读者会以为 200 条都评估了。
+        **改进**：无答案样本单独评估正确拒答率；报告中给出每个指标的样本数和被跳过/失败的 ID；裁判调用加重试与超时控制。
+    - id: d29-c1-q3
+      kp: d29-k4
+      type: code
+      question: 需求变更：「评估要按问题类型分层输出，并能在 10 分钟内跑完 500 条样本；裁判结果要能被人工抽查。」请说明应如何修改这段脚本。
+      key_points:
+        - {text: "评估集增加 question_type，按类型分组计算并输出指标", dim: engineering}
+        - {text: "用 Semaphore 限制并发并 gather 执行，注意限流", dim: engineering}
+        - {text: "保存每条样本明细包括检索结果、回答、分数，供人工抽查", dim: engineering}
+        - {text: "固定裁判模型版本并记录到报告中", dim: engineering}
+      reference: |
+        1. **分层**：评估集每行增加 question_type；把单条样本的评估封装为 `async def eval_case(case) -> dict`，返回类型、各项指标、是否拒答等；汇总时按 question_type 分组求平均，同时给出整体值和每组样本数。
+        2. **并发**：`sem = asyncio.Semaphore(10)`，在 eval_case 中 `async with sem:` 包住系统调用和裁判调用，用 `asyncio.gather(*tasks)` 并发执行；并发数要考虑 LLM API 限流，裁判调用加超时和有限重试。500 条 × 每条两三次 LLM 调用，在并发 10 的情况下通常可在十分钟量级完成（取决于模型延迟）。
+        3. **可抽查**：每条样本的问题、检索到的 doc_id 列表、回答、各项分数、裁判失败原因写入 JSONL 明细文件，并附带评估集版本号；人工按低分排序抽查。
+        4. **可复现**：报告中记录裁判模型名与版本、被评估系统的 Git 提交号、配置（K、阈值），便于对比和排查分数漂移。
+sources:
+  - {title: "RAGAS - List of available metrics", url: "https://docs.ragas.io/en/stable/concepts/metrics/available_metrics/"}
+  - {title: "RAGAS - Faithfulness", url: "https://docs.ragas.io/en/latest/concepts/metrics/available_metrics/faithfulness/"}
+  - {title: "RAGAS - Context Recall", url: "https://docs.ragas.io/en/latest/concepts/metrics/available_metrics/context_recall/"}
+  - {title: "ragas on PyPI", url: "https://pypi.org/project/ragas/"}
+  - {title: "Judging LLM-as-a-Judge（arXiv:2306.05685）", url: "https://arxiv.org/abs/2306.05685"}

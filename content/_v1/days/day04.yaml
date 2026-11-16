@@ -1,0 +1,733 @@
+day: 4
+phase: 1
+title: Python 工程基础：模块、异常、日志与依赖管理
+goals:
+  - 能解释 import 的查找与缓存机制，读懂 AI 生成项目的包结构，并排查循环导入和「找不到模块」问题
+  - 能分析一段异常处理代码是否吞掉了错误、是否保留了异常链，并能设计分层的自定义异常
+  - 能说明为什么后端用 logging 而不是 print，并读懂日志配置
+  - 能解释虚拟环境的原理，比较 pip/venv、uv、Poetry，并说清 pyproject.toml 与锁文件各自的作用
+knowledge_points:
+  - id: d04-k1
+    name: 模块、包与 import 机制
+    level: P0
+    summary: import 先查 sys.modules 缓存，再按 sys.path 查找并执行模块顶层代码一次；包是带层级的模块命名空间
+    why: |
+      AI 生成的 FastAPI 项目通常有 `app/api`、`app/services`、`app/models` 等多层目录。**「ModuleNotFoundError」「cannot import name ... partially initialized module」是新手最常遇到、也最看不懂的报错**；不理解模块顶层代码在导入时执行，就会把数据库连接、模型加载写在顶层，导致启动慢、测试难。
+    problem: |
+      模块系统解决代码的组织与复用：把功能拆分到不同文件，通过 import 复用，并保证每个模块只初始化一次。理解 import 的查找顺序与执行时机，能让你正确设计项目结构、定位导入错误，并控制「什么代码在什么时候运行」。
+    principle: |
+      **一、模块与包**
+
+      - **模块**：一个 `.py` 文件就是一个模块，模块名就是文件名。
+      - **包**：一个包含模块的目录，通常带 `__init__.py`。`import app.services.llm` 中，`app` 和 `app.services` 是包，`llm` 是模块。
+      - `__init__.py` 在包第一次被导入时执行，常用于暴露公共接口（`from .client import LLMClient`）。没有 `__init__.py` 的目录也能作为**命名空间包**导入（PEP 420），但业务项目建议显式写上，避免工具识别问题。
+
+      **二、import 的执行过程**
+
+      ```mermaid
+      flowchart TB
+        A["执行 import app.services.llm"] --> B{"sys.modules 中已有吗"}
+        B -->|"有"| C["直接返回缓存的模块对象 不再执行"]
+        B -->|"没有"| D["按 sys.path 顺序查找 当前脚本目录 PYTHONPATH site-packages"]
+        D -->|"找不到"| E["ModuleNotFoundError"]
+        D -->|"找到"| F["创建空模块对象并先放入 sys.modules"]
+        F --> G["从上到下执行模块顶层代码"]
+        G --> H["顶层的 def class 赋值 import 依次生效"]
+        H --> I["绑定名字到导入方的命名空间"]
+      ```
+
+      关键结论：
+
+      1. **模块顶层代码只在第一次导入时执行一次**，之后都从 `sys.modules` 拿缓存。所以模块级变量相当于**进程级单例**——这是 Day 01~03 那些「全局默认 dict 被污染」问题的根源，也是配置对象、日志器通常放在模块级的原因。
+      2. **`sys.path` 决定能不能找到**。第一项是被运行脚本所在目录（或 `-m` 运行时的当前目录）。在 `app/api/` 目录下直接 `python routes.py`，`app` 包就不在搜索路径里，于是 `import app.services` 失败。**推荐在项目根目录用 `python -m app.main` 或 `uvicorn app.main:app` 启动。**
+      3. **模块对象先放入 `sys.modules` 再执行代码**，这是循环导入能「部分成功」的原因，也是它报错的原因（见下）。
+
+      **三、`__name__` 与 `if __name__ == "__main__"`**
+
+      直接运行的文件 `__name__` 是 `"__main__"`，被导入时是模块的完整名字（如 `app.config`）。把自测代码放在 `if __name__ == "__main__":` 下，导入时就不会执行。
+
+      **四、绝对导入与相对导入**
+
+      - 绝对：`from app.services.llm import summarize`，清晰、推荐。
+      - 相对：`from .llm import summarize`、`from ..models import User`，只能在包内使用。直接 `python file.py` 运行包含相对导入的文件会报 `attempted relative import with no known parent package`，因为此时它不属于任何包。
+
+      **五、循环导入**
+
+      `a.py` 顶层 `from b import B`，`b.py` 顶层 `from a import A`：导入 a 时先把空的 a 放进 sys.modules，执行到 `from b import B` 去导入 b；b 执行到 `from a import A` 时发现 a 已在 sys.modules 里，但 A 还没定义，于是报 `ImportError: cannot import name 'A' from partially initialized module 'a'`。
+
+      解决思路：**把共同依赖抽到第三个模块**（如 `schemas.py`、`errors.py`）；或把导入移到函数内部；仅用于类型注解时可用 `if TYPE_CHECKING:` 导入。
+
+      **六、导入时不要做重活**
+
+      模块顶层创建数据库连接、加载模型、发网络请求，会导致：导入即失败（测试也跑不起来）、启动变慢、多 worker 下每个进程都执行一遍。应放到应用启动钩子（FastAPI 的 lifespan，Day 05/09）或按需初始化的函数里。
+
+      **不这样理解会怎样**：遇到 ModuleNotFoundError 只会让 AI 反复改 import 路径；遇到循环导入只会把 import 挪来挪去；把重资源初始化写在顶层，导致单元测试一导入就去连生产数据库。
+    scenarios: |
+      - **项目启动方式**：在根目录执行 `uv run uvicorn app.main:app --reload`，而不是进入子目录运行文件。
+      - **拆分模块**：`schemas.py` 放 Pydantic 模型、`errors.py` 放自定义异常，被 api 和 services 共同依赖，避免两者互相导入。
+      - **排查导入路径**：打印 `sys.path` 和 `module.__file__`，确认导入的是哪一份代码（常见于同名文件遮蔽标准库，如自己建了 `json.py`、`logging.py`）。
+    code: |
+      ```python
+      # 项目结构
+      # app/
+      #   __init__.py
+      #   main.py          FastAPI 入口
+      #   config.py        配置（模块级单例）
+      #   errors.py        自定义异常，被多处依赖
+      #   services/
+      #     __init__.py
+      #     llm.py         from app.config import settings
+      #   api/
+      #     __init__.py
+      #     routes.py      from app.services.llm import summarize
+
+      import sys
+      import app.config as cfg
+
+      print(cfg.__name__, cfg.__file__)      # app.config 以及实际文件路径
+      print("app.config" in sys.modules)     # True，再次 import 不会重新执行
+      print(sys.path[0])                     # 当前脚本目录或 -m 时的工作目录
+      ```
+    pitfalls: |
+      - **误区：每次 import 都会重新执行模块。** 只执行一次，之后用缓存；修改了代码需要重启进程（或开发模式的 reload）。
+      - **误区：在子目录里 `python xxx.py` 和在根目录 `python -m app.xxx` 一样。** sys.path 不同，包内导入的结果也不同。
+      - **误区：循环导入只能靠调整 import 顺序解决。** 根本办法是抽取公共模块、调整依赖方向。
+      - **坑：文件名和标准库或第三方库同名**（`json.py`、`openai.py`），会遮蔽真正的库。
+      - **坑：模块顶层连数据库/加载模型**，导致导入即副作用。
+    interview_asks:
+      - "Python 的 import 是怎么查找和加载模块的？为什么模块只会执行一次？"
+      - "什么是循环导入？你怎么解决？"
+      - "if __name__ == '__main__' 的作用是什么？"
+    project_example: |
+      一个 RAG 项目中，`app/rag/retriever.py` 导入了 `app/api/deps.py` 里的 `get_settings`，而 `deps.py` 又导入了 `retriever.py` 里的 `Retriever` 来做依赖注入，启动时报 `cannot import name 'Retriever' from partially initialized module`。AI 建议把 import 挪到函数里，虽然能跑但依赖关系更乱。最终做法是把 `get_settings` 移到独立的 `app/config.py`，让 api 层依赖 rag 层、rag 层只依赖 config，依赖方向变成单向。
+    freshness: |
+      核对于 2026-11：Python 3.15 新增显式惰性导入（PEP 810），可写 `lazy import json`、`lazy from pathlib import Path`，模块在名字首次被使用时才真正加载；只能用在模块顶层（函数内、类体内、try 块内使用会 SyntaxError），加载失败的异常在首次使用处抛出。需要兼容 3.15 以前版本的代码不能使用该语法，可用 `__lazy_modules__` 或传统的「函数内导入」。
+    sources:
+      - {title: "What's new in Python 3.15 - PEP 810 explicit lazy imports", url: "https://docs.python.org/3.15/whatsnew/3.15.html"}
+
+  - id: d04-k2
+    name: 异常处理与异常链
+    level: P0
+    summary: 只捕获你能处理的具体异常；转换异常时用 raise ... from e 保留根因；绝不静默吞掉错误
+    why: |
+      AI 生成代码最常见的坏味道就是 `try: ... except Exception: return None` —— **错误被吞掉，接口返回「成功但为空」，日志里什么都没有，线上排查无从下手。** 调用 LLM、向量库、数据库都会失败，异常处理写得好坏，直接决定一个 AI 应用是「偶尔报错但可定位」还是「莫名其妙不工作」。
+    problem: |
+      异常机制把「正常流程」和「出错处理」分开：底层遇到无法处理的情况就抛出，由真正知道如何处理的上层捕获。配合异常链和自定义异常体系，可以在跨越多层调用后，仍然知道错误的根因、类型和发生位置，并把它转换成对用户友好的 HTTP 响应。
+    principle: |
+      **一、异常层级：知道你在捕获什么**
+
+      ```mermaid
+      flowchart TB
+        BE["BaseException"] --> EX["Exception 业务代码应捕获的范围"]
+        BE --> KI["KeyboardInterrupt"]
+        BE --> SE["SystemExit"]
+        BE --> CE["asyncio.CancelledError 3.8 起"]
+        EX --> VE["ValueError"]
+        EX --> KE["LookupError 下有 KeyError IndexError"]
+        EX --> OE["OSError 下有 TimeoutError ConnectionError"]
+        EX --> HX["httpx.HTTPError 等第三方异常"]
+        EX --> AE["AppError 自定义业务异常基类"]
+        AE --> LE["LLMServiceError"]
+        LE --> LT["LLMTimeoutError"]
+      ```
+
+      - `except Exception` 不会捕获 `KeyboardInterrupt`、`SystemExit`、`asyncio.CancelledError`，这是有意设计：它们表示「程序该停了/任务被取消了」，不应被业务代码吞掉。**裸 `except:` 会捕获一切，包括这些，几乎总是错的。**
+      - 捕获父类会连带捕获所有子类，所以 `except` 子句要**先写具体的、后写宽泛的**。
+
+      **二、try / except / else / finally 的执行顺序**
+
+      - `try`：可能出错的代码，**范围越小越好**。
+      - `except`：匹配到异常类型时执行。
+      - `else`：try **没有异常**时执行，适合放「成功后才做」的事，避免把它们也包进 try 里误捕获。
+      - `finally`：**无论如何都执行**，用于释放资源（更推荐用 `with`，Day 05）。
+
+      **三、异常链：raise ... from e**
+
+      跨层时常需要把底层异常转换成业务异常（如 `httpx.TimeoutException` → `LLMTimeoutError`）：
+
+      ```python
+      try:
+          resp = httpx.post(url, json=payload, timeout=30)
+      except httpx.TimeoutException as e:
+          raise LLMTimeoutError("调用模型超时") from e
+      ```
+
+      - `from e` 把原异常存进新异常的 `__cause__`，traceback 会打印两段，中间是 **「The above exception was the direct cause of the following exception」**，根因一目了然。
+      - 不写 `from`，在 except 块里抛新异常时 Python 也会自动记录 `__context__`，提示语是 **「During handling of the above exception, another exception occurred」**，读起来像是「处理异常时又出了 bug」，容易误导。
+      - `raise X from None` 会**主动隐藏**原异常，只在原异常确实无关或包含敏感信息时使用。
+      - 在 except 中只写 `raise`（不带参数）会**原样重新抛出**当前异常，保留完整 traceback，适合「记录一下再往上抛」。
+
+      **四、自定义异常体系**
+
+      定义一个业务基类，再按可处理方式细分：
+
+      ```python
+      class AppError(Exception): ...
+      class LLMServiceError(AppError): ...
+      class LLMTimeoutError(LLMServiceError): ...
+      class LLMRateLimitError(LLMServiceError): ...
+      ```
+
+      上层可以按需粗细捕获：重试逻辑只捕获 `LLMTimeoutError` 和 `LLMRateLimitError`；API 层统一捕获 `AppError` 转成 HTTP 响应。FastAPI 中用 `@app.exception_handler(AppError)` 注册全局处理器，把异常映射为 504/429/502 等状态码，而不是每个路由各写一遍。
+
+      **五、吞异常为什么危险**
+
+      `except Exception: return None` 有三个后果：**丢失错误类型**（上层无法区分超时还是参数错误，也就无法决定是否重试）；**丢失 traceback**（如果日志只写了 `str(e)`）；**错误被延迟**（None 在更远的地方引发 `TypeError`，离根因很远）。如果确实要在某层兜底，至少用 `logger.exception(...)` 记录完整堆栈，并返回明确的错误结果。
+
+      **六、Python 3.11+ 的补充能力**
+
+      `e.add_note("tenant=t1 doc=123")` 给异常附加上下文；`ExceptionGroup` 与 `except*` 用于同时处理多个并发任务的异常（asyncio TaskGroup，见 Day 06）。
+
+      **不这样理解会怎样**：会写出「接口返回 200 但内容为空」的隐性故障；重试逻辑把参数错误也重试三次浪费额度；日志里只有一句 `summarize failed: ` 后面什么都没有。
+    scenarios: |
+      - **LLM 调用层**：把 httpx 的超时、4xx、5xx 分别转换成 `LLMTimeoutError`、`LLMBadRequestError`、`LLMServiceError`，用 `from e` 保留根因。
+      - **API 层**：全局异常处理器把业务异常映射成状态码和统一的错误响应体，不向前端暴露堆栈。
+      - **批量入库**：单个文档失败时记录 `logger.exception` 并继续处理下一个，最后汇总失败列表，而不是整批失败或静默跳过。
+    code: |
+      ```python
+      import logging
+
+      import httpx
+      from fastapi import FastAPI, Request
+      from fastapi.responses import JSONResponse
+
+      logger = logging.getLogger(__name__)
+
+      class AppError(Exception):
+          status_code = 500
+
+      class LLMTimeoutError(AppError):
+          status_code = 504
+
+      def call_llm(url: str, payload: dict) -> dict:
+          try:
+              resp = httpx.post(url, json=payload, timeout=30.0)
+              resp.raise_for_status()
+          except httpx.TimeoutException as e:
+              raise LLMTimeoutError("调用模型超时") from e   # 保留根因
+          else:
+              return resp.json()                              # 只有成功才执行
+
+      app = FastAPI()
+
+      @app.exception_handler(AppError)
+      async def handle_app_error(request: Request, exc: AppError) -> JSONResponse:
+          logger.error("app error on %s", request.url.path, exc_info=exc)
+          return JSONResponse(status_code=exc.status_code, content={"error": type(exc).__name__})
+      ```
+    pitfalls: |
+      - **误区：`except Exception: pass` 能让程序更稳定。** 它只是让错误更难被发现。
+      - **误区：裸 `except:` 和 `except Exception:` 一样。** 前者还会捕获 KeyboardInterrupt、SystemExit 和 CancelledError。
+      - **误区：转换异常时不写 from 也无所谓。** 会丢失「直接原因」的语义，traceback 提示还会误导排查方向。
+      - **误区：try 块包得越大越安全。** 范围越大越容易误捕获不相关的错误，应把成功后的逻辑放进 else。
+      - **坑：在 finally 里写 return。** 会吞掉正在传播的异常，Python 3.14 起编译器会对此发出 SyntaxWarning（PEP 765）。
+    interview_asks:
+      - "raise 和 raise ... from e 有什么区别？异常链有什么用？"
+      - "为什么不建议 except Exception: pass？你在项目中如何设计异常处理？"
+      - "try/except/else/finally 各自什么时候执行？"
+    project_example: |
+      文档问答服务的 `answer()` 函数用 `except Exception: return "抱歉，暂时无法回答"` 兜底。某天向量库的认证令牌过期，所有请求都返回这句话，接口状态码是 200，监控没有任何告警，持续了半天才被用户投诉发现。整改后：底层把认证失败转换成 `VectorStoreAuthError(...) from e`，API 层统一映射为 503 并触发告警；兜底分支改为 `logger.exception` 记录完整堆栈。
+    freshness: |
+      核对于 2026-11：Python 3.14 起，`return`/`break`/`continue` 跳出 `finally` 块时编译器发出 SyntaxWarning（PEP 765）；`except` 捕获多个类型且不使用 `as` 时可省略括号，如 `except TimeoutError, ConnectionError:`（PEP 758），但需要兼容 3.13 及以前版本的代码仍应写括号。`add_note()`、`ExceptionGroup` 与 `except*` 自 3.11 起可用。
+    sources:
+      - {title: "Python Tutorial - Errors and Exceptions（异常链 from / from None）", url: "https://docs.python.org/3/tutorial/errors.html"}
+      - {title: "What's new in Python 3.14 - PEP 758 / PEP 765", url: "https://docs.python.org/3/whatsnew/3.14.html"}
+
+  - id: d04-k3
+    name: 日志 logging 与 print 的区别
+    level: P1
+    summary: logging 有级别、来源、格式和输出目标，可按环境开关；print 只适合临时调试
+    why: |
+      线上服务出问题时，**日志是你唯一能看到的东西**。AI 生成的代码常常到处 `print`，上线后要么什么都看不到（被容器丢弃或缓冲），要么把 API Key、用户隐私打印出来。读懂并配置好 logging，是从「会写代码」到「能运维系统」的第一步。
+    problem: |
+      logging 解决「在不改代码的情况下，按环境控制输出什么、输出到哪里、以什么格式输出」的问题：开发时看 DEBUG，线上只看 INFO 以上；同一条日志带上时间、模块、级别、请求 ID；输出到控制台、文件或日志平台。print 做不到这些。
+    principle: |
+      **一、四个组件**
+
+      ```mermaid
+      flowchart LR
+        C["业务代码 logger.info"] --> L["Logger 按名字分层 如 app.services.llm"]
+        L --> F1{"级别是否达到 Logger 阈值"}
+        F1 -->|"否"| DROP["丢弃"]
+        F1 -->|"是"| H["交给 Handler 并向父 Logger 传播"]
+        H --> FM["Formatter 拼接时间 级别 模块 消息"]
+        FM --> OUT1["控制台 stdout"]
+        FM --> OUT2["文件或日志平台"]
+      ```
+
+      - **Logger**：`logging.getLogger(__name__)` 按模块名创建，名字用点号分层（`app` → `app.services` → `app.services.llm`），子 logger 的日志默认**向上传播**给父 logger 的 handler。所以通常只在根 logger 或 `app` 上配置一次 handler。
+      - **Handler**：决定输出到哪里（StreamHandler、FileHandler、发送到日志平台的 handler）。
+      - **Formatter**：决定格式，例如 `%(asctime)s %(levelname)s %(name)s %(message)s`。
+      - **Level**：DEBUG < INFO < WARNING < ERROR < CRITICAL。低于阈值的日志被丢弃，开销很小。
+
+      **二、关键用法**
+
+      - **惰性格式化**：`logger.info("user=%s tokens=%d", user_id, n)`，只有真正要输出时才拼接字符串；写成 f-string 则无论是否输出都会先拼接。
+      - **记录异常**：在 except 块中用 `logger.exception("msg")`（ERROR 级别并自动附带 traceback），或 `logger.error("msg", exc_info=True)`。**只写 `logger.error(str(e))` 会丢失堆栈**。
+      - **配置只做一次**：在程序入口（`main.py`）调用 `logging.basicConfig(...)` 或 `logging.config.dictConfig(...)`，库代码和业务模块只 `getLogger`，**不要在模块里各自 basicConfig**。
+      - uvicorn 有自己的 logger（`uvicorn`、`uvicorn.error`、`uvicorn.access`），可以在 dictConfig 中统一格式。
+
+      **三、为什么不用 print**
+
+      | 维度 | print | logging |
+      |---|---|---|
+      | 级别控制 | 无，只能删代码 | 改配置即可开关 |
+      | 来源信息 | 无 | 时间、模块、行号、进程 |
+      | 输出目标 | stdout | 任意 handler |
+      | 异常堆栈 | 需手动 | `logger.exception` 自动附带 |
+      | 结构化 | 难 | 可输出 JSON 便于检索 |
+
+      **四、AI 应用日志的特殊要求**
+
+      - **记录**：请求 ID、模型名、耗时、token 用量、重试次数、错误类型——这些是排查和计费的依据。
+      - **不要记录**：API Key、完整的用户隐私数据、可能包含敏感信息的完整 Prompt（需要时脱敏或采样）。
+      - 生产环境推荐**结构化日志**（JSON），方便在日志平台按字段过滤（见 Day 48）。
+
+      **不这样理解会怎样**：线上出问题只能「加 print 重新发版再等复现」；日志里只有错误信息没有堆栈；或者把 API Key 打进日志平台，造成密钥泄露。
+    scenarios: |
+      - **LLM 调用埋点**：`logger.info("llm_call model=%s latency_ms=%d prompt_tokens=%d", ...)`，用于成本和性能分析。
+      - **异常排查**：兜底分支 `logger.exception("summarize failed doc_id=%s", doc_id)`，日志平台可直接看到堆栈。
+      - **按环境调整**：开发环境 DEBUG，生产环境 INFO，通过环境变量 `LOG_LEVEL` 控制。
+    code: |
+      ```python
+      import logging
+      import os
+
+      logging.basicConfig(
+          level=os.getenv("LOG_LEVEL", "INFO"),
+          format="%(asctime)s %(levelname)s %(name)s %(message)s",
+      )
+      logger = logging.getLogger(__name__)
+
+      def parse(doc_id: str, raw: str) -> dict:
+          logger.debug("parsing doc_id=%s len=%d", doc_id, len(raw))   # 生产环境不输出
+          try:
+              return {"id": doc_id, "pages": int(raw)}
+          except ValueError:
+              logger.exception("parse failed doc_id=%s", doc_id)        # 自动附带 traceback
+              raise
+
+      try:
+          parse("d1", "abc")
+      except ValueError:
+          pass
+      ```
+    pitfalls: |
+      - **误区：`logger.error(e)` 就够了。** 只有错误消息没有堆栈，要用 `logger.exception` 或 `exc_info=True`。
+      - **误区：每个模块都调用 `basicConfig`。** 只有第一次调用生效，配置应集中在入口。
+      - **误区：日志用 f-string 更清晰。** 会在日志被丢弃时也执行格式化，且不利于日志平台按模板聚合。
+      - **安全坑：把请求头、API Key、完整 Prompt 原样记录。** 需要脱敏。
+    interview_asks:
+      - "为什么后端服务不用 print 而用 logging？logging 有哪些核心组件？"
+      - "记录异常时 logger.error 和 logger.exception 有什么区别？"
+      - "AI 应用的日志你会记录哪些字段？哪些不能记录？"
+    project_example: |
+      一个 Agent 服务排查「工具调用偶发失败」时，发现日志里只有 `tool failed: ` 后面是空字符串——原来是某个自定义异常没有消息，`str(e)` 为空，而代码用的是 `logger.error(f"tool failed: {e}")`。改为 `logger.exception("tool failed tool=%s run_id=%s", tool_name, run_id)` 后，日志里能直接看到异常类型和完整堆栈，十分钟就定位到是工具参数 Schema 校验失败。
+
+  - id: d04-k4
+    name: 虚拟环境与依赖管理（venv、pyproject.toml、锁文件、uv）
+    level: P0
+    summary: 虚拟环境隔离每个项目的依赖；pyproject.toml 声明依赖范围，锁文件固定精确版本，保证可复现
+    why: |
+      「我本地能跑，服务器上跑不了」是 Python 项目最常见的部署问题，根源几乎都是依赖：版本不一致、装到了全局环境、漏装了某个包。**AI 生成的项目可能用 pip + requirements.txt、Poetry 或 uv，你需要看懂并选择合适的方式，才能让项目在任何机器上稳定复现。**
+    problem: |
+      虚拟环境解决「不同项目依赖不同版本的同一个库」的冲突；依赖声明文件解决「这个项目需要哪些库」的问题；锁文件解决「每台机器、每次部署装的是完全相同的版本」的问题。三者结合，才能做到开发、CI、生产环境一致。
+    principle: |
+      **一、虚拟环境是什么（原理）**
+
+      `python -m venv .venv` 会创建一个目录，里面有：
+
+      - `pyvenv.cfg`：记录 `home`（创建它的基础 Python 所在位置）等配置。
+      - `Scripts/`（Windows）或 `bin/`：Python 可执行文件的副本或链接，以及激活脚本。
+      - `Lib/site-packages/`：**这个环境独立的第三方包目录**。
+
+      Python 启动时发现旁边有 `pyvenv.cfg`，就把 `sys.prefix` 指向虚拟环境、`sys.path` 中使用该环境的 site-packages。可以用 `sys.prefix != sys.base_prefix` 判断当前是否在虚拟环境中。
+
+      **「激活」只是把环境的 Scripts/bin 目录加到 PATH 最前面**，让你敲 `python` 时用的是环境里的解释器；不激活、直接用 `.venv\Scripts\python.exe` 或 `uv run` 效果一样。官方文档强调：虚拟环境是**可丢弃、不可移动/复制**的，不要把它提交到 Git，也不要在机器间拷贝，应该按依赖声明重建。
+
+      **二、依赖声明：从 requirements.txt 到 pyproject.toml**
+
+      - **requirements.txt**：pip 专用的「要装哪些包」列表，常用 `pip freeze > requirements.txt` 生成。问题是它把直接依赖和间接依赖混在一起，难以维护。
+      - **pyproject.toml**：现在的标准项目配置文件。`[project]` 表声明名称、版本、`requires-python`、`dependencies`；`[dependency-groups]`（PEP 735）声明测试、lint 等开发依赖，不会进入发布的包元数据；`[tool.xxx]` 放 ruff、pytest、uv 等工具配置；`[build-system]` 声明构建后端。
+      - **版本约束**：`httpx>=0.27,<1`（范围）、`pydantic~=2.14`（兼容发布，等价于 `>=2.14,<3`）、`==` 精确固定（一般只在锁文件里出现）。
+
+      **三、锁文件：可复现的关键**
+
+      ```mermaid
+      flowchart LR
+        P["pyproject.toml 声明直接依赖和版本范围"] --> R["解析器求解 包含所有间接依赖"]
+        R --> LOCK["锁文件 uv.lock 或 pylock.toml 精确版本和哈希"]
+        LOCK --> S["同步 sync 到 .venv"]
+        S --> DEV["开发机"]
+        LOCK --> CI["CI 环境"]
+        LOCK --> PROD["生产镜像"]
+      ```
+
+      pyproject.toml 写的是**范围**（「pydantic 2.x 就行」），今天和下个月解析出的具体版本可能不同；锁文件记录解析出的**精确版本（以及哈希）**，提交到 Git，所有环境按锁文件安装，结果完全一致。**应用项目必须提交锁文件**；发布给别人用的库通常只声明范围。
+
+      **四、工具对比（2026-11 现状）**
+
+      | 工具 | 定位 | 依赖声明 | 锁文件 |
+      |---|---|---|---|
+      | pip + venv | 标准库自带，最基础 | requirements.txt 或 pyproject | pip 25.1 起有实验性 `pip lock` 生成 pylock.toml |
+      | uv | Rust 编写的一体化工具：装 Python、建环境、解析、锁定、运行 | pyproject.toml | uv.lock（跨平台通用锁文件） |
+      | Poetry | 老牌项目管理工具 | 2.0 起支持标准 `[project]` 表 | poetry.lock |
+
+      uv 的日常命令：`uv init` 创建项目，`uv add httpx` 添加依赖（同时更新 pyproject 和 uv.lock），`uv sync` 按锁文件同步 `.venv`，`uv run python -m app.main` 在项目环境中运行（会自动确保环境最新），`uv python pin 3.13` 固定 Python 版本。
+
+      **五、为什么不能装到全局**
+
+      全局环境被所有项目共享，A 项目要 `pydantic 1.x`、B 项目要 `2.x` 时只能二选一；升级一个包可能悄悄破坏其他项目；部分 Linux 发行版的系统 Python 还会直接拒绝 pip 安装（PEP 668 的 externally-managed 机制），以免破坏系统工具。
+
+      **不这样理解会怎样**：部署时 `pip install -r requirements.txt` 装到了新版本的某个库，接口参数变了直接报错；把 `.venv` 提交到 Git 导致仓库巨大且换台机器就失效；在 IDE 里选错解释器，「明明装了却 ModuleNotFoundError」。
+    scenarios: |
+      - **新项目初始化**：`uv init`、`uv add fastapi uvicorn pydantic-settings httpx`、`uv add --dev pytest ruff`，提交 pyproject.toml 和 uv.lock，`.venv` 加入 .gitignore。
+      - **CI 与 Docker**：`uv sync --frozen`（按锁文件安装，不允许修改锁文件），保证与开发环境一致。
+      - **排查 ModuleNotFoundError**：打印 `sys.executable` 和 `sys.prefix`，确认当前运行的是不是项目 `.venv` 里的解释器。
+      - **接手旧项目**：只有 requirements.txt 时，可先在 venv 中安装运行，再逐步迁移到 pyproject.toml 和锁文件。
+    code: |
+      ```toml
+      # pyproject.toml（uv 管理的 FastAPI 项目示例）
+      [project]
+      name = "kb-assistant"
+      version = "0.1.0"
+      requires-python = ">=3.13"
+      dependencies = [
+          "fastapi>=0.115",
+          "uvicorn[standard]>=0.30",
+          "pydantic-settings>=2.4",
+          "httpx>=0.27,<1",
+      ]
+
+      [dependency-groups]
+      dev = ["pytest>=8", "ruff>=0.6"]
+
+      [tool.ruff.lint]
+      select = ["E", "F", "B"]     # B 规则包含可变默认参数检查 B006
+      ```
+
+      ```python
+      import sys
+      print(sys.executable)                    # 当前解释器路径
+      print(sys.prefix != sys.base_prefix)     # True 表示在虚拟环境中
+      ```
+    pitfalls: |
+      - **误区：激活虚拟环境是必须的。** 激活只是改 PATH，直接用环境内的解释器或 `uv run` 同样有效。
+      - **误区：把 .venv 提交到 Git 或拷贝到服务器。** 虚拟环境不可移动，应按锁文件重建。
+      - **误区：有了 pyproject.toml 就能复现环境。** 版本范围会随时间解析出不同结果，必须配合锁文件。
+      - **误区：`pip freeze` 生成的 requirements.txt 就是好的依赖声明。** 它混合了间接依赖，难以升级和审查。
+      - **混淆：uv.lock 和 pylock.toml。** uv.lock 是 uv 专用格式，pylock.toml 是 PEP 751 标准格式，uv 可以导出为后者。
+    interview_asks:
+      - "虚拟环境的原理是什么？激活虚拟环境时到底发生了什么？"
+      - "pyproject.toml 和锁文件分别解决什么问题？为什么锁文件要提交到 Git？"
+      - "pip、Poetry、uv 你用过哪些？怎么选？"
+    project_example: |
+      一个知识库项目只用 `requirements.txt` 写了 `langchain` 和 `openai`，没有版本约束。两个月后重新部署，自动装上了新的大版本，原来的导入路径和调用方式失效，服务启动即报错，而开发机上的旧环境一切正常。迁移到 uv 后，依赖在 pyproject.toml 中声明范围，`uv.lock` 固定精确版本并提交到仓库，Dockerfile 中使用 `uv sync --frozen`，之后每次部署的依赖都与开发环境一致，升级依赖改为有意识的 `uv lock --upgrade-package xxx` 并跑完测试再合并。
+    freshness: |
+      核对于 2026-11：uv 最新为 0.13.7（2026-11-03），0.13.0 起把 Python 3.15 作为默认稳定版本；uv 项目使用 pyproject.toml + uv.lock（跨平台通用、uv 专用格式，应提交到版本库）+ 项目内 `.venv`，可用 `uv export -o pylock.toml` 导出标准锁文件。pip 最新为 26.3（2026-11-02）：25.1 起支持 `--group` 安装 PEP 735 依赖组、提供实验性 `pip lock`；26.1 起实验性支持 `-r pylock.toml`。Poetry 2.0（2025-01-05）起支持标准 `[project]` 表，最新 2.5.1（2026-09-20），`poetry shell` 已移到插件，`poetry sync` 取代 `install --sync`。PEP 751 定义了标准锁文件 pylock.toml，各工具支持程度不同，以各自文档为准。
+    sources:
+      - {title: "uv - Project structure and files（pyproject.toml、.venv、uv.lock、pylock.toml）", url: "https://docs.astral.sh/uv/concepts/projects/layout/"}
+      - {title: "uv Releases", url: "https://github.com/astral-sh/uv/releases"}
+      - {title: "Python Packaging User Guide - Writing your pyproject.toml", url: "https://packaging.python.org/en/latest/guides/writing-pyproject-toml/"}
+      - {title: "Python Packaging - Dependency Groups 规范", url: "https://packaging.python.org/en/latest/specifications/dependency-groups/"}
+      - {title: "Python 文档 - venv", url: "https://docs.python.org/3/library/venv.html"}
+      - {title: "pip install 文档（--group、pylock.toml）", url: "https://pip.pypa.io/en/stable/cli/pip_install/"}
+      - {title: "Announcement: pip 26.3 release", url: "https://discuss.python.org/t/announcement-pip-26-3-release/109822"}
+      - {title: "Poetry - The pyproject.toml file", url: "https://python-poetry.org/docs/pyproject/"}
+      - {title: "Announcing Poetry 2.0.0", url: "https://python-poetry.org/blog/announcing-poetry-2.0.0"}
+
+quiz:
+  - id: d04-q1
+    kp: d04-k1
+    type: single
+    question: |
+      项目结构为 `app/__init__.py`、`app/config.py`、`app/api/routes.py`，routes.py 中有 `from app.config import settings`。开发者进入 `app/api/` 目录执行 `python routes.py`，报 `ModuleNotFoundError: No module named 'app'`。最主要的原因是？
+    options:
+      - "app 目录缺少 __init__.py，导致不能被识别为包"
+      - "直接运行脚本时 sys.path 的第一项是脚本所在目录 app/api，项目根目录不在搜索路径中"
+      - "config.py 中有语法错误，导致模块无法导入"
+      - "绝对导入必须改成相对导入 from ..config import settings 才能运行"
+    answer: [1]
+    explain: |
+      直接运行脚本时，sys.path[0] 是脚本所在目录 app/api，Python 只能在这里、PYTHONPATH 和 site-packages 中找 app 包，自然找不到。题目已说明有 __init__.py，A 不成立；语法错误会报 SyntaxError 而不是 ModuleNotFoundError，C 不对；D 改成相对导入后直接运行脚本反而会报 attempted relative import with no known parent package。正确做法是在项目根目录执行 python -m app.api.routes 或用 uvicorn app.main:app 启动。
+  - id: d04-q2
+    kp: d04-k2
+    type: multi
+    question: 关于异常处理，下列哪些说法正确？
+    options:
+      - "`except Exception` 不会捕获 KeyboardInterrupt 和 asyncio.CancelledError"
+      - "`raise LLMError(\"超时\") from e` 会把 e 保存到新异常的 __cause__，traceback 会显示两段"
+      - "在 except 块中只写 `raise` 会丢失原来的 traceback"
+      - "`try/except/else` 中，else 块只在 try 没有抛出异常时执行"
+      - "把整个函数体都包进 try 里是最安全的写法"
+    answer: [0, 1, 3]
+    explain: |
+      A 正确，KeyboardInterrupt、SystemExit、CancelledError 都直接继承 BaseException。B 正确，from e 设置 __cause__，traceback 中显示 direct cause 提示。C 错误，不带参数的 raise 会原样重新抛出当前异常，完整保留 traceback。D 正确，else 用于放成功后才执行的逻辑。E 错误，try 范围过大会误捕获不相关的错误，掩盖真正问题。
+  - id: d04-q3
+    kp: d04-k4
+    type: judge
+    question: 只要提交了 pyproject.toml，并在其中写了 `pydantic>=2.10`，那么任何时间、任何机器执行安装，得到的依赖版本都完全一致。
+    answer: false
+    explain: |
+      pyproject.toml 中写的是版本范围，解析器会选择当时满足范围的最新版本，今天和下个月可能解析出不同的 pydantic 以及不同的间接依赖版本。要完全复现，需要锁文件（如 uv.lock、poetry.lock 或 pylock.toml）记录精确版本和哈希，并在 CI 和部署时按锁文件安装（如 uv sync --frozen）。
+  - id: d04-q4
+    kp: d04-k3
+    type: short
+    question: 为什么后端服务应该用 logging 而不是 print？在 except 块里记录错误时，`logger.error(str(e))` 和 `logger.exception("...")` 有什么区别？
+    key_points:
+      - {text: "说明 logging 支持级别控制，可按环境开关而无需改代码", dim: concept}
+      - {text: "说明 logging 自动附带时间、模块名等来源信息，并可配置输出到不同目标和格式", dim: principle}
+      - {text: "指出 logger.error(str(e)) 只有消息没有堆栈，且消息可能为空", dim: principle}
+      - {text: "说明 logger.exception 以 ERROR 级别记录并自动附带完整 traceback，便于线上定位", dim: engineering}
+    reference: |
+      print 只能输出到标准输出，没有级别、没有来源信息，要关闭只能删代码，也无法统一格式或发到日志平台。logging 有 Logger、Handler、Formatter 和级别：开发环境开 DEBUG、生产只开 INFO 以上，改配置即可；每条日志自带时间、级别、模块名，能输出到控制台、文件或日志平台，还能做成 JSON 结构化日志。记录异常时，`logger.error(str(e))` 只记录了异常消息，丢失了异常类型和调用堆栈，有些异常的消息甚至是空字符串；`logger.exception("...")` 要在 except 块中调用，它以 ERROR 级别记录，并自动附带当前异常的完整 traceback，能直接看到错误发生在哪个文件哪一行。等价写法是 `logger.error("...", exc_info=True)`。
+  - id: d04-q5
+    kp: d04-k2
+    type: scenario
+    question: |
+      文档问答接口某天开始对所有问题都返回「抱歉，暂时无法回答」，HTTP 状态码 200，监控没有告警，持续半天才被用户发现。代码如下，请分析问题并给出改进方案。
+
+      ```python
+      def answer(question: str) -> str:
+          try:
+              chunks = vector_store.search(question, top_k=5)
+              return llm.generate(question, chunks)
+          except Exception:
+              return "抱歉，暂时无法回答"
+      ```
+    key_points:
+      - {text: "指出 except Exception 吞掉了所有异常，没有任何日志和堆栈，无法定位根因", dim: engineering}
+      - {text: "指出返回 200 和兜底文案让监控无法识别故障，错误被伪装成正常响应", dim: concept}
+      - {text: "提出按异常类型区分处理：底层转换为自定义业务异常并 raise from 保留根因", dim: principle}
+      - {text: "提出 API 层统一映射为合适的状态码（如 503/504）并告警，兜底分支至少用 logger.exception 记录", dim: engineering}
+    reference: |
+      问题有三层。第一，`except Exception` 把向量库认证失败、网络超时、模型限流、代码 bug 全部吞掉，没有记录任何日志，排查时完全不知道发生了什么。第二，函数返回一段正常文案，接口状态码是 200，从监控角度看服务完全健康，错误率指标不会上升，所以没有告警。第三，上层也无法区分错误类型，不能决定是否重试或降级。改进：底层按类型转换异常，例如向量库客户端捕获认证错误后 `raise VectorStoreAuthError("向量库认证失败") from e`，LLM 层把超时转换成 `LLMTimeoutError`；`answer()` 不再兜底吞异常，或者只捕获明确可降级的异常类型；API 层用 FastAPI 的全局 exception_handler 把业务异常映射成 503/504 等状态码并返回统一错误体，配合错误率告警。如果产品确实要求给用户友好文案，也应在兜底分支 `logger.exception(...)` 记录完整堆栈，并上报错误指标。
+    followup:
+      question: 如果业务要求「模型超时时给用户返回友好提示，但其他错误要报错」，代码应该怎么写？
+      key_points: ["只捕获 LLMTimeoutError 并返回友好提示", "其他异常继续向上抛由全局处理器处理", "超时分支仍需记录日志和指标"]
+      reference: |
+        只写 `except LLMTimeoutError: logger.warning(...); return 友好提示`，并记录超时指标；其他异常不捕获，让它们向上传播到全局异常处理器，转换成相应的状态码并告警。这样既满足产品体验，又不会掩盖真正的故障。
+  - id: d04-q6
+    kp: d04-k4
+    type: design
+    question: 你接手一个只有 `requirements.txt`（无版本号）的 AI 项目，部署经常出现「本地能跑、服务器报错」。请设计依赖与环境管理的改造方案，包括工具选择、文件、开发流程和 CI/部署方式。
+    key_points:
+      - {text: "说明问题根因：无版本约束且无锁文件，不同时间安装得到不同版本，可能还装在了全局环境", dim: principle}
+      - {text: "提出使用 pyproject.toml 声明直接依赖和版本范围，开发依赖放入 dependency-groups", dim: concept}
+      - {text: "提出生成并提交锁文件（如 uv.lock），.venv 不入库，CI 和 Docker 按锁文件安装（如 uv sync --frozen）", dim: engineering}
+      - {text: "提出固定 Python 版本（requires-python、uv python pin）并在依赖升级时走锁文件更新加测试的流程", dim: engineering}
+    reference: |
+      根因是 requirements.txt 没有版本约束，也没有锁文件，每次安装都解析出当时最新的版本，大版本升级后 API 变化就会导致报错；如果服务器还把包装在全局环境，还会和其他项目冲突。改造方案：第一，选择 uv 作为项目工具（也可以用 Poetry 或 pip-tools，原则相同）。第二，在 pyproject.toml 的 `[project].dependencies` 中声明直接依赖及合理范围（先以当前生产可用的版本为基准，如 `httpx>=0.27,<1`），测试和 lint 工具放到 `[dependency-groups].dev`，`requires-python` 写明下限，并用 `uv python pin` 固定开发版本。第三，`uv lock` 生成 uv.lock 并提交到 Git，`.venv` 加入 .gitignore。第四，CI 和 Dockerfile 中使用 `uv sync --frozen`，锁文件与 pyproject 不一致时直接失败，保证与开发环境完全一致；用 `uv run pytest` 跑测试。第五，依赖升级变成显式操作：`uv lock --upgrade-package xxx`，跑完测试再合并。如果部署环境只能用 pip，可以 `uv export` 导出锁定版本的 requirements 或 pylock.toml 供 pip 安装。
+
+code_reading:
+  id: d04-c1
+  kp: [d04-k2, d04-k3, d04-k1]
+  title: 文本总结服务的异常处理与日志
+  scenario: |
+    这是一个 FastAPI 项目中的三个文件片段：`app/errors.py` 定义业务异常，`app/services/llm_service.py` 调用大模型做文本总结，`app/api/routes.py` 暴露 `POST /summaries` 接口。运维反馈：模型服务偶发超时时，接口返回 500「总结失败」，而不是预期的 504「上游模型超时」；同时安全审计在容器标准输出里发现了明文 API Key。
+  language: python
+  code: |
+    # ---- app/errors.py ----
+    class AppError(Exception): ...
+    class LLMServiceError(AppError): ...
+    class LLMTimeoutError(LLMServiceError): ...
+
+    # ---- app/services/llm_service.py ----
+    import logging
+
+    import httpx
+
+    from app.config import settings
+    from app.errors import LLMServiceError, LLMTimeoutError
+
+    logger = logging.getLogger(__name__)
+
+
+    def _post(payload: dict) -> dict:
+        try:
+            resp = httpx.post(
+                f"{settings.llm_base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {settings.llm_api_key}"},
+                json=payload,
+                timeout=30.0,
+            )
+            resp.raise_for_status()
+        except httpx.TimeoutException as e:
+            raise LLMTimeoutError("LLM request timed out") from e
+        except httpx.HTTPStatusError as e:
+            raise LLMServiceError(f"LLM returned {e.response.status_code}") from e
+        return resp.json()
+
+
+    def summarize(text: str) -> str | None:
+        payload = {"model": settings.llm_model,
+                   "messages": [{"role": "user", "content": f"请总结：{text}"}]}
+        print("calling llm", payload, settings.llm_api_key)
+        try:
+            data = _post(payload)
+            return data["choices"][0]["message"]["content"]
+        except Exception as e:
+            logger.error("summarize failed: %s", e)
+            return None
+
+    # ---- app/api/routes.py ----
+    from fastapi import APIRouter, HTTPException
+
+    from app.errors import LLMTimeoutError
+    from app.schemas import SummaryIn, SummaryOut
+    from app.services.llm_service import summarize
+
+    router = APIRouter()
+
+
+    @router.post("/summaries")
+    def create_summary(body: SummaryIn) -> SummaryOut:
+        try:
+            result = summarize(body.text)
+        except LLMTimeoutError:
+            raise HTTPException(status_code=504, detail="上游模型超时")
+        if result is None:
+            raise HTTPException(status_code=500, detail="总结失败")
+        return SummaryOut(summary=result)
+  walkthrough:
+    function: |
+      接收一段文本，调用 OpenAI 兼容接口生成总结并返回。设计意图是：底层 `_post` 把 httpx 的超时和 HTTP 错误转换为业务异常，路由层把超时映射为 504，其他失败返回 500。
+    key_functions: |
+      - `AppError` / `LLMServiceError` / `LLMTimeoutError`：业务异常层级，超时是服务错误的子类。
+      - `_post()`：发送 HTTP 请求；`raise_for_status()` 在 4xx/5xx 时抛 `httpx.HTTPStatusError`；用 `raise ... from e` 转换异常并保留根因；成功时在 try 之外返回 JSON。
+      - `summarize()`：组装 Prompt 调用 `_post`，从响应中取出总结文本；用 `except Exception` 兜底返回 None。
+      - `create_summary()`：路由函数，期望捕获超时异常返回 504，结果为 None 时返回 500。
+    params: |
+      请求体经 `SummaryIn` 校验后，`body.text` 传给 `summarize(text)`；`summarize` 把文本拼进 messages，作为 payload 传给 `_post(payload)`；配置项 `settings.llm_base_url`、`llm_api_key`、`llm_model` 来自模块级单例 `app.config.settings`（导入时创建一次）。返回值沿 `_post → summarize → create_summary` 逐层返回。
+    data_flow: |
+      ```mermaid
+      sequenceDiagram
+        participant C as 客户端
+        participant R as create_summary
+        participant S as summarize
+        participant P as _post
+        participant L as 模型服务
+        C->>R: POST /summaries
+        R->>S: summarize(text)
+        S->>S: print 输出 payload 和 api_key 到 stdout
+        S->>P: _post(payload)
+        P->>L: httpx.post 超时 30 秒
+        L-->>P: 超时
+        P-->>S: 抛 LLMTimeoutError from TimeoutException
+        S->>S: except Exception 捕获 记录一行错误 返回 None
+        S-->>R: None
+        R-->>C: 500 总结失败 而非 504
+      ```
+    failure_points: |
+      - **问题一（值得审查）：`summarize` 中的 `except Exception` 吞掉了 `_post` 精心转换的 `LLMTimeoutError`。** 异常没有传播到路由层，`except LLMTimeoutError` 分支成了永远不会执行的死代码，超时被当成普通失败返回 500；而且 `logger.error("...: %s", e)` 只记录消息、没有堆栈，`from e` 保留的根因也看不到。
+      - **问题二（值得审查）：`print(..., settings.llm_api_key)` 把明文密钥输出到标准输出**，容器日志会被采集到日志平台，造成密钥泄露；print 也没有级别，无法在生产关闭。
+      - `data["choices"][0]["message"]["content"]` 在响应结构异常时抛 `KeyError`/`IndexError`，同样被吞成 None。
+      - `httpx.ConnectError` 等网络错误既不是 `TimeoutException` 也不是 `HTTPStatusError`，会以原始 httpx 异常向上抛（在当前代码中又被 summarize 吞掉）。
+    debugging: |
+      - 用 respx 或 `httpx.MockTransport` 模拟超时，调用接口观察返回的状态码；在 `except Exception as e` 处打断点，查看 `type(e)` 和 `e.__cause__`，会看到 `LLMTimeoutError` 以及其根因 `httpx.ReadTimeout`。
+      - 临时把 `logger.error` 改为 `logger.exception`，日志中会出现两段 traceback 和 direct cause 提示。
+      - 在日志平台检索 `calling llm` 关键字，评估密钥泄露范围，并立即轮换 API Key。
+    change_request: |
+      - 修复问题一：删除 `summarize` 中的宽泛 except，让业务异常向上传播；把 `KeyError/IndexError` 转换为 `LLMServiceError("响应格式异常") from e`；返回类型改为 `str`。路由层可以去掉 try，在 `main.py` 中注册 `@app.exception_handler(AppError)`，按异常类型映射 504/502，并用 `logger.exception` 或 `exc_info` 记录堆栈。
+      - 修复问题二：删除 print，改为 `logger.debug("calling llm model=%s text_len=%d", settings.llm_model, len(text))`，不记录密钥；配置中密钥用 `SecretStr`。
+      - 如果需求改成「超时自动重试 2 次」，应只针对 `LLMTimeoutError` 在 `_post` 外层加重试（Day 05 讲装饰器实现，Day 20 讲退避策略）。
+  questions:
+    - id: d04-c1-q1
+      kp: d04-k2
+      type: code
+      question: 当模型服务响应超过 30 秒时，按执行顺序说明异常从哪里产生、经过哪些 except、每一层发生了什么，以及客户端最终收到什么响应。为什么路由中的 `except LLMTimeoutError` 不起作用？
+      key_points:
+        - {text: "说明 httpx.post 抛出 httpx.TimeoutException 的子类，被 _post 的第一个 except 捕获并转换为 LLMTimeoutError，__cause__ 指向原异常", dim: principle}
+        - {text: "说明 LLMTimeoutError 传播到 summarize，被 except Exception 捕获，只记录消息后返回 None", dim: concept}
+        - {text: "说明路由拿到 None 后返回 500 总结失败，except LLMTimeoutError 永远不会被触发", dim: concept}
+        - {text: "给出修复：移除宽泛捕获让业务异常传播，或在全局异常处理器中映射状态码并记录堆栈", dim: engineering}
+      reference: |
+        超时发生在 `httpx.post` 内部，抛出的是 `httpx.TimeoutException` 的子类（如 ReadTimeout）。它在 `_post` 的 try 中被第一个 except 捕获，转换为 `LLMTimeoutError("LLM request timed out")`，`from e` 让新异常的 `__cause__` 指向原始超时异常。LLMTimeoutError 向上传播到 `summarize`，`except Exception` 能匹配任何 Exception 子类，于是捕获它，只用 `logger.error` 记录了一句 "summarize failed: LLM request timed out"（没有堆栈），然后返回 None。对路由来说，`summarize` 是正常返回的，没有任何异常，所以 `except LLMTimeoutError` 不会执行；接着 `result is None` 成立，抛出 `HTTPException(500, "总结失败")`，客户端收到 500。路由中的超时分支失效，根本原因是中间层吞掉了异常。修复方式是删除 summarize 中的宽泛捕获，只在需要转换时捕获具体异常并 raise from，让 LLMTimeoutError 传播到路由或全局异常处理器，映射为 504，同时用 logger.exception 记录完整的两段 traceback。
+    - id: d04-c1-q2
+      kp: d04-k3
+      type: code
+      question: 分析 `summarize` 中 `print` 和 `logger.error` 两行在生产环境中的实际效果和风险，并改写成合适的日志语句。
+      key_points:
+        - {text: "指出 print 把 payload 和明文 api_key 输出到 stdout，会被容器日志采集，造成密钥和用户文本泄露", dim: engineering}
+        - {text: "指出 print 无级别、无来源信息，生产环境无法按配置关闭", dim: concept}
+        - {text: "指出 logger.error 使用 %s 只记录消息，丢失异常类型和 traceback", dim: principle}
+        - {text: "给出改写：logger.debug 只记录模型名和文本长度等非敏感字段，异常分支用 logger.exception", dim: engineering}
+      reference: |
+        `print("calling llm", payload, settings.llm_api_key)` 每次请求都会把完整的 payload（包含用户提交的原文）和明文 API Key 写到标准输出。容器环境下 stdout 会被日志采集系统收集，任何能看日志的人都能拿到密钥和用户数据，属于安全事故；而且 print 没有级别，生产环境无法通过配置关闭，只能改代码发版。`logger.error("summarize failed: %s", e)` 虽然用了 logging，但只记录了 `str(e)`，没有异常类型和堆栈，也看不到 `__cause__` 中的原始 httpx 异常，排查信息不足。改写：调用前 `logger.debug("calling llm model=%s text_len=%d", settings.llm_model, len(text))`，只记录非敏感的元数据；异常分支（如果保留）用 `logger.exception("summarize failed model=%s", settings.llm_model)`，自动附带完整 traceback；密钥字段在配置中用 SecretStr，即使被误打印也会显示为星号。
+    - id: d04-c1-q3
+      kp: d04-k1
+      type: code
+      question: 三个文件之间的 import 依赖关系是怎样的？`app.config.settings` 在整个进程里会被创建几次？如果有人在 `app/errors.py` 中加了一行 `from app.services.llm_service import summarize`，启动时会发生什么？
+      key_points:
+        - {text: "说明依赖方向：routes 依赖 errors、schemas、llm_service；llm_service 依赖 config 和 errors；errors 不依赖其他模块", dim: concept}
+        - {text: "说明模块顶层只在首次导入时执行一次，settings 在进程内只创建一次，后续导入从 sys.modules 取缓存", dim: principle}
+        - {text: "说明 errors 反向导入 llm_service 会形成循环导入，llm_service 导入 errors 时拿到部分初始化的模块，导致 cannot import name 错误", dim: principle}
+        - {text: "提出保持 errors 作为无依赖的底层模块，依赖方向单向", dim: engineering}
+      reference: |
+        依赖关系是：routes.py 导入 errors、schemas 和 llm_service；llm_service.py 导入 config 和 errors；errors.py 不导入任何项目模块，是最底层。`app.config` 第一次被导入时（通常在 llm_service 被导入时）执行顶层代码创建 settings，模块对象放进 sys.modules；之后任何地方再 `from app.config import settings` 都直接从缓存取，所以 settings 在一个进程中只创建一次（多 worker 部署时每个进程各一次）。如果在 errors.py 加 `from app.services.llm_service import summarize`：假设 routes 先导入 errors，errors 开始执行、被放入 sys.modules，执行到这一行去导入 llm_service；llm_service 执行到 `from app.errors import LLMServiceError, LLMTimeoutError` 时，发现 app.errors 已在 sys.modules 中，但它还停在第一行附近、异常类尚未定义，于是抛出 `ImportError: cannot import name 'LLMServiceError' from partially initialized module 'app.errors'`，应用启动失败。正确做法是保持 errors 作为不依赖其他模块的底层模块，依赖方向始终单向。
+
+interview:
+  - id: d04-i1
+    kp: d04-k1
+    type: oral
+    difficulty: 1
+    question: Python 的 import 是怎么工作的？什么是循环导入，怎么解决？
+    key_points:
+      - {text: "说明 import 先查 sys.modules 缓存，未命中再按 sys.path 查找，找到后执行模块顶层代码", dim: principle}
+      - {text: "说明模块只执行一次，模块级变量相当于进程内单例", dim: concept}
+      - {text: "说明循环导入时模块先放入 sys.modules 再执行，另一方拿到部分初始化模块而报 cannot import name", dim: principle}
+      - {text: "给出解决方式：抽取公共模块调整依赖方向、函数内导入或 TYPE_CHECKING 导入，并举项目例子", dim: project}
+    reference: |
+      执行 import 时，Python 先查 sys.modules，有缓存直接返回；没有就按 sys.path 的顺序（脚本目录或 -m 时的当前目录、PYTHONPATH、site-packages）查找模块文件，找不到抛 ModuleNotFoundError。找到后创建模块对象并先放入 sys.modules，然后从上到下执行模块顶层代码，def、class、赋值依次生效，最后把名字绑定到导入方。因为有缓存，模块顶层代码在一个进程里只执行一次，模块级变量实际上是进程内单例，这也是为什么不应该在顶层做数据库连接这类重操作。循环导入是 a 导入 b、b 又导入 a：a 执行到一半去导入 b，b 再 from a import X 时，a 已在 sys.modules 中但 X 还没定义，就报 cannot import name X from partially initialized module。解决方法首选调整依赖方向，把双方共同依赖的东西（配置、异常、schema）抽到底层模块；其次可以把 import 放到函数内部延迟到调用时；只用于类型注解时用 `if TYPE_CHECKING:` 导入。我在 RAG 项目里遇到过 api 层的 deps 和 rag 层的 retriever 互相导入，最后把配置抽成独立的 config 模块解决。
+    oral: |
+      import 的时候 Python 先查 sys.modules 缓存，有就直接用；没有就按 sys.path 找文件，找到后执行模块的顶层代码，所以一个模块在进程里只执行一次，模块级变量就是单例。循环导入是两个模块互相 import，一方执行到一半去导入另一方，另一方再回头导入时拿到的是没初始化完的模块，就报 cannot import name。我解决的思路是调整依赖方向，把公共的配置、异常、schema 抽到底层模块。我们 RAG 项目里 api 层和检索层互相导入，后来把配置单独抽成 config 模块，依赖变成单向就好了。
+  - id: d04-i2
+    kp: d04-k2
+    type: oral
+    difficulty: 2
+    question: 你在项目中是如何设计异常处理的？raise 和 raise ... from e 有什么区别？
+    key_points:
+      - {text: "说明定义业务异常基类和按处理方式细分的子类（超时、限流、参数错误等）", dim: concept}
+      - {text: "说明底层把第三方异常转换为业务异常并用 from e 保留根因，traceback 显示 direct cause", dim: principle}
+      - {text: "说明不带参数的 raise 原样重抛并保留堆栈，from None 用于隐藏无关或敏感的原异常", dim: principle}
+      - {text: "说明 API 层通过全局异常处理器映射状态码，避免吞异常，兜底时用 logger.exception 并接入告警", dim: engineering}
+      - {text: "结合项目说明吞异常导致故障被掩盖的教训", dim: project}
+    reference: |
+      我的做法分三层。底层（LLM 客户端、向量库客户端、数据库访问）只捕获具体的第三方异常，比如 httpx.TimeoutException、HTTPStatusError，把它们转换成自己定义的业务异常：一个 AppError 基类，下面按「上层能怎么处理」细分为 LLMTimeoutError、LLMRateLimitError、VectorStoreError、InvalidInputError 等，转换时一律 `raise X(...) from e`。中间的业务层原则上不吞异常，只在明确可以降级的地方捕获特定类型，比如超时时返回缓存结果；重试逻辑只对超时和限流生效。最外层 API 用 FastAPI 的 exception_handler 统一把业务异常映射成 504、429、400 等状态码和统一的错误体，同时用 exc_info 记录堆栈并计入错误率指标。区别方面：`raise X from e` 会把 e 存入 `__cause__`，traceback 显示两段并提示 direct cause，能直接看出根因；不写 from 时 Python 记录的是 `__context__`，提示语是 during handling another exception occurred，容易误以为异常处理代码有 bug；在 except 中只写 raise 是原样重抛，保留完整堆栈，适合记录日志后继续上抛；`from None` 会隐藏原异常，只用于原异常无关或含敏感信息的情况。我们曾经因为 answer 函数 except Exception 返回固定文案，向量库令牌过期了半天才被发现，之后就严格执行这套规范。
+    oral: |
+      我一般分三层。底层只捕获具体的第三方异常，转换成自定义的业务异常，比如超时、限流、向量库错误，并且一定用 raise from 保留根因。中间层不随便吞异常，只在明确能降级的地方捕获特定类型。最外层用 FastAPI 的全局异常处理器，把业务异常映射成 504、429 这样的状态码，同时记录堆栈、接入告警。raise from 会把原异常放进 __cause__，traceback 会明确告诉你是直接原因；只写 raise 是原样重抛。我们之前有个接口 except Exception 返回固定文案，向量库令牌过期半天都没人发现，之后我们就不允许这种写法了。
+  - id: d04-i3
+    kp: d04-k3
+    type: oral
+    difficulty: 2
+    question: AI 应用的日志你会怎么设计？为什么不能用 print？
+    key_points:
+      - {text: "说明 logging 的 Logger、Handler、Formatter、Level 分工，以及 getLogger(__name__) 的分层和传播", dim: concept}
+      - {text: "说明在入口集中配置一次日志，生产环境用结构化日志和按环境设置的级别", dim: engineering}
+      - {text: "列出应记录的字段：请求 ID、模型、耗时、token 用量、重试次数、错误类型与堆栈", dim: project}
+      - {text: "说明不能记录 API Key、完整隐私数据，Prompt 需要脱敏或采样", dim: engineering}
+    reference: |
+      print 只能输出到 stdout，没有级别和来源信息，不能按环境开关，也没法统一格式，线上排查基本没用。我会用标准库 logging：每个模块 `logger = logging.getLogger(__name__)`，名字按模块分层，日志向上传播到在入口统一配置的 handler；在 main.py 里用 dictConfig 集中配置一次，开发环境 DEBUG、生产 INFO，由环境变量控制，生产输出 JSON 结构化日志便于日志平台按字段检索，同时统一 uvicorn 的日志格式。字段上，每次 LLM 调用记录请求 ID（贯穿整条链路）、用户或租户 ID、模型名、耗时、prompt/completion token 数、重试次数、是否命中缓存；出错时记录错误类型并用 logger.exception 附带堆栈。安全上，API Key、Authorization 头绝不记录，用户原文和完整 Prompt 默认不记，需要调试时脱敏或按比例采样。日志使用 `%s` 惰性格式化，避免在高 QPS 下做无用的字符串拼接。
+    oral: |
+      print 没有级别、没有来源，线上关不掉，也没法统一格式，所以我都用 logging。每个模块用 getLogger(__name__)，在入口集中配置一次，开发是 DEBUG，生产是 INFO，输出 JSON 方便检索。AI 应用我会重点记录请求 ID、租户、模型、耗时、token 数、重试次数，出错时用 logger.exception 带上堆栈。同时 API Key 绝对不记，用户原文和 Prompt 默认不记或者脱敏采样。我们之前在容器日志里发现过明文 API Key，就是有人用 print 调试没删，之后就统一了这套规范。
+  - id: d04-i4
+    kp: d04-k4
+    type: oral
+    difficulty: 3
+    question: 虚拟环境的原理是什么？pip、Poetry、uv 你怎么选？如何保证开发、CI、生产环境的依赖一致？
+    key_points:
+      - {text: "说明 venv 通过 pyvenv.cfg 和独立 site-packages 隔离依赖，激活只是修改 PATH，环境不可移动应重建", dim: principle}
+      - {text: "区分 pyproject.toml 声明版本范围与锁文件固定精确版本和哈希的作用", dim: concept}
+      - {text: "对比工具现状：pip 基础且锁文件支持仍是实验性，Poetry 2.x 支持标准 project 表，uv 一体化且速度快、使用跨平台 uv.lock", dim: engineering}
+      - {text: "说明一致性方案：提交锁文件、.venv 不入库、CI 与 Docker 用 frozen 模式按锁文件安装、固定 Python 版本", dim: engineering}
+      - {text: "结合项目说明无锁文件导致部署故障及改造经验", dim: project}
+    reference: |
+      虚拟环境就是一个目录：pyvenv.cfg 记录基础解释器位置，Scripts 或 bin 下是解释器和激活脚本，Lib/site-packages 是这个环境独立的第三方包。Python 启动时读取 pyvenv.cfg，把 sys.prefix 指向这个目录，从而只看到环境内的包；激活只是把 Scripts 目录加到 PATH 前面，不激活直接用环境里的解释器也一样。官方文档说虚拟环境应该是可丢弃、不可移动的，所以不入库、不拷贝，而是按依赖声明重建。依赖声明方面，pyproject.toml 写直接依赖和版本范围，锁文件记录解析出的全部依赖的精确版本和哈希。工具上：pip + venv 是标准库自带的最小方案，pip 25.1 起支持 dependency groups，但锁文件（pip lock、-r pylock.toml）截至 26.3 仍是实验性；Poetry 2.0 起支持标准的 [project] 表，生态成熟；uv 用 Rust 编写，能管理 Python 版本、虚拟环境、依赖解析、锁定和运行，速度很快，uv.lock 是跨平台通用锁文件，也能导出标准的 pylock.toml。新项目我倾向用 uv。一致性方案：pyproject.toml 和 uv.lock 都提交，.venv 加入 .gitignore；requires-python 和 .python-version 固定 Python 版本；CI 和 Dockerfile 用 `uv sync --frozen`，锁文件不匹配就失败；依赖升级通过 `uv lock --upgrade-package` 显式进行并跑完测试。我接手过一个只有无版本号 requirements.txt 的项目，重新部署时装上了新大版本导致启动报错，迁移到这套方案后再没出现过环境不一致的问题。
+    oral: |
+      虚拟环境其实就是一个目录，里面有 pyvenv.cfg、一份解释器和独立的 site-packages，Python 启动时读到 pyvenv.cfg 就只用这个环境的包。激活只是改了 PATH。它不能拷贝，要按依赖文件重建。依赖上我分两层：pyproject.toml 写范围，锁文件固定精确版本。工具我现在新项目用 uv，一个工具管 Python 版本、环境、锁定和运行，还很快；Poetry 2.x 也支持标准格式了；pip 的锁文件支持目前还是实验性的。保证一致我会提交 uv.lock，CI 和 Docker 里用 uv sync --frozen。之前接手的项目只有不带版本号的 requirements.txt，部署时装上了新大版本直接起不来，迁移到 uv 加锁文件之后就没再出过这种问题。
+
+sources:
+  - {title: "uv - Project structure and files", url: "https://docs.astral.sh/uv/concepts/projects/layout/"}
+  - {title: "Python Packaging User Guide - Writing your pyproject.toml", url: "https://packaging.python.org/en/latest/guides/writing-pyproject-toml/"}
+  - {title: "Python Tutorial - Errors and Exceptions", url: "https://docs.python.org/3/tutorial/errors.html"}
+  - {title: "Python Logging HOWTO", url: "https://docs.python.org/3/howto/logging.html"}

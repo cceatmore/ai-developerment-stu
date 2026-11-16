@@ -1,0 +1,778 @@
+day: 28
+phase: 3
+title: Agentic RAG：检索决策、多跳检索、Corrective RAG 与 GraphRAG
+goals:
+  - 能说清固定流水线 RAG 与 Agentic RAG 的区别，判断什么时候值得让模型决定「要不要检索、去哪检索」
+  - 能设计多跳检索的执行方式，区分可并行的子问题和有依赖的子问题
+  - 能解释 Corrective RAG 与 Self-RAG 的核心思想，并设计一个有次数上限的「评估-改写-重检索」循环
+  - 能说出 GraphRAG 的索引与查询方式、适用问题和代价，判断项目里该不该用
+minutes: 60
+resources:
+  - title: "LangGraph 官方教程 - Build a custom RAG agent with LangGraph"
+    url: "https://docs.langchain.com/oss/python/langgraph/agentic-rag"
+    kind: doc
+    lang: en
+    minutes: 30
+    note: "看 Generate a query or respond、Grade documents、Rewrite the question、Assemble the graph 四节，对照今天 d28-k1 和 d28-k3 的流程图；LangGraph 语法 Day 36 再细学，现在只看节点怎么分工"
+  - title: "Corrective Retrieval Augmented Generation（CRAG 论文）"
+    url: "https://arxiv.org/abs/2401.15884"
+    kind: article
+    lang: en
+    minutes: 15
+    note: "只看摘要和 Figure 2，理解检索评估器和 Correct / Incorrect / Ambiguous 三种动作"
+  - title: "Microsoft GraphRAG 文档首页"
+    url: "https://microsoft.github.io/graphrag/"
+    kind: doc
+    lang: en
+    minutes: 15
+    note: "看 GraphRAG vs Baseline RAG 和 The GraphRAG Process 两节，理解它擅长的两类问题；再看 Query Engine 页的四种搜索模式"
+knowledge_points:
+  - id: d28-k1
+    name: 检索决策：从固定流水线到按需检索与路由
+    level: P0
+    summary: 普通 RAG 每次都「检索一次再回答」；Agentic RAG 把检索做成工具，由模型决定是否检索、检索哪个数据源、要不要再查一次
+    analogy: |
+      **像前端的按需请求**：普通 RAG 像页面一打开就把所有接口都请求一遍；Agentic RAG 像路由守卫 + 按需加载——寒暄不请求，问制度查制度库，问工单查工单接口。
+
+      **不一样的地方**：前端「请求哪个接口」是你写死的 `if`，Agentic RAG 的决策是 **LLM 做的**，可能选错、可能循环；而且**选哪个数据源可以交给模型，但用户有没有权限绝不能交给模型**。
+    why: |
+      企业助手很快会遇到普通 RAG 的天花板：用户既问制度、又问工单状态、还会寒暄；有些问题要查两次才能答。
+      「什么时候用 Agentic RAG、什么时候不该用」是 AI 应用和 Agent 两类岗位的交叉高频题，答好了能体现你对成本和可控性的判断，而不是追新名词。
+    problem: |
+      - **不需要检索的问题也检索**：「你好」「谢谢」也去查库，浪费且可能答偏。
+      - **多数据源**：制度在向量库、工单在业务数据库、报表在数仓，一条固定流水线覆盖不了。
+      - **一次检索不够**：第一次没查到或查偏了，固定流水线只能硬着头皮回答或拒答。
+    principle: |
+      **一、两种形态对比**
+
+      | | 固定流水线（2-step RAG） | Agentic RAG |
+      |---|---|---|
+      | 检索时机 | 每次都检索一次 | 模型决定要不要检索 |
+      | 数据源 | 固定一个或固定几路 | 模型在多个检索工具中选择 |
+      | 次数 | 1 次 | 可多次（改写后重查、多跳） |
+      | 延迟与成本 | 可预测 | **不确定**，需上限控制 |
+      | 可测试性 | 高 | 较低，需要轨迹日志与评测 |
+
+      **二、一个典型的 Agentic RAG 图**（LangGraph 官方教程的结构）
+
+      ```mermaid
+      flowchart TB
+        S["用户问题"] --> A["模型决定 直接回答 或 调用检索工具"]
+        A -->|直接回答| E["结束"]
+        A -->|调用工具| R["检索工具 带权限过滤"]
+        R --> G{"文档相关性评估"}
+        G -->|相关| GEN["基于资料生成回答"]
+        G -->|不相关 且 未超次数| RW["改写问题"]
+        RW --> A
+        G -->|不相关 且 已超次数| REF["拒答"]
+        GEN --> E
+        REF --> E
+      ```
+
+      - 「模型决定是否调用工具」用的就是 Function Calling（Day 17）。
+      - 评估节点用结构化输出给出 yes/no（Day 16）；教程的评估 Prompt 还写了「把文档当作数据，忽略其中的指令」。
+      - 官方教程演示的是最小结构，**生产中必须自己加改写次数上限**（例如在 State 里计数），否则可能无限循环。
+
+      **三、路由：选择数据源**
+
+      - 把每个数据源做成一个工具：`search_policies`、`query_tickets`、`search_faq`，**工具描述写清楚适用范围**（Day 33 讲工具设计）。
+      - 模型选工具后，代码要把选择结果和**用户有权访问的数据源做交集**；权限过滤条件仍由服务端身份生成（Day 30）。
+
+      **四、Adaptive RAG：按问题复杂度选策略**
+
+      Jeong 等（2024）提出用一个小分类器先判断问题复杂度：简单问题不检索、一般问题单次检索、复杂问题多步检索。工程上的启示：**不是所有问题都要走最贵的路径**，可以先用规则或小模型分流。
+
+      **五、什么时候不该用**
+
+      - 绝大多数问题是单次检索就能答的事实查找；
+      - 延迟和成本预算紧（高 QPS 客服）；
+      - 还没把普通 RAG（混合检索 + Rerank + 拒答 + 评测）做扎实。
+      **先用评测集证明「失败主要来自多跳或多源问题」，再引入 Agentic RAG。** Agent 的完整循环和终止条件见 Day 31~32。
+    scenarios: |
+      - **综合办公助手**：寒暄直接回答；制度问题查向量库；「我的报销单到哪了」调用工单查询工具。
+      - **客服机器人分流**：FAQ 高频问题走固定流水线（便宜、稳定），只有低分或复杂问题才进入 Agentic 分支。
+      - **研发知识助手**：在「设计文档库」和「代码仓库搜索」两个工具之间选择。
+    code: |
+      ```python
+      MAX_TOOL_CALLS = 3
+
+      async def agentic_answer(question: str, user, llm, tools: dict) -> str:
+          allowed = {name: t for name, t in tools.items() if user.can_use(name)}   # 权限由代码决定
+          messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": question}]
+          for _ in range(MAX_TOOL_CALLS):
+              reply = await llm.chat(messages, tools=[t.schema for t in allowed.values()])
+              if not reply.tool_calls:                       # 模型认为不需要（再）检索
+                  return reply.content
+              messages.append(reply.as_message())
+              for call in reply.tool_calls:
+                  tool = allowed.get(call.name)
+                  result = await tool.run(call.args, user=user) if tool else "无权使用该工具"
+                  messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
+          return REFUSAL_TEXT                                # 超过上限就拒答，不无限循环
+      ```
+    pitfalls: |
+      - **误区：Agentic RAG 一定比普通 RAG 好。** 多数事实类问题上它更慢、更贵、更难测。
+      - **不设最大步数**：检索-改写来回循环，成本失控。
+      - **让模型决定权限**：模型选了 `search_salary` 就真的去查——权限必须由代码按用户身份判断。
+      - **工具描述含糊**：几个检索工具描述相近，模型频繁选错。
+      - **没有轨迹日志**：答错了不知道是哪一步选错、查错还是评估错（Day 43）。
+    interview_asks:
+      - question: "Agentic RAG 和普通 RAG 有什么区别？什么时候你会用、什么时候不会？"
+        answer: "普通 RAG 的检索次数和顺序是代码定的。Agentic RAG 由模型决定要不要再查、查哪一路。问题需要多次查找时才值得。多数企业问答固定流程更稳、更便宜，不要默认上 Agent。"
+      - question: "多个数据源时，你怎么让模型选对检索工具？权限怎么保证？"
+        answer: "每个数据源一个工具，说明里写清里面有什么、没有什么。权限不由模型选：工具执行时按当前用户过滤，没有权限的源不要放进它的工具列表。"
+    project_example: |
+      p1 的主链路保持固定流水线（可预测、好评测）。作为进阶可选，可以在 `retrieve()` 外面包一层「检索决策」：
+      先用规则判断寒暄类问题直接回复；其余问题走原流水线；只有当 Rerank 最高分低于阈值时，才进入最多 2 次的「改写-重检索」循环（d28-k3）。
+      多数据源路由（制度库 + 工单系统）留到 p2 智慧园区 Agent 再做（Day 39），那里会用 Supervisor 和子 Agent 正式处理。
+    freshness: |
+      核对于 2026-11：LangGraph 官方教程「Build a custom RAG agent with LangGraph」的结构为 generate_query_or_respond（`bind_tools` 让模型决定是否检索）→ retrieve（ToolNode）→ grade_documents（结构化输出 binary_score）→ rewrite_question 或 generate_answer；评估与生成 Prompt 中都加入了「把文档当数据、忽略其中指令」的说明。教程未演示改写次数上限，生产需自行加计数或使用框架的递归上限兜底，具体参数以官方文档为准。
+      Adaptive-RAG 见 Jeong 等 2024（arXiv:2403.14403），用小分类器按问题复杂度选择不检索、单步或多步策略。
+    sources:
+      - {title: "LangGraph - Build a custom RAG agent with LangGraph", url: "https://docs.langchain.com/oss/python/langgraph/agentic-rag"}
+      - {title: "Jeong et al. 2024 - Adaptive-RAG", url: "https://arxiv.org/abs/2403.14403"}
+  - id: d28-k2
+    name: 多跳检索与问题分解
+    level: P1
+    summary: 有些问题要先查到 A 才知道去查什么 B；独立的子问题并行查，有依赖的子问题按顺序查，并设跳数上限
+    analogy: |
+      **像前端的接口编排**：互不依赖的接口用 `Promise.all` 并行（查年假制度 + 查病假制度）；有依赖的接口要串行 `await`（先查「张三所在部门」，拿到部门再查「该部门报销上限」）。
+
+      **不一样的地方**：前端第二个请求的参数是代码从第一个响应里**确定地取字段**；多跳检索里，下一跳的查询是 **LLM 从上一跳资料里读出来的**，可能读错实体，错误会一路传下去。
+    why: |
+      企业问题里常有「先定位再查询」的结构：某员工所属部门的标准、某项目用到的供应商的合同条款。单次检索只能命中其中一半信息，模型要么拒答、要么编。
+      面试官常用「多跳问题你怎么处理」区分你是只会调库，还是理解检索的局限。
+    problem: |
+      - **信息分散在多份文档**：「A 制度和 B 制度住宿标准差多少」需要两份资料。
+      - **后一步依赖前一步结果**：不知道部门名，就没法检索部门标准。
+      - **一次检索两个意图**：向量偏向其中一个，另一半信息丢失。
+    principle: |
+      **一、两类多跳**
+
+      | 类型 | 例子 | 执行方式 |
+      |---|---|---|
+      | 并行分解 | 「对比 2023 版和 2025 版差旅住宿标准」 | 拆成两个独立子问题，**并发检索**，合并资料生成 |
+      | 顺序依赖 | 「项目 X 的供应商合同里违约金怎么约定」 | 先查项目 X 的供应商是谁 → 再用供应商名查合同条款 |
+
+      **二、顺序依赖的执行流程**
+
+      ```mermaid
+      sequenceDiagram
+        participant U as 用户
+        participant P as 规划与执行
+        participant R as 检索工具
+        participant L as 模型
+        U->>P: 项目 X 的供应商合同违约金怎么约定
+        P->>R: 第 1 跳 检索 项目 X 供应商
+        R-->>P: 项目立项书 供应商为甲公司
+        P->>L: 从资料中抽取下一跳实体
+        L-->>P: 甲公司
+        P->>R: 第 2 跳 检索 甲公司 合同 违约金
+        R-->>P: 合同第 9 条
+        P->>L: 汇总两跳资料生成回答 带引用
+        L-->>U: 回答 引用立项书与合同
+      ```
+
+      **三、工程控制**
+
+      1. **跳数上限**（如 3 跳）：超过就拒答或说明「只找到部分信息」。
+      2. **中间结果可见**：每一跳的查询、命中片段、抽取的实体都写进轨迹日志。
+      3. **实体校验**：抽取出的实体（部门名、供应商名）尽量和结构化数据核对，避免读错一路传错。
+      4. **引用覆盖每一跳**：最终回答要能引用到每一跳的依据，而不只是最后一跳。
+      5. **能结构化就别多跳**：「张三的部门」这种事实在 HR 数据库里一查就有，用工具或 SQL 查比让模型从文档里读更可靠（Text2SQL 见 Day 39）。
+
+      **四、和 Day 26 问题分解的关系**：Day 26 的问题分解是**一次性**拆成独立子问题并行检索；多跳是**边查边决定下一步**，本质上已经是一个小 Agent 循环（Day 32 的 ReAct）。
+    scenarios: |
+      - **制度对比**：「新旧两版差旅住宿标准差多少」并行检索两个版本，回答中分别引用。
+      - **合同问答**：先从项目台账查供应商，再查合同条款。
+      - **员工自助**：「我能报多少差旅费」→ 先查用户职级（调用 HR 接口，而不是检索文档），再检索对应职级标准。
+    pitfalls: |
+      - **把依赖型多跳当并行处理**：第二个子问题缺少关键实体，检索落空。
+      - **不设跳数上限**：模型反复「再查一次」。
+      - **只引用最后一跳**：前面关键的定位依据无法核查。
+      - **能查结构化数据却让模型从文档里读**：慢且容易读错。
+      - **误区：多跳问题只要换更强的模型就能一次检索答对。** 资料没检索进来，模型再强也只能编。
+    interview_asks:
+      - question: "什么是多跳问题？你会怎么处理？"
+        answer: "一个问题要先查到一个事实，再用这个事实查下一个，比如先查负责人是谁，再查他的制度。可以拆成两步检索，把第一步的结果放进第二步的查询。不要指望一次向量检索跳两跳。"
+      - question: "多跳检索中第一跳抽取的实体错了怎么办？"
+        answer: "第一步的抽取要校验，实体必须真的出现在检索结果里。错了就停止，不要拿错实体去第二跳。日志里记下两跳分别查了什么，方便看到是哪一跳错。"
+    project_example: |
+      p1 里先只支持「并行分解」这一类多跳：问题含「对比、区别、分别」时拆成最多 3 个子问题并发检索，资料分组注入 Prompt（每组标明子问题），回答要求分别引用。
+      依赖型多跳（先查人或项目再查制度）在 p1 中改为调用结构化接口获取用户职级、部门，再做一次检索；真正的多步 Agent 放到 p2 的手写循环（Day 32）中实现。
+      评测集为这两类问题各准备若干条样本，单独统计正确率。
+  - id: d28-k3
+    name: Corrective RAG 与 Self-RAG：检索结果的评估与纠正
+    level: P0
+    summary: 检索完先评估「资料到底有没有用」，没用就改写重查、换数据源或拒答，而不是硬着头皮回答；循环必须有次数上限
+    analogy: |
+      **像 axios 响应拦截器的「无感刷新令牌」**：响应回来先检查——401 就刷新令牌、重放请求；成功才交给业务。
+      Corrective RAG 同理：检索结果回来先评估——不相关就改写问题、重新检索；相关才交给生成。
+
+      **不一样的地方**：401 是确定的状态码，「资料相不相关」是 **LLM 或模型打分判断的**，会误判；而且和无感刷新一样，**必须防止无限重试**（刷新失败就跳登录页 ↔ 改写两次仍不相关就拒答）。
+    why: |
+      普通 RAG 最大的隐患是「检索错了还继续生成」——模型拿着不相关的资料，要么硬编、要么答偏。
+      CRAG、Self-RAG 是面试里最常被点名的 RAG 改进方法，讲清它们的核心思想，再说出企业里怎么「低成本地落地」，比背论文细节更加分。
+    problem: |
+      - 检索返回的片段话题相关但不含答案，模型照样作答。
+      - 第一次查询表述不好导致召回失败，没有补救机会。
+      - 生成内容和资料不一致，没有自检环节。
+    principle: |
+      **一、Corrective RAG（CRAG，Yan 等 2024）**
+
+      ```mermaid
+      flowchart TB
+        Q["问题"] --> R["检索"]
+        R --> EV["检索评估器 给出置信度"]
+        EV -->|Correct 至少一条高于上阈值| RF["知识精炼 拆成小片段 过滤 重组"]
+        EV -->|Incorrect 全部低于下阈值| WS["丢弃结果 换知识来源 论文中为网页搜索"]
+        EV -->|Ambiguous 介于两者| BOTH["精炼结果与新来源结合"]
+        RF --> G["生成"]
+        WS --> G
+        BOTH --> G
+      ```
+
+      - 论文用一个微调过的轻量模型（T5-large）做检索评估器，按上下两个阈值分成三种动作。
+      - **Ambiguous** 是关键设计：评估器拿不准时两路结合，降低对评估器准确率的依赖。
+      - Correct 分支的「知识精炼」：把文档拆成更小的知识条，过滤无关条，再重组——本质是**去噪**。
+
+      **二、Self-RAG（Asai 等 2023）**
+
+      - **训练**一个模型，让它在生成过程中输出特殊的「反思 Token」：要不要检索（Retrieve）、片段是否相关（IsRel）、这句话是否被片段支持（IsSup）、回答是否有用（IsUse）。
+      - 推理时可按这些 Token 控制检索频率、挑选更有依据的片段和句子。
+      - 注意：原版 Self-RAG **需要专门训练的模型**，不是给任意模型写个 Prompt 就有的；工程上常见的是「借鉴思想、用 LLM 评估节点实现」。
+
+      **三、企业里的落地版本**
+
+      | 论文做法 | 企业常见替代 |
+      |---|---|
+      | 微调 T5 做检索评估器 | 直接用 **Rerank 最高分**做评估（零额外调用），或小模型二分类 |
+      | Incorrect 时网页搜索 | 很多企业**禁止联网**：改为换另一个知识库、HyDE 补救检索（Day 26）、追问澄清或拒答 |
+      | 反思 Token 判断是否被支持 | 生成后做引用校验与抽样支持性判断（Day 27、Day 29） |
+
+      **四、循环控制（必须）**
+
+      - 改写-重检索**最多 1~2 次**，超过就拒答或说明信息不足；
+      - 每次改写要基于**原问题 + 上次失败的原因**，否则可能重复生成同一个查询；
+      - 记录每一轮的查询、评估结果、耗时，监控「平均轮数」和「超限率」。
+    scenarios: |
+      - **p1 低分补救**：Rerank 最高分低于阈值 → 改写一次再检索 → 仍低于阈值就拒答。
+      - **多知识库**：在 HR 库评估不相关时，自动尝试「通用制度库」，再不行拒答。
+      - **允许联网的研究助手**：内部资料不足时按 CRAG 思路调用网页搜索，并在回答中区分内部来源和外部来源。
+    code: |
+      ```python
+      async def corrective_retrieve(question: str, user, max_retries: int = 1):
+          query = question
+          for attempt in range(max_retries + 1):
+              cands = await rerank(query, await hybrid_search(query, user))
+              top = cands[0].score if cands else 0.0
+              log_step(question=question, query=query, attempt=attempt, top=top)
+              if top >= HIGH:                         # Correct：直接用
+                  return cands[:5], "ok"
+              if attempt < max_retries:               # 还有次数：基于原问题改写再查
+                  query = await rewrite_for_retrieval(question, failed_query=query)
+          return [], "refuse"                         # 次数用完：拒答，不无限循环
+      ```
+    pitfalls: |
+      - **不设重试上限**：评估器一直判不相关，循环烧钱。
+      - **改写只基于上一次改写结果**：越改越偏离原意。
+      - **评估器太严**：大量本可回答的问题被判不相关，误拒率上升；评估器也要用评测集校准。
+      - **误区：Self-RAG 是一种 Prompt 技巧，任何模型加几句提示就能实现。** 原版需要训练带反思 Token 的模型。
+      - **企业内照搬网页搜索**：可能违反数据与合规要求，且外部内容不受权限和版本管理。
+    interview_asks:
+      - question: "了解 Corrective RAG 吗？它解决什么问题？"
+        answer: "检索结果可能不相关。Corrective RAG 先判断这批结果能不能用，不能用就改写查询再检，或放弃检索。解决的是「检错了还照样拿去生成」。"
+      - question: "Self-RAG 和 CRAG 有什么区别？"
+        answer: "CRAG 重点在检索结果好不好、要不要重检。Self-RAG 还会让模型判断要不要检索、生成的句子有没有被资料支持。两者都是多几次判断，都要用评测看值不值得，不是论文里有就上。"
+      - question: "不能联网的企业里，你怎么落地「检索纠正」？"
+        answer: "纠正用的判断模型也部署在内网。不相关就用本地模型改写再检，次数设上限。没有外网搜索这一步。判断标准用自己的评测集，不依赖外部服务。"
+    project_example: |
+      p1 里实现一个最小的 corrective 分支：评估器直接用 Rerank 最高分（复用 Day 26 已有的模型，不增加调用），分高、中、低三档——
+      高分直接生成；中分在 Prompt 中提示「资料可能不完整，只回答能确认的部分」；低分改写一次重查，仍低则拒答。
+      日志记录 `attempt / top_score / action`，评测时对比加分支前后的正确拒答率、误拒率和 P95 延迟。
+    freshness: |
+      核对于 2026-11：CRAG（Yan 等，arXiv:2401.15884）使用微调的 T5-large 作为检索评估器，依据上下阈值触发 Correct / Incorrect / Ambiguous，Incorrect 时以网页搜索补充，并用 decompose-then-recompose 精炼文档。
+      Self-RAG（Asai 等，arXiv:2310.11511）训练模型生成反思 Token（Retrieve、IsRel、IsSup、IsUse），按需检索并自评。两者均为论文方法，工程落地多为借鉴思想。
+    sources:
+      - {title: "Yan et al. 2024 - Corrective Retrieval Augmented Generation", url: "https://arxiv.org/abs/2401.15884"}
+      - {title: "Asai et al. 2023 - Self-RAG", url: "https://arxiv.org/abs/2310.11511"}
+      - {title: "LangGraph - Build a custom RAG agent with LangGraph", url: "https://docs.langchain.com/oss/python/langgraph/agentic-rag"}
+  - id: d28-k4
+    name: GraphRAG（了解）
+    level: P2
+    summary: 先用 LLM 从文本里抽实体和关系建知识图谱并生成社区摘要，擅长「跨大量文档的全局总结」和「连点成线」类问题，但索引很贵
+    analogy: |
+      **像 Vite 构建时的模块依赖图**：先把所有模块和 import 关系扫一遍建成图，之后查「谁依赖了谁」就很快。
+      GraphRAG 先把文档里的实体和关系抽成图，再按图回答问题。
+
+      **不一样的地方**：Vite 的依赖图是从代码里**确定地解析**出来的，GraphRAG 的图是 **LLM 抽取**的——有噪声、成本高，文档一改还要重建。
+    why: |
+      面试常问「了解 GraphRAG 吗」。不需要会实现，但要能说清它补了普通 RAG 的哪块短板、代价多大、什么时候不该用——这比会背名词更能体现判断力。
+    problem: |
+      - 「这 3000 份报告主要讨论了哪些主题」这类**全局问题**，任何 Top-K 片段都代表不了全集。
+      - 需要把分散在多份文档里的实体关系「连起来」的问题，向量检索很难一次命中。
+    principle: |
+      **索引阶段**（微软开源实现）：切分文本单元 → LLM 抽取实体、关系（可选 claims）→ Leiden 层次聚类成社区 → 自底向上为每个社区生成摘要报告。
+
+      **查询阶段**：
+      - **Local Search**：从问题相关的实体出发，组合邻居关系和原文片段，适合具体实体的问题；
+      - **Global Search**：以 map-reduce 方式遍历社区报告，适合「整体讲了什么」，**资源消耗大**；
+      - **DRIFT Search**：在 Local 的基础上引入社区信息，扩大起点；
+      - **Basic Search**：普通向量 Top-K，用于对比。
+
+      ```mermaid
+      flowchart LR
+        D["原始文档"] --> E["LLM 抽取实体与关系"]
+        E --> G["知识图谱"]
+        G --> C["社区划分与社区报告"]
+        Q["用户问题"] --> L["Local Search 以实体为入口"]
+        Q --> GS["Global Search 遍历社区报告"]
+        G --> L
+        C --> GS
+      ```
+
+      **代价**：官方估计图抽取约占索引成本的 75%；**FastGraphRAG** 用 NLP 名词短语抽取替代部分 LLM 抽取，便宜很多但图更嘈杂。文档更新后的增量维护也复杂。
+
+      **现状**：PyPI 上 graphrag 为 3.3.0，官方仓库已声明项目**基本处于维护模式**（只修 bug 和依赖）。思想仍有价值，选型时要考虑长期维护。
+
+      **选型建议**：先把普通 RAG 做好；只有评测证明大量失败来自全局总结或跨文档关联问题，才对这类低频高价值场景试点。
+    scenarios: |
+      - **行业报告分析**：「近两年各厂商技术路线有什么变化」用 Global Search。
+      - **情报与调查**：梳理人物、公司、事件之间的关系网络。
+      - **不适合**：「年假几天」这类事实查找，普通 RAG 更便宜、更准、更好维护。
+    pitfalls: |
+      - **把 GraphRAG 当作普通 RAG 的必然升级**：多数企业问答是事实查找。
+      - **低估索引成本和更新难度**：每次文档变更都可能触发大量 LLM 调用。
+      - **忽视项目维护状态**：选型时要评估长期依赖风险。
+      - **图谱绕过权限**：社区摘要混合了多份文档内容，可能把无权文档的信息「总结」给用户。
+    interview_asks:
+      - question: "了解 GraphRAG 吗？它和普通 RAG 有什么区别？"
+        answer: "普通 RAG 找相似片段。GraphRAG 先从文档抽出实体和关系建图，适合问「这些事有什么联系」这类要汇总全库的问题。建图和更新都很贵。"
+      - question: "你的项目会用 GraphRAG 吗？为什么？"
+        answer: "制度问答找某一条，用普通 RAG 就够，不上 GraphRAG。只有评测证明大量问题是跨文档关系、普通检索答不好，才考虑。默认不选。"
+    project_example: |
+      p1 不默认引入 GraphRAG：企业制度问答以事实查找为主，普通 RAG + Rerank + 拒答已经覆盖。
+      如果业务方提出「总结今年所有制度修订的主要变化」这类全局需求，先评估低成本方案（按文档预先生成摘要，再对摘要做检索和汇总），确有必要再用 FastGraphRAG 对单个知识库试点，并注意社区摘要的权限边界——不同权限的文档不能混在同一张图里。
+    freshness: |
+      核对于 2026-11：微软 GraphRAG 文档的查询模式为 Local、Global、DRIFT、Basic Search 及 Question Generation；索引方法有 Standard 与 FastGraphRAG（`graphrag index --method fast`），官方估计图抽取约占索引成本 75%。PyPI 最新版本 3.3.0，README 声明项目基本处于维护模式，不再接受新特性。
+    sources:
+      - {title: "Microsoft GraphRAG 文档首页", url: "https://microsoft.github.io/graphrag/"}
+      - {title: "Microsoft GraphRAG - Query Engine Overview", url: "https://microsoft.github.io/graphrag/query/overview/"}
+      - {title: "Microsoft GraphRAG - Indexing Methods", url: "https://microsoft.github.io/graphrag/index/methods/"}
+      - {title: "graphrag on PyPI", url: "https://pypi.org/project/graphrag/"}
+test:
+  - id: d28-t1
+    kp: d28-k1
+    type: single
+    question: 下列哪一点最能区分 Agentic RAG 与普通的固定流水线 RAG？
+    options:
+      - "Agentic RAG 使用了向量数据库，普通 RAG 只用关键词检索"
+      - "Agentic RAG 一定会检索多次，普通 RAG 只检索一次"
+      - "Agentic RAG 使用更大的模型生成回答"
+      - "由模型决定是否检索、检索哪个数据源、是否需要再查一次"
+    answer: [3]
+    explain: |
+      Agentic RAG 的核心是把检索变成工具，由模型做检索决策；它可能一次都不检索（寒暄），也可能多次检索。
+      A 与检索方式无关；B 不准确，「一定多次」不是定义，按需才是；C 模型大小与是否 Agentic 无关。
+  - id: d28-t2
+    kp: d28-k1
+    type: judge
+    question: Agentic RAG 比普通 RAG 更智能，因此新项目应直接采用 Agentic RAG 作为默认架构。
+    answer: false
+    explain: |
+      Agentic RAG 的调用次数不确定、延迟和成本更高、行为更难测试。多数企业问题是单次检索就能回答的事实查找。
+      应先把普通 RAG 做扎实并建立评测，评测证明失败主要来自多跳、多源问题时再引入。
+  - id: d28-t3
+    kp: d28-k1
+    type: multi
+    question: 引入 Agentic RAG 会带来哪些新的工程问题？
+    options:
+      - "LLM 调用次数不确定，延迟和成本波动大"
+      - "可能出现检索-改写的循环，需要最大步数控制"
+      - "需要记录每一步的轨迹，才能排查是选错工具还是评估出错"
+      - "模型可能选择用户无权访问的数据源，必须由代码校验"
+      - "向量检索的召回率一定会下降"
+    answer: [0, 1, 2, 3]
+    explain: |
+      A~D 都是让模型做决策后必然出现的问题：成本不可预测、可能循环、难以排查、权限不能交给模型。
+      E 错：Agentic RAG 不改变底层检索本身的召回能力，它改变的是何时、如何调用检索。
+  - id: d28-t4
+    kp: d28-k1
+    type: single
+    question: 下面的路由代码让模型选择知识库再检索。它最严重的问题是什么？
+    code: |
+      async def route_and_search(question: str, user):
+          choice = await llm_choose_kb(question)   # 返回如 "hr_salary"、"policy"
+          kb = KNOWLEDGE_BASES[choice]
+          return await kb.search(question, tenant_id=user.tenant_id)
+    options:
+      - "没有对 question 做 Query Rewrite，召回率会下降"
+      - "知识库由模型选择后没有与用户可访问的知识库做交集校验，存在越权"
+      - "llm_choose_kb 应该改为同步函数，否则会阻塞"
+      - "tenant_id 应该由模型从问题里抽取，而不是从 user 读取"
+    answer: [1]
+    explain: |
+      模型完全可能（或被注入诱导）选到 hr_salary，代码直接去查，普通员工就能拿到薪酬资料。选择结果必须和「用户有权访问的知识库集合」求交集，不在集合内就拒绝。
+      A 是效果优化不是最严重问题；C 错，异步调用正是正确写法；D 恰好相反，租户必须来自服务端身份。
+  - id: d28-t5
+    kp: d28-k1
+    type: single
+    question: 以下哪个场景最适合保持固定流水线 RAG，而不是引入 Agentic RAG？
+    options:
+      - "高 QPS 的 FAQ 客服，问题大多是单一事实查找，P95 要求 1 秒内"
+      - "助手需要在制度库、工单系统和报表数据库之间选择数据源"
+      - "大量问题需要先查项目供应商再查合同条款"
+      - "检索结果经常不相关，需要改写后重新检索"
+    answer: [0]
+    explain: |
+      单一事实查找、高并发、严格延迟预算正是固定流水线的优势场景：可预测、便宜、好测试。
+      B 是多源路由、C 是依赖型多跳、D 是检索纠正，都是 Agentic 思路能发挥价值的情况。
+  - id: d28-t6
+    kp: d28-k2
+    type: single
+    question: 下列哪个问题属于「顺序依赖」的多跳问题？
+    options:
+      - "年假和病假分别有几天？"
+      - "2023 版和 2025 版差旅住宿标准有什么区别？"
+      - "项目 X 的供应商合同里违约金是怎么约定的？"
+      - "报销需要哪些材料？"
+    answer: [2]
+    explain: |
+      必须先查到「项目 X 的供应商是谁」，才能用供应商名去检索合同条款，后一步依赖前一步结果。
+      A、B 可以拆成独立子问题并行检索；D 是单次检索就能回答的事实问题。
+  - id: d28-t7
+    kp: d28-k2
+    type: multi
+    question: 实现顺序依赖的多跳检索时，下列哪些控制措施是必要的？
+    options:
+      - "设置最大跳数，超过后拒答或说明只找到部分信息"
+      - "记录每一跳的查询、命中片段和抽取的实体"
+      - "最终回答引用覆盖每一跳的依据"
+      - "能从结构化系统直接查到的事实，优先调用接口而不是从文档里读"
+      - "为了速度，把所有跳并行执行"
+    answer: [0, 1, 2, 3]
+    explain: |
+      A 防止无限循环；B 便于排查哪一跳出错；C 让定位依据也可核查；D 避免模型读错实体一路传错。
+      E 错：顺序依赖的后一跳需要前一跳的结果，无法并行。
+  - id: d28-t8
+    kp: d28-k2
+    type: judge
+    question: 问题分解后，相互独立的子问题可以并发检索；存在依赖关系的子问题必须按顺序执行。
+    answer: true
+    explain: |
+      独立子问题（如两个版本的制度）没有先后关系，并发能把延迟降到最慢那一路；依赖型子问题需要前一步的输出作为下一步的查询条件，只能串行。
+  - id: d28-t9
+    kp: d28-k2
+    type: single
+    question: 多跳问答中，第一跳把「华东区」错误抽取为「华南区」，第二跳据此检索并给出了错误答案。最有效的改进是？
+    options:
+      - "把最大跳数从 3 提高到 5，给模型更多纠错机会"
+      - "换一个参数更大的模型重新生成最终回答"
+      - "第二跳同时检索华东和华南，让模型自己挑"
+      - "对抽取出的实体用结构化数据校验，并在日志中记录每跳的中间结果"
+    answer: [3]
+    explain: |
+      多跳的典型风险是中间实体抽错并向后传递。用组织架构等结构化数据校验实体，能在错误传播前拦截；中间结果入日志便于定位。
+      A 不解决抽错问题；B 最终生成再强也基于错误资料；C 增加噪声，还可能把错误地区的资料当成答案。
+  - id: d28-t10
+    kp: d28-k3
+    type: single
+    question: 关于 Corrective RAG（CRAG）的核心机制，下列描述正确的是？
+    options:
+      - "检索后用评估器判断资料质量，按置信度分三档触发纠正动作"
+      - "训练模型在生成时输出反思 Token，决定是否检索和是否被支持"
+      - "先用 LLM 抽取实体关系构建知识图谱，再按社区摘要回答"
+      - "把用户问题改写成多个查询，分别检索后用 RRF 合并结果"
+    answer: [0]
+    explain: |
+      CRAG 的关键是轻量检索评估器加三种纠正动作，Ambiguous 降低了对评估器准确率的依赖。
+      B 描述的是 Self-RAG；C 是 GraphRAG；D 是 Day 26 的多查询改写。
+  - id: d28-t11
+    kp: d28-k3
+    type: judge
+    question: Self-RAG 是一种提示词技巧，在任意通用模型的 System Prompt 中加入「判断是否需要检索、判断片段是否相关」即可完整实现。
+    answer: false
+    explain: |
+      原版 Self-RAG 需要训练模型生成特殊的反思 Token（Retrieve、IsRel、IsSup、IsUse），并在推理时据此控制检索和挑选输出。
+      用 Prompt 让通用模型做评估是「借鉴其思想」的工程实现，效果和可控性与原方法不同。
+  - id: d28-t12
+    kp: d28-k3
+    type: multi
+    question: 某国企不允许系统访问公网。借鉴 CRAG 思路时，「检索结果不相关」分支可以采用哪些替代动作？
+    options:
+      - "基于原问题改写后重新检索一次"
+      - "切换到另一个有权限的内部知识库检索"
+      - "向用户追问澄清关键信息"
+      - "次数用完后返回固定拒答话术"
+      - "改为调用公网搜索引擎，只要不告诉用户即可"
+    answer: [0, 1, 2, 3]
+    explain: |
+      A~D 都在内部合规边界内完成纠正或安全退出。
+      E 违反合规要求，外部内容也不受企业权限和版本管理，「不告诉用户」更是严重的问题。
+  - id: d28-t13
+    kp: d28-k3
+    type: single
+    question: 下面的检索纠正代码在线上偶尔出现单个请求调用上百次模型的情况。根本原因是？
+    code: |
+      async def answer(question):
+          query = question
+          while True:
+              docs = await search(query)
+              if await grade(question, docs) == "yes":
+                  return await generate(question, docs)
+              query = await rewrite(query)
+    options:
+      - "grade 函数应该用 query 而不是 question 作为参数"
+      - "search 没有设置超时，导致请求卡住"
+      - "循环没有次数上限，评估一直判不相关时会无限改写重查"
+      - "generate 应该在循环外部调用"
+    answer: [2]
+    explain: |
+      while True 没有退出条件，只要资料始终被判不相关，就会无限循环；而且每次改写基于上一次的改写结果，越改越偏。
+      应设最多 1~2 次重试，超过就拒答，并基于原问题加失败原因改写。A 用原问题评估是对的；B 超时会报错而非循环上百次；D 位置无关。
+  - id: d28-t14
+    kp: d28-k3
+    type: single
+    question: 加入「LLM 评估资料是否相关」的节点后，编造减少了，但误拒率明显上升。抽查发现很多资料其实能回答问题却被判为不相关。最合理的做法是？
+    options:
+      - "用人工标注样本校准评估 Prompt 或阈值，并回归误拒率"
+      - "去掉评估节点，恢复原来没有评估的固定流水线"
+      - "让评估节点多运行几次，只要有一次判相关就算相关"
+      - "把改写重查的次数上限从 1 次提高到 10 次"
+    answer: [0]
+    explain: |
+      评估器本身也会误判，需要像 LLM-as-judge 一样用人工标注校准（Day 29），再看正确拒答率和误拒率的平衡。
+      B 放弃了已经得到的收益；C 只是变相放宽标准，结果不可控且更贵；D 增加成本，误判问题依旧。
+  - id: d28-t15
+    kp: d28-k4
+    type: single
+    question: 下列哪个问题最适合使用 GraphRAG 的 Global Search？
+    options:
+      - "员工试用期有几天？"
+      - "报销单 BX20261103 审批到哪一步了？"
+      - "这 3000 份行业报告整体讨论了哪些主要主题？"
+      - "合同第 9 条的违约金比例是多少？"
+    answer: [2]
+    explain: |
+      Global Search 以 map-reduce 方式遍历社区报告，适合需要理解整个数据集的全局总结类问题。
+      A、D 是事实查找，普通 RAG 更合适；B 是结构化数据查询，应调用业务接口。
+  - id: d28-t16
+    kp: d28-k4
+    type: judge
+    question: GraphRAG 的索引成本和普通向量入库相当，而且文档更新后图谱可以低成本地增量维护，因此适合文档频繁变化的知识库。
+    answer: false
+    explain: |
+      标准 GraphRAG 的实体关系抽取、摘要和社区报告都依赖大量 LLM 调用，官方估计图抽取约占索引成本 75%；文档变化后图谱和社区报告的维护也复杂。频繁变化的事实类知识库更适合普通 RAG。
+  - id: d28-t17
+    kp: d28-k4
+    type: multi
+    question: 评估是否在企业知识库中引入 GraphRAG 时，下列哪些因素需要考虑？
+    options:
+      - "索引阶段大量 LLM 调用带来的成本"
+      - "文档更新后图谱与社区报告的维护复杂度"
+      - "社区摘要可能混合不同权限文档的信息"
+      - "开源项目的维护状态与长期依赖风险"
+      - "GraphRAG 能让所有事实类问题的延迟降低"
+    answer: [0, 1, 2, 3]
+    explain: |
+      A、B 是成本与运维问题；C 是容易被忽视的权限风险；D 是选型必须看的依赖风险，微软仓库已声明基本处于维护模式。
+      E 错：事实类问题用普通向量检索通常更快，Global Search 还更耗资源。
+  - id: d28-t18
+    kp: d28-k4
+    type: single
+    question: 业务方看到 GraphRAG 的宣传，要求 p1 企业制度问答「全面升级为 GraphRAG」。你最合理的回应是？
+    options:
+      - "立即全面替换，GraphRAG 是普通 RAG 的升级版"
+      - "先用评测集分析失败类型，只有全局总结类问题占比高时才对该场景试点"
+      - "拒绝讨论，GraphRAG 已经过时不能用"
+      - "同时运行两套系统，让用户自己选择"
+    answer: [1]
+    explain: |
+      决策应基于数据：制度问答以事实查找为主，普通 RAG 已能覆盖；只有评测证明全局或跨文档关联问题是主要失败来源，才值得为该场景承担 GraphRAG 的成本。
+      A 盲目跟风；C 武断，其思想仍有价值；D 增加维护成本，把选择负担推给用户。
+exam:
+  - id: d28-e1
+    kp: d28-k1
+    type: single
+    question: 一个办公助手同时接入制度向量库和工单系统接口。用户问「我上周提的报销单到哪一步了？」最合理的处理是？
+    options:
+      - "模型选择工单查询工具，代码按当前用户身份查询并校验权限"
+      - "在制度向量库中检索「报销单进度」相关片段后回答"
+      - "同时检索所有数据源，把结果全部拼进 Prompt"
+      - "直接让模型根据常识回答报销一般需要几天"
+    answer: [0]
+    explain: |
+      这是结构化的实时状态查询，应路由到工单工具；查询条件和权限由代码按服务端身份决定，模型只负责选择工具。
+      B 制度库里没有个人单据状态；C 浪费成本、增加噪声，还可能扩大数据暴露面；D 是编造。
+  - id: d28-e2
+    kp: d28-k3
+    type: single
+    question: 团队想在 p1 里实现检索纠正，但担心每次多一次 LLM 评估调用会让延迟超标。最具性价比的检索评估方式是？
+    options:
+      - "为每个片段单独调用一次大模型判断是否相关"
+      - "训练一个 Self-RAG 模型替换现有生成模型"
+      - "直接复用已有的 Rerank 最高分，按阈值分档触发后续动作"
+      - "去掉评估，只要检索有结果就生成"
+    answer: [2]
+    explain: |
+      Rerank 已经在流水线中，它的分数本身就是「问题与片段相关程度」的判断，按阈值分高中低三档几乎零额外成本。
+      A 调用次数随片段数线性增长；B 训练和部署成本高；D 放弃了纠正的价值。
+  - id: d28-e3
+    kp: d28-k2
+    type: single
+    question: 多跳检索在第 3 跳仍未找到关键信息，已达到跳数上限。此时系统最合理的行为是？
+    options:
+      - "继续检索直到找到为止，保证回答完整"
+      - "让模型根据已有信息推测缺失部分并给出完整答案"
+      - "返回固定拒答话术，丢弃已找到的所有信息"
+      - "回答已确认的部分并引用依据，明确说明缺少哪些信息"
+    answer: [3]
+    explain: |
+      达到上限后应安全退出：已确认的部分有依据可以回答，缺失部分明确告知，既不编造也不浪费已有结果。
+      A 违背上限设计；B 是编造；C 过于保守，丢弃了有价值且有依据的部分信息。
+  - id: d28-e4
+    kp: d28-k4
+    type: single
+    question: 关于 GraphRAG 几种查询模式的适用性，下列判断正确的是？
+    options:
+      - "Basic Search 遍历所有社区报告，适合全局总结"
+      - "Local Search 从相关实体出发组合邻居关系与原文，适合具体实体问题"
+      - "Global Search 只查与问题最相近的 Top-K 原文片段"
+      - "DRIFT Search 完全不使用社区信息"
+    answer: [1]
+    explain: |
+      Local Search 以实体为入口扇出到邻居和关联原文，适合「某实体是什么、和谁有关」。
+      A 把 Basic 与 Global 弄反了，Basic 是普通向量 Top-K；C 错，Global 遍历社区报告做 map-reduce；D 错，DRIFT 正是在 Local 基础上引入社区信息。
+  - id: d28-e5
+    kp: d28-k1
+    type: multi
+    question: 为 Agentic RAG 设计可观测性时，每次请求的轨迹日志应包含哪些信息？
+    options:
+      - "每一步模型的决策：直接回答还是调用哪个工具"
+      - "每次工具调用的参数、命中片段与耗时"
+      - "检索评估结果与是否触发改写"
+      - "总步数、是否触达上限、Token 消耗"
+      - "用户的完整身份证号，方便核对身份"
+    answer: [0, 1, 2, 3]
+    explain: |
+      A~D 能还原「为什么这样决策、哪一步出错、花了多少」，是排查与成本监控的基础。
+      E 属于敏感个人信息，日志必须脱敏，身份核对用用户 ID 即可。
+  - id: d28-e6
+    kp: d28-k3
+    type: multi
+    question: 关于 CRAG 与 Self-RAG 的区别，下列说法正确的有？
+    options:
+      - "CRAG 在检索之后用独立的评估器判断资料质量并纠正"
+      - "Self-RAG 训练生成模型本身输出反思 Token 来自我评估"
+      - "CRAG 的 Ambiguous 动作用于降低对评估器准确率的依赖"
+      - "两者都需要先构建知识图谱"
+      - "Self-RAG 只能用于不需要检索的问题"
+    answer: [0, 1, 2]
+    explain: |
+      A、B 点出两者的核心差别：外挂评估器 vs 模型内生的反思能力；C 是 CRAG 的关键设计。
+      D 混淆了 GraphRAG；E 错，Self-RAG 的反思 Token 正是用来按需决定是否检索。
+  - id: d28-e7
+    kp: d28-k1
+    type: judge
+    question: 在 Agentic RAG 中，检索工具的权限过滤条件可以由模型根据对话内容生成，因为模型已经知道用户是谁。
+    answer: false
+    explain: |
+      模型输出是概率性的，还可能被提示注入诱导。权限过滤条件必须由服务端根据登录身份生成，模型最多决定「调用哪个工具、查什么内容」，选择结果也要与用户可访问范围做交集。
+  - id: d28-e8
+    kp: d28-k4
+    type: judge
+    question: FastGraphRAG 用 NLP 方法抽取名词短语、以共现关系建图，索引成本远低于标准 GraphRAG，但图谱噪声更大。
+    answer: true
+    explain: |
+      官方文档说明 FastGraphRAG 用 NLTK、spaCy 等抽取名词短语作为实体、以文本单元共现作为关系，省掉了大部分 LLM 抽取；代价是图更嘈杂，更适合以全局总结为主的场景。
+  - id: d28-e9
+    kp: d28-k3
+    type: case
+    question: |
+      某团队在知识库问答中加入了「评估资料相关性 → 不相关就改写重查」的循环，上线一周后模型费用翻了 3 倍。
+      轨迹日志显示：约 8% 的请求循环了 10 轮以上，这些请求大多是知识库里确实没有答案的问题；每次改写都基于上一次改写结果，后几轮的查询已经和原问题关系不大。
+      最合理的修复方案是？
+    options:
+      - "换一个更便宜的模型做改写，循环次数不变"
+      - "把评估器换成更严格的 Prompt，让它更少判断为相关"
+      - "取消评估节点，所有问题都直接生成回答"
+      - "设改写上限 1~2 次并基于原问题改写，超限即拒答，同时监控平均轮数与超限率"
+    answer: [3]
+    explain: |
+      根因是循环没有上限，加上「基于改写再改写」导致漂移；无答案问题本就不该反复重查。设上限、基于原问题改写、超限拒答，并把轮数纳入监控，能同时解决成本和效果问题。
+      A 只降单价不治根；B 更严会导致更多循环；C 放弃了纠正价值，编造会回升。
+interview:
+  - id: d28-i1
+    kp: d28-k1
+    type: scenario
+    difficulty: 2
+    question: 业务方反馈知识库问答有几类问题答不好：「张三所在部门的差旅标准是多少」「对比新旧两版报销制度」「我的报销单到哪了」。有同事提议直接全面改成 Agentic RAG。你怎么判断和推进？
+    key_points:
+      - {text: "先用评测集和日志给失败问题分类，量化各类占比，再决定方案", dim: engineering}
+      - {text: "区分三类问题：依赖型多跳、可并行的对比分解、结构化实时查询", dim: concept}
+      - {text: "给出针对性方案：对比类并行分解，部门与单据类调用结构化接口，主链路保持固定流水线", dim: principle}
+      - {text: "说明 Agentic 分支要有步数上限、权限由代码校验、轨迹日志，并评估成本与延迟", dim: engineering}
+      - {text: "上线后对比各类问题正确率与 P95 延迟，用数据决定是否扩大 Agentic 范围", dim: project}
+    reference: |
+      **先分类再选方案**：拉一批失败样本和日志，按类型标注并统计占比。这三个例子分别是：
+      1. 「张三所在部门的差旅标准」——**依赖型多跳**，但第一跳「张三的部门」是结构化事实，调用 HR 接口比从文档里读更可靠，第二跳再检索制度。
+      2. 「对比新旧两版报销制度」——**可并行的问题分解**，两个子问题并发检索、分组注入、分别引用，不需要循环。
+      3. 「我的报销单到哪了」——**结构化实时查询**，路由到工单工具，代码按当前用户查。
+      **推进方式**：主链路保持固定流水线（大多数事实问题便宜稳定）；加一个轻量路由层，规则或小模型识别这三类问题分流；只有确需多步决策的部分才用有上限的 Agent 循环。所有工具调用的权限由代码按身份校验，轨迹完整记录。
+      **验证**：评测集为每类问题准备样本，对比改造前后的正确率、P95 延迟和成本，收益明确再扩大范围。
+    oral: |
+      我不会直接全面改，先拿失败样本分类。这三个例子其实是三类问题：第一个是先查人再查制度的多跳，但「张三的部门」在 HR 系统里一查就有，调接口比让模型从文档里读靠谱；第二个是对比，拆成两个子问题并行检索就行，不需要循环；第三个是查单据状态，应该路由到工单接口。
+      所以我的方案是主链路保持固定流水线，前面加一个轻量路由层分流，只有真正需要多步决策的才走有步数上限的 Agent 循环，工具权限全部由代码按用户身份校验。
+      上线前后我会按问题类型对比正确率和 P95，在我的项目里【填你的分类占比和改造效果】，数据说明值得才扩大范围。
+  - id: d28-i2
+    kp: d28-k3
+    type: scenario
+    difficulty: 3
+    question: 面试官问：「你了解 Corrective RAG 吗？如果公司不允许联网，你怎么在企业知识库里落地类似的检索纠正？」
+    key_points:
+      - {text: "讲清 CRAG 核心：检索评估器加 Correct、Incorrect、Ambiguous 三种动作，Incorrect 时论文用网页搜索补充", dim: concept}
+      - {text: "提出低成本评估：复用 Rerank 最高分分档，或小模型二分类，避免每段一次大模型调用", dim: engineering}
+      - {text: "给出不联网的替代动作：基于原问题改写重查、换有权限的知识库、HyDE 补救、追问澄清、拒答", dim: principle}
+      - {text: "强调循环上限与日志：最多 1~2 次，超限拒答，监控平均轮数和超限率", dim: engineering}
+      - {text: "用评测集校准阈值，同时看正确拒答率、误拒率和延迟", dim: project}
+    reference: |
+      **CRAG 是什么**：在检索和生成之间加一个检索评估器，按置信度分三种动作——Correct（至少一条高于上阈值）时对文档做知识精炼去噪；Incorrect（全部低于下阈值）时丢弃结果、换知识来源，论文里用网页搜索；Ambiguous 时两者结合，降低对评估器准确率的依赖。
+      **不联网的落地**：
+      1. **评估器**：直接复用 Rerank 最高分按阈值分高、中、低三档，零额外调用；需要更细判断时再用小模型二分类。
+      2. **高分**：正常生成；**中分**：Prompt 提示「资料可能不完整，只回答能确认的部分」。
+      3. **低分**：基于原问题改写一次重查，或切换到有权限的通用知识库，或触发 HyDE 补救检索；仍低则追问澄清或拒答。
+      4. **循环控制**：最多 1~2 次，每轮记录查询、分数、动作；监控平均轮数、超限率。
+      5. **校准**：阈值在评测集上标定，回归正确拒答率、误拒率和 P95 延迟。
+    oral: |
+      CRAG 的核心是检索完不直接生成，先用一个评估器判断资料质量，分成正确、错误、拿不准三档：正确就去噪后生成，错误就换知识来源，论文里是网页搜索，拿不准就两路结合。
+      不能联网的话，我会这样落地：评估器直接用已有的 Rerank 最高分分档，不增加调用；低分时基于原问题改写一次重查，或者换一个有权限的通用知识库，再不行就追问或者拒答，循环最多两次。
+      阈值在评测集上标定，同时看正确拒答率和误拒率。在我的知识库项目里，【填你加这个分支前后的拒答和延迟数据】。
+  - id: d28-i3
+    kp: d28-k1
+    type: design
+    difficulty: 4
+    question: 请为企业知识库设计一个「受控的 Agentic RAG」：要同时接入制度库和工单系统，支持改写重查和简单多跳，并保证成本可控、权限安全、出错可排查。说说架构、关键控制点和上线评估方式。
+    key_points:
+      - {text: "分层架构：规则或小模型分流，简单问题走固定流水线，复杂问题进入有上限的 Agent 循环", dim: concept}
+      - {text: "工具设计：每个数据源一个工具、描述清晰，参数校验，返回前先 Rerank 精简", dim: engineering}
+      - {text: "权限：工具可用集合与查询条件由服务端身份决定，模型选择结果做交集校验", dim: principle}
+      - {text: "控制：最大步数与重试上限、总 Token 预算、超时降级与超限拒答", dim: engineering}
+      - {text: "可观测与评估：轨迹日志，按问题类型评测正确率、步数分布、成本与 P95", dim: project}
+    reference: |
+      **1. 分流**：入口用规则加小模型判断问题类型——寒暄直接答；单一事实问题走固定流水线（混合检索 + Rerank + 拒答）；需要多源或多步的进入 Agent 循环。
+      **2. 工具**：`search_policies(query)`、`query_my_tickets(status?)`，描述写清适用范围；参数用 Schema 校验（Day 17、Day 33）；检索工具内部做混合检索 + Rerank，只返回前几条和出处，控制上下文长度。
+      **3. 权限**：可用工具集合按用户角色计算后才交给模型；工具执行时的租户、用户组、本人 ID 都来自服务端身份，模型只提供查询内容；选择结果不在可用集合内直接拒绝。
+      **4. 控制**：最大工具调用 3 次、改写重查最多 1 次、单请求 Token 预算、每步超时；超限时回答已确认部分或拒答。
+      **5. 可观测**：每步记录决策、工具参数、命中片段、评估结果、耗时与 Token，按请求 ID 串成轨迹（Day 43）。
+      **6. 评估**：评测集按问题类型分组（事实、多源、多跳、无答案、越权尝试），看正确率、拒答率、步数分布、超限率、单次成本和 P95；越权样本必须 100% 被拒。灰度上线先覆盖一个部门，再逐步扩大。
+    oral: |
+      我会做成「受控」的，而不是让模型完全自由发挥。入口先分流：寒暄直接答，单一事实问题走原来的固定流水线，只有需要查多个数据源或多步的才进 Agent 循环。
+      工具按数据源拆，制度检索和我的工单查询各一个，描述写清楚，检索工具内部先 Rerank 只返回前几条。权限这块是重点：哪些工具能用、查询时的租户和用户 ID 全部由服务端身份决定，模型只能决定调哪个、查什么。
+      控制上，工具调用最多三次、改写重查最多一次，超限就回答已确认的部分或者拒答；每一步都记轨迹。评估按问题类型分组，看正确率、步数分布、成本和延迟，越权样本必须全部拦住。在我的项目里【填你的评测结果】，先灰度一个部门再推广。
+sources:
+  - {title: "LangGraph - Build a custom RAG agent with LangGraph", url: "https://docs.langchain.com/oss/python/langgraph/agentic-rag"}
+  - {title: "CRAG（arXiv:2401.15884）", url: "https://arxiv.org/abs/2401.15884"}
+  - {title: "Self-RAG（arXiv:2310.11511）", url: "https://arxiv.org/abs/2310.11511"}
+  - {title: "Adaptive-RAG（arXiv:2403.14403）", url: "https://arxiv.org/abs/2403.14403"}
+  - {title: "Microsoft GraphRAG 文档", url: "https://microsoft.github.io/graphrag/"}
+  - {title: "graphrag on PyPI", url: "https://pypi.org/project/graphrag/"}

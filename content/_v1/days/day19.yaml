@@ -1,0 +1,726 @@
+day: 19
+phase: 2
+title: Structured Output
+goals:
+  - 能区分「Prompt 约束 JSON」「JSON mode」「Structured Outputs（strict）」三种方式的保证级别和适用场景
+  - 能写出符合 strict 子集要求的 JSON Schema，并说明可选字段、枚举、嵌套的写法和限制
+  - 能用 Pydantic v2 定义输出模型，配合 SDK 的 parse 方法拿到类型安全的结果，并处理拒答、截断、校验失败
+  - 能为结构化抽取管道设计完整的失败兜底策略
+knowledge_points:
+  - id: d19-k1
+    name: 结构化输出的三个层级：Prompt 约束、JSON mode 与 Structured Outputs
+    level: P0
+    summary: Prompt 约束靠模型自觉，JSON mode 保证是合法 JSON，Structured Outputs 才保证符合你的 Schema
+    why: |
+      LLM 应用里大量需求是「把非结构化文本变成程序能用的数据」：抽发票字段、分类工单、生成 UI 配置。
+      输出一旦不是程序预期的格式，下游就会崩。三种方案的可靠性差别很大，选错方案是线上解析失败的头号原因，也是面试常见对比题。
+    problem: |
+      解决「**模型输出如何稳定地被程序解析和使用**」的问题：既要语法上是合法 JSON，又要字段名、类型、枚举值完全符合约定，
+      还要能区分「模型拒答」「输出被截断」等异常情况。
+    principle: |
+      **一、三个层级对比**
+
+      | 方式 | 做法 | 保证什么 | 不保证什么 |
+      |---|---|---|---|
+      | Prompt 约束 | 在提示词里写「请输出 JSON，格式如下」 | 什么都不保证 | 可能多出解释文字、代码块标记、缺字段 |
+      | JSON mode | `response_format: {"type": "json_object"}` | 输出是**合法 JSON** | 不保证字段和类型符合你的结构 |
+      | Structured Outputs | `json_schema` + `strict: true` | 完成且未拒答的输出**符合你的 Schema** | 不保证内容正确，不覆盖拒答和截断 |
+
+      OpenAI 文档的原话是：Structured Outputs 是 JSON mode 的演进，两者都确保合法 JSON，**只有 Structured Outputs 确保遵循 Schema**，建议能用就用 Structured Outputs。
+
+      **二、Structured Outputs 为什么能「保证」？——约束解码**
+
+      回顾 Day 16：模型每一步输出所有 Token 的概率，然后采样。OpenAI 在发布 Structured Outputs 时介绍，它采用**约束解码（constrained decoding）**：
+      把你的 JSON Schema 转换成一种语法规则，生成每个 Token 时，**把不符合语法的 Token 概率屏蔽掉**，只在合法 Token 中采样。
+
+      ```mermaid
+      flowchart LR
+        A["JSON Schema"] --> B["转换为语法规则 并缓存"]
+        C["模型输出 logits"] --> D["按当前位置的合法 Token 做掩码"]
+        B --> D
+        D --> E["只在合法 Token 中采样"]
+        E --> F["拼回输出 进入下一步"]
+        F --> C
+      ```
+
+      举例：Schema 规定 `status` 只能是 `"paid"` 或 `"unpaid"`，那么生成到这个值时，除这两个词对应的 Token 外，其他 Token 都不可能被选中。
+
+      这也解释了两个现象：
+      - **首次使用某个 Schema 有额外延迟**：服务端要先处理 Schema（文档说明后续相同 Schema 不再有额外延迟）。
+      - **只支持 JSON Schema 的子集**：语法转换需要有限、确定的结构（见 d19-k2）。
+
+      **三、仍然要处理的三种情况**
+
+      1. **拒答（refusal）**：出于安全原因模型拒绝回答时，不会输出符合 Schema 的 JSON，而是给出 `refusal` 字段（Chat Completions 为 `message.refusal`）。
+      2. **截断**：达到输出上限时 JSON 不完整（Chat 的 finish_reason 为 length，Responses 的 status 为 incomplete）。
+      3. **内容错误**：格式对，但值可能是错的或编造的——「符合 Schema」不等于「事实正确」。
+
+      **四、和 Function Calling 的关系（Day 18）**
+
+      两者底层都可以用 strict 约束。OpenAI 的建议：**连接工具、数据、系统**时用 Function Calling；**约束模型回复用户的格式**时用 response_format / text.format。
+
+      **五、不这样做会怎样？**
+
+      - 只靠 Prompt：模型偶尔输出「好的，以下是 JSON：」加代码块，`json.loads` 失败。
+      - 只用 JSON mode：输出合法 JSON，但字段名一会儿叫 `total` 一会儿叫 `amount`。
+      - 用了 Structured Outputs 但不处理 refusal：拿到 `parsed = None` 后直接访问属性崩溃。
+    scenarios: |
+      - **信息抽取**：发票、合同、简历字段抽取直接用 Structured Outputs。
+      - **分类与路由**：输出 `{category: 枚举, confidence: 数字}`，枚举保证类别合法。
+      - **生成 UI 或配置**：输出受 Schema 约束的组件树，前端直接渲染（OpenAI 文档有递归 Schema 的 UI 生成示例）。
+      - **老模型或不支持 json_schema 的兼容接口**：退而使用 JSON mode + Pydantic 校验 + 重试。
+    pitfalls: |
+      - **误区：JSON mode 就是结构化输出。** 它只保证语法合法，不保证结构。
+      - **误区：strict 保证内容正确。** 只保证格式，值仍可能是编造的。
+      - **JSON mode 不在提示词里提到 JSON**：OpenAI 文档说明此时模型可能输出无尽空白直到 Token 上限，API 会在上下文中没有 JSON 字样时直接报错；DeepSeek、百炼也要求提示词包含 json 字样。
+      - **忽略 refusal 和截断**：这两种情况下拿不到合法结果。
+      - **Schema 和代码类型各写一份**：迟早不一致，官方建议用 SDK 的 Pydantic / Zod 辅助生成。
+    interview_asks:
+      - JSON mode 和 Structured Outputs 有什么区别？
+      - Structured Outputs 是怎么保证输出符合 Schema 的？
+      - 用了 Structured Outputs 还需要做哪些异常处理？
+    project_example: |
+      一个工单分类服务最初用 Prompt 要求输出 JSON，解析失败率约 4%：有时带 markdown 代码块，有时多一句解释。
+      改用 JSON mode 后语法错误消失，但出现了「category 写成中文」「多出 reason 字段」的问题。
+      最终改为 Structured Outputs：category 用枚举、所有字段 required、禁止额外字段，并处理 refusal 和截断，解析失败率降到 0；
+      剩余问题变成「分类是否正确」，转由评测集来衡量和优化。
+    freshness: |
+      核对于 2026-11：OpenAI Structured Outputs 指南：Structured Outputs 与 JSON mode 都在 Responses、Chat Completions 等 API 中支持；Responses 中通过 text.format 设置（type 为 json_schema 并 strict），Chat Completions 使用 response_format；
+      仍需处理 refusal、incomplete 与 API 错误；首次使用新 Schema 有额外延迟；JSON mode 必须在上下文中出现 JSON 字样否则报错。
+      约束解码原理来自 OpenAI 2024 年的发布文章《Introducing Structured Outputs in the API》。
+    sources:
+      - {title: "OpenAI Docs - Structured model outputs", url: "https://platform.openai.com/docs/guides/structured-outputs"}
+      - {title: "OpenAI - Introducing Structured Outputs in the API", url: "https://openai.com/index/introducing-structured-outputs-in-the-api/"}
+
+  - id: d19-k2
+    name: JSON Schema 与 strict 模式的限制
+    level: P0
+    summary: strict 只支持 JSON Schema 子集：根必须是 object、字段全部 required、禁止额外字段，可选用 null 表达
+    why: |
+      写不出合规的 Schema，请求会被直接拒绝；写得不好（字段描述含糊、该用枚举没用），即使格式对了内容也不可用。
+      Schema 是你和模型之间的「接口契约」，你做过接口集成，这个思维可以直接迁移。
+    problem: |
+      解决「**如何用 JSON Schema 精确描述期望的输出结构**」以及「**strict 模式下哪些写法合法、哪些会被拒**」的问题。
+    principle: |
+      **一、一个合规的 strict Schema 示例**
+
+      ```json
+      {
+        "type": "object",
+        "properties": {
+          "invoice_no": {"type": "string", "description": "发票号码"},
+          "issue_date": {"type": "string", "format": "date"},
+          "currency": {"type": "string", "enum": ["CNY", "USD"]},
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {"type": "string"},
+                "quantity": {"type": "integer", "minimum": 1},
+                "unit_price": {"type": "number"}
+              },
+              "required": ["name", "quantity", "unit_price"],
+              "additionalProperties": false
+            }
+          },
+          "buyer_tax_id": {"type": ["string", "null"], "description": "购买方税号 没有则为 null"}
+        },
+        "required": ["invoice_no", "issue_date", "currency", "items", "buyer_tax_id"],
+        "additionalProperties": false
+      }
+      ```
+
+      **二、strict 的硬性规则（OpenAI 文档，2026-11 核对）**
+
+      - **根必须是 object**，且根不能是 `anyOf`（Zod 的可辨识联合常会生成根 anyOf，要包一层）。
+      - **所有字段都必须 required**；可选字段用 `["类型", "null"]` 联合表示。
+      - **每个 object 都必须 `additionalProperties: false`**。
+      - **支持的类型**：string、number、integer、boolean、object、array、enum、anyOf；支持 `$defs` 定义复用和**递归** Schema。
+      - **支持的约束**：string 的 `pattern`、`format`（date-time、date、email、uuid 等）；number 的 `minimum`、`maximum`、`multipleOf` 等；array 的 `minItems`、`maxItems`。
+      - **不支持的组合关键字**：`allOf`、`not`、`if/then/else`、`dependentRequired` 等。
+      - **规模限制**：最多 5000 个对象属性、10 层嵌套、1000 个枚举值，以及字符串总长度限制。
+      - **输出键顺序与 Schema 中的顺序一致**——可以利用这一点，把「推理过程」字段放在「结论」字段前面。
+
+      ```mermaid
+      flowchart TD
+        A["设计输出结构"] --> B{"根是 object 吗"}
+        B -- "否" --> B1["包一层 object"]
+        B -- "是" --> C{"所有字段都在 required 中吗"}
+        C -- "否" --> C1["全部列入 可选的改为 null 联合类型"]
+        C -- "是" --> D{"每个 object 都禁止额外字段吗"}
+        D -- "否" --> D1["补 additionalProperties false"]
+        D -- "是" --> E{"用到了 allOf not if then 吗"}
+        E -- "是" --> E1["改写为 anyOf 或拆分字段"]
+        E -- "否" --> F["可用于 strict 模式"]
+      ```
+
+      **三、Schema 设计技巧**
+
+      - **description 就是提示词**：写清字段含义、单位、格式、没有时怎么填。
+      - **能枚举就枚举**：类别、状态、币种。
+      - **给模型「说没有」的出口**：输入可能与任务无关时，模型会「尽力」填满 Schema 从而编造（文档明确提到这种幻觉风险）。可以加 `is_relevant` 布尔字段或让字段可为 null。
+      - **先推理后结论**：需要推理的任务把 `reasoning` 字段放在 `answer` 前面（利用键顺序）；推理模型则不需要。
+
+      **四、不这样做会怎样？**
+
+      - 漏写 additionalProperties 或 required：strict 请求直接 400。
+      - 没有 null 出口：上传一张风景照让它抽发票，它也会编出发票号。
+      - 用 allOf 组合复用：在 strict 下被拒，要改成 `$defs` 引用。
+    scenarios: |
+      - **从 OpenAPI 文档迁移 Schema**：删掉不支持的关键字，补齐 required 与 additionalProperties。
+      - **多类型输出**：用 anyOf 表达「文本块或表格块」，但根仍是 object。
+      - **复杂嵌套表单**：控制在 10 层以内，过深时拆成多次抽取。
+    pitfalls: |
+      - **以为 Pydantic 的所有约束都会体现在 Schema 中**：`field_validator` 这类自定义校验不会进入 Schema，只在本地校验时生效。
+      - **为了「可选」去掉 required**：strict 不允许。
+      - **枚举太多**：超过 1000 个枚举值不被支持，大规模类目应先检索再选择。
+      - **频繁动态生成不同 Schema**：每个新 Schema 首次使用都有处理延迟，并且影响缓存。
+      - **兼容接口支持度不同**：例如 DeepSeek 文档中 JSON Output 只提供 json_object；百炼支持 json_schema 并建议 strict 为 true，以各自文档为准。
+    interview_asks:
+      - strict 模式对 JSON Schema 有哪些限制？
+      - 可选字段在 strict 模式下怎么表达？
+      - 输入和任务无关时，结构化输出会出现什么问题？怎么设计 Schema 避免？
+    project_example: |
+      简历解析项目中，Schema 的 `work_experience` 用了 allOf 复用一个基础对象，开启 strict 后请求全部 400。
+      改为 `$defs` 引用后恢复。上线后又发现用户上传「求职信」时，模型也会编造工作经历。
+      于是在根上增加 `document_type` 枚举（resume、cover_letter、other），非简历时其余字段全部为 null，并在后端据此拒绝入库，编造问题消失。
+    freshness: |
+      核对于 2026-11：OpenAI Structured Outputs 指南「Supported schemas」：支持类型 String、Number、Boolean、Integer、Object、Array、Enum、anyOf；
+      根对象必须为 object 且不能为 anyOf；所有字段必须 required；必须设置 additionalProperties false；最多 5000 个对象属性、10 层嵌套、1000 个枚举值；
+      不支持 allOf、not、dependentRequired、dependentSchemas、if、then、else；支持 definitions 与递归；输出键顺序与 Schema 一致。
+      阿里云百炼 response_format 支持 text、json_object、json_schema（含 strict）；DeepSeek JSON Output 为 json_object。
+    sources:
+      - {title: "OpenAI Docs - Structured model outputs（Supported schemas）", url: "https://platform.openai.com/docs/guides/structured-outputs"}
+      - {title: "阿里云百炼 - OpenAI 兼容 Chat 参数说明（response_format）", url: "https://help.aliyun.com/zh/model-studio/qwen-api-via-openai-chat-completions"}
+      - {title: "DeepSeek API Docs - JSON Output", url: "https://api-docs.deepseek.com/guides/json_mode.md"}
+
+  - id: d19-k3
+    name: Pydantic 校验与 SDK 的 parse 辅助方法
+    level: P0
+    summary: 用 Pydantic 模型同时生成 Schema 和校验结果，SDK 的 parse 方法把输出直接变成类型安全的对象
+    why: |
+      Python AI 后端里，Pydantic 是「数据契约」的事实标准：FastAPI 请求校验（Day 09）、LLM 输出校验、工具参数校验都用它。
+      你习惯 TypeScript 的类型系统，Pydantic 可以理解为「运行时也会检查的 TypeScript 类型」。
+      会用 SDK 的 parse 辅助方法，能少写大量手写 Schema 和解析代码，也避免 Schema 与代码不一致。
+    problem: |
+      解决三件事：
+      - **单一事实来源**：Schema 和代码里的类型只定义一次；
+      - **运行时校验**：模型输出、JSON mode 输出、兼容接口输出都要在进入业务前被校验；
+      - **业务规则校验**：Schema 表达不了的规则（合计金额等于明细之和）也要能检查。
+    principle: |
+      **一、Pydantic v2 的核心用法**
+
+      ```python
+      from datetime import date
+      from typing import Literal
+      from pydantic import BaseModel, Field, ValidationError, model_validator
+
+      class LineItem(BaseModel):
+          name: str
+          quantity: int = Field(ge=1)
+          unit_price: float
+
+      class Invoice(BaseModel):
+          invoice_no: str = Field(description="发票号码")
+          issue_date: date
+          currency: Literal["CNY", "USD"]
+          items: list[LineItem]
+          total: float
+          buyer_tax_id: str | None = Field(description="购买方税号，没有则为 null")
+
+          @model_validator(mode="after")
+          def check_total(self) -> "Invoice":
+              s = round(sum(i.quantity * i.unit_price for i in self.items), 2)
+              if abs(s - self.total) > 0.01:
+                  raise ValueError(f"明细合计 {s} 与总额 {self.total} 不一致")
+              return self
+
+      schema = Invoice.model_json_schema()            # 生成 JSON Schema
+      inv = Invoice.model_validate_json('{"invoice_no": "..."}')  # 从 JSON 字符串校验，失败抛 ValidationError
+      ```
+
+      - `Literal` / `Enum` → Schema 中的 enum；`Field(ge=1)` → minimum；`str | None` 且无默认值 → 必填但可为 null（正好符合 strict 要求）。
+      - `model_validator` / `field_validator` 是**本地业务校验**，不会进入发给模型的 Schema。
+      - 旧写法（Pydantic v1）：`.dict()`、`.parse_raw()`、`class Config`；新写法：`.model_dump()`、`.model_validate_json()`、`model_config`。
+
+      **二、OpenAI SDK 的 parse 辅助方法（openai-python 3.x，2026-11 核对）**
+
+      | 接口 | 写法 | 结果 |
+      |---|---|---|
+      | Responses | `client.responses.parse(model=..., input=..., text_format=Invoice)` | `response.output_parsed` |
+      | Chat Completions | `client.chat.completions.parse(model=..., messages=..., response_format=Invoice)` | `message.parsed`，拒答时看 `message.refusal` |
+
+      - SDK 会把 Pydantic 模型**转换为 strict JSON Schema** 发送，再把输出解析回模型实例。
+      - Chat 的 `parse()` 遇到 finish_reason 为 length 或 content_filter 时抛 `LengthFinishReasonError` / `ContentFilterFinishReasonError`。
+      - 工具参数也可以用 `openai.pydantic_function_tool(Model)` 生成 strict 工具，parse 后从 `parsed_arguments` 拿到模型实例。
+      - 旧写法：早期是 `client.beta.chat.completions.parse`，现在为 `client.chat.completions.parse`。
+
+      **三、完整的数据流**
+
+      ```mermaid
+      sequenceDiagram
+        participant C as 业务代码
+        participant P as Pydantic 模型
+        participant S as OpenAI SDK
+        participant M as 模型服务
+        C->>P: 定义 Invoice 类型
+        C->>S: parse 并传入 Invoice
+        S->>P: 生成 strict JSON Schema
+        S->>M: 请求 携带 Schema
+        M-->>S: 约束解码后的 JSON 或拒答
+        S->>P: 按 Invoice 解析与校验
+        P-->>S: 实例 或 抛出校验错误
+        S-->>C: parsed 或 refusal
+        C->>C: 业务校验 入库
+      ```
+
+      **四、不支持 json_schema 的兼容接口怎么办？**
+
+      用 JSON mode（或纯 Prompt）拿到字符串，再用 `Invoice.model_validate_json()` 校验，失败进入重试或兜底流程（d19-k4）。Pydantic 在这里是**最后一道防线**。
+    scenarios: |
+      - **抽取服务**：Pydantic 模型即接口契约，FastAPI 返回值也复用同一模型。
+      - **多厂商**：OpenAI 用 parse；其他厂商用 JSON mode + model_validate_json，业务层拿到的都是同一个类型。
+      - **业务规则**：合计校验、日期不能在未来、税号格式等放在 validator 中。
+      - **工具参数**：用 pydantic_function_tool 定义工具，执行前再校验一次。
+    pitfalls: |
+      - **parsed 为 None 时直接取属性**：拒答时 parsed 为空，要先判断 refusal。
+      - **以为 parse 成功就万事大吉**：格式正确不代表值正确，业务 validator 必不可少。
+      - **给字段设默认值来表示可选**：发给模型的 strict Schema 仍要求字段 required，用 `X | None` 表达更直接；默认值相关行为以 SDK 报错为准。
+      - **混用 Pydantic v1 写法**：`.dict()`、`class Config` 在 v2 中已弃用。
+      - **校验失败后原样重试**：同样的输入大概率得到同样的错误，应把错误信息反馈给模型。
+    interview_asks:
+      - Pydantic 在 LLM 应用里起什么作用？
+      - OpenAI SDK 的 parse 方法做了什么？拒答时怎么处理？
+      - 哪些校验是 Schema 做不到、必须在代码里做的？
+    project_example: |
+      报销系统的票据抽取最初手写 JSON Schema 并在代码里用字典取值，字段改名时 Schema 和代码只改了一边，导致线上 KeyError。
+      重构后用 Pydantic 定义 `Invoice`，通过 `client.chat.completions.parse(response_format=Invoice)` 直接拿实例；
+      业务规则（明细合计等于总额、开票日期不晚于今天）写在 model_validator 中；对接的另一家兼容接口不支持 json_schema，就用 JSON mode 加 `model_validate_json` 校验，
+      两条链路输出同一个类型，下游代码完全不用区分。
+    freshness: |
+      核对于 2026-11：openai-python helpers.md 提供 client.chat.completions.parse（response_format 传 Pydantic 模型，结果在 message.parsed，拒答在 message.refusal，length 与 content_filter 抛异常）
+      与 client.responses.parse（text_format 传模型，结果在 output_parsed），以及 pydantic_function_tool；Structured Outputs 指南推荐使用 SDK 的 Pydantic/Zod 辅助以避免 Schema 与类型不一致。
+      阿里云百炼文档说明通过 OpenAI SDK 的 parse 方法可直接传入 Pydantic 类。旧写法 client.beta.chat.completions.parse 已迁出 beta。
+    sources:
+      - {title: "openai-python helpers.md", url: "https://raw.githubusercontent.com/openai/openai-python/main/helpers.md"}
+      - {title: "OpenAI Docs - Structured model outputs", url: "https://platform.openai.com/docs/guides/structured-outputs"}
+      - {title: "阿里云百炼 - OpenAI 兼容 Chat 参数说明", url: "https://help.aliyun.com/zh/model-studio/qwen-api-via-openai-chat-completions"}
+
+  - id: d19-k4
+    name: 结构化输出的失败兜底
+    level: P1
+    summary: 把失败分成拒答、截断、格式不符、业务不符四类，分别走提示、拆分、带错误重试、人工复核
+    why: |
+      即使用了 Structured Outputs，生产环境仍然会遇到拒答、截断、业务规则不通过、兼容接口返回空白等情况。
+      没有兜底策略，要么接口报错，要么更糟——把错误数据写进了数据库。面试中「结构化输出失败怎么办」是检验工程思维的典型问题。
+    problem: |
+      解决「**结构化输出不符合预期时，系统应该怎么做**」：哪些情况重试有用、重试时如何提高成功率、
+      什么时候降级或转人工，以及如何保证错误数据不会进入下游。
+    principle: |
+      **一、失败分类与对策**
+
+      | 失败类型 | 表现 | 对策 |
+      |---|---|---|
+      | 拒答 | refusal 有值，parsed 为空 | 不重试，记录并提示用户或转人工 |
+      | 截断 | finish_reason 为 length 或 status 为 incomplete | 提高输出上限、拆分输入后分段抽取 |
+      | 格式不符 | JSON 解析失败或 Pydantic 校验失败（JSON mode 或兼容接口） | 把校验错误反馈给模型重试 1~2 次 |
+      | 业务不符 | 合计不平、日期非法 | 带错误重试，仍失败转人工复核 |
+      | 空内容 | 例如 DeepSeek 文档提到 JSON Output 不可识别时用空格替换，content 可能全是空格 | 视为失败，重试或换模型 |
+
+      **二、带错误反馈的修复重试**
+
+      ```mermaid
+      sequenceDiagram
+        participant S as 抽取服务
+        participant M as LLM
+        participant V as Pydantic 校验
+        S->>M: 原始文本加 Schema
+        M-->>S: JSON 输出
+        S->>V: 校验
+        V-->>S: 失败 明细合计与总额不一致
+        S->>M: 追加上次输出和校验错误 请修正
+        M-->>S: 修正后的 JSON
+        S->>V: 再次校验
+        V-->>S: 通过
+        S->>S: 入库 并记录重试次数
+      ```
+
+      要点：
+      - 重试时把**上一次的输出和具体错误**告诉模型，而不是原样重发。
+      - 重试次数要有上限（通常 1~2 次），超出转人工或标记待复核。
+      - 拒答和额度类错误不重试。
+
+      **三、绝不返回「假数据」**
+
+      失败时返回一个全是默认值的对象（金额 0、日期今天），比直接报错更危险：下游会把它当真实数据入库。
+      正确做法是抛出明确的业务异常或返回带状态的结果（如 `status: needs_review`）。
+
+      **四、降级链**
+
+      Structured Outputs → JSON mode + Pydantic 校验 → 更强的模型 → 人工复核。每一级都要记录原因，便于统计。
+    scenarios: |
+      - **票据抽取**：校验失败带错误重试一次，仍失败进入人工复核队列。
+      - **长合同抽取**：截断时按章节拆分，分别抽取后合并。
+      - **非目标文档**：模型通过 document_type 字段说明不是发票，直接拒绝而非重试。
+      - **监控**：统计拒答率、截断率、校验失败率、重试成功率。
+    pitfalls: |
+      - **`except Exception` 返回默认对象**：错误数据静默入库。
+      - **对拒答反复重试**：浪费成本，可能触发风控。
+      - **截断后继续重试相同请求**：输出上限不变，结果一样被截断。
+      - **无限重试**：一条坏数据拖住整个批处理任务。
+    interview_asks:
+      - 结构化输出校验失败了，你怎么处理？
+      - 为什么失败时不能返回一个默认值对象？
+    project_example: |
+      财务系统的发票抽取服务曾在异常分支里返回「金额为 0 的空发票」，结果月底对账发现几十张 0 元发票入账。
+      整改后：拒答直接标记人工处理；截断按页拆分重抽；Pydantic 业务校验失败时把错误信息反馈给模型重试一次，仍失败进入复核队列；
+      接口返回值改为带状态的结果对象。之后再没有出现假数据入账，复核队列量稳定在约 2%。
+    freshness: |
+      核对于 2026-11：OpenAI Structured Outputs 指南要求应用处理 refusal、incomplete（max_output_tokens、content_filter）与 API 错误，并提示输入与 Schema 无关时可能产生幻觉；
+      DeepSeek JSON Output 文档说明不可识别的非 JSON 内容会被替换为空格，content 可能为空白，建议在代码中处理（如重试）。
+    sources:
+      - {title: "OpenAI Docs - Structured model outputs（Handle edge cases）", url: "https://platform.openai.com/docs/guides/structured-outputs"}
+      - {title: "DeepSeek API Docs - JSON Output", url: "https://api-docs.deepseek.com/guides/json_mode.md"}
+quiz:
+  - id: d19-q1
+    kp: d19-k1
+    type: judge
+    question: 只要设置 response_format 为 json_object（JSON mode），模型输出就一定包含 Schema 中定义的所有字段且类型正确。
+    answer: false
+    explain: |
+      JSON mode 只保证输出是语法合法的 JSON，不保证遵循任何特定结构，字段可能缺失、多出或类型不符。
+      只有 Structured Outputs（json_schema 加 strict）才保证完成且未拒答的输出符合 Schema。另外 JSON mode 还要求上下文中明确提到 JSON，否则可能报错或输出空白。
+  - id: d19-q2
+    kp: d19-k2
+    type: single
+    question: 以下哪个 Schema 设计可以直接用于 OpenAI 的 strict 结构化输出？
+    options:
+      - "根为 anyOf，两个分支分别是文本块对象和表格块对象，每个对象都禁止额外字段"
+      - "根为 object，字段 note 不在 required 中，其余字段 required，并设置 additionalProperties 为 false"
+      - "根为 object，所有字段 required，可选字段类型为 string 与 null 的联合，每个 object 设置 additionalProperties 为 false"
+      - "根为 object，用 allOf 组合基础信息和扩展信息两个子 Schema"
+    answer: [2]
+    explain: |
+      strict 要求根为 object 且不能是 anyOf，所有字段 required，每个 object 设置 additionalProperties 为 false，可选语义用 null 联合类型表达。
+      第一项根为 anyOf 不合法；第二项有字段不在 required 中；第四项使用了不支持的 allOf，可改为 $defs 引用。
+  - id: d19-q3
+    kp: d19-k1
+    type: multi
+    question: 已经使用 Structured Outputs（strict）后，应用代码仍然需要处理哪些情况？
+    options:
+      - "模型出于安全原因拒答，返回 refusal 而不是符合 Schema 的结果"
+      - "输出达到上限被截断，JSON 不完整"
+      - "完成且未拒答的输出中出现 Schema 未定义的额外字段"
+      - "字段格式正确但值与原文不符或是编造的"
+      - "明细合计与总额不一致等 Schema 无法表达的业务规则"
+    answer: [0, 1, 3, 4]
+    explain: |
+      Structured Outputs 保证的是完成且未拒答的输出符合 Schema，因此在 additionalProperties 为 false 时不会出现额外字段。
+      但拒答和截断不在保证范围内，需要检查 refusal 与 finish_reason 或 status；格式正确不代表内容正确，编造和业务规则不一致仍需校验和评测。
+  - id: d19-q4
+    kp: d19-k3
+    type: short
+    question: 在 LLM 抽取服务中，Pydantic 模型承担了哪些职责？为什么说它是「最后一道防线」？
+    key_points:
+      - {text: "说明 Pydantic 作为单一事实来源生成 JSON Schema，避免 Schema 与代码不一致", dim: concept}
+      - {text: "说明 model_validate_json 在运行时校验类型与约束，失败抛 ValidationError", dim: principle}
+      - {text: "说明 validator 可做 Schema 表达不了的业务校验", dim: engineering}
+      - {text: "说明对 JSON mode 或兼容接口的输出同样适用，统一下游类型", dim: engineering}
+    reference: |
+      第一，Pydantic 模型是数据契约的单一事实来源：通过 model_json_schema 或 SDK 的 parse 自动生成发给模型的 strict Schema，代码里的类型和 Schema 不会不一致。
+      第二，运行时校验：无论输出来自 Structured Outputs、JSON mode 还是不支持 json_schema 的兼容接口，都用 model_validate_json 校验类型、枚举、数值范围，不合格直接抛 ValidationError，不会让脏数据进入业务。
+      第三，业务校验：model_validator / field_validator 可以检查合计金额、日期合理性等 Schema 表达不了的规则，这些规则不会发给模型，只在本地执行。
+      第四，统一类型：不同模型链路最终都产出同一个 Pydantic 实例，下游代码不用区分来源。
+      之所以是最后一道防线，是因为模型侧的约束可能不存在（兼容接口）、可能不覆盖（拒答、截断、业务规则），只有本地校验能保证进入数据库的数据满足约定。
+  - id: d19-q5
+    kp: d19-k2
+    type: scenario
+    question: |
+      简历解析服务使用 Structured Outputs，Schema 包含姓名、电话、工作经历等字段，全部为 string 类型且 required。
+      用户误传了一份「采购合同」，系统依然返回了一份完整的「简历」，姓名填的是合同甲方，工作经历是编造的。请分析原因并给出改进方案。
+    key_points:
+      - {text: "指出约束解码会强制产出符合 Schema 的结构，输入无关时模型倾向于编造填满字段", dim: principle}
+      - {text: "提出增加文档类型枚举或 is_relevant 字段，让模型有说没有的出口", dim: engineering}
+      - {text: "提出字段改为 null 联合类型并在提示中说明无法提取时填 null", dim: engineering}
+      - {text: "提出后端根据类型字段拒绝入库并统计此类输入", dim: engineering}
+    reference: |
+      Structured Outputs 保证输出符合 Schema，而这个 Schema 要求所有字段都是非空字符串，模型没有「这不是简历」的表达途径，只能尽力填满，于是把合同信息硬塞进简历字段并编造经历。
+      OpenAI 文档也提醒：输入与 Schema 完全无关时，模型仍会尝试遵循 Schema，可能产生幻觉。
+      改进：在根上增加 document_type 枚举（resume、other）或 is_relevant 布尔字段，并放在其他字段之前；业务字段改为 string 与 null 的联合类型，提示词说明无法从原文得到时填 null，不要推测；
+      后端在 document_type 不是 resume 时拒绝入库并提示用户重新上传；对关键字段做原文校验（如电话号码必须出现在原文中）；统计此类输入比例，必要时在上传环节先做文档分类。
+    followup:
+      question: 如果字段是 null 联合类型，模型会不会因此变得「懒惰」，本来能提取的也填 null？怎么发现和控制？
+      key_points: [用带标注的评测集统计字段召回率, 在描述中明确何时必须填写, 对比改动前后的抽取指标]
+      reference: 有可能，需要用带标注的评测集统计每个字段的召回率和准确率，对比改动前后；在字段描述中写清「原文出现时必须提取」，并用示例说明；指标下降时调整描述或提示，而不是取消 null 出口。
+  - id: d19-q6
+    kp: d19-k4
+    type: design
+    question: |
+      请为「发票抽取 → 写入财务系统」设计一条结构化输出管道，要求同时支持 OpenAI（支持 Structured Outputs）和一家只支持 JSON mode 的兼容接口，
+      并说明各类失败的兜底策略和如何保证错误数据不会入账。
+    key_points:
+      - {text: "用 Pydantic 定义统一模型，OpenAI 走 parse，兼容接口走 JSON mode 加 model_validate_json", dim: engineering}
+      - {text: "区分拒答、截断、格式失败、业务校验失败并给出不同对策", dim: principle}
+      - {text: "带错误反馈的有限次重试，超限进入人工复核", dim: engineering}
+      - {text: "失败返回带状态的结果，禁止返回默认值对象，入账前再校验", dim: engineering}
+    reference: |
+      模型层：用 Pydantic 定义 Invoice（明细、总额、币种枚举、可为 null 的税号、document_type），业务规则写在 model_validator 中。
+      OpenAI 链路用 chat.completions.parse 或 responses.parse 传入模型；兼容接口链路用 JSON mode，提示词包含 json 字样和示例，拿到字符串后用 model_validate_json 校验，空白内容视为失败。
+      失败处理：拒答直接标记人工处理，不重试；截断时提高输出上限或按页拆分后合并；JSON 解析或 Pydantic 校验失败时，把上次输出和错误信息追加到对话让模型修正，最多 2 次；
+      业务规则失败同样带错误重试，仍失败进入人工复核队列；主模型连续失败可降级到备用模型。
+      入账保护：服务返回带状态的结果（ok、needs_review、rejected），禁止在异常时返回默认值对象；写入财务系统前再做一次校验并以发票号做幂等。
+      监控：记录拒答率、截断率、各类校验失败率、重试成功率、人工复核量，作为 Prompt 和 Schema 优化依据。
+code_reading:
+  id: d19-c1
+  kp: [d19-k3, d19-k4, d19-k1]
+  title: 基于 Pydantic 与 parse 的发票抽取函数
+  scenario: |
+    报销系统在用户上传发票后调用 `extract_invoice()`，把 OCR 得到的文本交给模型抽取结构化字段，结果直接写入财务系统。
+    月底对账发现多张「0 元、发票号为空」的记录。请审查这段代码，找出原因。
+  language: python
+  code: |
+    import logging
+    import os
+    from datetime import date
+    from typing import Literal
+
+    from openai import OpenAI
+    from pydantic import BaseModel, Field
+
+    logger = logging.getLogger(__name__)
+    client = OpenAI(api_key=os.environ["LLM_API_KEY"], timeout=60.0)
+    MODEL = os.getenv("LLM_MODEL", "gpt-5.5")
+
+
+    class LineItem(BaseModel):
+        name: str
+        quantity: int = Field(ge=1)
+        unit_price: float
+
+
+    class Invoice(BaseModel):
+        invoice_no: str = Field(description="发票号码")
+        issue_date: date
+        currency: Literal["CNY", "USD"]
+        items: list[LineItem]
+        total: float
+        buyer_tax_id: str | None = Field(description="购买方税号，没有则为 null")
+
+
+    def extract_invoice(ocr_text: str) -> Invoice:
+        try:
+            completion = client.chat.completions.parse(
+                model=MODEL,
+                messages=[
+                    {"role": "system", "content": "从发票文本中抽取字段，金额单位为元。"},
+                    {"role": "user", "content": ocr_text},
+                ],
+                response_format=Invoice,
+            )
+            invoice = completion.choices[0].message.parsed
+            logger.info("invoice=%s total=%s", invoice.invoice_no, invoice.total)
+            return invoice
+        except Exception as e:
+            logger.error("extract failed: %s", e)
+            return Invoice(invoice_no="", issue_date=date.today(), currency="CNY",
+                           items=[], total=0.0, buyer_tax_id=None)
+  walkthrough:
+    function: |
+      把 OCR 文本发送给模型，使用 Structured Outputs 按 `Invoice` 模型抽取发票号、日期、币种、明细、总额和税号，
+      SDK 自动把输出解析成 Pydantic 实例返回；出现任何异常时记录日志并返回一个默认的空发票对象。
+    key_functions: |
+      - `LineItem` / `Invoice`：Pydantic 模型，既是发给模型的 Schema 来源，也是返回值类型；`Literal` 生成枚举，`Field(ge=1)` 生成最小值约束，`str | None` 表示可为 null 但必填。
+      - `client.chat.completions.parse()`：SDK 辅助方法，把 `Invoice` 转为 strict JSON Schema 发送，并把结果解析到 `message.parsed`；拒答时 `parsed` 为空、`refusal` 有值；length 或 content_filter 时抛专门的异常。
+      - `extract_invoice()`：业务入口，负责调用、日志和异常兜底。
+    params: |
+      `ocr_text` 作为 user 消息传入；`response_format=Invoice` 传的是类本身而不是实例；
+      返回的 `completion.choices[0].message` 上有 `parsed`（Invoice 实例或 None）和 `refusal`（字符串或 None）；
+      `MODEL` 与 API Key 来自环境变量，客户端超时 60 秒。
+    data_flow: |
+      ```mermaid
+      flowchart TD
+        A["OCR 文本"] --> B["chat.completions.parse"]
+        B --> C{"调用结果"}
+        C -- "正常" --> D["message.parsed 为 Invoice"]
+        C -- "拒答" --> E["parsed 为 None"]
+        C -- "截断或过滤" --> F["抛出 FinishReason 异常"]
+        C -- "网络或 API 错误" --> G["抛出 API 异常"]
+        D --> H["记录日志并返回"]
+        E --> I["访问 invoice_no 抛 AttributeError"]
+        F --> J["except 分支"]
+        G --> J
+        I --> J
+        J --> K["返回 0 元空发票 被当作正常结果入账"]
+      ```
+    failure_points: |
+      - **吞掉异常并返回假数据（值得审查的问题 1）**：任何失败都返回金额 0、发票号为空、日期为今天的「合法」Invoice 对象，调用方无法区分成功与失败，于是写入财务系统——这正是对账发现 0 元发票的原因。
+      - **没有处理拒答（值得审查的问题 2）**：拒答时 `parsed` 为 None，`invoice.invoice_no` 抛 AttributeError，又被上面的兜底吞掉。
+      - 截断（输出上限不足，明细很多时）抛 `LengthFinishReasonError`，同样被吞。
+      - **缺少业务校验**：明细合计与总额是否一致、日期是否合理都没有检查；模型可能编造字段（输入不是发票时）。
+      - 网络、429、5xx 等也被统一吞掉，无法区分是否值得重试。
+    debugging: |
+      - 查看 error 日志中的异常类型，按 AttributeError（拒答）、LengthFinishReasonError（截断）、APIStatusError（接口错误）分类统计。
+      - 拿到一条 0 元发票对应的原始 OCR 文本，单独调用 parse 并打印 `message.refusal` 和 finish_reason。
+      - 写单元测试：模拟 parse 返回 parsed 为 None，断言函数抛出业务异常而不是返回默认对象。
+      - 在财务写入前加断言或校验，拦截 total 为 0 且发票号为空的记录并告警。
+    change_request: |
+      如果需求改为「抽取失败的发票进入人工复核，而不是报错」：把返回值改为带状态的结果（如 `ExtractResult(status, invoice, reason)`）；
+      在 parse 后先检查 `message.refusal`，再做业务校验（可在 Invoice 中加 model_validator）；分别捕获 `LengthFinishReasonError`、`ValidationError`、`openai.APIStatusError` 等，
+      可修复的错误带错误信息重试一次，其余返回 `needs_review`；调用方只在 `status == "ok"` 时入账。
+  questions:
+    - id: d19-c1-q1
+      kp: d19-k4
+      type: code
+      question: 假设模型对某张发票拒答。请按执行顺序说明 extract_invoice 的执行过程、最终返回值、日志内容和对下游的影响。
+      key_points:
+        - {text: "说明 parse 正常返回，但 message.parsed 为 None、refusal 有值", dim: principle}
+        - {text: "说明访问 invoice.invoice_no 时抛出 AttributeError", dim: principle}
+        - {text: "说明异常被 except 捕获，只记录 error 日志并返回 0 元默认发票", dim: engineering}
+        - {text: "指出下游无法区分失败，把假数据写入财务系统", dim: engineering}
+      reference: |
+        拒答不会抛出异常，parse 正常返回，`completion.choices[0].message.parsed` 为 None，`message.refusal` 中是拒答文本。
+        代码没有检查 refusal，执行 `logger.info("invoice=%s ...", invoice.invoice_no, ...)` 时，由于 invoice 是 None，访问属性抛出 AttributeError。
+        异常被 `except Exception` 捕获，记录一条 error 日志，内容只有 AttributeError 的信息，看不出是拒答；随后返回一个发票号为空、日期为今天、金额为 0 的 Invoice。
+        这个对象类型完全合法，调用方无法区分，于是写入财务系统，形成 0 元发票。
+        修复：先判断 refusal 并返回 needs_review 或抛业务异常，日志记录拒答原因；绝不在失败时构造默认对象。
+    - id: d19-c1-q2
+      kp: d19-k3
+      type: code
+      question: 说明 `response_format=Invoice` 背后发生了什么：Invoice 中的 `Literal`、`Field(ge=1)`、`str | None` 分别会变成什么样的 Schema？哪些规则不会被发送给模型？
+      key_points:
+        - {text: "说明 SDK 将 Pydantic 模型转换为 strict JSON Schema 并发送，再把输出解析为实例", dim: principle}
+        - {text: "说明 Literal 转为 enum，ge 转为 minimum，str 或 None 转为允许 null 且仍为 required", dim: concept}
+        - {text: "说明 validator 等自定义校验不会进入 Schema，只在本地解析时生效", dim: concept}
+      reference: |
+        SDK 根据 Invoice 生成 JSON Schema，并按 strict 要求处理：每个 object 设置 additionalProperties 为 false，所有字段列入 required，嵌套的 LineItem 通过定义引用或内联；然后以 json_schema 加 strict 的形式随请求发送，模型在约束解码下输出，SDK 再把 JSON 解析成 Invoice 实例。
+        `currency: Literal["CNY", "USD"]` 变为字符串 enum；`quantity: int = Field(ge=1)` 变为 integer 且 minimum 为 1；`issue_date: date` 变为 string 加 date 格式；
+        `buyer_tax_id: str | None` 变为允许 string 或 null 的类型（常见表示为 anyOf 包含 null），并且仍在 required 中，没有值时模型输出 null。
+        如果在 Invoice 中加 model_validator（如合计校验）或 field_validator，这些 Python 逻辑不会出现在 Schema 中，模型不知道这些规则，只会在本地解析时执行并可能抛出校验错误，所以这类错误需要额外的重试或复核流程。
+    - id: d19-c1-q3
+      kp: d19-k1
+      type: code
+      question: |
+        一张发票有 300 行明细，抽取时总是失败。结合 parse 的行为说明可能的执行路径，并给出两种以上的解决方案。
+      key_points:
+        - {text: "指出输出超过上限，finish_reason 为 length，parse 抛出 LengthFinishReasonError", dim: principle}
+        - {text: "指出该异常被吞掉并返回默认发票，日志难以定位", dim: engineering}
+        - {text: "提出提高输出上限、按页拆分抽取再合并、只抽汇总字段等方案", dim: engineering}
+      reference: |
+        300 行明细的 JSON 很长，超过默认或模型允许的输出长度后生成被截断，finish_reason 为 length。chat.completions.parse 在这种情况下会抛出 LengthFinishReasonError，而不是返回半截结果。
+        这个异常被 `except Exception` 吞掉，返回 0 元默认发票，日志里只有一条 extract failed，必须看异常类型才能知道是截断。
+        解决方案：一是显式设置更大的 max_completion_tokens（推理模型还要考虑推理 Token 也计入上限）；二是按页或按行块拆分 OCR 文本分段抽取明细，再在代码中合并并校验合计；
+        三是调整需求，只让模型抽取表头和汇总，明细用规则或表格解析；同时单独捕获 LengthFinishReasonError，转入拆分流程而不是重试相同请求。
+interview:
+  - id: d19-i1
+    kp: d19-k1
+    type: oral
+    difficulty: 1
+    question: JSON mode 和 Structured Outputs 有什么区别？你会怎么选？
+    key_points:
+      - {text: "说明 JSON mode 只保证合法 JSON，Structured Outputs 保证符合 Schema", dim: concept}
+      - {text: "说明 Structured Outputs 基于约束解码", dim: principle}
+      - {text: "说明 JSON mode 需在提示中出现 JSON 字样等注意事项", dim: concept}
+      - {text: "给出选择原则与兼容接口下的降级方案", dim: engineering}
+    reference: |
+      JSON mode（response_format 为 json_object）只保证输出是语法合法的 JSON，不保证字段、类型和枚举符合你的结构，而且要求在上下文中明确提到 JSON，否则 OpenAI 会报错，模型也可能输出大量空白。
+      Structured Outputs（json_schema 加 strict）保证完成且未拒答的输出严格符合你提供的 Schema，原理是约束解码：把 Schema 转换为语法规则，生成每个 Token 时屏蔽不合法的候选。
+      OpenAI 建议能用 Structured Outputs 就不用 JSON mode。选择上：模型支持时优先 Structured Outputs；兼容接口只支持 JSON mode 时，用 JSON mode 加示例提示，再用 Pydantic 校验和带错误的重试兜底。
+      无论哪种，都要处理拒答、截断和业务校验。连接工具和系统时用 Function Calling，约束回复格式时用 response_format。
+    oral: |
+      一句话区别：JSON mode 保证是合法 JSON，Structured Outputs 保证是你要的那个 JSON。Structured Outputs 背后是约束解码，生成时直接把不符合 Schema 的 Token 屏蔽掉。
+      我做工单分类时，Prompt 约束的解析失败率约 4%，换 JSON mode 后语法错误没了，但字段名会变、会多字段；换成 Structured Outputs 加枚举后解析失败率就是 0。
+      所以我优先用 Structured Outputs；对只支持 JSON mode 的兼容接口，就用 JSON mode 加 Pydantic 校验和重试兜底。另外不管哪种，拒答和截断都要自己处理。
+  - id: d19-i2
+    kp: d19-k2
+    type: oral
+    difficulty: 2
+    question: strict 模式下的 JSON Schema 有哪些限制？可选字段怎么表达？
+    key_points:
+      - {text: "根必须是 object 且不能是 anyOf", dim: concept}
+      - {text: "所有字段 required，每个 object 设置 additionalProperties false，可选用 null 联合", dim: concept}
+      - {text: "不支持 allOf、not、if then else 等，有嵌套深度与属性数量限制", dim: concept}
+      - {text: "说明为什么有这些限制（便于转换为语法规则做约束解码）并给出改写经验", dim: principle}
+    reference: |
+      OpenAI strict 模式只支持 JSON Schema 的子集：根必须是 object，不能是 anyOf；所有字段都必须列入 required；每个 object 都必须设置 additionalProperties 为 false；
+      支持 string、number、integer、boolean、object、array、enum、anyOf，以及 pattern、format、minimum、maximum、minItems 等约束和 $defs、递归；
+      不支持 allOf、not、if/then/else、dependentRequired 等；有最多 5000 个属性、10 层嵌套、1000 个枚举值等规模限制；输出键顺序与 Schema 一致。
+      可选字段的表达方式是仍然放在 required 中，类型写成「原类型与 null 的联合」，没有值时模型输出 null。
+      这些限制源于约束解码需要把 Schema 转换为确定、有限的语法规则。实践中 allOf 改成 $defs 引用，根 anyOf 外面包一层 object，过深的结构拆成多次抽取。
+    oral: |
+      strict 的规则我记成三条加一个出口：根是 object，所有字段都 required，每个对象都禁止额外字段；出口就是可选字段用「类型或 null」表示。
+      另外不支持 allOf、not、if then else 这类组合，嵌套和属性数量也有上限。我的理解是约束解码要把 Schema 编译成语法，所以只能支持确定的子集。
+      我做简历解析时用 allOf 复用工作经历的结构，开 strict 后全部 400，改成 $defs 引用就好了。
+  - id: d19-i3
+    kp: d19-k3
+    type: oral
+    difficulty: 3
+    question: 在你的项目里，Pydantic 和 OpenAI SDK 的 parse 是怎么配合使用的？拒答和校验失败怎么处理？
+    key_points:
+      - {text: "说明 Pydantic 模型作为单一事实来源，SDK 自动转 strict Schema 并解析回实例", dim: principle}
+      - {text: "说明 Chat 用 message.parsed 与 refusal，Responses 用 output_parsed", dim: concept}
+      - {text: "说明 length 和 content_filter 会抛专门异常，需分别处理", dim: engineering}
+      - {text: "说明 validator 做业务校验，失败带错误重试或转人工", dim: engineering}
+      - {text: "结合项目说明多厂商下统一类型的做法", dim: project}
+    reference: |
+      我用 Pydantic 定义输出模型，例如 Invoice，枚举用 Literal，范围用 Field 约束，可为空用 X 或 None；业务规则用 model_validator。
+      OpenAI 链路调用 client.chat.completions.parse 并传 response_format=Invoice，或者 client.responses.parse 传 text_format=Invoice；SDK 把模型转换为 strict JSON Schema 发送，再把输出解析为实例。
+      Chat 接口中先检查 message.refusal，有值说明拒答，parsed 为 None，不重试，标记人工处理；finish_reason 为 length 或 content_filter 时 parse 会抛 LengthFinishReasonError 或 ContentFilterFinishReasonError，截断走拆分流程。
+      本地 validator 失败抛 ValidationError 时，把上次输出和错误信息反馈给模型重试一次，仍失败进入复核队列。
+      对只支持 JSON mode 的厂商，用 model_validate_json 校验字符串，产出同一个类型，下游无感知。旧写法 client.beta.chat.completions.parse 已不再需要 beta 前缀。
+    oral: |
+      我的做法是 Pydantic 模型就是契约。定义好 Invoice，调用 chat.completions.parse 时直接把类传进去，SDK 帮我转成 strict Schema，回来直接是实例。
+      拿到结果先看 refusal，拒答就不重试、转人工；截断的话 parse 会抛专门的异常，我会拆分再抽。业务规则比如明细合计等于总额，我写在 model_validator 里，失败了把错误信息告诉模型让它修一次，还不行就进复核队列。
+      我们还接了一家只支持 JSON mode 的厂商，那边用 model_validate_json 校验，最终两条链路输出同一个类型，下游代码完全不用管来源。
+  - id: d19-i4
+    kp: d19-k4
+    type: oral
+    difficulty: 3
+    question: 结构化输出失败了你怎么兜底？为什么不能返回一个默认对象？
+    key_points:
+      - {text: "按拒答、截断、格式失败、业务失败分类处理", dim: principle}
+      - {text: "格式与业务失败带错误反馈重试且有上限", dim: engineering}
+      - {text: "说明返回默认对象会让下游把假数据当真，应返回带状态结果或抛业务异常", dim: engineering}
+      - {text: "提出降级链与失败率监控", dim: engineering}
+      - {text: "结合项目举出假数据入库的教训", dim: project}
+    reference: |
+      先分类：拒答不重试，记录原因并转人工；截断时提高输出上限或拆分输入；JSON 解析或 Pydantic 校验失败时，把上一次输出和具体错误反馈给模型重试 1 到 2 次；业务规则失败同样带错误重试，仍不通过进入人工复核；兼容接口返回空白内容视为失败。
+      降级链可以是 Structured Outputs、JSON mode 加校验、更强的模型、人工复核。
+      不能返回默认对象，是因为它在类型上完全合法，调用方无法区分成功与失败，会把金额为 0、字段为空的假数据写入数据库或财务系统，问题被推迟到对账时才暴露，而且很难追溯。
+      正确做法是返回带状态的结果（ok、needs_review、rejected）或抛明确的业务异常，入库前再做一次校验并以业务主键幂等。
+      监控拒答率、截断率、校验失败率、重试成功率和复核量。
+    oral: |
+      我会先把失败分四类：拒答、截断、格式不对、业务不对。拒答不重试转人工；截断就拆分；格式和业务不对就把错误信息告诉模型让它改，最多重试两次，还不行进复核队列。
+      默认对象我是吃过亏的：之前发票抽取在 except 里返回了一个 0 元空发票，类型完全合法，结果月底对账发现几十张 0 元发票入了账。
+      后来改成返回带状态的结果，只有 ok 才入账，入账前再校验一次，复核量稳定在 2% 左右，再没出现假数据。
+  - id: d19-i5
+    kp: d19-k2
+    type: design
+    difficulty: 4
+    question: |
+      请设计一个生产级的「合同关键信息抽取」服务：输入是几十页的合同文本，输出是甲乙方、金额、期限、违约条款等结构化字段，
+      要求支持多模型、可审计、错误不入库。请说明 Schema 设计、调用策略、长文档处理、校验与兜底、评测与监控。
+    key_points:
+      - {text: "Schema 用 Pydantic 定义，含文档类型、null 出口、枚举、原文引用字段", dim: engineering}
+      - {text: "长文档按章节拆分或先定位相关段落再抽取，避免截断与上下文超长", dim: principle}
+      - {text: "多模型下 Structured Outputs 与 JSON mode 加校验的双链路，统一类型", dim: engineering}
+      - {text: "业务校验、带错误重试、人工复核、带状态结果与幂等入库", dim: engineering}
+      - {text: "用标注评测集衡量字段准确率与召回率并持续监控", dim: project}
+    reference: |
+      Schema：用 Pydantic 定义 ContractInfo，根包含 document_type 枚举（合同、其他）；甲乙方、金额（数值加币种枚举）、起止日期、违约条款列表等字段；无法确定时为 null；
+      关键字段附带 evidence（原文片段）和所在页码，便于审计和人工核对；结构控制在 strict 子集内，字段描述写清格式与单位。
+      长文档：几十页合同直接整体抽取容易截断或超长，先按章节切分，用关键词或检索定位与金额、期限、违约相关的段落，再分字段组抽取，最后在代码中合并，冲突时保留证据并标记复核。
+      调用：OpenAI 用 parse 走 Structured Outputs；只支持 JSON mode 的厂商用 JSON mode 加示例和 model_validate_json；统一调用层负责超时、重试与降级（Day 20）。
+      校验与兜底：model_validator 检查日期先后、金额为正、evidence 必须出现在原文中；拒答转人工，截断走更细拆分，校验失败带错误重试一次，仍失败返回 needs_review；禁止默认对象，入库前以合同编号幂等。
+      评测与监控：建立带人工标注的合同评测集，统计每个字段的准确率、召回率；线上监控拒答率、截断率、校验失败率、复核率与成本，Schema 或 Prompt 变更必须回归评测。
+    oral: |
+      我会分五块设计。Schema 用 Pydantic，根上先有文档类型，字段都留 null 出口，关键字段带原文证据和页码，方便审计。
+      长文档不整篇丢给模型，先按章节切、定位相关段落，再分组抽取后合并，避免截断。调用层 OpenAI 走 parse，只支持 JSON mode 的厂商走校验链路，输出同一个类型。
+      校验上除了 Schema，还用 validator 检查日期先后、金额为正、证据必须在原文中出现；失败带错误重试一次，不行就进复核，绝不返回默认对象，这个我在发票项目里吃过亏。
+      最后用标注评测集按字段统计准确率和召回率，Schema 一改就跑回归，线上盯拒答率、截断率和复核率。
+sources:
+  - {title: "OpenAI Docs - Structured model outputs", url: "https://platform.openai.com/docs/guides/structured-outputs"}
+  - {title: "OpenAI - Introducing Structured Outputs in the API", url: "https://openai.com/index/introducing-structured-outputs-in-the-api/"}
+  - {title: "openai-python helpers.md", url: "https://raw.githubusercontent.com/openai/openai-python/main/helpers.md"}
+  - {title: "DeepSeek API Docs - JSON Output", url: "https://api-docs.deepseek.com/guides/json_mode.md"}
+  - {title: "阿里云百炼 - OpenAI 兼容 Chat 参数说明", url: "https://help.aliyun.com/zh/model-studio/qwen-api-via-openai-chat-completions"}

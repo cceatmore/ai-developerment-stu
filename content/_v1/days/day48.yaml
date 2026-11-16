@@ -1,0 +1,685 @@
+day: 48
+phase: 5
+title: AI 应用评估
+goals:
+  - 能解释为什么非确定性的 LLM 系统也必须测试，并区分单元测试、离线评估集、线上监控各自负责什么
+  - 能设计一个黄金评估集，并说清 LLM-as-judge 的常见偏差和校准方法
+  - 能为 Prompt 或模型变更设计 CI 中的回归评估流程，包括基线、阈值和分组对比
+  - 能说出一条 LLM 请求在可观测平台中应记录的关键字段，并了解 OpenTelemetry GenAI 语义约定和主流工具现状
+knowledge_points:
+  - id: d48-k1
+    name: 非确定性系统的测试分层
+    level: P0
+    summary: 确定的部分用单元测试锁死，不确定的部分用评估集统计，线上用监控兜底
+    why: |
+      很多团队的 AI 功能「全靠手点几下觉得还行就上线」，改一句 Prompt 或升级一次模型后，某类问题悄悄变差，直到用户投诉才发现。
+      面试中「你们怎么测试 LLM 应用」是区分「会调 API」和「能交付产品」的关键问题。
+    problem: |
+      解决「输出不固定的系统怎么判断对不对、改动后有没有变差」的问题。
+      传统测试依赖「相同输入 → 相同输出 → 精确断言」，LLM 不满足这个前提；但如果因此放弃测试，就无法安全地改 Prompt、换模型、调检索参数。
+    principle: |
+      **一、为什么非确定性系统也要测**
+
+      - LLM 输出受采样影响，即使温度为 0，厂商侧的批处理、硬件和模型更新也可能让输出变化，**不能假设完全确定**。
+      - 但系统里大量部分**是确定的**：Prompt 模板渲染、检索参数、工具 Schema、结果解析、权限过滤、重试逻辑。这些错了，模型再好也没用。
+      - 不确定的部分无法用「对 / 错」一次断言，但可以用**一组样本的通过率、分数分布**来衡量，并和上一个版本比较。
+
+      **二、三层测试各管什么**
+
+      ```mermaid
+      flowchart TB
+        A["单元与集成测试 每次提交 秒级"] --> B["离线评估集 改Prompt或模型时 分钟级"]
+        B --> C["线上监控与反馈 持续"]
+        C -->|"发现新的失败案例"| D["补充进评估集"]
+        D --> B
+      ```
+
+      | 层次 | 测什么 | 怎么判定 | 何时跑 |
+      |---|---|---|---|
+      | 单元/集成测试 | 模板渲染、解析、权限、工具参数、错误处理 | 精确断言，LLM 用 Mock 或录制回放 | 每次提交 |
+      | 离线评估集 | 回答正确性、忠实度、检索命中、格式合规、安全用例 | 规则断言 + 相似度 + LLM 评审，看通过率 | Prompt/模型/检索变更时，CI 门禁 |
+      | 线上监控 | 真实流量的质量、延迟、成本、用户反馈 | 抽样评审、指标趋势、告警 | 持续 |
+
+      **三、评估中常用的判定方式（由便宜到昂贵）**
+
+      1. **确定性规则**：JSON 是否能解析、是否符合 Schema、是否包含必需引用、是否没有出现禁止词、长度是否在范围内。
+      2. **基于参考答案**：关键事实是否包含、与参考答案的语义相似度。
+      3. **LLM 评审（LLM-as-judge）**：用评分规则让另一个模型打分，适合开放式回答。
+      4. **人工评审**：最贵也最准，用来校准前三种。
+
+      **四、应对非确定性的实践**
+
+      - 评估时固定温度等参数，记录模型版本快照名。
+      - 关键用例**重复运行多次**看通过率，而不是单次结果。
+      - 判断回归时看**整体通过率 + 分组通过率**的变化是否超过阈值，而不是要求每条结果都与上次一致。
+      - 单元测试中的 LLM 调用用 Mock，保证 CI 稳定、快、不花钱。
+
+      **不做会怎样**：每次改动都是赌博，问题只能靠用户投诉发现；团队对改 Prompt 产生恐惧，系统无法迭代。
+    scenarios: |
+      - 每次提交跑单元测试：断言 Prompt 模板在缺少检索结果时会走「无法回答」分支，断言工具参数解析失败时返回明确错误。
+      - 修改 System Prompt 后跑 200 条评估集，对比通过率与上个版本。
+      - 线上每天抽样 1% 对话做自动评审，并统计用户点踩率趋势。
+    pitfalls: |
+      - **误区：LLM 输出不确定，所以没法测。** 确定性部分可以精确测，不确定部分可以统计测。
+      - **误区：温度设为 0 就能用字符串完全相等来断言。** 输出仍可能变化，应断言结构与关键事实。
+      - **误区：评估集等于单元测试。** 评估集看的是分数分布和趋势，不要求每条都通过。
+      - **误区：只做离线评估。** 线上问题分布会漂移，必须用监控和反馈持续补充评估集。
+    interview_asks:
+      - LLM 输出不确定，你们怎么做测试？
+      - 单元测试、评估集、线上监控分别负责什么？
+      - 评估时如何应对模型输出的随机性？
+    project_example: |
+      知识库问答项目的测试分层：单元测试 120 条（模板、权限过滤、引用解析，LLM 全部 Mock），每次提交 20 秒内跑完；
+      离线评估集 300 条，覆盖 8 类问题和 30 条安全用例，修改 Prompt、模型或检索参数时在 CI 中运行约 6 分钟；
+      线上每天抽样 500 条对话自动评审，点踩的对话经人工确认后补充进评估集，三个月内评估集增长到 520 条。
+  - id: d48-k2
+    name: 黄金数据集与 LLM-as-judge
+    level: P0
+    summary: 评估集质量决定评估的上限；LLM 评审要用人工标注来校准，并控制位置、长度、自我偏好偏差
+    why: |
+      没有评估集，就没有「变好还是变差」的客观依据；而 LLM-as-judge 是目前开放式回答评估的主流方式，几乎所有评估工具都内置。
+      面试官常追问「你怎么保证评审模型打分是可信的」，答不出偏差和校准，评估结论就站不住。
+    problem: |
+      解决「用什么数据评估」和「开放式回答谁来打分」两个问题。
+      随手写 20 条问题的评估集覆盖不了真实分布，分数高也没意义；直接让模型打分而不校准，可能系统性偏向长回答或自家模型，导致优化方向错误。
+    principle: |
+      **一、黄金数据集怎么建**
+
+      ```mermaid
+      flowchart LR
+        S1["线上日志抽样 脱敏"] --> M["候选池"]
+        S2["业务专家编写 关键场景"] --> M
+        S3["失败案例与投诉"] --> M
+        S4["红队与安全用例"] --> M
+        M --> L["标注 参考答案 关键事实 应引用文档"]
+        L --> V["分组打标签 版本化存储"]
+        V --> E["评估集 v3"]
+      ```
+
+      - **来源多样**：真实日志（反映分布）、专家编写（覆盖关键业务）、失败案例（防止复发）、安全用例（注入、越权，见 Day 47）。
+      - **每条样本包含**：输入、参考答案或关键事实点、应命中的文档 ID（用于检索评估，见 Day 29）、分组标签（问题类型、难度、租户类型）。
+      - **规模**：起步 50~200 条高质量样本比 2000 条低质量样本有用；之后按失败案例持续增长。
+      - **版本化**：评估集像代码一样有版本号，分数只在同一版本评估集上可比。
+      - **防止污染**：评估样本不能出现在 Few-shot 示例或微调数据中，否则分数虚高。
+      - **脱敏**：来自线上日志的样本先脱敏（Day 47）。
+
+      **二、LLM-as-judge 的三种形式**
+
+      - **单点打分**：给回答按评分规则打 1~5 分或通过/不通过。
+      - **成对比较**：给出 A、B 两个回答，选更好的一个，适合比较两个版本。
+      - **基于参考**：给出参考答案或关键事实，判断回答是否覆盖、是否矛盾。最稳定，推荐优先使用。
+
+      **三、已知偏差**（Zheng 等人 2023 年 MT-Bench 研究中系统讨论过）
+
+      | 偏差 | 表现 | 缓解 |
+      |---|---|---|
+      | 位置偏差 | 成对比较时偏向放在前面或后面的回答 | 交换顺序各评一次，不一致记为平局 |
+      | 长度偏差 | 偏向更长、看起来更详细的回答 | 评分规则明确「简洁准确优先」，参考答案对照 |
+      | 自我偏好 | 偏向自己或同系模型生成的回答 | 评审模型与被测模型使用不同厂商或系列 |
+
+      其他注意：评审 Prompt 要给出**明确的评分规则和示例**；输出结构化结果（分数 + 理由）；评审温度设低；评审本身也有成本，需控制样本量。
+
+      **四、用人工标注校准评审**
+
+      ```mermaid
+      sequenceDiagram
+        participant H as 人工标注
+        participant J as LLM评审
+        participant A as 一致性分析
+        H->>A: 100条样本的人工判定
+        J->>A: 同样100条的评审判定
+        A-->>J: 一致率低于阈值 修改评分规则或换评审模型
+        A-->>H: 分歧样本复核 补充评分规则示例
+      ```
+
+      先人工标注一小批样本（如 100 条），计算评审与人工的一致率；一致率达到可接受水平后才把评审用于大规模评估，并定期抽检。
+
+      **不做会怎样**：评估集不代表真实分布，分数涨了用户体验却没变；评审有系统偏差时，团队会朝「更啰嗦」的方向优化。
+    scenarios: |
+      - 客服机器人：从过去一个月日志中按问题类型分层抽样 150 条，业务专家写参考答案与必须提到的政策条款。
+      - 比较新旧两版 Prompt：用成对比较评审，每对样本交换顺序评两次，只统计两次一致的结果。
+      - 每季度人工复核 100 条评审结果，检查评审模型与人工一致率是否下降。
+    pitfalls: |
+      - **误区：评估集越大越好。** 低质量、重复、无参考答案的样本只会制造噪音。
+      - **误区：用被测模型自己当评审。** 存在自我偏好偏差，且模型的盲区在评审中也会被放过。
+      - **误区：评审模型说好就是好。** 没有与人工标注的一致性校准，分数没有可信度。
+      - **误区：评估样本可以顺手当 Few-shot 示例。** 会造成数据污染，评估分数虚高。
+    interview_asks:
+      - 你们的评估集是怎么构建的？有多少条？怎么维护？
+      - LLM-as-judge 可信吗？有哪些偏差，怎么缓解？
+      - 你怎么验证评审模型的打分是准确的？
+    project_example: |
+      合同问答助手的评估集 v1 有 180 条：120 条来自脱敏后的线上日志分层抽样，40 条由法务专家编写，20 条为注入与越权用例。
+      评审采用「基于关键事实点」的方式，评审模型与被测模型来自不同厂商。人工标注 100 条做校准，第一版评分规则一致率只有约七成，补充了「部分正确」的判定示例后提升到九成左右，之后才正式启用。
+    sources:
+      - {title: "Zheng et al. 2023 - Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena", url: "https://arxiv.org/abs/2306.05685"}
+  - id: d48-k3
+    name: Prompt 与模型变更的回归测试
+    level: P0
+    summary: 把 Prompt 当代码管理：版本化、CI 跑评估集、与基线比较、分组看结果、灰度上线
+    why: |
+      AI 应用最频繁的改动不是代码，而是 Prompt、模型版本、检索参数。这些改动不经过回归测试，就是「修好一类问题、弄坏另一类问题」的高发区。
+      模型厂商还会下线旧模型，迁移新模型是每个团队都会遇到的真实任务。
+    problem: |
+      解决「这次改动有没有让系统变差」的问题。
+      没有回归流程时：Prompt 直接在后台改、没有版本记录；换模型只试了几个例子；上线后某一类问题准确率大幅下降，却无法定位是哪次改动导致的。
+    principle: |
+      **一、变更来源与触发**
+
+      需要触发回归评估的改动：System Prompt / 模板、模型名称或快照版本、温度等参数、检索 Top-K / 切片策略 / Rerank、工具定义、评估集本身的更新。
+
+      **二、CI 中的回归流程**
+
+      ```mermaid
+      flowchart LR
+        PR["提交 Prompt 或模型变更"] --> U["单元测试 Mock LLM"]
+        U --> E["运行评估集 新版本"]
+        E --> C["与基线对比 整体与分组"]
+        C -->|"未超阈值"| G["合并 灰度发布"]
+        C -->|"超阈值下降"| F["阻止合并 输出失败样本"]
+        G --> O["线上监控 对比新旧版本"]
+        O -->|"稳定"| B["更新基线"]
+      ```
+
+      关键设计：
+      - **Prompt 版本化**：Prompt 存在代码仓库或带版本号的 Prompt 管理系统中，每次调用在 Trace 里记录 Prompt 版本号。
+      - **固定模型快照**：使用带日期或版本的模型标识，而不是会被厂商静默更新的别名，否则「什么都没改」分数也可能变。
+      - **基线**：保存上一个已发布版本在同一评估集版本上的结果，包括整体通过率和每个分组的通过率。
+      - **阈值与分组**：整体下降超过如 2 个百分点阻止合并；**任何一个关键分组**（如安全用例）不允许下降。只看整体平均会掩盖局部退化。
+      - **失败样本可读**：CI 输出新旧版本结果不同的样本列表，方便人工判断是真退化还是评审误差。
+      - **成本与延迟也是回归项**：新 Prompt 让平均输入 Token 增加 40%，即使质量不变也要被看见。
+
+      **三、线上灰度与对比**
+
+      离线评估通过后，通过配置开关让 5%~10% 流量使用新版本，对比点踩率、转人工率、平均 Token、延迟。稳定后全量，并把新结果设为基线。
+
+      **四、统计意义的直觉**
+
+      评估集只有 100 条时，通过率从 82% 变到 80% 可能只是随机波动（2 条样本的差异）。对小幅变化要多跑几次或扩大样本，再下结论；对关键分组宁可保守。
+    scenarios: |
+      - 厂商宣布旧模型下线：用同一评估集比较三个候选模型的通过率、成本、延迟，选定后灰度 10% 流量一周。
+      - 产品经理要求「回答更简洁」：改 Prompt 后在 CI 中发现「多步骤操作指引」分组通过率下降，回到 Prompt 中对该类问题单独说明。
+      - 调整检索 Top-K 从 8 到 5：同时观察检索命中率、回答通过率和平均输入 Token。
+    pitfalls: |
+      - **误区：Prompt 放在数据库里由运营随时修改且没有评估。** 等于绕过了所有测试直接改生产。
+      - **误区：只看整体通过率。** 整体上升 3% 的同时，安全用例或某类业务可能明显下降。
+      - **误区：使用会被静默更新的模型别名做基线。** 基线本身在漂移，对比没有意义。
+      - **误区：评估集中出错的样本直接跳过不计。** 会让通过率虚高，错误应计为失败并单独统计。
+    interview_asks:
+      - 你们修改 Prompt 的流程是怎样的？怎么保证不会改坏？
+      - 要把模型从 A 换成 B，你会怎么评估和上线？
+      - 回归评估的阈值怎么定？
+    project_example: |
+      客服机器人迁移模型：在 400 条评估集上，新模型整体通过率从 86% 升到 89%，但「退款政策」分组从 92% 降到 78%。
+      分析失败样本发现新模型更倾向于自行概括政策而不是引用原文，于是在 Prompt 中要求该类问题逐条引用条款，分组恢复到 93%。
+      之后灰度 10% 一周，点踩率无显著变化，全量上线并更新基线。
+  - id: d48-k4
+    name: 可观测性：Trace、Token、成本与用户反馈
+    level: P1
+    summary: 每次 LLM 调用都要能回答：谁、调了什么、花了多久、多少 Token、多少钱、结果好不好
+    why: |
+      LLM 应用出问题时，很少是「报错」，更多是「答得不好」「突然变慢」「成本翻倍」。没有可观测性，就只能靠猜。
+      离线评估只覆盖已知问题，线上 Trace 和反馈是发现未知问题的唯一途径，也是补充评估集的主要来源。
+    problem: |
+      解决「线上到底发生了什么」的问题：一次回答经过了哪些步骤、每步耗时、检索到了什么、用了多少 Token、用户是否满意。
+      没有 Trace，排查一次错误回答需要翻遍多个服务的日志并手工拼接时间线。
+    principle: |
+      **一、Trace 与 Span**
+
+      一次用户请求是一个 **Trace**，内部每个步骤是一个 **Span**，Span 之间有父子关系，组成调用树：
+
+      ```mermaid
+      flowchart TB
+        T["Trace 用户提问 总耗时 4.2s"] --> S1["Span 鉴权 5ms"]
+        T --> S2["Span 检索 180ms 返回5个片段ID"]
+        T --> S3["Span LLM调用 3.9s 输入3100 输出420 Token"]
+        T --> S4["Span 工具调用 查订单 120ms"]
+        S2 --> S21["Span Embedding 60ms"]
+        S2 --> S22["Span 向量检索 40ms"]
+        S2 --> S23["Span Rerank 70ms"]
+      ```
+
+      **二、每次 LLM 调用应记录的字段**
+
+      - 模型与参数：提供方、请求的模型名、实际响应的模型名、温度、max_tokens。
+      - 用量与成本：输入 Token、输出 Token、缓存命中 Token、按价格表折算的成本。
+      - 性能：总耗时、TTFT（流式）。
+      - 结果：结束原因（正常结束、长度截断、内容过滤、工具调用）、错误类型。
+      - 业务上下文：用户 ID / 租户 ID（用于成本归因）、Prompt 版本号、会话 ID。
+      - 质量信号：用户点赞/点踩、是否转人工、线上抽样评审分数，并关联回对应 Trace。
+      - **内容（Prompt 与回答原文）默认不记录**，需要时脱敏后在受控范围内开启（Day 47）。
+
+      **三、OpenTelemetry GenAI 语义约定（现状）**
+
+      OpenTelemetry 为生成式 AI 定义了一组统一的属性名，例如 `gen_ai.operation.name`、`gen_ai.provider.name`（旧名 `gen_ai.system`）、`gen_ai.request.model`、`gen_ai.usage.input_tokens` / `gen_ai.usage.output_tokens`，以及用于记录评估结果的 `gen_ai.evaluation.result` 事件。好处是用一套埋点就能把数据发给不同的后端平台。
+
+      但要知道它**还在快速变化**：
+      - 截至 2026-11，GenAI 相关的 Span、指标、事件、属性**全部处于 Development（开发中）状态**，没有一项是 Stable。
+      - 2026 年这部分约定已从 OpenTelemetry 主语义约定仓库**迁移到独立仓库** `semantic-conventions-genai`，主仓库中的旧 `gen_ai.*` 定义已标记弃用；独立仓库尚无正式发布版本。
+      - 历史上发生过多次改名（如 `prompt_tokens` → `input_tokens`，`gen_ai.system` → `gen_ai.provider.name`），各框架实际输出的字段可能新旧混杂。
+
+      工程建议：固定你使用的埋点库版本；查询时兼容新旧字段名；自定义业务属性不要放在 `gen_ai.*` 命名空间下；以实际导出的 Span 为准，而不是只看文档。
+
+      **四、从数据到行动**
+
+      - 大盘：QPS、P95/P99、TTFT、错误率、429 率、每租户 Token 与成本、点踩率。
+      - 告警：错误率、成本日环比、点踩率突增。
+      - 闭环：点踩和低分 Trace 进入人工复核队列，确认后加入评估集（k1 的闭环）。
+    scenarios: |
+      - 成本异常排查：大盘显示某租户日成本翻倍，按 Trace 下钻发现一个 Agent 循环调用工具 30 次才结束。
+      - 回答质量投诉：根据用户提供的会话 ID 找到 Trace，看到检索返回的片段全部来自过期文档。
+      - 发布新 Prompt 后，按 Prompt 版本号分组对比点踩率和平均 Token。
+    pitfalls: |
+      - **误区：把 OTel GenAI 字段名当成稳定契约写进报表。** 字段仍在改名，需要做兼容映射。
+      - **误区：为了方便排查默认记录全部 Prompt 和回答。** 可观测平台会变成敏感数据仓库。
+      - **误区：只记录错误日志。** LLM 应用的大多数问题不报错，需要记录正常请求的 Token、耗时和质量信号。
+      - **误区：用户反馈只做统计不关联 Trace。** 无法回放出问题的具体请求。
+    interview_asks:
+      - 你们怎么监控 LLM 应用？一次调用记录哪些字段？
+      - 了解 OpenTelemetry 的 GenAI 语义约定吗？现在可以直接用吗？
+      - 怎么把线上用户反馈用起来？
+    project_example: |
+      知识库平台用 OpenTelemetry SDK 埋点，Span 发往自托管的 LLM 可观测平台，固定埋点库版本并在查询层兼容新旧 Token 字段名。
+      每个 LLM Span 带租户 ID、Prompt 版本号，默认不采集内容。上线后通过成本大盘发现某租户批量导入时重复向量化同一文档，加入 Embedding 缓存后该租户成本下降约 60%。
+    freshness: |
+      核对于 2026-11：OpenTelemetry GenAI 语义约定全部为 Development 状态（官方仓库稳定化追踪 issue 于 2026-11-06 更新时仍写明核心定义为 development）；GenAI 约定已迁移至独立仓库 open-telemetry/semantic-conventions-genai，opentelemetry.io 上原 GenAI 属性页已改为「已迁移」指引；该仓库尚无打标签的正式版本（OpenTelemetry JS 新增 GenAI 包的 PR 中写明 registry has no tagged release yet）。
+      旧写法 vs 新写法：`gen_ai.system` → `gen_ai.provider.name`；`gen_ai.usage.prompt_tokens/completion_tokens` → `gen_ai.usage.input_tokens/output_tokens`。指标名在独立仓库主分支上仍在调整（如 token 用量指标被拆分），以实际使用的埋点库版本为准。
+    sources:
+      - {title: "OpenTelemetry - Gen AI 属性（已迁移说明页）", url: "https://opentelemetry.io/docs/specs/semconv/registry/attributes/gen-ai/"}
+      - {title: "open-telemetry/semantic-conventions-genai 仓库", url: "https://github.com/open-telemetry/semantic-conventions-genai"}
+      - {title: "semantic-conventions-genai Issue 511 - 稳定化追踪", url: "https://github.com/open-telemetry/semantic-conventions-genai/issues/511"}
+      - {title: "opentelemetry-js PR 7014 - 新增 GenAI 语义约定包", url: "https://github.com/open-telemetry/opentelemetry-js/pull/7014"}
+      - {title: "第三方整理：OpenTelemetry GenAI semantic conventions November 2026 status", url: "https://john-hodge.com/blog/opentelemetry-genai-semantic-conventions/"}
+  - id: d48-k5
+    name: 评估与可观测工具现状
+    level: P2
+    summary: 工具解决的是「存、看、比」，评估集和评分规则仍要你自己设计
+    why: |
+      面试和工作中都会被问「你们用什么做 LLM 观测和评估」。了解主流工具的定位、开源许可和部署方式，能做出合理选型，而不是被某个框架绑定。
+    problem: |
+      解决「自己从零搭 Trace 存储、评估运行器、对比界面成本太高」的问题，同时避免选型时忽视数据合规（Trace 中可能有敏感数据，是否能自托管）。
+    principle: |
+      **几款主流工具（核对于 2026-11）**
+
+      | 工具 | 定位 | 许可与部署 |
+      |---|---|---|
+      | LangSmith | LangChain 公司的观测与评估平台，不限于 LangChain，支持 OTel 接入 | 商业 SaaS，有免费档；自托管属于企业版附加项 |
+      | Langfuse | 开源 LLM 工程平台：Trace、评估、Prompt 管理 | 核心功能 MIT 开源，可自托管；2026 年 1 月被 ClickHouse 收购，官方表示保持开源 |
+      | Arize Phoenix | 观测与评估，基于 OpenTelemetry 与 OpenInference 约定 | Elastic License 2.0，可免费自托管（注意 ELv2 不是 OSI 认可的开源许可证） |
+      | promptfoo | 命令行评估与红队测试，声明式配置，适合接入 CI | MIT 开源；2026 年 3 月 OpenAI 宣布收购，官方表示保持开源 |
+
+      选型要点：
+      - **数据合规**：Trace 含敏感信息时优先能自托管的方案。
+      - **标准化接入**：优先通过 OpenTelemetry 埋点，后端平台可替换，避免锁定。
+      - **评估能力**：数据集版本管理、实验对比、在线评审、人工标注队列。
+      - **工具不替代方法**：评估集、评分规则、阈值仍由团队设计。
+    scenarios: |
+      - 金融客户要求数据不出内网：选择可自托管的 Langfuse 或 Phoenix，通过 OTel 埋点接入。
+      - 在 CI 中加入 promptfoo 配置，每次 Prompt 变更自动运行评估与注入红队用例。
+    pitfalls: |
+      - **误区：上了观测平台就等于有了评估。** 平台只负责存储和展示，评估集与规则要自己建。
+      - **误区：把「开源」和「可商用自托管」画等号。** 要看具体许可证条款，例如 ELv2 与 MIT 的限制不同。
+      - **误区：直接把含 PII 的 Trace 发往 SaaS 平台。** 需先评估合规与脱敏。
+    interview_asks:
+      - 你们用什么工具做 LLM 观测和评估？为什么选它？
+      - 如果客户要求数据不能出内网，你会怎么选型？
+    project_example: |
+      团队早期使用 SaaS 平台快速起步，接入企业客户后因数据不能出内网，迁移到自托管的开源平台。由于埋点一开始就基于 OpenTelemetry，迁移只改了导出端点和鉴权配置，业务代码无改动。
+    freshness: |
+      核对于 2026-11：Langfuse 于 2026-01 加入 ClickHouse，核心保持 MIT 并可自托管，支持 OTLP 端点接入；LangSmith 支持 OTel 接入，开发者档免费含每月 5k 基础 Trace，自托管为企业版附加项；Phoenix 采用 Elastic License 2.0；OpenAI 于 2026-03-09 宣布收购 promptfoo，promptfoo 表示继续以 MIT 开源维护。价格与功能变化快，以官网为准。
+    sources:
+      - {title: "ClickHouse welcomes Langfuse", url: "https://clickhouse.com/blog/clickhouse-acquires-langfuse-open-source-llm-observability"}
+      - {title: "Langfuse - OpenTelemetry 接入", url: "https://langfuse.com/integrations/native/opentelemetry"}
+      - {title: "LangSmith - Trace with OpenTelemetry", url: "https://docs.langchain.com/langsmith/trace-with-opentelemetry"}
+      - {title: "LangSmith Plans and Pricing", url: "https://www.langchain.com/pricing"}
+      - {title: "Arize Phoenix - License", url: "https://arize.com/docs/phoenix/self-hosting/license"}
+      - {title: "OpenAI to acquire Promptfoo", url: "https://openai.com/index/openai-to-acquire-promptfoo/"}
+      - {title: "promptfoo GitHub 仓库", url: "https://github.com/promptfoo/promptfoo"}
+quiz:
+  - id: d48-q1
+    kp: d48-k1
+    type: single
+    question: 以下哪项最适合用「Mock LLM + 精确断言」的单元测试来覆盖，而不是放进评估集？
+    options:
+      - "回答是否准确引用了正确的政策条款"
+      - "检索结果为空时，Prompt 模板是否走「无法回答」分支并且不调用模型"
+      - "新模型在复杂多步骤问题上的表现是否优于旧模型"
+      - "回答语气是否足够专业友好"
+    answer: [1]
+    explain: |
+      「检索为空时走哪个分支、是否调用模型」是确定性的程序逻辑，可以 Mock 掉 LLM 后精确断言，适合单元测试，每次提交都跑。
+      其余三项都依赖模型的实际生成结果，结果不唯一，需要通过评估集用规则、参考答案或 LLM 评审统计通过率来判断。
+  - id: d48-q2
+    kp: d48-k2
+    type: multi
+    question: 关于 LLM-as-judge，以下哪些说法是正确的？
+    options:
+      - "成对比较时评审可能偏向某个固定位置的回答，可以交换顺序各评一次"
+      - "评审模型可能偏向更长的回答，即使内容并不更准确"
+      - "用被测模型自己做评审最客观，因为它最理解自己的输出"
+      - "启用评审前应先用一批人工标注样本校准，检查一致率"
+      - "只要评审模型足够强，就不需要评分规则"
+    answer: [0, 1, 3]
+    explain: |
+      位置偏差、长度偏差是 LLM 评审的已知偏差，交换顺序和明确评分规则可以缓解；用人工标注校准一致率是启用评审前的必要步骤。
+      用被测模型自评存在自我偏好偏差，应使用不同厂商或系列的模型；没有评分规则时评审标准不稳定，强模型也会给出不一致的分数。
+  - id: d48-q3
+    kp: d48-k1
+    type: judge
+    question: 只要把 temperature 设为 0，同一个 Prompt 每次调用的输出就完全一样，因此评估中可以直接用字符串完全相等来断言回答。
+    answer: false
+    explain: |
+      温度为 0 会显著降低随机性，但厂商侧的批处理、硬件差异、模型静默更新等因素仍可能让输出变化，不能假设完全确定。
+      评估应断言结构（Schema）、关键事实、引用等可验证的部分，开放式内容用参考答案或 LLM 评审判断，并看多次运行的通过率。
+  - id: d48-q4
+    kp: d48-k4
+    type: single
+    question: 截至 2026 年 11 月，关于 OpenTelemetry 生成式 AI 语义约定（gen_ai.*），哪个说法准确？
+    options:
+      - "已全部进入 Stable 状态，可以作为长期不变的报表字段契约"
+      - "全部仍为 Development 状态，并已迁移到独立仓库，字段名仍在调整"
+      - "OpenTelemetry 已放弃 GenAI 约定，改为推荐各厂商私有格式"
+      - "只有 gen_ai.system 是稳定字段，其余为实验字段"
+    answer: [1]
+    explain: |
+      截至 2026-11，GenAI 相关的 Span、指标、事件和属性全部为 Development 状态，并已从主语义约定仓库迁移到独立的 semantic-conventions-genai 仓库，该仓库尚无正式发布版本。
+      gen_ai.system 恰恰已被改名为 gen_ai.provider.name，不是稳定字段；OpenTelemetry 也没有放弃这套约定。
+  - id: d48-q5
+    kp: d48-k3
+    type: scenario
+    question: |
+      你修改了客服机器人的 System Prompt，让回答更简洁。CI 评估显示整体通过率从 84% 提升到 87%，团队准备上线。
+      但你注意到评估集中有「安全用例」「退款政策」「多步骤操作指引」等分组。你会怎么判断能否上线？还需要看什么？
+    key_points:
+      - {text: "提出必须按分组对比通过率，整体提升可能掩盖关键分组下降", dim: principle}
+      - {text: "提出安全用例等关键分组设置不允许下降的硬性门槛", dim: engineering}
+      - {text: "提出查看新旧结果不同的失败样本，区分真实退化与评审误差", dim: engineering}
+      - {text: "提出同时检查 Token、延迟等成本指标，并通过灰度对比线上反馈", dim: engineering}
+    reference: |
+      不能只看整体。第一步按分组对比：如果「多步骤操作指引」因为要求简洁而漏掉步骤，分组通过率可能明显下降，整体却被其他分组的提升抵消。安全用例分组应设为硬门槛，任何下降都阻止合并。
+      第二步看差异样本：列出新旧版本结果不一致的样本，人工判断是真正退化还是评审误差；评估集样本少时，3 个百分点的变化也可能是随机波动，可多跑几次。
+      第三步看成本和延迟：简洁化通常降低输出 Token，是额外收益，但要确认。
+      最后通过配置开关灰度 5%~10% 流量，对比点踩率、转人工率，稳定后再全量并更新基线。如果某个分组退化，可以在 Prompt 中对该类问题单独说明，而不是整体回退。
+    followup:
+      question: 如果评估集只有 60 条，你对「提升 3 个百分点」这个结论有多大信心？怎么办？
+      key_points: [60 条中 3 个百分点约等于 2 条样本, 可能是随机波动, 多次运行或扩充评估集后再下结论]
+      reference: 信心不高。60 条样本中 3 个百分点只相当于约 2 条结果变化，完全可能来自模型输出的随机性或评审误差。应对同一版本多跑几次看波动范围，查看具体变化的样本，并逐步扩充评估集，尤其是关键分组的样本量。
+  - id: d48-q6
+    kp: d48-k2
+    type: design
+    question: 你接手一个已上线三个月的企业 IT 服务台机器人（回答 VPN、账号、软件申请等问题），目前没有任何评估集。请设计评估集的构建方案，包括来源、样本结构、规模、评审方式和维护机制。
+    key_points:
+      - {text: "来源包含脱敏后的线上日志分层抽样、专家编写的关键场景、历史失败案例与安全用例", dim: engineering}
+      - {text: "每条样本有输入、参考答案或关键事实点、应命中的文档 ID 与分组标签", dim: concept}
+      - {text: "起步规模为一两百条高质量样本，并对评估集版本化", dim: engineering}
+      - {text: "评审优先用规则与基于参考的 LLM 评审，并用人工标注校准一致率", dim: principle}
+      - {text: "维护上把线上点踩与转人工的案例复核后持续补充", dim: project}
+    reference: |
+      来源：① 从三个月的线上日志按问题类型（VPN、账号、软件、硬件、权限申请等）分层抽样 120 条，先脱敏；② 请 IT 专家针对高频与高风险场景编写 40 条（如账号锁定、离职权限回收）；③ 收集历史投诉和转人工的失败案例 20 条；④ 加入 20 条安全用例（套取其他员工信息、诱导执行越权操作、注入）。
+      样本结构：id、问题（必要时含多轮上下文）、参考答案或必须提到的关键事实点、应命中的知识库文档 ID、分组标签（类型、难度）、是否允许拒答。
+      评审方式：格式、是否引用文档、是否拒答等用规则判定；正确性用「基于关键事实点」的 LLM 评审，评审模型与被测模型使用不同系列；先人工标注 100 条计算一致率，达标后启用；检索部分用命中率单独评估。
+      维护：评估集放在仓库中版本化；每周把点踩、转人工的会话复核后补充；知识库政策变化时同步更新参考答案；每季度重新校准评审。
+  - id: d48-q7
+    kp: d48-k4
+    type: short
+    question: 线上没有标准答案，你如何持续感知 AI 回答质量的变化？请列出至少三类信号，并说明如何把它们与具体请求关联起来。
+    key_points:
+      - {text: "显式反馈：点赞点踩、评分、转人工、重新生成", dim: concept}
+      - {text: "隐式与规则信号：拒答率、无检索结果率、引用缺失、长度截断比例", dim: engineering}
+      - {text: "抽样自动评审与人工复核，如忠实度或相关性评分", dim: engineering}
+      - {text: "通过 trace_id 或会话 ID 把反馈与评分关联到具体 Trace，并按 Prompt 版本分组", dim: engineering}
+    reference: |
+      信号分三类：① 显式反馈：点赞/点踩、评分、用户点击「转人工」或「重新生成」；② 隐式与规则信号：拒答比例、检索无结果比例、回答缺少引用的比例、因长度截断的比例、同一问题短时间内重复提问；③ 抽样评审：每天抽取一定比例的对话，用 LLM 评审评估忠实度、相关性，低分样本进入人工复核。
+      关联方式：前端提交反馈时带上会话 ID 和消息对应的 trace_id；评审结果作为评估事件写回同一个 Trace（OpenTelemetry GenAI 约定中有 gen_ai.evaluation.result 事件可用于此类关联）；所有 Span 带 Prompt 版本号、模型名、租户 ID，便于按版本对比趋势。确认的问题样本补充进离线评估集，形成闭环。
+code_reading:
+  id: d48-c1
+  kp: [d48-k3, d48-k2]
+  title: CI 中的 RAG 回归评估脚本
+  scenario: 团队在 GitHub Actions 中，每当 Prompt 或模型配置变更时运行这个脚本。它读取黄金数据集，对每条样本调用被测系统，再用 LLM 评审判断是否通过，最后与基线比较，下降超过 2 个百分点则以非零退出码让 CI 失败。
+  language: python
+  code: |
+    import asyncio
+    import json
+    import logging
+    import os
+    import sys
+    from pathlib import Path
+
+    from openai import AsyncOpenAI
+
+    from app.rag import answer_question
+
+    logger = logging.getLogger("eval")
+    client = AsyncOpenAI(timeout=60.0)
+    JUDGE_MODEL = os.environ["LLM_MODEL"]  # 与被测系统使用同一个模型配置
+    BASELINE = json.loads(Path("eval/baseline.json").read_text(encoding="utf-8"))
+
+    JUDGE_PROMPT = """你是严格的评审。根据参考要点判断回答是否正确且没有编造。
+    只输出 JSON：{{"pass": true 或 false, "reason": "简短理由"}}
+    问题：{question}
+    参考要点：{reference}
+    待评回答：{answer}"""
+
+
+    async def judge(case: dict, answer: str) -> bool:
+        resp = await client.chat.completions.create(
+            model=JUDGE_MODEL,
+            response_format={"type": "json_object"},
+            messages=[{"role": "user", "content": JUDGE_PROMPT.format(answer=answer, **case)}],
+        )
+        return bool(json.loads(resp.choices[0].message.content)["pass"])
+
+
+    async def run_case(case: dict) -> bool | None:
+        try:
+            result = await answer_question(case["question"], tenant_id=case["tenant_id"])
+            return await judge(case, result.answer)
+        except Exception as e:
+            logger.warning("case %s skipped: %s", case["id"], e)
+            return None
+
+
+    async def main() -> int:
+        lines = Path("eval/golden.jsonl").read_text(encoding="utf-8").splitlines()
+        cases = [json.loads(line) for line in lines if line.strip()]
+        results = await asyncio.gather(*(run_case(c) for c in cases))
+
+        scored = [r for r in results if r is not None]
+        pass_rate = sum(scored) / len(scored)
+        print(f"cases={len(cases)} scored={len(scored)} pass_rate={pass_rate:.3f} "
+              f"baseline={BASELINE['pass_rate']:.3f}")
+        if pass_rate < BASELINE["pass_rate"] - 0.02:
+            print("REGRESSION: pass rate dropped")
+            return 1
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(asyncio.run(main()))
+  walkthrough:
+    function: |
+      读取 `eval/golden.jsonl` 中的评估样本，并发调用被测 RAG 系统得到回答，再用 LLM 评审逐条判定通过与否，计算通过率并与 `baseline.json` 中的基线比较；下降超过 2 个百分点时返回 1 让 CI 失败。
+    key_functions: |
+      - `judge`：把问题、参考要点、待评回答填入评审 Prompt，使用 JSON 模式让模型只输出 JSON，解析出 `pass` 字段。
+      - `run_case`：对单条样本调用 `answer_question`，再调用 `judge`；任何异常都记录警告并返回 None。
+      - `main`：加载样本、`asyncio.gather` 并发运行全部样本、过滤掉 None、计算通过率、与基线比较并决定退出码。
+    params: |
+      - 每条样本是一个 dict，需包含 `id`、`question`、`reference`、`tenant_id` 字段；`JUDGE_PROMPT.format(answer=answer, **case)` 把 dict 展开为模板参数（多余字段会被忽略）。
+      - `JUDGE_MODEL` 从环境变量 `LLM_MODEL` 读取，与被测系统共用。
+      - 退出码由 `main` 返回，经 `sys.exit` 传给 CI。
+    data_flow: |
+      ```mermaid
+      flowchart TB
+        G["golden.jsonl 样本"] --> R["run_case 并发执行全部样本"]
+        R --> A["answer_question 被测系统"]
+        A --> J["judge LLM评审 与被测同模型"]
+        J --> P["True 或 False"]
+        R -->|"任何异常"| N["None 被跳过"]
+        P --> S["scored 列表"]
+        N -.->|"不计入分母"| S
+        S --> C["pass_rate 与基线比较"]
+        C --> X["退出码 0 或 1"]
+      ```
+    failure_points: |
+      - **失败样本被跳过（重点）**：被测系统超时、报错、返回格式异常时都返回 None，被排除在分母之外。系统越不稳定，参与计分的样本越少、通过率反而可能越高，CI 会「绿着」放过严重退化；若全部失败，`len(scored)` 为 0 还会抛出 ZeroDivisionError。
+      - **评审与被测同模型、未固定温度（重点）**：存在自我偏好偏差，模型自己的盲区在评审中也会被放过；未设置温度，评审结果本身随机，基线对比的噪声变大。
+      - `asyncio.gather` 无并发上限，样本多时会瞬间打满上游配额触发 429，又被上一条问题转化为「跳过」。
+      - 只比较整体通过率，没有分组与关键用例门槛；没有输出失败样本明细，CI 失败时难以定位。
+      - 评审输出若缺少 `pass` 字段会抛 KeyError，同样被吞成 None。
+    debugging: |
+      - 在输出中增加 `errors=len(cases)-len(scored)`，或故意让被测系统对一半样本抛异常，观察通过率是否反而不降。
+      - 把每条样本的回答、评审理由、耗时写入 `eval/results.jsonl` 作为 CI 产物，便于对比新旧版本差异。
+      - 对同一版本连续运行 3 次，观察通过率波动范围，判断 2 个百分点阈值是否合理。
+    change_request: |
+      若需求改为「按分组统计，安全用例分组不允许任何下降」：
+      - 样本增加 `group` 字段；`run_case` 返回 `(case_id, group, status)`，status 区分 pass/fail/error；
+      - 按分组计算通过率，error 计为失败；
+      - 基线文件改为按分组存储；
+      - 判定逻辑：整体下降超过阈值或 `security` 分组任何下降都返回 1，并打印每组变化与差异样本。
+  questions:
+    - id: d48-c1-q1
+      kp: d48-k3
+      type: code
+      question: 假设本次 Prompt 改动导致被测系统对 300 条样本中的 90 条抛出解析异常，其余 210 条中有 190 条被判通过。基线通过率为 0.85。请按代码执行过程推算脚本的输出和退出码，并说明问题所在及修改方法。
+      key_points:
+        - {text: "推算出 90 条异常返回 None 被过滤，scored 只剩 210 条", dim: principle}
+        - {text: "推算出 pass_rate 约为 190 除以 210 约 0.905，高于基线，退出码为 0，CI 通过", dim: principle}
+        - {text: "指出真实情况是 300 条中只有 190 条正确约 0.633，严重退化被掩盖", dim: principle}
+        - {text: "修改：错误计为失败或单独设错误率门槛，并处理分母为零的情况", dim: engineering}
+      reference: |
+        执行过程：`gather` 并发运行 300 条，90 条在 `answer_question` 中抛出异常，被 `except Exception` 捕获后返回 None；其余 210 条进入评审，190 条为 True。`scored` 过滤掉 None 后长度为 210，`pass_rate = 190 / 210 ≈ 0.905`。打印 `cases=300 scored=210 pass_rate=0.905 baseline=0.850`，0.905 不小于 0.83，返回 0，CI 显示通过。
+        问题：真实的通过情况是 300 条里只有 190 条正确，约 0.633，比基线低 20 多个百分点，但因为失败样本被移出分母，脚本反而报告「变好了」。异常越多越容易出现这种假象。
+        修改：run_case 返回明确的状态（pass/fail/error），error 一律计为失败参与分母；另设错误率门槛（如 error 超过 2% 直接失败）；输出每条错误的样本 ID 与异常类型；分母为零时直接返回失败。
+    - id: d48-c1-q2
+      kp: d48-k2
+      type: code
+      question: 请分析 `judge` 函数中评审模型的选择与调用参数存在什么问题，会对评估结论产生什么影响，你会怎么改？
+      key_points:
+        - {text: "指出评审模型与被测系统同模型，存在自我偏好偏差与相同盲区", dim: principle}
+        - {text: "指出未设置较低温度，评审结果本身有随机性，增加对比噪声", dim: principle}
+        - {text: "提出使用不同厂商或系列的评审模型、固定快照版本与低温度", dim: engineering}
+        - {text: "提出用人工标注样本校准评审一致率，并保存评审理由便于复核", dim: engineering}
+      reference: |
+        问题：① `JUDGE_MODEL` 与被测系统共用 `LLM_MODEL`，评审会偏向与自己风格一致的回答（自我偏好），而且被测模型理解错的地方评审很可能也理解错，导致错误被放过；更糟的是，当团队为了升级而修改 `LLM_MODEL` 时，评审标准也随之改变，新旧版本的分数不再可比。② 没有设置 temperature，评审输出有随机性，同一回答多次评审结果可能不同，2 个百分点阈值容易被噪声触发或掩盖。③ 评审理由 `reason` 被丢弃，无法复核。
+        修改：评审模型单独配置（如 `JUDGE_MODEL` 独立环境变量），选用与被测模型不同厂商或系列、带固定版本的模型，温度设低；评审 Prompt 中加入评分规则与边界示例；把评审理由写入结果文件；启用前用约 100 条人工标注样本计算一致率，之后定期抽检。
+    - id: d48-c1-q3
+      kp: d48-k3
+      type: code
+      question: 当评估集从 300 条增长到 3000 条时，`asyncio.gather(*(run_case(c) for c in cases))` 会带来什么问题？它与第一题的问题如何相互放大？请给出改法。
+      key_points:
+        - {text: "指出 gather 会同时发起 3000 个协程，被测系统与评审的请求瞬间打满上游 RPM 与 TPM", dim: principle}
+        - {text: "指出大量 429 或超时被吞成 None，进一步缩小分母、扭曲通过率", dim: principle}
+        - {text: "提出用 asyncio.Semaphore 限制并发，并为上游错误做有限次退避重试", dim: engineering}
+      reference: |
+        `gather` 会立即创建并调度 3000 个协程，每个协程先调用被测系统（内部又调用 Embedding、检索、LLM），再调用评审 LLM，等于同时向上游发起数千个请求，很快触发 429 或超时；评估还会挤占同一账号下线上服务的配额。
+        这些 429 和超时异常都被 `run_case` 吞掉变成 None，参与计分的样本数随机减少，而且被跳过的往往是更长、更复杂的样本，通过率因此被系统性抬高，CI 结论不可靠，并且每次运行结果差异很大。
+        改法：在模块中创建 `sem = asyncio.Semaphore(16)`，`run_case` 内 `async with sem:` 包住调用；对 429 和超时做有限次带抖动的退避重试，最终仍失败的计为 error 并参与分母；评估使用独立的 API Key 或配额，避免影响线上服务。
+interview:
+  - id: d48-i1
+    kp: d48-k1
+    type: oral
+    difficulty: 1
+    question: LLM 的输出是不确定的，你们怎么给 LLM 应用做测试？
+    key_points:
+      - {text: "区分确定性部分与不确定部分，确定性部分用 Mock LLM 的单元测试", dim: principle}
+      - {text: "不确定部分用评估集统计通过率，并与基线比较", dim: concept}
+      - {text: "线上用监控和用户反馈补充，失败案例回流评估集", dim: engineering}
+      - {text: "给出项目中测试分层的具体规模或流程", dim: project}
+    reference: |
+      我把测试分成三层。
+      第一层是单元和集成测试：系统里大量部分是确定的，比如 Prompt 模板渲染、检索参数、权限过滤、结果解析、错误处理，这些把 LLM Mock 掉之后可以精确断言，每次提交都跑。
+      第二层是离线评估集：模型生成的部分无法单次断言对错，所以用一批有参考答案的样本，通过规则、关键事实比对和 LLM 评审统计通过率，并与上一个版本的基线比较。每次改 Prompt、换模型、调检索参数都要跑。评估时固定参数和模型快照，关键用例多跑几次。
+      第三层是线上监控：抽样评审、用户点踩、转人工率等，发现的失败案例经过复核再补进评估集。
+      在知识库项目里，单元测试约 120 条 20 秒跑完，评估集 300 条在 CI 中作为合并门禁。
+    oral: |
+      我的做法是分三层。系统里其实大部分逻辑是确定的，比如模板渲染、权限过滤、结果解析，我把模型 Mock 掉写普通单元测试，每次提交都跑。
+      模型生成的部分不追求单次断言，而是用一套带参考答案的评估集统计通过率，跟上个版本的基线比，改 Prompt 或换模型时在 CI 里当门禁。
+      线上再用点踩、转人工和抽样评审兜底，发现的坏案例补回评估集。我们知识库项目的评估集就是这样三个月从 300 条长到 500 多条的。
+  - id: d48-i2
+    kp: d48-k2
+    type: oral
+    difficulty: 2
+    question: 你们用 LLM-as-judge 吗？你怎么保证评审结果可信？
+    key_points:
+      - {text: "说明评审形式：基于参考、单点打分、成对比较，并优先基于参考", dim: concept}
+      - {text: "说出位置偏差、长度偏差、自我偏好等偏差及对应缓解措施", dim: principle}
+      - {text: "说明用人工标注样本校准一致率后才启用，并定期抽检", dim: engineering}
+      - {text: "说明评审模型与被测模型分离、固定版本、低温度、结构化输出", dim: engineering}
+    reference: |
+      用，但不会直接相信。
+      形式上优先用「基于参考要点」的评审：评估集中每条样本有关键事实点，评审只判断回答是否覆盖、是否矛盾、是否编造，这比开放式打分稳定得多。比较两个版本时用成对比较。
+      已知偏差及缓解：位置偏差——成对比较时交换顺序各评一次，不一致算平局；长度偏差——评分规则明确简洁准确优先，用参考要点约束；自我偏好——评审模型与被测模型使用不同厂商或系列。
+      工程上：评审模型独立配置并固定版本、温度设低、输出结构化的分数和理由并保存。
+      最重要的是校准：先人工标注约 100 条，计算评审与人工的一致率，达到可接受水平才启用；之后每季度抽检，评审模型或评分规则变更时重新校准。我们第一版规则一致率只有七成左右，补充了「部分正确」的判定示例后才提升到九成左右。
+    oral: |
+      用，但会先校准再信它。我优先用基于参考要点的评审，每条样本有关键事实点，评审只判断有没有覆盖、有没有编造，这比让它自由打分稳定得多。
+      它有几个已知偏差：偏向某个位置、偏向长回答、偏向自家模型。对应地，我们成对比较时交换顺序评两次，评分规则写明简洁优先，评审模型和被测模型用不同厂商的。
+      最关键的是人工校准，我们先人工标了 100 条，第一版一致率只有七成左右，补了判定示例后才到九成左右，之后才正式启用。
+  - id: d48-i3
+    kp: d48-k3
+    type: oral
+    difficulty: 3
+    question: 现在要把线上模型从 A 换成 B，或者大改一次 Prompt，你会怎么保证不出问题？
+    key_points:
+      - {text: "Prompt 与模型配置版本化，使用固定快照版本，并在 Trace 中记录版本", dim: engineering}
+      - {text: "在同一版本评估集上对比整体与分组通过率，并设置关键分组硬门槛", dim: engineering}
+      - {text: "同时比较成本、延迟、格式合规率等非质量指标", dim: engineering}
+      - {text: "查看差异样本，考虑随机波动，再决定是否接受", dim: principle}
+      - {text: "灰度发布、线上指标对比、可快速回滚，并更新基线", dim: project}
+    reference: |
+      我会按「离线对比 → 灰度 → 全量」三步走。
+      准备：Prompt 和模型配置都在仓库中版本化，模型使用固定快照版本而不是会静默更新的别名，Trace 中记录 Prompt 版本和模型名。
+      离线对比：在同一版本评估集上运行 A 与 B，比较整体通过率和每个分组的通过率；安全用例等关键分组设为硬门槛不允许下降；同时比较平均输入/输出 Token、成本、P95 延迟、JSON 格式合规率、拒答率。查看两者结果不同的样本，判断是真退化还是评审噪声，小样本时多跑几次。
+      如果某个分组退化，针对性调整 Prompt 后重新评估，而不是只看整体。
+      灰度：通过配置开关让 5%~10% 流量走新版本，对比点踩率、转人工率、错误率、成本，准备一键回滚。稳定一周后全量，把新版本结果设为基线。
+      我做过一次迁移：新模型整体高 3 个百分点，但退款政策分组掉了 14 个点，就是靠分组对比发现并修正的。
+    oral: |
+      我会分三步：离线对比、灰度、全量。先保证 Prompt 和模型都版本化，模型用固定快照。然后在同一份评估集上跑新旧两版，不只看整体，还要按分组看，安全用例不允许任何下降，同时比成本、延迟和格式合规率。
+      我之前做模型迁移，新模型整体高了 3 个点，但退款政策这一组掉了 14 个点，看失败样本发现它喜欢自己概括政策，改了 Prompt 让它逐条引用才恢复。
+      离线过了之后灰度 10% 流量，盯点踩率和成本，能一键回滚，稳定一周再全量并更新基线。
+  - id: d48-i4
+    kp: d48-k4
+    type: oral
+    difficulty: 4
+    question: 请你为公司的 AI 平台设计一套可观测性方案：要记录什么、用什么标准、怎么用这些数据？
+    key_points:
+      - {text: "用 Trace 与 Span 记录完整调用链：检索、LLM、工具、Agent 步骤", dim: concept}
+      - {text: "列出 LLM Span 的关键字段：模型、Token、成本、耗时、TTFT、结束原因、Prompt 版本、租户", dim: engineering}
+      - {text: "说明采用 OpenTelemetry 埋点但 GenAI 约定仍为 Development，需固定版本并兼容字段名", dim: principle}
+      - {text: "说明默认不采集内容并脱敏，按租户控制访问", dim: engineering}
+      - {text: "说明大盘、告警、反馈关联 Trace、失败案例回流评估集的闭环", dim: project}
+    reference: |
+      记录什么：每次用户请求一个 Trace，内部的鉴权、检索（Embedding、向量检索、Rerank）、LLM 调用、工具调用、Agent 每一步都是 Span。LLM Span 记录提供方、请求与响应模型名、参数、输入/输出/缓存 Token、按价格表折算的成本、总耗时与 TTFT、结束原因、错误类型、Prompt 版本、租户和用户 ID、会话 ID。用户反馈和抽样评审结果通过 trace_id 关联。
+      用什么标准：业务代码通过 OpenTelemetry SDK 埋点，后端平台可替换（自托管开源平台或商业 SaaS）。GenAI 语义约定截至 2026-11 全部为 Development 并已迁到独立仓库，字段曾多次改名，所以固定埋点库版本、查询层兼容新旧字段、自定义属性用自己的命名空间。
+      隐私：默认不采集 Prompt 与回答原文，需要时脱敏后短期开启；平台按租户控制访问。
+      怎么用：大盘看 QPS、P95/P99、TTFT、错误率、429 率、每租户成本、点踩率；告警覆盖错误率、成本日环比、点踩率突增；点踩和低分 Trace 进入复核队列，确认后加入评估集；按 Prompt 版本和模型分组对比，支持灰度决策。
+    oral: |
+      我会以 Trace 为核心。一次请求一个 Trace，检索、模型调用、工具调用、Agent 每一步都是 Span。模型调用的 Span 记录模型名、输入输出 Token、成本、耗时和首 Token 时间、结束原因，再带上 Prompt 版本和租户 ID，方便按版本对比和按租户算成本。
+      埋点用 OpenTelemetry，这样后端平台可以换。不过它的 GenAI 约定现在还是开发中状态，字段改过好几次名，所以我们锁定埋点库版本，查询时兼容新旧字段。
+      内容默认不采集。数据用在三处：大盘和告警、反馈关联到具体 Trace、坏案例复核后补进评估集。我们就是靠成本大盘发现某租户重复向量化，加缓存后成本降了六成。
+  - id: d48-i5
+    kp: d48-k3
+    type: oral
+    difficulty: 4
+    question: 离线评估集通过率一直很高，但线上用户反馈质量在下降。可能是什么原因？你会怎么处理？
+    key_points:
+      - {text: "指出评估集与线上分布不一致或已过时，即评估集漂移", dim: principle}
+      - {text: "指出知识库内容、用户问题类型、上游模型静默更新等变化未被评估覆盖", dim: principle}
+      - {text: "指出评审模型偏差或评估流程缺陷导致分数虚高", dim: principle}
+      - {text: "提出用线上 Trace 与反馈分析失败模式，抽样补充评估集并重新校准评审", dim: engineering}
+      - {text: "提出建立线上抽样评审与持续回流机制", dim: project}
+    reference: |
+      可能原因：① 评估集漂移：评估集是半年前建的，线上问题类型已经变化（新产品上线、新政策），评估集不代表当前分布；② 知识库变化：文档更新、过期文档未下线，检索质量下降，而评估集参考答案仍是旧的；③ 上游变化：使用了会静默更新的模型别名；④ 评估本身失真：评审与被测同模型、失败样本被跳过、只看整体平均；⑤ 体验类问题：延迟变高、格式问题，评估集不测这些。
+      处理：先用线上数据定位——按问题类型、租户、时间段统计点踩率，抽取点踩 Trace 人工归类失败模式（检索没命中、回答过时、格式、拒答过多等）。然后补齐评估：把归类后的典型失败样本脱敏后加入评估集并版本升级，重新校准评审一致率，检查评估脚本是否吞掉错误。最后建立机制：线上每日抽样评审、点踩自动进入复核队列、每月对比线上与评估集的问题分布，模型使用固定快照。
+    oral: |
+      这种情况我第一反应是评估集过时了，它代表的是过去的问题分布。可能是用户问题类型变了，知识库文档更新了但参考答案没更新，或者模型别名被厂商静默升级了。也有可能评估本身有问题，比如评审用了同一个模型，或者脚本把失败样本跳过了。
+      我会先从线上点踩的 Trace 里抽一批人工归类，看主要是检索没命中、答案过时还是格式问题，然后把这些样本补进评估集、重新校准评审。
+      长期上要让线上抽样评审和点踩回流常态化，这样评估集才能跟着业务一起长。
+sources:
+  - {title: "OpenTelemetry semantic-conventions-genai 仓库", url: "https://github.com/open-telemetry/semantic-conventions-genai"}
+  - {title: "semantic-conventions-genai Issue 511 - 稳定化追踪", url: "https://github.com/open-telemetry/semantic-conventions-genai/issues/511"}
+  - {title: "Langfuse - OpenTelemetry 接入", url: "https://langfuse.com/integrations/native/opentelemetry"}
+  - {title: "LangSmith - Trace with OpenTelemetry", url: "https://docs.langchain.com/langsmith/trace-with-opentelemetry"}
+  - {title: "Arize Phoenix GitHub 仓库", url: "https://github.com/Arize-ai/phoenix/"}
+  - {title: "promptfoo GitHub 仓库", url: "https://github.com/promptfoo/promptfoo"}
+  - {title: "Zheng et al. 2023 - Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena", url: "https://arxiv.org/abs/2306.05685"}

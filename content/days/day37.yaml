@@ -1,0 +1,959 @@
+day: 37
+phase: 4
+title: LangGraph 进阶：checkpoint 断点恢复、interrupt 人工审批与流式输出
+goals:
+  - 能说清 checkpoint 存了什么、什么时候存、thread_id 起什么作用，以及「继续、重试、恢复、回放」四种调用的区别
+  - 能为生产环境选择 checkpointer 和 durability 模式，并处理「第一个快照前就崩溃」这类边界情况
+  - 能用 interrupt + Command(resume) 实现跨天审批，并避开节点重跑导致的重复副作用
+  - 能把 LangGraph 的流式事件通过 SSE 推给 Vue 前端，区分 token、进度和审批事件
+minutes: 60
+resources:
+  - title: "LangChain Academy：Introduction to LangGraph（Module 3）"
+    url: "https://academy.langchain.com/courses/intro-to-langgraph"
+    kind: course
+    lang: en
+    minutes: 60
+    note: "只看 Module 3：Streaming、Breakpoints、Editing State and Human Feedback、Dynamic Breakpoints、Time Travel 五课，正好对应今天四个知识点"
+  - title: "LangGraph 官方文档：Interrupts"
+    url: "https://docs.langchain.com/oss/python/langgraph/interrupts"
+    kind: doc
+    lang: en
+    minutes: 25
+    note: "重点读 Resuming interrupts 和 Rules of interrupts 两节，「节点会从头重跑」「不要用裸 try/except 包 interrupt」这些坑都在这里"
+  - title: "LangGraph 官方文档：Persistence（Checkpointers）"
+    url: "https://docs.langchain.com/oss/python/langgraph/checkpointers"
+    kind: doc
+    lang: en
+    minutes: 25
+    note: "看 Threads、Checkpoints、Replay、Update state 和 Checkpointer libraries 几节，对照 k1、k2 里的四种调用方式和存储选型"
+  - title: "LangGraph 官方文档：Streaming"
+    url: "https://docs.langchain.com/oss/python/langgraph/streaming"
+    kind: doc
+    lang: en
+    minutes: 20
+    note: "看 Supported stream modes 表格、LLM tokens、Custom data 三节和文末 Migrate to v2，对应 k4"
+knowledge_points:
+  - id: d37-k1
+    name: Checkpointer 与 thread_id：每一步自动存快照
+    level: P0
+    summary: 编译时挂上 checkpointer，图每走完一个 super-step 就把状态存成快照；thread_id 决定读写哪一条快照链
+    analogy: |
+      **像 Git。** thread_id 像一个分支，checkpoint 像分支上的 commit，`get_state` 像看 HEAD，`get_state_history` 像 `git log`，从旧快照分叉像 `git checkout` 旧 commit 再开新分支。
+
+      **不一样的地方：**
+      - Git 要你手动 commit；LangGraph **每个 super-step 自动存**一次。
+      - Git commit 只存文件；checkpoint 还存了**下一步要执行哪些节点**（`next`）和挂起的中断，所以能「接着跑」。
+      - Git checkout 旧版本只是恢复文件；LangGraph 从旧快照继续会**重新执行**之后的节点（包括重新调用 LLM），结果可能和上次不同。
+    why: |
+      Day 36 迁移到图，真正的回报在今天。没有 checkpointer，图和手写循环一样：
+      - 多轮对话要你自己存历史；
+      - 进程一挂，跑到一半的任务**全丢**；
+      - 没法「暂停等人」，因为暂停就意味着这次执行先结束、以后再接着跑。
+      checkpoint 是**多轮记忆、断点恢复、人工审批、时间旅行**四个能力的共同地基。
+    problem: |
+      解决「**Agent 执行到一半时，状态和执行位置如何保存下来，以便之后在任意进程里接着跑**」的问题。
+      LangGraph 的做法是：每个 super-step 结束时把 State、下一步待执行的节点、元数据一起写进 checkpointer，按 thread_id 归档。之后只要拿着同一个 thread_id 调用，就能找到最新快照继续。
+    principle: |
+      **一、挂上 checkpointer**
+
+      ```python
+      from langgraph.checkpoint.memory import InMemorySaver
+
+      graph = builder.compile(checkpointer=InMemorySaver())
+      cfg = {"configurable": {"thread_id": "user-42"}}
+      graph.invoke({"messages": [{"role": "user", "content": "3号楼有告警吗"}]}, cfg)
+      graph.invoke({"messages": [{"role": "user", "content": "那4号楼呢"}]}, cfg)
+      ```
+
+      第二次调用会**带着第一轮的状态**继续：新消息经过 add_messages 追加到历史后面。这就是多轮记忆（Day 35 讲的短期记忆）在 LangGraph 里的落地方式。
+
+      **二、什么时候存、存了什么**
+
+      ```mermaid
+      sequenceDiagram
+        participant C as 调用方
+        participant G as 图运行时
+        participant S as Checkpointer
+        C->>G: invoke 输入 加 thread_id
+        G->>S: 写快照 输入已接收
+        G->>G: super-step 1 执行 agent
+        G->>S: 写快照 next 为 tools
+        G->>G: super-step 2 执行 tools
+        G->>S: 写快照 next 为 agent
+        G->>G: super-step 3 执行 agent
+        G->>S: 写快照 next 为空
+        G-->>C: 返回最终状态
+      ```
+
+      每个快照（`StateSnapshot`）里主要有：
+      - `values`：当时的 State；
+      - `next`：下一步要执行的节点，**空表示已经跑完**；
+      - `config`：含 `thread_id` 和这个快照的 `checkpoint_id`；
+      - `metadata`：哪一步、由哪个节点写入；
+      - `tasks` / `interrupts`：待执行任务和挂起的中断。
+
+      **三、四种调用方式，必须分清**
+
+      | 调用 | 含义 |
+      |---|---|
+      | `invoke(新输入, cfg)` | 在最新状态上**开始新一轮**（多轮对话） |
+      | `invoke(None, cfg)` | **不给新输入**，从最新快照接着跑，用于出错后重试 |
+      | `invoke(Command(resume=值), cfg)` | **回答中断**，让暂停的节点继续（k3） |
+      | `invoke(None, 历史快照的 config)` | **回放**：从某个旧快照重新执行之后的步骤（k2） |
+
+      重点：**复用 thread_id 不等于恢复。** 传了新输入就是新一轮；想接着跑，要传 `None` 或 `Command(resume=...)`。
+
+      **四、pending writes：失败时不重跑已成功的节点**
+
+      同一个 super-step 里 A、B 并行，A 成功、B 抛异常。A 的输出会作为 **pending writes** 先存下来；修好问题后 `invoke(None, cfg)` 恢复，**只重跑 B**，A 不会再执行一遍。
+
+      **五、thread_id 怎么取**
+
+      thread_id 是你自己定的字符串。常见做法：**会话 ID**（多轮对话）或**业务单号**（一次告警处置一个线程）。不要每次请求随机生成，否则每次都是全新线程，没有任何记忆。
+    scenarios: |
+      - **多轮对话**：thread_id 用会话 ID，每轮只传新消息，历史由快照自动带上。
+      - **长任务出错重试**：第 5 步调用外部接口超时，修好后 `invoke(None, cfg)` 从第 5 步继续，前 4 步不重跑。
+      - **人工审批**：暂停时状态在快照里，审批结果回来后用同一 thread_id 恢复（k3）。
+      - **排查线上问题**：用 `get_state_history` 看 Agent 每一步的状态，定位从哪一步开始走偏。
+    code: |
+      ```python
+      import uuid
+      from langgraph.checkpoint.memory import InMemorySaver
+
+      graph = builder.compile(checkpointer=InMemorySaver())
+      cfg = {"configurable": {"thread_id": "session-7f3a"}}
+
+      graph.invoke({"messages": [{"role": "user", "content": "3号楼有告警吗"}]}, cfg)
+
+      snap = graph.get_state(cfg)
+      print(snap.values["messages"][-1].content)  # 最后一条回复
+      print(snap.next)                             # () 表示这一轮已跑完
+
+      for s in graph.get_state_history(cfg):       # 最新的快照排在最前面
+          print(s.metadata["step"], s.next, s.config["configurable"]["checkpoint_id"])
+
+      # 反例：每次请求随机 thread_id，等于每次都是新会话，没有记忆
+      bad_cfg = {"configurable": {"thread_id": str(uuid.uuid4())}}
+      ```
+    pitfalls: |
+      - **每次请求随机生成 thread_id**：快照链永远只有一轮，表现为「多轮对话没记忆」。
+      - **以为复用 thread_id 就会自动恢复**：传入新输入是开始新一轮；恢复要传 `None` 或 `Command(resume=...)`。
+      - **生产用 InMemorySaver**：进程重启全丢，多实例之间也不共享，只能用于开发和测试。
+      - **State 里放大对象**：每个 super-step 都写一次快照，大对象会让存储量和延迟成倍增长。
+      - **把 checkpoint 当长期记忆**：它按线程隔离，跨会话的用户偏好应放 Store 或业务库（见 Day 35）。
+    interview_asks:
+      - question: "LangGraph 的 checkpoint 存了什么？什么时候存？"
+        answer: "存这一步之后的状态、走到了哪个节点、下一步是什么。每个 super-step 成功后存一次。靠它才能在进程重启后从这一步继续，而不是从头跑。"
+      - question: "thread_id 有什么用？复用 thread_id 就等于断点恢复吗？"
+        answer: "thread_id 是这一条对话或任务的存档钥匙。用同一个 id 会读到已有存档，所以恢复时必须用原 id。但你还要确认从哪一个检查点继续，不能随便复用别人的 id。"
+      - question: "一个 super-step 里部分节点失败，恢复时会怎样？"
+        answer: "这一步没成功落档，恢复会重跑这一步里的节点。所以节点必须能重入：写操作要幂等，不能假设失败就等于没做。"
+    project_example: |
+      **p2 智慧园区运营 Agent：** 我们用两种 thread_id：
+      - 运营台聊天用**会话 ID**，支持多轮追问「那4号楼呢」；
+      - 告警处置用**告警单号**（如 `alarm-20261112-001`），一个告警从查询、生成工单草稿到审批完成都在同一条快照链上。
+
+      值班长第二天打开审批页，后端只需要拿告警单号查 `get_state`，就能看到 Agent 停在哪一步、草稿是什么。
+    freshness: |
+      核对日期 2026-11（langgraph 1.2.x、langgraph-checkpoint 4.x）。`InMemorySaver` 从 `langgraph.checkpoint.memory` 导入（旧名 `MemorySaver` 仍可在老代码中见到）。`get_state_history` 返回最新在前。Deep Agents、create_agent 也都通过同一套 checkpointer 实现记忆与恢复。
+    sources:
+      - title: "LangGraph Persistence（Checkpointers）"
+        url: "https://docs.langchain.com/oss/python/langgraph/checkpointers"
+  - id: d37-k2
+    name: 生产持久化：存储选型、durability 与时间旅行
+    level: P1
+    summary: 生产用 Postgres 等持久化 checkpointer；用 durability 权衡性能和崩溃安全；用历史快照回放和分叉调试
+    analogy: |
+      **像前端的草稿自动保存策略。** `exit` 像「离开页面时才保存」，`async` 像「后台节流保存」，`sync` 像「每次输入都等保存成功再继续」。
+
+      **不一样的地方：** 草稿丢了用户能重写；Agent 的快照丢了，可能意味着**工单已经建了但系统不知道**，所以要结合业务的幂等和对账一起设计。
+    why: |
+      开发时 InMemorySaver 一切正常，上线后才发现：Pod 重启审批全丢、多实例之间看不到彼此的线程、同步保存拖慢了响应。
+      存储选型和 durability 是**从 Demo 到生产**最容易被忽略的一步，面试问「你的 Agent 怎么做容灾」时就要答到这一层。
+    problem: |
+      解决「**快照存在哪、多久落盘一次、出问题时怎么回看和修正**」的问题。
+      checkpointer 是可插拔的，按环境选不同实现；durability 控制写入时机；时间旅行（回放、分叉、修改状态）让你能复现和修正 Agent 的历史执行。
+    principle: |
+      **一、checkpointer 选型**
+
+      | 包 | 类 | 适合 |
+      |---|---|---|
+      | `langgraph-checkpoint` | `InMemorySaver` | 开发、单元测试 |
+      | `langgraph-checkpoint-sqlite` | `SqliteSaver` / `AsyncSqliteSaver` | 单机工具、本地 Demo |
+      | `langgraph-checkpoint-postgres` | `PostgresSaver` / `AsyncPostgresSaver` | **生产**、多实例共享 |
+
+      两个必记细节：
+      - Postgres 版**首次使用要调用 `.setup()`** 建表；
+      - 用 `ainvoke` / `astream` 的异步图，要配 **Async 版本**的 saver。
+
+      **二、durability：什么时候真正落盘**
+
+      | 模式 | 行为 | 取舍 |
+      |---|---|---|
+      | `exit` | 整次执行结束（完成、出错、中断）才写 | 最快，中途崩溃会丢进度 |
+      | `async` | 下一步执行时**后台异步**写上一步 | 性能和安全折中 |
+      | `sync` | 每步写完才进入下一步 | 最安全，延迟最高 |
+
+      调用时传入，例如 `graph.invoke(inputs, cfg, durability="sync")`。**有外部副作用的长流程（建工单、发通知）建议用 `sync`。**
+
+      **三、一个边界：第一个快照之前就崩溃**
+
+      请求刚进来、第一个快照还没落盘时进程挂了，这个线程在 checkpointer 里**看起来和从没开始过一样**。如果靠「有没有快照」判断任务是否存在，这次请求就静默丢了。
+
+      解决办法：**先在业务库写一条受理记录（outbox）**，再启动图；巡检任务找出「已受理但没有快照或长时间无进展」的记录重新拉起。
+
+      **四、时间旅行：回放与分叉**
+
+      ```mermaid
+      flowchart LR
+        C1["快照1 收到问题"] --> C2["快照2 调用查询工具"]
+        C2 --> C3["快照3 生成错误结论"]
+        C2 -.->|"update_state 修正参数"| F1["新快照 分叉"]
+        F1 --> F2["重新执行 得到新结论"]
+      ```
+
+      - **回放**：拿 `get_state_history` 里某个旧快照的 config 调 `invoke(None, 旧config)`，从那里**重新执行**后续节点。注意 LLM、API、interrupt 都会**重新发生**，不是读缓存。
+      - **修改状态**：`update_state(config, 新值, as_node="某节点")` 会**新建**一个快照（分叉），不改写历史；更新同样经过 reducer；`as_node` 决定「假装是哪个节点写的」，从而影响下一步走向。
+
+      **五、改图时的兼容性**
+
+      快照里记着「下一步去哪个节点」。如果有线程正停在中断上，你发布新版本**把它即将进入的节点改名或删除**，恢复时就会找不到节点。增删其他节点、加字段一般没问题。
+    scenarios: |
+      - **多实例部署**：所有 Pod 共用 AsyncPostgresSaver，审批请求落到哪个 Pod 都能恢复。
+      - **复现线上 Bad Case**：拿出问题线程的历史快照，在测试环境回放，调 Prompt 后对比结果。
+      - **人工修正后继续**：模型把楼栋识别错了，运营在后台用 update_state 改正，再继续执行。
+      - **防丢单**：告警受理先写业务库，巡检任务兜底拉起没有快照的任务。
+    pitfalls: |
+      - **生产用 InMemorySaver 或 SQLite 跑多实例**：重启丢失、实例间不共享。
+      - **忘了 `setup()`**：第一次运行直接报表不存在。
+      - **异步图配同步 saver**：会报错或阻塞事件循环，要用 Async 版本。
+      - **以为回放读的是缓存**：回放会重新调 LLM 和外部接口，有副作用的工具会再执行一次。
+      - **只靠快照判断任务是否存在**：第一个快照前崩溃的任务会静默丢失，要有业务侧受理记录。
+      - **发版时重命名中断线程的下一节点**：停在审批上的线程恢复失败，改名前先处理完存量线程或保留旧节点名。
+    interview_asks:
+      - question: "生产环境你用什么 checkpointer？durability 怎么选？"
+        answer: "用数据库持久化，不用内存。重要写操作要等检查点落盘再响应。只是聊天演示可以放松。进程一多，内存检查点会丢，也不能跨副本。"
+      - question: "LangGraph 的时间旅行是什么？回放会不会重新调用模型？"
+        answer: "时间旅行是从以前某个检查点把状态取出来再继续，用来调试或改一条分支。从那之后的节点会重新执行，所以会再次调用模型和工具，除非你在测试里替换掉它们。它不是免费的录像回看。"
+      - question: "如何保证请求进来后、第一个快照落盘前崩溃的任务不丢？"
+        answer: "先把任务写进自己的队列表再开始跑图。崩溃后扫描未完成的任务重新拉起。不能假设「图已经开始就一定有检查点」。"
+    project_example: |
+      **p2 智慧园区运营 Agent 的持久化方案：**
+      - 开发用 InMemorySaver，测试和生产用 **AsyncPostgresSaver**，与业务库同一个 Postgres 实例的独立 schema；
+      - 告警处置流程用 `durability="sync"`，因为后面有建工单这类外部副作用；运营问答用默认模式；
+      - 告警受理时先写 `alarm_tasks` 表（状态为「已受理」），巡检任务每 5 分钟扫描「已受理但无快照或超过 30 分钟无进展」的记录；
+      - 运营发现 Agent 结论错误时，可在后台查看历史快照并回放，作为评测集的 Bad Case 来源（见 Day 41）。
+    freshness: |
+      核对日期 2026-11。checkpointer 分包：langgraph-checkpoint（内存与基类）、langgraph-checkpoint-sqlite、langgraph-checkpoint-postgres（另有社区与官方维护的 MongoDB 等实现）。durability 支持 exit / async / sync 三种。官方文档明确：第一个持久快照写入前崩溃，线程与「从未开始」无法区分，需要业务侧记录兜底。
+    sources:
+      - title: "LangGraph Persistence（Checkpointers）"
+        url: "https://docs.langchain.com/oss/python/langgraph/checkpointers"
+      - title: "LangGraph Interrupts（Graph migrations 说明）"
+        url: "https://docs.langchain.com/oss/python/langgraph/interrupts"
+  - id: d37-k3
+    name: interrupt 人工审批：暂停、恢复与节点重跑
+    level: P0
+    summary: 节点里调用 interrupt 暂停并把审批内容抛给调用方；之后用同一 thread_id 传 Command(resume) 恢复，节点从头重跑
+    analogy: |
+      **像前端的 `await showConfirmDialog()`。** 代码停在那一行，等用户点确定，返回值就是用户的选择。
+
+      **不一样的地方：**
+      - 前端弹窗时 JS 线程还活着，Promise 一直挂着；`interrupt` 是**这次执行直接结束**，状态存进快照，可能一天后在**另一个进程**里恢复。
+      - 恢复时**整个节点从头重跑**，不是从 interrupt 那一行接着跑。interrupt 之前的代码会再执行一遍，所以那里不能有不可重复的副作用。
+    why: |
+      生产 Agent 几乎都有「**模型提议、人来拍板**」的环节：建工单、发通知、退款、执行 SQL 写操作。
+      面试高频场景题「审批等了一天服务重启了，Agent 怎么从断点继续」考的就是：你知不知道 interrupt 依赖 checkpointer、恢复语义是什么、节点重跑会带来什么坑。
+    problem: |
+      解决「**Agent 执行到高风险操作前，如何停下来等人决定，并在任意时间、任意进程里带着人的决定继续**」的问题。
+      interrupt 把「等待」从内存里的阻塞变成**持久化的暂停**：状态在快照里，审批结果作为 resume 值注入，流程按人的决定继续或终止。
+    principle: |
+      **一、基本用法**
+
+      ```python
+      from langgraph.types import interrupt, Command
+
+      def approve(state: State) -> dict:
+          decision = interrupt({
+              "kind": "ticket_approval",
+              "draft": state["ticket_draft"],
+              "options": ["approve", "edit", "reject"],
+          })
+          if decision["action"] == "reject":
+              return {"approved": False}
+          draft = decision.get("draft", state["ticket_draft"])
+          return {"approved": True, "ticket_draft": draft}
+      ```
+
+      - 第一次执行到 `interrupt(...)`：执行停止，payload 作为中断信息返回给调用方（`result.interrupts`）；
+      - 之后调用 `graph.invoke(Command(resume={"action": "approve"}), cfg)`：节点**从头重跑**，这次 `interrupt(...)` 不再暂停，而是**直接返回 resume 的值**。
+
+      **二、跨天、跨进程的完整流程**
+
+      ```mermaid
+      sequenceDiagram
+        participant U as 运营台
+        participant A as 后端实例A
+        participant DB as Postgres快照
+        participant B as 后端实例B
+        participant M as 值班长
+        U->>A: 提交告警处置 thread_id 为告警单号
+        A->>DB: 每步写快照
+        A-->>U: 返回 interrupts 审批卡片
+        Note over A: 当天夜里 A 重启
+        M->>B: 第二天点击批准
+        B->>DB: 按 thread_id 读最新快照
+        B->>B: Command resume 重跑 approve 节点
+        B->>DB: 继续执行并写快照
+        B-->>M: 工单已创建
+      ```
+
+      **三、前提条件**
+
+      - 必须挂 **checkpointer**，生产用持久化实现；
+      - 恢复时用**同一个 thread_id**；
+      - payload 和 resume 值要能 **JSON 序列化**。
+
+      **四、四条规则（官方明确列出）**
+
+      1. **interrupt 之前的副作用必须幂等**：节点重跑时会再执行一次。最稳的做法是**把副作用和 interrupt 拆到不同节点**。
+      2. **不要用裸 `try/except Exception` 包住 interrupt**：interrupt 靠抛特殊异常实现暂停，被吞掉就停不下来。
+      3. **一个节点里多个 interrupt 不要改变顺序或条件跳过**：恢复时按**出现顺序**匹配 resume 值。
+      4. **不要传复杂对象**：函数、连接、类实例都不能进 payload。
+
+      **五、多个中断同时挂起**
+
+      并行分支各自 interrupt 时，`result.interrupts` 里有多个，每个有 `id`。恢复时传映射：`Command(resume={中断1.id: 值1, 中断2.id: 值2})`。
+
+      **六、两种更省事的写法**
+
+      - **`HumanInTheLoopMiddleware`**（create_agent 用）：配置 `interrupt_on={"create_ticket": {"allowed_decisions": ["approve", "edit", "reject"]}}`，模型想调这个工具时自动暂停；恢复传 `Command(resume={"decisions": [{"type": "approve"}]})`。
+      - **静态断点** `interrupt_before=["节点名"]`：compile 时设置，主要用于**调试**，业务审批推荐用 `interrupt()`。
+    scenarios: |
+      - **写操作审批**：建工单、派人、发群通知前暂停，展示草稿，支持批准、修改后批准、驳回。
+      - **补充信息**：模型发现缺少关键参数（如楼层），interrupt 问用户，拿到后继续。
+      - **工具调用复核**：Text2SQL 生成的 SQL 执行前让 DBA 确认（只读场景也可用于高成本查询）。
+      - **多人会签**：两个并行审批分支各自 interrupt，按中断 ID 分别回填。
+    code: |
+      ```python
+      from langgraph.types import Command
+
+      cfg = {"configurable": {"thread_id": "alarm-20261112-001"}}
+
+      # 第一次：跑到审批节点暂停
+      result = graph.invoke({"messages": [{"role": "user", "content": "3号楼烟感报警"}]},
+                            cfg, version="v2")
+      if result.interrupts:
+          card = result.interrupts[0].value     # 推给运营台渲染审批卡片
+          save_pending_approval(card, thread_id="alarm-20261112-001")
+
+      # 第二天，可能是另一个实例：按同一 thread_id 恢复
+      result = graph.invoke(
+          Command(resume={"action": "edit", "draft": {"title": "3号楼3层烟感复核"}}),
+          cfg,
+          version="v2",
+      )
+      print(result.value["approved"])
+      ```
+    pitfalls: |
+      - **在 interrupt 前发短信、建工单**：恢复时节点重跑，副作用执行两次。拆节点，或带幂等键。
+      - **在 interrupt 前调 LLM 生成草稿**：重跑时又生成一份**不同的**草稿，人批准的和最终执行的不一致。草稿应在前一个节点生成并存进 State。
+      - **裸 try/except 包住 interrupt**：暂停信号被吞掉，流程直接往下走。
+      - **恢复时换了 thread_id**：等于新开线程，找不到中断。
+      - **用静态断点做业务审批**：拿不到结构化的审批内容，也不好携带人的决定。
+      - **不给审批设超时**：线程永远挂着，要有过期策略（超时自动驳回并通知）。
+    interview_asks:
+      - question: "审批等了一天服务重启了，Agent 如何从断点继续？"
+        answer: "interrupt 时检查点已经在库里。重启后用原来的 thread_id 读出暂停点，人审批的结果用 Command 送回去继续。审批结果本身也要落库，不能只放在内存。"
+      - question: "interrupt 恢复后，节点从哪里开始执行？会带来什么问题？"
+        answer: "整个节点会重跑，不是从 interrupt 那一行的下一行接着执行。所以 interrupt 前的写操作会再做一次，必须幂等，或者把写操作放在人批准之后的另一个节点。"
+      - question: "HumanInTheLoopMiddleware 和自己写 interrupt 节点有什么区别？"
+        answer: "中间件是在指定工具执行前自动暂停，适合「这些工具要人点头」。自己写节点适合审批的是整段计划或业务对象，不只是某个工具。简单工具审批用中间件，少写一张图。"
+    project_example: |
+      **p2 智慧园区运营 Agent 的工单审批：**
+
+      图是 `draft_ticket → approve → create_ticket`，**三个节点分开**：
+      - `draft_ticket` 调 LLM 生成工单草稿，写进 State；
+      - `approve` 只做一件事：`interrupt` 把草稿和风险依据推给值班长；
+      - `create_ticket` 拿批准后的草稿调用工单系统，**请求带幂等键（告警单号）**，即使重试也不会建两张。
+
+      运营台审批卡片支持批准、修改后批准、驳回，超过 24 小时未处理自动驳回并在群里提醒。
+    freshness: |
+      核对日期 2026-11（langgraph 1.2.x、langchain 1.5.x）。`interrupt`、`Command` 从 `langgraph.types` 导入；`invoke(..., version="v2")` 返回带 `.value`、`.interrupts` 的 GraphOutput，旧写法 `result["__interrupt__"]` 仍兼容但已不推荐。langgraph 1.2.12 起 interrupt 支持 `response_schema` 校验 resume 值。HumanInTheLoopMiddleware 的决策类型为 approve / edit / reject / respond，默认按批次（batched）审批。
+    sources:
+      - title: "LangGraph Interrupts"
+        url: "https://docs.langchain.com/oss/python/langgraph/interrupts"
+      - title: "LangChain Human-in-the-loop"
+        url: "https://docs.langchain.com/oss/python/langchain/human-in-the-loop"
+  - id: d37-k4
+    name: 流式输出：stream mode、v2 格式与推送到 Vue
+    level: P1
+    summary: stream 按模式输出状态、更新、token、自定义进度；v2 统一成 type/ns/data 结构，后端转成 SSE 推给前端
+    analogy: |
+      **像前端的 `EventSource` 按事件名分发。** 后端推 `event: token`、`event: progress`、`event: approval`，前端分别 `addEventListener`。LangGraph 的 stream mode 就是在**图内部**区分这几类事件。
+
+      **不一样的地方：** EventSource 只能 GET、断线自动重连；Agent 对话一般用 POST + `fetch` 读流（见 Day 10）。断线后不能简单重放请求，否则会**再跑一遍 Agent**，要用 thread_id 查快照恢复界面。
+    why: |
+      Agent 一次任务可能跑几十秒：查设备、查告警、再总结。界面如果一直转圈，用户会以为卡死。
+      流式要同时解决三件事：**逐字输出回答**、**显示「正在查询设备…」进度**、**遇到审批时弹出卡片**。这正是前端负责人在 AI 项目里最能发挥价值的地方。
+    problem: |
+      解决「**如何把图执行过程中的不同类型信息（token、步骤进度、状态变化、中断）实时、分类地推给前端**」的问题。
+      LangGraph 的 stream 支持多种模式并可同时开启，v2 格式给每条事件打上类型标签，后端只需按类型转成 SSE 事件。
+    principle: |
+      **一、常用 stream mode**
+
+      | 模式 | 每条内容 | 典型用途 |
+      |---|---|---|
+      | `values` | 每步之后的**完整 State** | 调试、简单界面 |
+      | `updates` | 每步**哪个节点返回了什么** | 进度条、日志 |
+      | `messages` | LLM 的 **token 片段** + 元数据 | 打字机效果 |
+      | `custom` | 节点里用 `get_stream_writer()` 写的任意数据 | 「正在查询设备…」 |
+      | `checkpoints` / `tasks` / `debug` | 快照、任务、调试事件 | 排错与可观测 |
+
+      可以同时开：`stream_mode=["messages", "updates", "custom"]`。
+
+      **二、v2 格式**
+
+      传 `version="v2"` 后，**所有模式**都输出统一结构 `{"type": ..., "ns": ..., "data": ...}`：`type` 是模式名，`ns` 是子图命名空间，`data` 是内容。不用再区分「单模式返回原始数据、多模式返回元组」。
+
+      **三、messages 模式的细节**
+
+      - `data` 是 `(消息片段, 元数据)`；元数据里的 `langgraph_node` 告诉你 token 来自哪个节点；
+      - 图里**任何地方**调用的 LLM（包括工具内部）都会流出 token，要按节点或 tags 过滤；
+      - 不想流出的模型调用（如内部分类器）可以加 `nostream` 标签。
+
+      **四、从图到浏览器**
+
+      ```mermaid
+      sequenceDiagram
+        participant V as Vue 运营台
+        participant F as FastAPI
+        participant G as LangGraph
+        V->>F: POST chat 带 thread_id 和问题
+        F->>G: astream 开启 messages updates custom
+        G-->>F: custom 正在查询设备
+        F-->>V: event progress
+        G-->>F: messages token 片段
+        F-->>V: event token
+        G-->>F: 执行结束
+        F->>G: aget_state 检查 interrupts
+        F-->>V: event approval 或 event done
+      ```
+
+      **五、更新的一层：事件流 API**
+
+      langgraph 1.2 新增 `graph.stream_events(input, version="v3")`，返回一个可同时多方消费的流对象，按「投影」取数据：`stream.messages`（逐条消息与 token）、`stream.values`、`stream.interrupts`、`stream.output`、`stream.subgraphs`。官方推荐**新应用代码**优先用它；需要底层原始事件时再用 `stream(stream_mode=...)`。
+    scenarios: |
+      - **对话打字机**：messages 模式过滤 `langgraph_node == "agent"` 的 token。
+      - **多步骤进度**：查询节点开头用 `get_stream_writer()` 写进度，前端显示步骤条。
+      - **审批弹窗**：流结束后检查 interrupts，推 `approval` 事件，前端渲染审批卡片。
+      - **子 Agent 可视化**：开启 subgraphs，用 `ns` 区分主 Agent 和子 Agent 的输出（Day 39）。
+    code: |
+      ```python
+      import json
+      from fastapi import FastAPI
+      from fastapi.responses import StreamingResponse
+      from langgraph.config import get_stream_writer
+
+      app = FastAPI()
+
+
+      def check_devices(state: State) -> dict:
+          get_stream_writer()({"step": "正在查询设备", "building": state["building"]})
+          return {"findings": [query_devices(state["building"])]}
+
+
+      def sse(event: str, data: dict) -> str:
+          return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+      @app.post("/chat/{thread_id}")
+      async def chat(thread_id: str, body: dict):
+          cfg = {"configurable": {"thread_id": thread_id}}
+
+          async def events():
+              async for part in graph.astream(
+                  {"messages": [{"role": "user", "content": body["text"]}]},
+                  cfg,
+                  stream_mode=["messages", "custom"],
+                  version="v2",
+              ):
+                  if part["type"] == "messages":
+                      chunk, meta = part["data"]
+                      if chunk.content and meta["langgraph_node"] == "agent":
+                          yield sse("token", {"text": chunk.content})
+                  elif part["type"] == "custom":
+                      yield sse("progress", part["data"])
+              snap = await graph.aget_state(cfg)
+              if snap.interrupts:
+                  yield sse("approval", snap.interrupts[0].value)
+              yield sse("done", {})
+
+          return StreamingResponse(events(), media_type="text/event-stream")
+      ```
+    pitfalls: |
+      - **不过滤 messages**：内部分类器、工具里调用的 LLM token 也会混进回答。按 `langgraph_node` 或 tags 过滤，或给内部调用加 `nostream`。
+      - **用 values 模式做打字机**：values 只在每步结束才给完整状态，没有 token 级粒度。
+      - **前端断线就重新 POST**：会把 Agent 再跑一遍，甚至重复执行工具。应按 thread_id 调 `get_state` 恢复界面。
+      - **代理缓冲**：Nginx 默认缓冲会让 SSE 一次性到达，要关闭缓冲（Day 10 讲过 `X-Accel-Buffering: no`）。
+      - **混用 v1 和 v2 解析**：v1 单模式返回原始数据、多模式返回元组；升级 v2 后解析代码要同步改。
+    interview_asks:
+      - question: "LangGraph 有哪些 stream mode？打字机效果和进度提示分别用哪个？"
+        answer: "要模型逐字输出，用消息或 Token 那一档流。要告诉用户「正在查工单」，用更新状态那一档。前端两路分开接。具体模式名以你锁定的 LangGraph 版本文档为准，不要混用旧名字。"
+      - question: "Agent 流式输出过程中前端断线了，怎么处理？"
+        answer: "后端取消这次运行，能停的工具就停。已经做完的写操作不回滚掉，状态留在检查点。用户回来用 thread_id 看已经做到哪，而不是再开一个新任务重做。"
+    project_example: |
+      **p2 智慧园区运营 Agent 的 Vue3 运营台：**
+      - 后端 FastAPI 开启 `messages` + `custom`，转成 `token`、`progress`、`approval`、`done` 四类 SSE 事件；
+      - 前端用 `fetch` + `ReadableStream` 解析，`progress` 驱动步骤条，`approval` 弹出审批卡片；
+      - 刷新页面或断线后，前端用告警单号调 `/threads/{id}/state` 接口拿最新快照还原界面，而不是重新提交问题。
+
+      这部分是前端背景的加分项：面试时可以讲清「流式事件协议是我设计的」。
+    freshness: |
+      核对日期 2026-11。stream / astream 支持 values、updates、messages、custom、checkpoints、tasks、debug 七种模式；`version="v2"`（langgraph ≥1.1）统一为 type/ns/data，v1 仍是默认值。langgraph 1.2 新增 `stream_events(version="v3")` 事件流 API，官方称其为多数应用代码的推荐方式。`get_stream_writer` 从 `langgraph.config` 导入。
+    sources:
+      - title: "LangGraph Streaming"
+        url: "https://docs.langchain.com/oss/python/langgraph/streaming"
+      - title: "LangGraph Event streaming"
+        url: "https://docs.langchain.com/oss/python/langgraph/event-streaming"
+test:
+  - id: d37-t1
+    kp: d37-k1
+    type: single
+    question: |
+      图已挂上 checkpointer。用户第二次提问时，后端用**同一个 thread_id** 调用 `invoke({"messages": [新问题]}, cfg)`。会发生什么？
+    options:
+      - "清空旧状态，从头开始一次全新的执行"
+      - "在上一轮最终状态上开始新一轮，新消息追加到历史"
+      - "报错，因为该线程已经执行完毕不能再写入"
+      - "从上一轮第一步重新回放，再处理新消息"
+    answer: [1]
+    explain: |
+      同一 thread_id 加新输入，表示在最新快照的状态上开始新一轮。messages 用 add_messages 时新问题追加到历史后面，这就是多轮记忆。
+      不会清空，也不会报错，更不会回放旧步骤；回放要显式传入历史快照的 config。
+  - id: d37-t2
+    kp: d37-k1
+    type: judge
+    question: checkpointer 只在一次 invoke 完整结束时保存一次快照，中间步骤不会保存。
+    answer: false
+    explain: |
+      checkpointer 在每个 super-step 之后都会写一个快照，所以才能从中间某一步恢复、查看历史、做时间旅行。
+      durability 设为 exit 时，中间快照会延迟到执行结束（完成、出错或中断）时才真正落盘，但快照粒度仍然是每一步。
+  - id: d37-t3
+    kp: d37-k1
+    type: single
+    question: 长任务执行到第 5 步时调用外部接口超时报错，你已修好接口。想从第 5 步接着跑、前 4 步不重跑，应该怎么调用？
+    options:
+      - "用同一 thread_id 重新传入原始问题"
+      - "换一个新的 thread_id 重新执行"
+      - "用同一 thread_id 调用 invoke(None, cfg)"
+      - "调用 Command(resume=True) 恢复"
+    answer: [2]
+    explain: |
+      传 None 表示不给新输入，从最新快照接着执行，前面已成功的步骤不会重跑。
+      重新传原始问题会被当成新一轮输入；换 thread_id 是全新线程；Command(resume) 用于回答 interrupt，不是出错重试的语义。
+  - id: d37-t4
+    kp: d37-k1
+    type: multi
+    question: 通过 `graph.get_state(cfg)` 拿到的 StateSnapshot 中，包含哪些信息？
+    options:
+      - "values：当时的 State"
+      - "next：下一步要执行的节点，空表示已跑完"
+      - "config：含 thread_id 和该快照的 checkpoint_id"
+      - "该步调用 LLM 的完整 HTTP 请求和响应原文"
+    answer: [0, 1, 2]
+    explain: |
+      快照里有 values、next、config（含 checkpoint_id）、metadata，以及待执行任务和挂起的中断。
+      它不存 LLM 的 HTTP 原文，那类数据应该看 LangSmith 等追踪系统。
+  - id: d37-t5
+    kp: d37-k1
+    type: single
+    question: 下面的接口上线后，用户反馈「每次追问 Agent 都不记得上一句」。原因是：
+    code: |
+      graph = builder.compile(checkpointer=saver)
+
+      @app.post("/chat")
+      async def chat(body: dict):
+          cfg = {"configurable": {"thread_id": str(uuid.uuid4())}}
+          return await graph.ainvoke(
+              {"messages": [{"role": "user", "content": body["text"]}]}, cfg
+          )
+    options:
+      - "每次请求随机生成 thread_id，每次都是新线程"
+      - "ainvoke 不支持 checkpointer，必须改用 invoke"
+      - "messages 应该放在 configurable 里传入"
+      - "compile 时还需要额外开启 memory=True"
+    answer: [0]
+    explain: |
+      快照按 thread_id 归档，每次随机生成就等于每次都开一个新线程，自然没有历史。应由前端传会话 ID，或后端按用户和会话生成稳定的 thread_id。
+      ainvoke 完全支持 checkpointer（异步图配异步 saver）；messages 是输入不是配置；compile 没有 memory 参数。
+  - id: d37-t6
+    kp: d37-k2
+    type: single
+    question: p2 后端要部署 3 个实例，值班长的审批请求可能落到任意实例。checkpointer 应该选：
+    options:
+      - "InMemorySaver，读写最快且无需额外部署"
+      - "SqliteSaver，每个实例各存一个本地文件"
+      - "把 State 序列化后自己存进浏览器 localStorage"
+      - "AsyncPostgresSaver，所有实例共享同一个数据库"
+    answer: [3]
+    explain: |
+      多实例要共享快照，且要扛住重启，所以用 Postgres 这类持久化共享存储；FastAPI 是异步的，配 AsyncPostgresSaver，首次运行调用 setup 建表。
+      InMemorySaver 重启即丢且不共享；每实例一个 SQLite 文件彼此看不到；状态放浏览器既不安全也无法被后端恢复。
+  - id: d37-t7
+    kp: d37-k2
+    type: judge
+    question: 图用 ainvoke / astream 异步执行时，可以直接使用同步的 PostgresSaver。
+    answer: false
+    explain: |
+      异步图要配异步 saver，如 AsyncPostgresSaver、AsyncSqliteSaver。用同步 saver 会报错或在事件循环里阻塞（Day 6 讲过阻塞事件循环的后果）。
+  - id: d37-t8
+    kp: d37-k2
+    type: single
+    question: 告警处置流程后半段会调用外部系统建工单，你希望每一步的快照都**确保落盘后**才进入下一步。应选哪种 durability？
+    options:
+      - "exit，执行结束时统一写入"
+      - "sync，每步写完再继续"
+      - "async，后台异步写入上一步"
+      - "不用设置，默认就是每步同步写"
+    answer: [1]
+    explain: |
+      sync 在进入下一步前同步写完快照，崩溃安全性最高，适合有外部副作用的流程。
+      exit 只在结束时写，中途崩溃会丢进度；async 在下一步执行时后台写，极端情况下可能丢最后一步；默认并不是 sync。
+  - id: d37-t9
+    kp: d37-k2
+    type: multi
+    question: 关于 LangGraph 的时间旅行（回放与修改状态），哪些说法正确？
+    options:
+      - "get_state_history 返回的快照最新的排在最前"
+      - "从旧快照回放，会重新执行后续节点和 LLM 调用"
+      - "update_state 会新建快照形成分叉，而不是改写历史"
+      - "update_state 写入的值会绕过 reducer 直接覆盖"
+    answer: [0, 1, 2]
+    explain: |
+      历史按时间倒序返回；回放不是读缓存，后续节点、LLM、外部接口和 interrupt 都会重新发生；update_state 新建一个快照，历史保留。
+      update_state 的值同样经过各字段的 reducer，比如对 add_messages 字段是追加或按 ID 替换，而不是直接覆盖。
+  - id: d37-t10
+    kp: d37-k2
+    type: single
+    question: 告警请求刚进入、第一个快照还没落盘时进程崩溃了。巡检任务靠「checkpointer 里有没有这个线程」判断任务是否存在。会出现什么问题，怎么防？
+    options:
+      - "LangGraph 会自动重放该请求，不需要处理"
+      - "该线程会以报错状态出现在快照里，巡检可识别"
+      - "看起来和从没开始一样会静默丢失，要先写业务受理记录"
+      - "只要换成 sync 模式，这种情况就不可能发生"
+    answer: [2]
+    explain: |
+      第一个持久快照写入前崩溃，checkpointer 里没有任何痕迹，与从未开始无法区分，官方文档也明确提到这一点。防护方法是先在业务库写受理记录（outbox），巡检任务扫描「已受理但无快照或长时间无进展」的记录重新拉起。
+      sync 只保证每步写完才继续，挡不住第一步之前的崩溃；LangGraph 不会自动重放未持久化的请求。
+  - id: d37-t11
+    kp: d37-k3
+    type: single
+    question: 节点中调用了 `interrupt(payload)`。之后用 `Command(resume=value)` 恢复时，执行从哪里开始？
+    options:
+      - "从 interrupt 那一行的下一行继续"
+      - "从整个图的 START 重新开始"
+      - "跳过该节点，直接执行下一个节点"
+      - "从该节点开头重跑，interrupt 直接返回 value"
+    answer: [3]
+    explain: |
+      LangGraph 不保存函数内部的执行位置，恢复时会把整个节点从头重跑，这次 interrupt 不再暂停，而是返回 resume 的值。
+      所以 interrupt 之前的代码会再执行一次，这是很多重复副作用 bug 的根源。不会从 START 重来，也不会跳过节点。
+  - id: d37-t12
+    kp: d37-k3
+    type: single
+    question: 下面的审批节点上线后，值班长反映「每张工单都收到两条通知短信」。原因是：
+    code: |
+      def approve(state: State) -> dict:
+          sms.send(state["duty_phone"], "有新工单待审批")
+          decision = interrupt({"draft": state["ticket_draft"]})
+          if decision["action"] == "approve":
+              return {"approved": True}
+          return {"approved": False}
+    options:
+      - "短信服务自带重试，网络抖动时重复发送"
+      - "恢复时节点从头重跑，sms.send 又执行了一次"
+      - "interrupt 会让节点在暂停期间被调度两次"
+      - "checkpointer 写快照失败后自动重试了节点"
+    answer: [1]
+    explain: |
+      第一次执行发了短信并暂停；值班长批准后 Command(resume) 让节点从头重跑，sms.send 再执行一次。修复是把发短信移到前一个节点，或用幂等键保证只发一次，approve 节点只保留 interrupt。
+      其余选项都不是 interrupt 的执行机制。
+  - id: d37-t13
+    kp: d37-k3
+    type: judge
+    question: |
+      为了防止节点报错，用 `try: ... except Exception: ...` 把 interrupt() 调用整个包起来是安全的写法。
+    answer: false
+    explain: |
+      interrupt 是通过抛出一个特殊异常来暂停执行的，裸 except Exception 会把它吞掉，流程就不会暂停而是直接往下走。官方规则要求不要用裸 try/except 包住 interrupt，要捕获就只捕获具体的业务异常类型。
+  - id: d37-t14
+    kp: d37-k3
+    type: multi
+    question: 要让 interrupt 跨天审批可靠工作，下列哪些是必须遵守的？
+    options:
+      - "编译时挂上持久化的 checkpointer"
+      - "恢复时使用与暂停时相同的 thread_id"
+      - "payload 和 resume 值能 JSON 序列化"
+      - "恢复必须发生在暂停时的同一个进程里"
+    answer: [0, 1, 2]
+    explain: |
+      状态在 checkpointer 里，拿同一个 thread_id 就能在任何进程里恢复，这正是跨天审批能成立的原因；payload 与 resume 值要写进快照，必须可序列化。
+      恢复不需要同一个进程，多实例部署下由任意实例恢复都可以。
+  - id: d37-t15
+    kp: d37-k3
+    type: single
+    question: 使用 create_agent + HumanInTheLoopMiddleware 拦截 `create_ticket` 工具，值班长批准后，后端应该怎么恢复？
+    options:
+      - "Command(resume={\"decisions\": [{\"type\": \"approve\"}]})"
+      - "invoke(None, cfg) 直接继续执行"
+      - "重新传入用户原始问题，让模型再次决定"
+      - "调用 update_state 把 approved 字段设为 True"
+    answer: [0]
+    explain: |
+      HITL middleware 暂停时等待的是一组决策，恢复要用同一 thread_id 传入 Command(resume={"decisions": [...]})，决策类型可以是 approve、edit、reject、respond，按中断里动作的顺序给出。
+      传 None、重新提问或 update_state 都不能回答这个中断。
+  - id: d37-t16
+    kp: d37-k4
+    type: single
+    question: 想在 Vue 运营台实现「回答逐字出现」的打字机效果，应该开启哪种 stream mode？
+    options:
+      - "values，每步输出完整 State"
+      - "updates，每步输出节点的更新"
+      - "debug，输出尽可能多的执行信息"
+      - "messages，输出 LLM 的 token 片段"
+    answer: [3]
+    explain: |
+      messages 模式会把 LLM 生成的 token 片段连同元数据实时流出，适合打字机效果。
+      values 和 updates 都是每个节点执行完才输出一次，粒度太粗；debug 信息杂乱，不适合直接给前端。
+  - id: d37-t17
+    kp: d37-k4
+    type: single
+    question: 查询设备的节点要花 5 秒，你希望前端先显示「正在查询 3 号楼设备…」。最合适的做法是：
+    options:
+      - "在节点里 print 一行日志，前端轮询日志文件"
+      - "节点里用 get_stream_writer 写进度，开启 custom 模式"
+      - "让模型先输出一句「正在查询」，再调用工具"
+      - "把进度文字写进 State，等 values 模式推送"
+    answer: [1]
+    explain: |
+      get_stream_writer 写入的数据会出现在 custom 模式的流里，能在节点执行过程中立即推送，是官方推荐的自定义进度方式。
+      轮询日志不可靠；让模型说「正在查询」浪费 token 且不可控；写进 State 要等节点结束才会随 values 推出，起不到提示作用。
+  - id: d37-t18
+    kp: d37-k4
+    type: multi
+    question: 关于 stream 的 `version="v2"` 格式，哪些说法正确？
+    options:
+      - "每条事件都是含 type、ns、data 的字典"
+      - "同时开多个模式时，靠 type 区分事件类型"
+      - "invoke 传 version=\"v2\" 返回带 value 和 interrupts 的对象"
+      - "v2 已是默认值，不传 version 也是这个格式"
+    answer: [0, 1, 2]
+    explain: |
+      v2 把所有模式统一成 type/ns/data 结构，多模式时用 type 区分，子图用 ns 区分；invoke 传 v2 返回 GraphOutput，用 .value 和 .interrupts 取值。
+      v1 仍是默认值，要显式传 version="v2"，升级时解析代码也要同步修改。
+  - id: d37-t19
+    kp: d37-k4
+    type: judge
+    question: messages 模式只会流出最终回答节点的 token，工具内部或分类节点里调用的 LLM 不会出现在流里。
+    answer: false
+    explain: |
+      图里任何位置调用的 LLM（包括工具内部、分类节点）都会产生 messages 事件。要按元数据里的 langgraph_node 或 tags 过滤，或者给不想流出的模型调用加 nostream 标签。
+  - id: d37-t20
+    kp: d37-k4
+    type: single
+    question: Agent 流式回答到一半，用户刷新了页面。下面哪种恢复方式最合理？
+    options:
+      - "前端自动重新 POST 同一个问题，让 Agent 再跑一遍"
+      - "后端缓存所有 token，前端刷新后全部重放一次"
+      - "前端用 thread_id 查询最新快照还原界面"
+      - "提示用户这次对话已失效，请重新提问"
+    answer: [2]
+    explain: |
+      快照里有完整的对话状态和下一步信息，按 thread_id 读取即可还原界面；若停在审批中断上，也能重新渲染审批卡片。
+      重新 POST 会再执行一遍 Agent，可能重复调用工具；缓存全部 token 成本高且解决不了中断状态；让用户重问体验最差。
+exam:
+  - id: d37-e1
+    kp: d37-k3
+    type: single
+    question: 两个并行审批分支各自调用了 interrupt，`result.interrupts` 里有两个中断。恢复时应该怎么传值？
+    options:
+      - "调用两次 Command(resume=值)，按顺序各回答一个"
+      - "Command(resume={中断1.id: 值1, 中断2.id: 值2})"
+      - "只回答第一个，第二个会自动沿用同一个值"
+      - "用 update_state 分别写入两个节点的结果"
+    answer: [1]
+    explain: |
+      多个中断同时挂起时，用中断 ID 到 resume 值的映射一次性恢复，框架按 ID 把值分别交给对应的 interrupt。逐个调用、自动沿用都不是正确语义；update_state 不能回答中断。
+  - id: d37-e2
+    kp: d37-k3
+    type: single
+    question: compile 时设置的 `interrupt_before=["create_ticket"]` 和节点里调用 `interrupt()`，主要区别是：
+    options:
+      - "前者是静态断点，多用于调试；后者能携带结构化审批内容"
+      - "前者需要 checkpointer，后者不需要"
+      - "前者会让节点从头重跑，后者从断点那一行继续"
+      - "两者完全等价，只是写法不同"
+    answer: [0]
+    explain: |
+      两者都需要 checkpointer。静态断点在节点执行前或后固定停住，适合调试单步；interrupt() 写在节点内部，能把草稿等结构化内容抛给调用方，并接收 resume 值，是业务审批的推荐写法。interrupt 恢复时节点会从头重跑，而不是从断点那一行继续。
+  - id: d37-e3
+    kp: d37-k2
+    type: single
+    question: 运营发现 Agent 在第 3 步把楼栋识别错了，想手动改成「4号楼」后让 Agent 从这里继续。正确做法是：
+    options:
+      - "直接改数据库里的快照记录，再 invoke(None, cfg)"
+      - "用新 thread_id 重新提问，并在问题里写明是 4 号楼"
+      - "update_state 修改 building 字段，再从新快照继续"
+      - "Command(resume={\"building\": \"4号楼\"}) 恢复执行"
+    answer: [2]
+    explain: |
+      update_state 会基于当前快照新建一个修正后的快照，必要时用 as_node 控制下一步走向，然后 invoke(None, 新config) 继续。直接改数据库绕过了框架，容易破坏一致性；新线程丢掉了之前的步骤；没有中断时 Command(resume) 没有对象可回答。
+  - id: d37-e4
+    kp: d37-k4
+    type: single
+    question: 关于 langgraph 1.2 新增的 `graph.stream_events(input, version="v3")`，哪个说法正确？
+    options:
+      - "它取代了 checkpointer，流式时不再需要持久化"
+      - "它只能流出 token，拿不到最终状态和中断信息"
+      - "它是 LangGraph Server 专用 API，进程内不能调用"
+      - "它按 messages、values、interrupts 等投影提供数据"
+    answer: [3]
+    explain: |
+      事件流 API 返回一个可同时被多方消费的流对象，提供 stream.messages、stream.values、stream.interrupts、stream.output、stream.subgraphs 等投影，官方推荐多数应用代码使用。它与 checkpointer 无关，也可以在进程内直接调用。
+  - id: d37-e5
+    kp: d37-k3
+    type: multi
+    question: 设计「工单审批」的 interrupt payload 时，哪些内容适合放进去？
+    options:
+      - "工单草稿的标题、楼层、处理人"
+      - "模型给出的风险等级和依据摘要"
+      - "可选的决策类型和审批截止时间"
+      - "工单系统客户端对象，方便恢复后直接调用"
+    answer: [0, 1, 2]
+    explain: |
+      payload 要能 JSON 序列化，并给审批人足够的决策信息：草稿内容、风险依据、可选动作和截止时间。客户端对象不可序列化，也不该进快照；恢复后由 create_ticket 节点自己获取客户端。
+  - id: d37-e6
+    kp: d37-k2
+    type: multi
+    question: 把 checkpoint 方案从开发环境推到生产，下列哪些是必要的考虑？
+    options:
+      - "换成 Postgres 等持久化共享存储，并执行 setup 建表"
+      - "异步图配异步版本的 saver"
+      - "State 里只放引用，避免每步写入大对象"
+      - "发版前确认没有中断线程停在被改名的节点前"
+      - "保留 InMemorySaver，靠多实例冗余防丢失"
+    answer: [0, 1, 2, 3]
+    explain: |
+      持久化存储与建表、异步 saver、控制快照体积、发版兼容性都是生产化要点。InMemorySaver 每个实例各存各的，多实例冗余并不能共享或恢复快照。
+  - id: d37-e7
+    kp: d37-k1
+    type: judge
+    question: 同一个 super-step 里节点 A 成功、节点 B 失败，修复后用 invoke(None, cfg) 恢复，A 会重新执行一遍。
+    answer: false
+    explain: |
+      A 的输出已作为 pending writes 存进 checkpointer，恢复时只重跑失败的 B。这一机制避免了已成功节点的重复执行和重复副作用，但前提是挂了 checkpointer。
+  - id: d37-e8
+    kp: d37-k2
+    type: judge
+    question: 从历史快照回放（invoke(None, 旧快照config)）时，之后的 LLM 调用会读取上次的缓存结果，所以回放结果与原来完全一致。
+    answer: false
+    explain: |
+      回放会重新执行旧快照之后的节点，LLM、外部 API 和 interrupt 都会重新发生，结果可能不同；有副作用的工具也会再执行一次，所以回放调试最好在测试环境或用模拟工具进行。
+  - id: d37-e9
+    kp: d37-k3
+    type: case
+    question: |
+      p2 的告警处置图中，`approve_ticket` 节点先调用 LLM 根据 findings 生成工单草稿，再调用工单系统「创建草稿单」拿到 draft_id，最后 `interrupt` 把草稿推给值班长。值班长批准后，系统里出现了两张草稿单，而且最终提交的工单内容和值班长看到的不一致。最合理的改造是：
+    options:
+      - "给 LLM 设置 temperature=0，保证两次生成的草稿内容一致"
+      - "拆成生成草稿、审批、提交三个节点，审批节点只调 interrupt，提交带幂等键"
+      - "把 durability 改成 sync，确保 interrupt 前的步骤不会重复执行"
+      - "用 try/except 包住 interrupt，批准后跳过节点前半段的代码"
+    answer: [1]
+    explain: |
+      恢复时节点从头重跑，LLM 重新生成了一份不同的草稿，创建草稿单也执行了两次。根本解法是把「生成草稿」「审批」「提交」拆成独立节点：草稿在前一个节点生成并写进 State，审批节点只做 interrupt，提交时用告警单号做幂等键。
+      temperature=0 不能保证输出完全一致，也解决不了重复建单；durability 管的是快照何时落盘，不改变节点重跑语义；try/except 包 interrupt 会吞掉暂停信号。
+interview:
+  - id: d37-i1
+    kp: d37-k1
+    type: short
+    difficulty: 2
+    question: 讲讲 LangGraph 的 checkpoint 机制：存了什么、什么时候存、thread_id 起什么作用？「继续」「重试」「恢复中断」「回放」分别怎么调用？
+    key_points:
+      - {text: "说明每个 super-step 后保存快照，含 values、next、config、metadata 和挂起的中断", dim: principle}
+      - {text: "说明 thread_id 决定读写哪条快照链，复用 thread_id 不等于恢复", dim: concept}
+      - {text: "分清四种调用：新输入、传 None、Command resume、旧快照 config 回放", dim: principle}
+      - {text: "提到 pending writes 让已成功节点不重跑，以及生产要用持久化 saver", dim: engineering}
+    reference: |
+      **存什么、何时存：** 编译时挂上 checkpointer 后，图每走完一个 super-step 就保存一个 StateSnapshot，里面有当时的 State（values）、下一步要执行的节点（next）、含 thread_id 和 checkpoint_id 的 config、步骤元数据，以及待执行任务和挂起的中断。
+
+      **thread_id：** 快照按 thread_id 归档成一条链，相当于 Git 的分支。用会话 ID 就是多轮对话，用业务单号就是一次业务流程。要注意复用 thread_id 本身不等于恢复，关键看传什么输入。
+
+      **四种调用：**
+      - invoke(新输入, cfg)：在最新状态上开始新一轮；
+      - invoke(None, cfg)：不给新输入，从最新快照接着跑，用于出错重试；
+      - invoke(Command(resume=值), cfg)：回答中断；
+      - invoke(None, 旧快照的 config)：回放，后续节点和 LLM 会重新执行。
+
+      **补充：** 同一步并行节点部分失败时，成功节点的输出作为 pending writes 保存，恢复只重跑失败的节点。生产环境用 AsyncPostgresSaver 这类持久化共享存储。
+    oral: |
+      我理解 checkpoint 就是给 Agent 每一步自动打一个 Git commit。挂上 checkpointer 后，每个 super-step 结束都会存一份快照，里面有当时的状态、下一步要跑哪个节点，还有挂起的中断。
+      thread_id 相当于分支，决定读写哪条快照链。但复用 thread_id 不等于恢复，要看传什么：传新输入是新一轮对话，传 None 是出错后接着跑，传 Command resume 是回答审批中断，传旧快照的 config 是回放。
+      在园区项目里，聊天用会话 ID，告警处置用告警单号做 thread_id，生产用 Postgres 存，所以重启和多实例都没问题。
+  - id: d37-i2
+    kp: d37-k3
+    type: scenario
+    difficulty: 3
+    question: 园区 Agent 生成工单草稿后等待值班长审批。值班长第二天才点「批准」，而前一天夜里服务已经重启过，而且现在是 3 个实例。请说明 Agent 如何从断点继续，以及你在设计时防了哪些坑。
+    key_points:
+      - {text: "说明 interrupt 暂停时状态已存进持久化 checkpointer，按告警单号作 thread_id 可在任意实例恢复", dim: principle}
+      - {text: "说明恢复方式：同一 thread_id 传 Command resume，节点从头重跑、interrupt 返回审批结果", dim: principle}
+      - {text: "指出节点重跑带来的重复副作用和草稿不一致，给出拆节点和幂等键方案", dim: engineering}
+      - {text: "提到 durability sync、第一快照前崩溃靠受理记录兜底、审批超时策略", dim: engineering}
+      - {text: "提到发版时不要改名中断线程即将进入的节点，以及前端如何恢复审批卡片", dim: project}
+    reference: |
+      **为什么能继续：** 审批节点调用 interrupt 时，这次执行就结束了，State 和「下一步是 approve 节点」都已写进 AsyncPostgresSaver。重启只是丢了进程内存，快照还在数据库里。thread_id 用的是告警单号，所以值班长的请求落到任何一个实例，都能按单号找到这条快照链。
+
+      **怎么恢复：** 审批接口收到「批准」后调用 graph.ainvoke(Command(resume={"action": "approve"}), {"configurable": {"thread_id": 告警单号}})。approve 节点会从头重跑，这次 interrupt 直接返回审批结果，然后流程进入 create_ticket。
+
+      **防的坑：**
+      1. **重复副作用：** 节点重跑会把 interrupt 之前的代码再执行一遍。所以草稿生成、审批、提交拆成三个节点，审批节点只调 interrupt；提交工单带告警单号作为幂等键。
+      2. **落盘时机：** 这条流程用 durability="sync"，每步写完才继续。
+      3. **第一快照前崩溃：** 告警受理时先写业务表，巡检任务拉起「已受理但无快照」的记录。
+      4. **超时：** 24 小时未审批自动驳回并通知，避免线程永久挂起。
+      5. **发版兼容：** 有线程停在审批上时，不改名或删除 create_ticket 节点。
+
+      **前端：** 值班长打开审批页时，按告警单号调 get_state，从 interrupts 里取出草稿渲染卡片，所以页面刷新也不丢。
+    oral: |
+      结论是：能无缝继续，因为暂停时状态已经在 Postgres 里了，跟进程活不活着没关系。
+      我们用告警单号做 thread_id，interrupt 的时候这次执行就结束了，快照里记着状态和下一步是审批节点。第二天值班长点批准，请求不管落到哪个实例，都用同一个单号传 Command resume，审批节点从头重跑，interrupt 直接返回批准结果，然后进入建工单。
+      设计时我主要防了几个坑：一是节点会重跑，所以生成草稿、审批、提交拆成三个节点，提交带幂等键，不会建两张单；二是这条流程用 sync 落盘，受理时先写业务表兜底；三是审批超过 24 小时自动驳回；四是发版时不改审批后面的节点名。
+  - id: d37-i3
+    kp: d37-k4
+    type: design
+    difficulty: 3
+    question: 请为园区运营台设计 Agent 的流式交互协议：既要打字机输出，又要显示步骤进度，遇到审批要弹卡片，还要支持刷新页面后恢复。说说后端怎么从 LangGraph 取事件、事件怎么定义、前端怎么处理断线。
+    key_points:
+      - {text: "后端用 astream 同时开 messages 和 custom（或 stream_events v3），v2 格式按 type 分流", dim: principle}
+      - {text: "定义 token、progress、approval、done、error 等 SSE 事件，并说明数据结构", dim: engineering}
+      - {text: "说明 messages 要按 langgraph_node 或 tags 过滤，内部模型调用加 nostream", dim: principle}
+      - {text: "断线或刷新时不重新提交，而是按 thread_id 读快照还原界面和审批卡片", dim: engineering}
+      - {text: "提到 Nginx 关闭缓冲、POST 加 fetch 读流等前端落地细节", dim: project}
+    reference: |
+      **取事件：** FastAPI 接口用 graph.astream(输入, cfg, stream_mode=["messages", "custom"], version="v2")。messages 事件按元数据 langgraph_node 只保留回答节点的 token，意图分类这类内部模型调用加 nostream 标签。查询节点开头用 get_stream_writer 写进度。流结束后用 aget_state 检查 interrupts。新项目也可以用 stream_events(version="v3")，直接读 stream.messages 和 stream.interrupts 投影。
+
+      **事件协议：**
+      - token：{text}，打字机追加；
+      - progress：{step, building}，驱动步骤条；
+      - approval：{draft, risk, options, expires_at}，弹审批卡片；
+      - done：{thread_id}，结束；
+      - error：{code, message}，可重试或提示。
+
+      **前端：** 对话是 POST，所以用 fetch 加 ReadableStream 按 SSE 格式解析，而不是 EventSource。Nginx 关闭缓冲，否则事件会攒在一起才到。
+
+      **断线与刷新：** 不自动重新提交问题，否则 Agent 会重跑、工具会重复调用。前端保存 thread_id，刷新后调 /threads/{id}/state，后端返回快照中的消息和 interrupts：已完成就展示结果；停在审批就重新渲染卡片；仍在执行就显示「处理中」并轮询状态。
+    oral: |
+      我会把它分成取事件、定协议、做恢复三层。
+      后端用 astream 同时开 messages 和 custom 两种模式，用 v2 格式按 type 分流。messages 只保留回答节点的 token，内部分类器加 nostream；查询节点用 stream writer 推进度；流结束后检查快照里有没有中断。
+      对前端我定义了 token、progress、approval、done、error 五种事件，审批事件带草稿、风险依据和截止时间。因为是 POST，前端用 fetch 读流，Nginx 要关缓冲。
+      最关键的是断线不重发问题。前端存 thread_id，刷新后按 thread_id 拉快照，跑完就展示结果，停在审批就重新弹卡片，这样不会让 Agent 重跑。

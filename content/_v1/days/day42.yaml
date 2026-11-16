@@ -1,0 +1,765 @@
+day: 42
+phase: 5
+title: 异步任务：后台任务、任务队列与消息队列
+goals:
+  - "能判断一个操作该在请求内同步完成、用 BackgroundTasks，还是交给独立的任务队列，并说明 BackgroundTasks 的局限"
+  - "能画出 producer、broker、worker、result backend 的任务队列架构，并解释一条任务从投递到完成的全过程"
+  - "能解释 ack 时机、重试、幂等、死信的关系，分析「任务丢失」与「任务重复执行」的成因"
+  - "能为文档入库这类长任务设计提交、状态查询、进度与失败处理的完整接口"
+knowledge_points:
+  - id: d42-k1
+    name: 为什么需要异步任务：BackgroundTasks 及其局限
+    level: P0
+    summary: 慢操作移出请求；BackgroundTasks 在同一进程里跑，进程一死任务就没了
+    why: |
+      AI 应用里大量操作很慢：解析一个 200 页 PDF、切片、调用 Embedding 接口入库，可能要几分钟。如果放在 HTTP 请求里同步做，**网关超时、用户干等、服务的工作线程被占满**。面试官常问「文档上传后你们怎么处理」，答「直接在接口里处理」基本就出局了。
+    problem: |
+      要把「接收请求」和「执行耗时工作」解耦：接口快速返回「已受理」，真正的工作在后台进行。
+      FastAPI 自带的 BackgroundTasks 能做到「响应后再执行」，但它不能跨进程、不持久化、无重试——**适合发邮件这种小活，不适合文档入库这种必须可靠完成的长任务**。
+    principle: |
+      **一、三种执行方式**
+
+      | 方式 | 在哪里执行 | 适合 |
+      |---|---|---|
+      | 请求内同步 | 当前请求的协程或线程 | 毫秒到一两秒、用户必须立刻拿到结果的操作 |
+      | `BackgroundTasks` | **同一个 Web 进程**，响应发出之后 | 发通知、写审计日志等小任务，丢了也能接受 |
+      | 任务队列（Celery 等） | **独立的 worker 进程或机器** | 文档入库、批量 Embedding、报表生成等长任务或必须可靠完成的任务 |
+
+      **二、BackgroundTasks 的工作方式**
+
+      FastAPI 的 `BackgroundTasks` 直接来自 Starlette：你在路由里 `background_tasks.add_task(func, *args)`，FastAPI 先把响应发给客户端，然后在**同一个进程里**依次执行这些函数。`async def` 的任务在事件循环里运行，普通 `def` 的任务放进线程池运行。
+
+      ```mermaid
+      sequenceDiagram
+        participant C as 客户端
+        participant W as Web进程
+        participant T as 后台函数
+        C->>W: POST 上传文档
+        W-->>C: 202 已受理
+        W->>T: 响应发出后执行
+        Note over W,T: 同一进程 无持久化
+        T-->>W: 完成或异常 仅写日志
+      ```
+
+      **三、局限——每一条都是线上事故来源**
+
+      1. **不持久化**：任务只存在于进程内存中。发布新版本重启、容器被 OOM 杀掉、K8s 缩容，正在执行和排队的任务**全部丢失**，且没有任何记录。
+      2. **与 Web 共享资源**：CPU 密集的解析（PDF 解析、分词）会占用 Web 进程的 CPU；`async` 任务里如果有阻塞调用，会卡住整个事件循环，影响所有正常请求（Day 06 讲过）。
+      3. **无重试、无状态**：失败只能靠你自己 try/except；外部想知道「任务进行到哪了」没有现成机制。
+      4. **不能横向扩展执行能力**：任务只能在接收请求的那个进程里执行，不能把 100 个入库任务分给 10 台机器。
+      5. **没有并发控制**：瞬间上传 500 个文件，就在一个进程里堆 500 个后台任务。
+
+      FastAPI 官方文档的建议也是：需要重型后台计算、不需要和 Web 进程共享内存时，使用 Celery 这类更大的工具（配合 RabbitMQ 或 Redis 作为消息队列），以便在多个进程、多台服务器上执行。
+
+      **四、判断口诀**
+
+      - 用户要立即看到结果，且几百毫秒内能完成 → 同步。
+      - 丢了无所谓、很快、很轻 → BackgroundTasks。
+      - 慢、重、必须完成、需要重试或进度 → 任务队列。
+
+      ```mermaid
+      flowchart TD
+        A["一个操作"] --> B{"用户必须同步拿到结果且很快"}
+        B -->|"是"| S["请求内同步执行"]
+        B -->|"否"| C{"丢失可接受且很轻"}
+        C -->|"是"| BG["BackgroundTasks"]
+        C -->|"否"| Q["任务队列 加持久化状态"]
+      ```
+    scenarios: |
+      - 用户注册后发欢迎邮件：BackgroundTasks 足够，丢一封邮件影响不大。
+      - 上传知识库文档：任务队列，必须保证最终入库，需要进度和失败重试。
+      - 每次问答后写一条使用量统计：BackgroundTasks 或直接异步写，失败只记日志。
+      - 批量对 10 万条历史工单重新生成 Embedding：任务队列 + 分批 + 限速。
+    code: |
+      ```python
+      from fastapi import BackgroundTasks, FastAPI
+
+      app = FastAPI()
+
+      def write_audit(user_id: str, action: str) -> None:
+          ...  # 写审计日志，失败可接受
+
+      @app.post("/kb/{kb_id}/share")
+      async def share_kb(kb_id: str, background_tasks: BackgroundTasks) -> dict:
+          # ... 同步完成核心业务 ...
+          background_tasks.add_task(write_audit, "u42", f"share:{kb_id}")
+          return {"ok": True}
+      ```
+    pitfalls: |
+      - **误区：BackgroundTasks 就是异步任务队列。** 它没有 broker、不持久化、不能跨进程，重启即丢。
+      - **在 async 后台任务里调用同步阻塞的 PDF 解析库**，会卡住整个事件循环，所有接口一起变慢。
+      - **把文档入库放进 BackgroundTasks，状态只存在内存变量里**，多实例部署时查询状态的请求打到另一个实例就查不到。
+      - **误区：用了 async/await 就不需要任务队列。** async 解决的是 IO 等待时不阻塞，不解决持久化、重试和横向扩展。
+    interview_asks:
+      - "FastAPI 的 BackgroundTasks 和 Celery 有什么区别？什么时候用哪个？"
+      - "用户上传一个大文档，你的接口是怎么设计的？"
+    project_example: |
+      我们最初把文档入库写在 BackgroundTasks 里，测试环境一切正常。上线后每次发布重启，正在处理的文档就停在「处理中」再也不动，用户只能重新上传；另外大 PDF 解析时 Web 接口 P99 延迟明显升高。后来改成：接口只负责保存文件、写入 ingest_jobs 表并投递 Celery 任务，返回 202 和 job_id；解析和 Embedding 放到独立 worker，Web 进程只保留发通知、写审计这类轻任务。
+    freshness: |
+      核对于 2026-11（FastAPI 官方 Background Tasks 文档）：`BackgroundTasks` 来自 `starlette.background`，可在路由和依赖中声明，`async def` 与普通 `def` 任务均可；文档 Caveat 部分建议重型后台计算使用 Celery 这类工具（配合 RabbitMQ 或 Redis）。
+    sources:
+      - {title: "FastAPI - Background Tasks", url: "https://fastapi.tiangolo.com/tutorial/background-tasks/"}
+  - id: d42-k2
+    name: 任务队列架构：broker、worker 与结果存储
+    level: P0
+    summary: 生产者把任务消息放进 broker，worker 拉取执行，状态写入结果存储，三者解耦可扩展
+    why: |
+      Celery、RQ、Dramatiq、SAQ 等工具 API 各不相同，但**架构都是同一套**。理解了 producer、broker、worker、result backend 各自负责什么，你就能看懂任何任务队列的配置，也能在面试中讲清「任务是怎么从接口跑到 worker 上的」。
+    problem: |
+      要让任务：脱离 Web 进程独立执行；在进程崩溃时不丢失；能由多个 worker 并行消费以提升吞吐；能查询执行结果。任务队列用「消息 + 持久化中间件 + 独立消费者」的方式解决这些问题。
+    principle: |
+      **一、四个角色**
+
+      - **Producer（生产者）**：通常是 Web 接口。它不执行任务，只把「任务名 + 参数 + 任务 ID」序列化成一条消息，发给 broker。Celery 中就是 `task.delay(...)` 或 `apply_async(...)`。
+      - **Broker（消息中间件）**：存放待执行的消息，负责投递给 worker。常见选择是 RabbitMQ 或 Redis。它是**任务不丢的关键**：消息在被确认前一直保留在 broker 里。
+      - **Worker（执行者）**：独立进程，从 broker 拉取消息，反序列化后执行对应函数。可以起多个进程、部署在多台机器上横向扩展。
+      - **Result Backend（结果存储）**：保存任务状态（PENDING、STARTED、SUCCESS、FAILURE、RETRY 等）和返回值，供生产者查询。可以是 Redis 或数据库。
+
+      ```mermaid
+      flowchart LR
+        API["Web 接口 生产者"] -->|"任务消息 名称 参数 ID"| B[("Broker 队列")]
+        B --> W1["Worker 1"]
+        B --> W2["Worker 2"]
+        B --> W3["Worker 3"]
+        W1 --> RB[("结果存储")]
+        W2 --> RB
+        W3 --> RB
+        API -.->|"按任务 ID 查询状态"| RB
+        W1 --> DB[("业务数据库 与向量库")]
+      ```
+
+      **二、一条任务的完整生命周期（以 Celery 为例）**
+
+      1. 接口调用 `ingest_document.delay(job_id)`，Celery 生成 task_id，把消息发到 broker 的默认队列。
+      2. 某个 worker 进程预取（prefetch）到这条消息。
+      3. worker 执行函数；默认在**执行前**就向 broker 确认（ack）消息。
+      4. 执行成功，返回值和 SUCCESS 状态写入 result backend；失败则写入 FAILURE 和异常信息，或按配置进入重试。
+      5. 接口用 `AsyncResult(task_id)` 查询状态。
+
+      **三、关键设计点**
+
+      - **消息里只放 ID，不放大对象**：传 `job_id`，worker 自己去数据库和对象存储取文件。原因：消息体要序列化（Celery 默认 JSON），大文件会撑爆 broker；而且传过去的对象在排队期间可能已经过时。
+      - **队列分离**：把「入库」「批量 Embedding」「发通知」放不同队列、由不同 worker 池消费，避免慢任务堵住快任务。
+      - **并发与预取**：worker 的并发数决定同时执行多少任务；预取过多会让长任务在某个 worker 上排队，而其他 worker 空闲。长任务常把预取调低。
+      - **结果存储不是业务状态表**：result backend 里的结果默认会过期，而且只知道 Celery 的状态。**面向用户的任务状态（进度、错误原因、属于哪个用户）应该存在你自己的数据库表里**（见 d42-k4）。
+
+      **四、常见工具定位**
+
+      - **Celery**：功能最全、生态最大，支持多种 broker、定时任务、工作流编排；配置项多，学习成本高。
+      - **RQ**：基于 Redis，简单易用，功能较少。
+      - **arq / SAQ / streaQ / taskiq 等 asyncio 原生队列**：适合全异步代码库。注意 arq 已于 2025-10 宣布进入「仅维护」模式（只修关键安全问题），新项目要评估维护状态。
+    scenarios: |
+      - 知识库文档入库：Web 接口投递任务，worker 负责解析、切片、Embedding、写 pgvector。
+      - 定时任务：Celery beat 每晚触发过期文档清理和索引重建。
+      - 批量评估：把 1000 条评估问题拆成 1000 个任务并行跑，worker 数量控制对 LLM 的并发。
+    code: |
+      ```python
+      from celery import Celery
+
+      celery_app = Celery(
+          "kb",
+          broker="redis://redis:6379/1",
+          backend="redis://redis:6379/2",
+      )
+      celery_app.conf.update(
+          task_routes={"kb.tasks.ingest_document": {"queue": "ingest"}},
+          worker_prefetch_multiplier=1,  # 长任务：每个进程一次只预取一条
+          result_expires=3600,
+      )
+
+      @celery_app.task(name="kb.tasks.ingest_document")
+      def ingest_document(job_id: str) -> None:
+          ...
+
+      # 生产者：只传 ID
+      # ingest_document.delay(job_id)
+      # 启动消费者：celery -A kb.worker worker -Q ingest --concurrency=4
+      ```
+    pitfalls: |
+      - **把整个文件内容或 ORM 对象当任务参数**，消息巨大、序列化失败，或 worker 拿到的是过时数据。
+      - **误区：result backend 可以当任务记录表。** 结果会过期，也不含业务字段（用户、文档、错误原因的业务描述）。
+      - **所有任务共用一个队列**，一个批量 Embedding 任务就能让「发验证码」排队几分钟。
+      - **broker 和缓存共用一个开启了 allkeys-lru 的 Redis**，内存紧张时任务消息会被淘汰（Day 41）。
+      - **Web 和 worker 代码版本不一致**，任务签名改了但旧 worker 还在消费，导致参数错误。
+    interview_asks:
+      - "Celery 的 broker 和 backend 分别是什么？可以用同一个 Redis 吗？"
+      - "一个任务从接口调用到执行完成，中间经历了哪些步骤？"
+      - "为什么任务参数里只传 ID？"
+    project_example: |
+      知识库项目中，我们用 Redis 做 broker（独立实例、noeviction）、PostgreSQL 存业务任务状态，Celery 结果存储只保留 1 小时。队列分三条：ingest（文档入库，concurrency=4、prefetch=1）、embed（批量向量化，并发受 Embedding 供应商限速约束）、notify（通知类短任务）。上线初期所有任务都在默认队列里，一次批量重建索引让通知延迟了 20 分钟，拆分队列后问题消失。
+    freshness: |
+      核对于 2026-11：Celery 最新稳定版 5.7.0（代号 Collider，2026-11-05 发布）。PyPI 页面说明 5.7.x 运行于 Python 3.11+，且是最后一个支持 Python 3.11 的版本，后续 5.8/6.x 需要 Python 3.12+；Python 3.10 用户需停留在 5.6 或更早（官方 What's new 页面不同段落对 3.10 的表述不一致，以 PyPI 与实际安装约束为准）。arq 自 2025-10 起官方 README 标注为「maintenance only mode」。
+    sources:
+      - {title: "Celery - PyPI", url: "https://pypi.org/project/celery/"}
+      - {title: "What's new in Celery 5.7 (Collider)", url: "https://docs.celeryq.dev/en/latest/history/whatsnew-5.7.html"}
+      - {title: "arq README（maintenance only）", url: "https://github.com/python-arq/arq/blob/main/README.md"}
+      - {title: "arq issue 510 - Maintenance only mode", url: "https://github.com/python-arq/arq/issues/510"}
+  - id: d42-k3
+    name: 可靠性：ack 时机、重试、幂等与死信
+    level: P0
+    summary: 早 ack 可能丢任务，晚 ack 可能重复执行；所以任务必须幂等，重试要退避，失败要进死信
+    why: |
+      分布式系统里**「恰好执行一次」几乎不可能保证**，你只能在「最多一次（可能丢）」和「至少一次（可能重复）」之间选。不理解这一点，就会写出「worker 重启后任务丢了」或「同一份文档被入库三遍」的系统。这是任务队列面试最深的考点。
+    problem: |
+      worker 随时可能崩溃、网络随时可能中断、外部 API（LLM、Embedding）随时可能超时或限流。我们需要：任务不悄悄丢失；临时失败能自动重试且不压垮下游；重复执行不产生副作用；反复失败的任务被隔离出来供人工处理。
+    principle: |
+      **一、ack 时机决定语义**
+
+      broker 只有收到 worker 的确认（ack）后才删除消息。
+
+      - **早 ack（Celery 默认）**：worker 在执行任务**之前**确认。执行中崩溃，消息已被删除 → **任务丢失**（至多一次）。
+      - **晚 ack（`acks_late=True`）**：任务**执行完**才确认。执行中崩溃，消息会被重新投递给其他 worker → **任务可能被执行多次**（至少一次）。
+
+      Celery 官方文档明确：worker 无法判断你的任务是否幂等，所以默认早 ack；**只有任务是幂等的，才应该开启 acks_late**。另外即使开了 acks_late，如果执行任务的子进程被信号杀死，worker 仍会确认消息；想让这种情况也重新投递，需要再开启 `task_reject_on_worker_lost`。
+
+      用 Redis 作为 broker 时还有一个**可见性超时（visibility timeout）**：消息被取走后，如果在这个时间内没有 ack，就会被重新投递。如果你的任务执行时间超过可见性超时，即使 worker 正常运行，任务也会被**再投递给另一个 worker 重复执行**。长任务必须调大它（具体默认值以 Celery 当前版本的 Redis broker 文档为准）。
+
+      ```mermaid
+      stateDiagram-v2
+        [*] --> 排队中
+        排队中 --> 执行中: worker 取走
+        执行中 --> 成功: 执行完成并 ack
+        执行中 --> 排队中: 崩溃或超时未 ack 且晚确认
+        执行中 --> 重试等待: 临时错误
+        重试等待 --> 排队中: 退避时间到
+        执行中 --> 死信: 不可重试错误或超过最大次数
+        成功 --> [*]
+        死信 --> [*]
+      ```
+
+      **二、重试：区分错误类型 + 指数退避**
+
+      - **可重试**：网络超时、LLM 返回 429/503、数据库连接中断。
+      - **不可重试**：文件损坏、格式不支持、参数校验失败——重试一百次也一样失败，只会浪费资源。
+      - Celery 支持 `autoretry_for=(某些异常,)`、`max_retries`（默认 3）、`retry_backoff=True`（指数退避）、`retry_backoff_max`（默认 600 秒）、`retry_jitter`（默认开启，加随机性，避免大量任务同时重试形成「重试风暴」）。
+
+      **三、幂等：重复执行结果一样**
+
+      既然「至少一次」意味着可能重复，就要让任务**执行多次和执行一次效果相同**：
+      - 写入用 upsert 或「先删除该文档旧数据再写入」，放在同一个事务里。
+      - 用数据库唯一约束兜底（如 `document_id + chunk_index` 唯一）。
+      - 有外部副作用的步骤（扣费、发邮件）记录「已执行」标记，执行前先检查。
+      - 用状态机条件更新抢占：`UPDATE jobs SET status='running' WHERE id=? AND status='pending'`，影响行数为 0 就说明别人已在处理。
+
+      **四、死信：失败要有去处**
+
+      超过最大重试次数或遇到不可重试错误的任务，要进入「死信」状态：在业务表标记 failed 并记录错误原因，必要时投递到专门的死信队列，**告警 + 人工处理或一键重跑**。否则失败就悄无声息地消失了。RabbitMQ 原生支持死信交换机（DLX）；Celery 本身没有通用的「死信队列」开关，常见做法是在任务失败回调中写数据库和告警。
+    scenarios: |
+      - Embedding 接口偶发 429：autoretry_for 捕获限流异常，指数退避重试 5 次。
+      - PDF 加密无法解析：直接标记失败并提示用户，不重试。
+      - worker 发布时被重启：开启 acks_late，任务重新投递；任务幂等保证不会产生重复切片。
+    code: |
+      ```python
+      import httpx
+      from celery import Celery
+
+      celery_app = Celery("kb", broker="redis://redis:6379/1")
+
+      class UnsupportedFile(Exception):
+          """不可重试：文件格式不支持或已损坏"""
+
+      @celery_app.task(
+          bind=True,
+          acks_late=True,                      # 只在任务幂等时开启
+          autoretry_for=(httpx.TimeoutException, httpx.HTTPStatusError),
+          dont_autoretry_for=(UnsupportedFile,),
+          retry_backoff=True,
+          retry_backoff_max=300,
+          max_retries=5,
+      )
+      def embed_document(self, document_id: str) -> None:
+          ...
+      ```
+    pitfalls: |
+      - **误区：开了 acks_late 就万无一失。** 它把「丢任务」换成了「重复执行」，必须配合幂等。
+      - **对所有异常都重试**，格式错误的文件会被重试到 max_retries，白白消耗资源并延迟告警。
+      - **重试没有退避和抖动**，下游限流时大量任务同时重试，形成重试风暴。
+      - **长任务超过 Redis broker 的可见性超时**，被重复投递，表现为「同一任务莫名执行了两次」。
+      - **失败只写日志**，没有业务状态和告警，用户的文档永远停在「处理中」。
+    interview_asks:
+      - "Celery 的 acks_late 是什么？开启它有什么代价？"
+      - "怎么保证任务不丢也不重复？"
+      - "什么样的错误应该重试，什么样的不应该？"
+    project_example: |
+      我们的文档入库任务开启了 acks_late 和 task_reject_on_worker_lost，配合幂等写入：任务开始时用条件更新把 job 状态从 pending 改为 running，切片写入前在同一事务内删除该文档的旧切片，chunks 表有唯一约束。对 Embedding 接口的超时和 429 自动重试 5 次、指数退避上限 5 分钟；文件格式错误直接标记 failed 并在前端展示原因。超过重试次数的任务写入 failed 状态并发企业微信告警，运营后台提供「重新入库」按钮。
+    freshness: |
+      核对于 2026-11（Celery 官方 Tasks 用户指南）：默认在执行前 ack；`acks_late` 使执行后 ack，需任务幂等；子进程被终止时即使 acks_late 也会 ack，需 `task_reject_on_worker_lost` 才会重投；`max_retries` 默认 3，`retry_backoff_max` 默认 600 秒，`retry_jitter` 默认 True。Redis broker 可见性超时的默认值本文未逐条核对，以 Celery「Using Redis」文档为准。
+    sources:
+      - {title: "Celery - Tasks（acks_late、retry 相关）", url: "https://docs.celeryq.dev/en/stable/userguide/tasks.html"}
+      - {title: "Celery - Change history", url: "https://docs.celeryq.dev/en/latest/changelog.html"}
+  - id: d42-k4
+    name: 长任务的提交与状态查询设计
+    level: P1
+    summary: 提交返回 202 和 job_id，状态存业务表，前端轮询或订阅，查询时校验归属
+    why: |
+      用户上传文档后最关心的是「好了没有、卡在哪、失败了为什么」。很多系统只做了「投递任务」，没有设计状态查询，结果用户反复上传、客服无从排查。这块是面试中「讲讲你做的文档入库模块」时最能体现工程能力的部分。
+    problem: |
+      异步化之后，请求和结果分离了。需要一套机制让客户端：拿到任务标识；查询当前状态和进度；在失败时得到可理解的原因并能重试；同时保证只能查自己的任务，并且状态在 worker 崩溃、重试后依然正确。
+    principle: |
+      **一、接口设计**
+
+      - `POST /documents` → 保存文件到对象存储、在 `ingest_jobs` 表插入一行（status=pending、owner、document_id），**提交事务后**再投递任务，返回 `202 Accepted` 与 `job_id`。
+      - `GET /jobs/{job_id}` → 返回 `status`、`progress`、`stage`（解析/切片/向量化/写库）、`error_message`、更新时间。**查询前校验 job 属于当前用户/租户**，否则就是越权（Day 45 讲 IDOR）。
+      - `POST /jobs/{job_id}/retry` → 仅 failed 状态允许，重新投递。
+
+      **为什么先提交事务再投递？** 如果先投递再提交，worker 可能在事务提交前就开始执行，去数据库查 job 查不到，任务直接失败。要么提交后投递，要么用「事务发件箱（outbox）」模式：同一事务写业务数据和待发送消息，再由独立进程投递。
+
+      ```mermaid
+      sequenceDiagram
+        participant U as 前端
+        participant A as API
+        participant D as 数据库
+        participant Q as Broker
+        participant W as Worker
+        U->>A: POST documents 上传
+        A->>D: 插入 job pending 并提交
+        A->>Q: 投递 ingest job_id
+        A-->>U: 202 和 job_id
+        Q->>W: 取到任务
+        W->>D: 条件更新为 running
+        W->>D: 阶段与进度更新
+        U->>A: GET jobs job_id 轮询
+        A->>D: 校验归属后查询状态
+        A-->>U: running 60 百分比
+        W->>D: succeeded 或 failed 加原因
+      ```
+
+      **二、状态机**
+
+      `pending → running → succeeded`，或 `running → retrying → running`，或 `running → failed`。所有状态变化用**条件更新**保证合法（只能从 pending 变 running），防止重复投递导致状态倒退。
+
+      **三、推送还是轮询**
+
+      - **轮询**：前端每 2~3 秒 GET 一次，实现简单，适合大多数场景。注意加退避，任务时间长时降低频率。
+      - **推送**：用 SSE 或 WebSocket（Day 43）把进度推给前端，体验更好，但要处理连接管理。worker 可以把进度发布到 Redis Pub/Sub，Web 进程订阅后转发。
+
+      **四、超时与卡死检测**
+
+      worker 被强杀时，job 可能永远停在 running。需要一个定时任务扫描「running 且 updated_at 超过阈值」的 job，标记为失败或重新投递。
+    scenarios: |
+      - 文档管理页面显示每个文档的入库进度条和失败原因。
+      - 批量导入 500 个文件：父任务记录总数，子任务完成时累加计数，前端显示整体进度。
+      - 运营后台筛选所有 failed 的 job，批量重试。
+    pitfalls: |
+      - **直接把 Celery 的 task_id 和 AsyncResult 暴露给前端当唯一状态来源**：结果会过期，也无法校验归属。
+      - **状态查询接口不校验 owner**，任何人遍历 job_id 就能看到别人的文件名和错误信息。
+      - **先投递任务再提交数据库事务**，worker 查不到记录导致偶发失败，很难复现。
+      - **没有卡死检测**，worker 崩溃后 job 永远处于 running。
+    interview_asks:
+      - "文档上传后，前端怎么知道入库进度？你们的状态是存在哪里的？"
+      - "如果 worker 在处理中被杀掉，任务状态会怎样？你怎么处理？"
+    project_example: |
+      我们的 ingest_jobs 表包含 id、tenant_id、owner_id、document_id、status、stage、progress、error_code、error_message、attempts、updated_at。上传接口提交事务后才投递 Celery 任务；worker 每完成一个阶段更新 stage 和 progress；前端每 3 秒轮询，超过 1 分钟后改为 10 秒。另有每 5 分钟运行的巡检任务，把 running 超过 30 分钟未更新的 job 标记为 failed 并告警。查询接口按 tenant_id 和 owner_id 过滤，查不到统一返回 404。
+  - id: d42-k5
+    name: 消息队列与任务队列的选型
+    level: P2
+    summary: 任务队列关心「把活干完」，消息队列关心「把事件可靠地传给多方」
+    why: |
+      面试中常被问「你们为什么用 Redis 而不是 RabbitMQ/Kafka」。能讲清楚不同中间件的定位，说明你不是只会照抄配置。
+    problem: |
+      任务队列（Celery、RQ）、消息代理（RabbitMQ）、日志型消息系统（Kafka）、Redis Streams 都能「传递消息」，但设计目标不同。选错会导致：要么功能不够（无持久化、无回放），要么运维过重（为每天几千个任务部署一个 Kafka 集群）。
+    principle: |
+      **定位对比**
+
+      | 中间件 | 模型 | 优势 | 适合 |
+      |---|---|---|---|
+      | Redis List（Celery/RQ broker） | 简单队列 | 部署简单、已有 Redis 可复用 | 中小规模任务队列 |
+      | Redis Streams | 追加日志 + 消费组 + 待确认列表 | 支持多消费组、消息可保留与重放 | 轻量事件流、需要 ack 的消费 |
+      | RabbitMQ | 交换机 + 队列，按路由投递 | 灵活路由、死信交换机、成熟的 ack 语义 | 可靠任务分发、复杂路由 |
+      | Kafka | 分区日志，消费者自己管理位移 | 超高吞吐、长期保留、可回放 | 事件溯源、日志、数据管道 |
+
+      **核心区别**：任务队列里一条消息通常**只被一个 worker 消费一次**，消费完就删除；Kafka 这类日志系统里消息被**持久保留**，多个消费组可以各自独立读取、甚至从头回放。
+
+      **选型思路**：先看已有基础设施和规模。多数 AI 应用的异步任务量不大，Redis + Celery 足够；需要可靠路由和死信时用 RabbitMQ；当「文档已更新」这类事件需要同时通知索引服务、审计服务、统计服务并支持回放时，才考虑 Kafka。
+    scenarios: |
+      - 中小团队的知识库：Celery + Redis broker。
+      - 需要严格死信处理和优先级的企业流程：RabbitMQ。
+      - 文档变更事件同时驱动向量索引更新、搜索索引更新、数据仓库同步：Kafka 或 Redis Streams。
+    pitfalls: |
+      - **误区：Kafka 是更高级的任务队列。** Kafka 没有按任务的重试和单条 ack 语义，用它做任务队列需要自己补很多机制。
+      - **误区：Redis Pub/Sub 可以当任务队列。** Pub/Sub 不持久化，订阅者不在线时消息直接丢失。
+      - 为很小的业务量引入重量级中间件，运维成本远大于收益。
+    interview_asks:
+      - "Redis、RabbitMQ、Kafka 做消息队列有什么区别？"
+      - "Redis Pub/Sub 和 Redis Streams 有什么区别？"
+    project_example: |
+      我们的知识库系统一天几千个入库任务，用 Celery + 独立 Redis 实例做 broker 足够。后来增加了「文档更新后同步刷新搜索索引和统计看板」的需求，三个下游服务都需要感知变更且要能补消费，于是引入 Redis Streams 的消费组，每个下游一个消费组，各自 ack，没有为此单独上 Kafka。
+quiz:
+  - id: d42-q1
+    kp: d42-k1
+    type: judge
+    question: 使用 FastAPI 的 BackgroundTasks 处理文档入库时，即使服务在任务执行中途重启，任务也会在服务启动后自动继续执行。
+    answer: false
+    explain: |
+      BackgroundTasks 的任务只存在于当前 Web 进程的内存中，没有 broker、没有持久化。进程重启、被 OOM 杀掉或容器缩容时，正在执行和尚未执行的后台任务都会直接丢失，也不会留下任何记录。需要可靠完成的长任务应该交给 Celery 等任务队列，并在数据库中记录任务状态。
+  - id: d42-q2
+    kp: d42-k3
+    type: single
+    question: 某 Celery 任务开启了 `acks_late=True`，worker 在执行到一半时所在容器被正常重启。关于这条任务，最准确的描述是？
+    options:
+      - "任务已经在执行前确认，会直接丢失"
+      - "消息未被确认，会被重新投递，任务可能被再次完整执行，因此任务必须幂等"
+      - "Celery 会从上次中断的那一行代码继续执行"
+      - "任务会被自动标记为 FAILURE，不会再执行"
+    answer: [1]
+    explain: |
+      acks_late 让 worker 在任务执行完成后才确认消息，中途中断时 broker 会把消息重新投递给其他 worker，从头再执行一遍，这就是「至少一次」语义，所以任务必须幂等。选项一描述的是默认的早 ack；Celery 不保存执行断点，不会从中间继续；也不会自动标记失败。注意若子进程被信号杀死，还需 task_reject_on_worker_lost 才会重投。
+  - id: d42-q3
+    kp: d42-k2
+    type: multi
+    question: 关于任务队列的设计，以下哪些做法是正确的？（多选）
+    options:
+      - "任务参数只传 job_id 等标识，worker 自己从数据库和对象存储读取数据"
+      - "把慢任务和快任务放进不同队列，由不同的 worker 池消费"
+      - "用 Celery result backend 作为面向用户的任务状态唯一来源，长期保存"
+      - "长任务把 worker 的预取数调低，避免任务在某个 worker 上积压"
+      - "broker 与缓存共用一个 allkeys-lru 的 Redis 实例以节省成本"
+    answer: [0, 1, 3]
+    explain: |
+      只传 ID 能避免消息过大和数据过时；队列分离防止慢任务堵塞快任务；长任务调低 prefetch 能让空闲 worker 拿到任务。result backend 的结果默认会过期且不含归属等业务字段，不适合作为面向用户的状态来源。broker 与 allkeys-lru 缓存共用实例，内存紧张时任务消息可能被淘汰。
+  - id: d42-q4
+    kp: d42-k3
+    type: scenario
+    question: |
+      用户反馈：同一份 PDF 上传一次，在知识库检索结果里却出现了三份完全相同的片段。排查发现入库任务开启了 `acks_late`，日志显示该任务在三个不同 worker 上各执行了一次。请分析可能原因并给出修复方案。
+    key_points:
+      - {text: "指出 acks_late 是至少一次语义，任务会被重复投递执行", dim: concept}
+      - {text: "指出可能原因：worker 重启、或任务执行时间超过 Redis broker 的可见性超时被再次投递", dim: principle}
+      - {text: "指出根因是写入不幂等，每次执行都追加切片", dim: principle}
+      - {text: "提出幂等方案：同一事务内先删旧切片再写入、唯一约束、状态机条件更新抢占", dim: engineering}
+      - {text: "提出清理已产生的重复数据并加回归测试", dim: project}
+    reference: |
+      **为什么执行了三次**：acks_late 下消息在执行完成前不会被确认。若 worker 重启（发布、OOM），消息会重投；更隐蔽的是用 Redis 作 broker 时，如果任务耗时超过可见性超时，即使原 worker 还在正常执行，消息也会被投递给另一个 worker——大 PDF 处理时间长，最容易触发，三个 worker 各执行一次。
+
+      **根因**：重复投递在「至少一次」语义下是预期行为，真正的问题是**任务不幂等**——每次执行都直接 INSERT 新切片。
+
+      **修复**：
+      1. 任务开始时条件更新 `UPDATE ingest_jobs SET status='running', worker=? WHERE id=? AND status IN ('pending','retrying')`，影响 0 行说明已有人在处理或已完成，直接退出。
+      2. 写切片时在同一个事务中先 `DELETE FROM chunks WHERE document_id=?` 再批量插入；chunks 表加 `(document_id, chunk_index)` 唯一约束兜底。
+      3. 根据最长任务时间调大可见性超时，或把大文档拆成多个子任务。
+      4. 写脚本按 document_id + chunk_index 去重清理历史数据，并增加「同一任务执行两次后切片数不变」的测试。
+    followup:
+      question: 如果不想依赖可见性超时，还有什么办法减少长任务被重复投递？
+      key_points:
+        - 把长任务拆分成多个较短的子任务
+        - 换用对长时间未 ack 有心跳语义的 broker 如 RabbitMQ
+      reference: |
+        可以把一个大文档拆成「解析」「按页段切片与向量化」等多个子任务，每个子任务都远短于可见性超时；也可以改用 RabbitMQ 作为 broker，它基于连接与通道判断消费者是否存活，消费者断开才重投，不依赖固定的可见性超时。无论哪种方式，幂等仍然是必需的兜底。
+  - id: d42-q5
+    kp: d42-k1
+    type: short
+    question: 同事说「我们的接口全是 async def，已经是异步的了，文档入库直接 `await` 处理就行，不需要任务队列」。请反驳这个观点。
+    key_points:
+      - {text: "区分 async 解决的是 IO 等待不阻塞事件循环，而不是让请求立刻返回或持久化任务", dim: concept}
+      - {text: "指出请求内处理几分钟的任务会触发网关或客户端超时，用户必须等待", dim: principle}
+      - {text: "指出 CPU 密集的解析会阻塞事件循环，影响其他请求", dim: principle}
+      - {text: "指出缺少持久化、重试、横向扩展和进度查询能力", dim: engineering}
+    reference: |
+      async/await 让一个进程在等待 IO 时去处理别的请求，提升的是并发能力，但**请求本身仍然要等任务做完才返回**。文档入库可能要几分钟，会触发 Nginx/网关超时（常见 60 秒），用户刷新或重试又会重复提交。
+
+      其次，PDF 解析、分词等是 CPU 密集操作，在 async 函数里执行会阻塞事件循环，所有接口一起变慢。
+
+      最后，请求内处理没有持久化：服务重启任务就没了；没有自动重试；不能把任务分摊到多台机器；也没有进度查询。所以正确做法是接口快速返回 202 + job_id，任务交给独立 worker 执行，状态写入数据库。
+  - id: d42-q6
+    kp: d42-k4
+    type: design
+    question: 请设计「批量上传 100 个文档到知识库」的接口与状态查询方案，包括接口、数据表关键字段、任务拆分方式、进度计算、失败处理和权限校验。
+    key_points:
+      - {text: "提交接口返回 202 和批次 ID，先提交数据库事务再投递任务", dim: engineering}
+      - {text: "设计批次表与子任务表，包含 owner、tenant、status、progress、error 等字段", dim: engineering}
+      - {text: "每个文档一个子任务并行执行，批次进度由子任务完成数计算", dim: principle}
+      - {text: "单个文档失败不影响其他文档，失败可单独重试，有卡死巡检", dim: engineering}
+      - {text: "查询接口按租户和 owner 过滤，防止越权查看", dim: concept}
+    reference: |
+      **接口**：`POST /batches`（multipart 上传或传对象存储地址）→ 写 `ingest_batches` 一行和 100 行 `ingest_jobs`，提交事务后逐个投递 `ingest_document(job_id)`，返回 `202 {batch_id}`。`GET /batches/{id}` 返回总数、成功数、失败数、进行中数和失败明细；`POST /jobs/{id}/retry` 重试单个文档。
+
+      **表**：`ingest_batches(id, tenant_id, owner_id, total, created_at)`；`ingest_jobs(id, batch_id, tenant_id, owner_id, document_id, status, stage, progress, error_code, error_message, attempts, updated_at)`。
+
+      **执行**：每个文档一个子任务，放 ingest 队列并行消费；worker 用条件更新抢占 job，阶段性更新 progress。批次进度通过 `SELECT status, count(*) ... GROUP BY status` 计算，不在批次表上并发累加，避免锁竞争。
+
+      **失败**：可重试错误自动退避重试，不可重试错误标记 failed 并写可读原因；单个失败不影响其他文档；巡检任务处理 running 超时的 job。
+
+      **权限**：所有查询带 `tenant_id = 当前租户 AND owner_id = 当前用户`（或管理员角色），查不到统一返回 404。
+  - id: d42-q7
+    kp: d42-k5
+    type: single
+    question: 文档更新后，需要同时通知向量索引服务、搜索服务和统计服务，并且某个服务宕机恢复后要能补处理期间的事件。以下哪种方案最合适？
+    options:
+      - "Redis Pub/Sub，每个服务订阅同一个频道"
+      - "Celery 任务，把事件投递到一个队列，三个服务的 worker 一起消费"
+      - "Redis Streams 或 Kafka，每个服务一个消费组，各自确认进度"
+      - "FastAPI BackgroundTasks，依次调用三个服务的接口"
+    answer: [2]
+    explain: |
+      Streams 和 Kafka 会持久保留消息，每个消费组独立维护消费进度，服务宕机恢复后能从上次位置继续消费。Pub/Sub 不持久化，订阅者离线期间的消息直接丢失。Celery 队列里一条消息只会被一个 worker 消费，三个服务无法各收到一份。BackgroundTasks 不持久化，且某个服务失败无法补偿。
+code_reading:
+  id: d42-c1
+  kp: [d42-k3, d42-k4, d42-k2]
+  title: 文档入库的 Celery 任务与状态查询接口
+  scenario: 知识库系统中，用户上传文档后 API 创建 ingest job 并投递 Celery 任务；worker 负责解析、切片、调用 Embedding 并写入 pgvector；前端轮询 `/jobs/{job_id}` 获取进度。
+  language: python
+  code: |
+    import logging
+
+    import httpx
+    from celery import Celery
+    from fastapi import APIRouter, Depends, HTTPException
+    from sqlalchemy import select, update
+
+    from app.auth import CurrentUser, get_current_user
+    from app.db import SessionLocal, get_session
+    from app.models import Chunk, IngestJob
+    from app.pipeline import embed_texts, load_and_split
+
+    logger = logging.getLogger(__name__)
+    celery_app = Celery("kb", broker="redis://redis:6379/1")
+    router = APIRouter()
+
+    @celery_app.task(
+        bind=True,
+        acks_late=True,
+        autoretry_for=(httpx.TimeoutException,),
+        retry_backoff=True,
+        max_retries=5,
+    )
+    def ingest_document(self, job_id: str) -> None:
+        with SessionLocal() as db:
+            job = db.get(IngestJob, job_id)
+            db.execute(update(IngestJob).where(IngestJob.id == job_id).values(status="running"))
+            db.commit()
+            pieces = load_and_split(job.file_uri)  # 解析 + 切片
+            vectors = embed_texts([p.text for p in pieces])  # 调用 Embedding 接口
+            for i, (p, v) in enumerate(zip(pieces, vectors)):
+                db.add(Chunk(document_id=job.document_id, chunk_index=i, text=p.text, embedding=v))
+            db.execute(update(IngestJob).where(IngestJob.id == job_id).values(status="succeeded", progress=100))
+            db.commit()
+            logger.info("ingest done job=%s chunks=%d", job_id, len(pieces))
+
+    @router.get("/jobs/{job_id}")
+    def get_job(job_id: str, user: CurrentUser = Depends(get_current_user), db=Depends(get_session)) -> dict:
+        job = db.scalar(select(IngestJob).where(IngestJob.id == job_id))
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        return {"status": job.status, "progress": job.progress,
+                "file_name": job.file_name, "error": job.error_message}
+  walkthrough:
+    function: |
+      两部分：`ingest_document` 是 Celery 任务，从数据库读取 job，把状态改为 running，解析切片、批量向量化后逐条写入 chunks 表，最后标记 succeeded；`get_job` 是查询接口，根据 job_id 返回状态、进度、文件名和错误信息。
+    key_functions: |
+      - `ingest_document`：任务主体，开启 acks_late，超时异常自动指数退避重试最多 5 次。
+      - `load_and_split`：读取对象存储中的文件，解析并切片。
+      - `embed_texts`：调用外部 Embedding 接口，可能抛出 `httpx.TimeoutException`。
+      - `get_job`：依赖注入当前用户和数据库会话，按 ID 查询 job。
+    params: |
+      API 投递时只传 `job_id`（字符串），通过 broker 序列化传给 worker；`bind=True` 让任务第一个参数 `self` 是任务实例，可用于重试与更新状态。查询接口的 `job_id` 来自 URL 路径，`user` 由 JWT 解析得到，**但查询条件里没有使用 user**。
+    data_flow: |
+      ```mermaid
+      flowchart TD
+        A["API 投递 job_id"] --> B[("Redis broker")]
+        B --> C["worker 取到任务 未 ack"]
+        C --> D["读取 job 并置为 running"]
+        D --> E["load_and_split 解析切片"]
+        E --> F["embed_texts 调 Embedding"]
+        F -->|"超时"| R["autoretry 退避后从头执行"]
+        R --> C
+        F --> G["逐条 INSERT chunks"]
+        G --> H["置为 succeeded 并提交"]
+        H --> I["任务完成后 ack"]
+        U["前端 GET jobs id"] --> Q["get_job 仅按 id 查询"]
+        Q --> J["返回状态 文件名 错误"]
+      ```
+    failure_points: |
+      - **任务不幂等**：acks_late 和 autoretry 都会让任务从头再执行，每次都直接 INSERT 新切片，没有删除旧切片也没有唯一约束兜底，产生重复片段。
+      - **查询接口未校验归属（IDOR）**：只按 job_id 查询，任何登录用户遍历或猜到 job_id 就能看到别人的文件名和错误信息。
+      - `db.get` 可能返回 None（投递早于事务提交或 job 被删除），后续 `job.file_uri` 抛 AttributeError。
+      - 状态更新为 running 没有条件判断，重复投递时可能把已 succeeded 的 job 改回 running。
+      - 非超时异常（文件损坏、HTTP 429）没有被分类：损坏文件直接失败但 job 状态停在 running，没有写 error_message；429 不在 autoretry_for 里不会重试。
+      - 切片写入与最终状态在同一个大事务中，大文档时事务过长。
+    debugging: |
+      - 复现重复：在测试中对同一 job_id 连续调用两次 `ingest_document.apply(args=[job_id])`（同步执行），断言 chunks 数量是否翻倍。
+      - 用 mock 让 `embed_texts` 第一次抛 `httpx.TimeoutException`，观察重试后 chunks 是否重复（注意本例中切片写入在 Embedding 之后，所以要构造「写入后失败」的情况，如在最后的 update 处抛异常）。
+      - 查看 worker 日志中同一 job_id 的 `ingest done` 出现次数，以及 Celery 事件中该 task 的 retries 字段。
+      - 用另一个租户的账号请求 `/jobs/{别人的job_id}`，确认是否返回了数据。
+    change_request: |
+      如果需求改为「任务可安全重复执行，并支持失败原因展示」：在任务开头用条件更新 `WHERE status IN ('pending','retrying')` 抢占，影响 0 行则退出；写切片前在同一事务中 `DELETE FROM chunks WHERE document_id=?`，并为 chunks 加唯一约束；用 try/except 区分不可重试错误，写入 status=failed 和 error_message；`get_job` 的查询加 `IngestJob.tenant_id == user.tenant_id` 与 `IngestJob.owner_id == user.id` 条件。
+  questions:
+    - id: d42-c1-q1
+      kp: d42-k3
+      type: code
+      question: 假设 `embed_texts` 成功，切片已经 `db.add` 完毕，但在最后一次 `db.commit()` 之后、任务返回之前 worker 进程被重启。请按执行顺序说明接下来会发生什么，最终数据库里会出现什么问题。
+      key_points:
+        - {text: "指出 acks_late 下任务尚未 ack，broker 会把消息重新投递给 worker", dim: principle}
+        - {text: "指出第二次执行从头开始，再次把状态改为 running 并重新解析与向量化", dim: principle}
+        - {text: "指出第二次执行会再插入一整份切片，导致切片重复，且 Embedding 费用重复消耗", dim: concept}
+        - {text: "提出条件更新抢占、先删后写、唯一约束三项修复", dim: engineering}
+      reference: |
+        1. 第一次执行：状态置为 running 并提交 → 解析切片 → 向量化 → 添加全部 Chunk → 状态置为 succeeded 并提交。此时数据已经完整写入。
+        2. 进程在返回前重启，任务没有完成，消息未被 ack（acks_late）。重启后（或其他 worker）重新拿到这条消息。
+        3. 第二次执行：`db.get` 拿到 job，**无条件**把状态从 succeeded 改回 running → 再次解析、再次调用 Embedding（重复付费）→ 再插入一整份 Chunk → 再置为 succeeded。
+
+        结果：chunks 表中该文档的每个切片出现两份，检索时返回重复片段；状态短暂倒退为 running。修复：开头用 `UPDATE ... WHERE id=? AND status IN ('pending','retrying')` 抢占，影响 0 行直接返回；写入前在同一事务删除该文档旧切片；`(document_id, chunk_index)` 唯一约束兜底。
+    - id: d42-c1-q2
+      kp: d42-k4
+      type: code
+      question: 请分析 `get_job` 接口存在的安全问题：攻击者需要具备什么条件、能拿到什么信息？应该如何修改代码？修改后对「不存在」和「不属于你」两种情况应分别返回什么？
+      key_points:
+        - {text: "指出接口只按 job_id 查询，没有使用 user 做归属过滤，属于越权访问 IDOR", dim: concept}
+        - {text: "指出攻击者只需任意登录账号和猜到或枚举出 job_id，即可读取他人文件名与错误信息", dim: principle}
+        - {text: "给出在查询条件中加入 tenant_id 与 owner_id 的修改", dim: engineering}
+        - {text: "说明两种情况都返回 404，避免泄露资源是否存在", dim: engineering}
+      reference: |
+        `get_job` 依赖注入了 `user`，但查询 `select(IngestJob).where(IngestJob.id == job_id)` 完全没有用到它。攻击者只要有一个普通账号，再拿到别人的 job_id（日志泄露、前端分享链接、若 ID 是自增整数则可直接枚举），就能看到他人的文件名（可能含敏感信息，如「2026 裁员名单.xlsx」）、状态和错误信息——这是典型的 IDOR（不安全的直接对象引用）。
+
+        修改：`select(IngestJob).where(IngestJob.id == job_id, IngestJob.tenant_id == user.tenant_id, IngestJob.owner_id == user.id)`；管理员角色可放宽 owner 条件但仍限定租户。job_id 使用 UUID 而非自增 ID，增加枚举难度（但不能替代授权校验）。
+
+        「不存在」和「不属于你」都返回 404，否则攻击者可以通过 403/404 的差异探测哪些 job_id 是真实存在的。
+    - id: d42-c1-q3
+      kp: d42-k3
+      type: code
+      question: 如果上传的 PDF 是损坏文件，`load_and_split` 抛出 `ValueError`。请说明此时任务会如何表现、用户在前端看到什么，并给出你的修改方案。
+      key_points:
+        - {text: "指出 ValueError 不在 autoretry_for 中，任务直接失败不重试", dim: principle}
+        - {text: "指出状态已被提交为 running，异常后没有更新为 failed，前端永远显示处理中", dim: concept}
+        - {text: "提出捕获不可重试异常并写入 failed 与用户可读的错误原因", dim: engineering}
+        - {text: "提出对 429 等可重试错误加入 autoretry_for，并加卡死巡检兜底", dim: engineering}
+      reference: |
+        执行顺序：状态更新为 running 并已 commit → `load_and_split` 抛 ValueError → 因为它不在 `autoretry_for=(httpx.TimeoutException,)` 中，任务直接以 FAILURE 结束（Celery 状态），但没有任何代码去更新业务表。
+
+        结果：数据库中 job 永远停在 running，前端进度条一直转，`error` 字段为空，用户不知道是文件坏了，只能反复上传。
+
+        修改：
+        - 定义不可重试异常（如 `UnsupportedFile`），在 `load_and_split` 外 try/except，捕获后写 `status='failed', error_code='BAD_FILE', error_message='文件已损坏或加密，请重新导出后上传'` 并 return。
+        - 对 `httpx.HTTPStatusError`（429/503）也加入自动重试；超过 max_retries 时在失败处理中写 failed 并告警。
+        - 增加巡检任务：running 超过阈值未更新的 job 标记失败。
+interview:
+  - id: d42-i1
+    kp: d42-k1
+    type: oral
+    difficulty: 1
+    question: 为什么后端需要异步任务？FastAPI 的 BackgroundTasks 能不能替代 Celery？
+    key_points:
+      - {text: "说明异步任务把耗时操作移出请求，避免超时、提升响应速度和吞吐", dim: concept}
+      - {text: "说明 BackgroundTasks 在同一 Web 进程内响应后执行，不持久化、无重试", dim: principle}
+      - {text: "指出进程重启任务丢失、CPU 密集任务影响 Web 性能、不能横向扩展", dim: principle}
+      - {text: "结合项目说明轻任务用 BackgroundTasks、文档入库用任务队列", dim: project}
+    reference: |
+      异步任务的意义是把耗时或不需要立即返回结果的工作移出 HTTP 请求：接口快速响应，避免网关超时，用户体验更好，Web 进程也不会被长任务占住。
+
+      FastAPI 的 BackgroundTasks 会在响应发送之后，在同一个进程中执行任务函数。它的局限：不持久化，进程重启或崩溃任务就丢；没有重试和状态查询；和 Web 共享 CPU 与事件循环，重任务会拖慢接口；只能在接收请求的进程里执行，不能分发到多台机器。
+
+      所以它不能替代 Celery。我的划分是：发通知、写审计日志这类轻量、丢了可接受的用 BackgroundTasks；文档入库、批量向量化这类耗时、必须完成、需要进度和重试的任务用 Celery 等任务队列，并在数据库记录业务状态。
+    oral: |
+      异步任务的核心是把慢活从请求里拿出去，接口先返回「已受理」，避免超时。
+      BackgroundTasks 不能替代 Celery。它其实是在同一个 Web 进程里、响应发出后再执行，没有持久化，进程一重启任务就没了，也没有重试和进度查询，重任务还会拖慢接口。
+      我们项目一开始就把文档入库放在 BackgroundTasks 里，结果每次发版都有文档卡在「处理中」。后来改成 Celery：接口只写数据库并投递任务，worker 独立部署。BackgroundTasks 只保留给发通知、写审计日志这种轻任务。
+  - id: d42-i2
+    kp: d42-k2
+    type: oral
+    difficulty: 2
+    question: 讲讲 Celery 的架构：broker、worker、backend 分别是什么？一个任务从投递到完成经历了什么？
+    key_points:
+      - {text: "说明生产者只发消息，broker 存放消息，worker 独立进程消费执行，backend 存状态与结果", dim: concept}
+      - {text: "按顺序描述 delay 投递、worker 预取、执行、ack、写结果、查询的过程", dim: principle}
+      - {text: "说明参数只传 ID、队列分离、预取设置等关键设计", dim: engineering}
+      - {text: "指出 backend 结果会过期，业务状态应存在自己的数据库", dim: project}
+    reference: |
+      **角色**：生产者是 Web 接口，调用 `task.delay()` 只把任务名、参数和 task_id 序列化为消息；broker（Redis 或 RabbitMQ）保存消息直到被确认；worker 是独立进程，可多实例部署，拉取消息后执行函数；result backend 保存任务状态和返回值。
+
+      **流程**：接口 delay → 消息进入指定队列 → worker 预取消息 → 默认在执行前 ack（acks_late 则执行后 ack）→ 执行函数 → 成功写 SUCCESS 与结果，失败写 FAILURE 或按配置重试 → 调用方通过 AsyncResult 查询。
+
+      **设计要点**：参数只传 ID，避免大消息与数据过时；不同类型任务分队列，避免慢任务堵快任务；长任务把 worker_prefetch_multiplier 设为 1；broker 用独立 Redis 实例并设 noeviction。
+
+      在我们的项目中，result backend 只保留 1 小时，面向用户的状态和进度写在 PostgreSQL 的 ingest_jobs 表里，查询接口按租户和用户过滤。
+    oral: |
+      Celery 可以拆成四个角色：Web 接口是生产者，只负责把任务名和参数发出去；broker 是消息中转站，我们用的是独立的 Redis；worker 是独立进程，真正执行任务，可以横向扩容；backend 存任务的状态和结果。
+      一个任务的流程是：接口调用 delay，消息进队列，worker 取到后执行，默认执行前就确认消息，完成后把结果写到 backend。
+      我们有几个实践：参数只传 job_id；入库、向量化、通知分三个队列；长任务预取设为 1；另外 backend 的结果会过期，所以用户看到的进度其实存在我们自己的 ingest_jobs 表里。
+  - id: d42-i3
+    kp: d42-k3
+    type: oral
+    difficulty: 3
+    question: 如何保证异步任务「不丢失」且「不重复」？
+    key_points:
+      - {text: "指出分布式环境无法保证恰好一次，只能选至少一次加幂等", dim: concept}
+      - {text: "解释早 ack 可能丢任务、晚 ack 可能重复，以及 task_reject_on_worker_lost 与可见性超时", dim: principle}
+      - {text: "给出幂等手段：条件更新抢占、先删后写或 upsert、唯一约束、副作用去重表", dim: engineering}
+      - {text: "说明重试分类与指数退避加抖动，以及死信与告警", dim: engineering}
+      - {text: "提出提交事务后再投递或事务发件箱，避免投递与数据不一致", dim: engineering}
+    reference: |
+      先说结论：分布式系统里很难保证「恰好一次」，工程上的标准做法是 **「至少一次投递 + 幂等消费」**。
+
+      **不丢**：
+      - 投递侧：业务数据提交后再投递，或使用事务发件箱，避免「数据写了任务没发」或反过来。
+      - broker 侧：使用持久化的 broker，独立实例、不允许淘汰。
+      - 消费侧：开启 acks_late，执行完成才确认；配合 task_reject_on_worker_lost 让子进程被杀时也能重投；长任务调大 Redis broker 的可见性超时。
+      - 兜底：巡检卡在 running 的任务。
+
+      **不重复（效果上）**：
+      - 任务开始用条件更新抢占状态，重复投递直接退出。
+      - 数据写入幂等：upsert、先删后写同一事务、唯一约束。
+      - 有外部副作用的操作（扣费、发消息）用去重表记录已执行的业务键。
+
+      **失败处理**：区分可重试与不可重试错误，可重试的指数退避加抖动，超过次数进入死信状态并告警，提供人工重跑。
+    oral: |
+      我的理解是，恰好一次在分布式系统里基本做不到，所以我们选择「至少一次加幂等」。
+      不丢的部分：数据库事务提交后才投递任务；broker 用独立的、不淘汰的 Redis；worker 开 acks_late，执行完才确认，再加 task_reject_on_worker_lost；还有一个巡检任务处理卡死的 job。
+      不重复是靠幂等：任务一开始用条件更新把状态从 pending 抢成 running，抢不到就退出；写切片时同一个事务先删旧的再写新的，表上还有唯一约束兜底。
+      失败的话，超时和 429 指数退避重试，文件损坏直接标记失败，超过重试次数告警。
+  - id: d42-i4
+    kp: d42-k4
+    type: design
+    difficulty: 3
+    question: 请完整设计知识库的「文档入库」模块：从用户上传到可以被检索，包括接口、任务拆分、状态与进度、失败处理和可观测性。
+    key_points:
+      - {text: "上传接口存文件到对象存储、写 job 表、提交后投递任务、返回 202 与 job_id", dim: engineering}
+      - {text: "worker 分阶段执行解析、切片、向量化、写库，阶段性更新进度", dim: principle}
+      - {text: "说明幂等、重试分类、死信与卡死巡检", dim: engineering}
+      - {text: "状态查询按租户和 owner 过滤，支持轮询或 SSE 推送", dim: engineering}
+      - {text: "提到指标与日志：队列长度、任务耗时、失败率、Embedding 调用量，并带 job_id 串联", dim: project}
+    reference: |
+      **上传**：`POST /kb/{kb_id}/documents` 校验文件类型与大小 → 文件写入对象存储 → 同一事务写 documents（status=pending）与 ingest_jobs → 提交后投递 `ingest_document(job_id)` 到 ingest 队列 → 返回 `202 {job_id}`。
+
+      **执行**：worker 条件更新抢占 job → 阶段一解析（PDF/Word，Day 22）→ 阶段二切片（Day 23）→ 阶段三分批调用 Embedding（受供应商限速，失败批次可重试）→ 阶段四在事务中先删该文档旧切片再批量写入 pgvector → 文档状态置为 ready，此时才对检索可见。每个阶段更新 stage 和 progress。
+
+      **失败**：超时、429 自动退避重试；文件损坏、加密等不可重试，写 failed 与可读原因；超过重试次数进入失败状态并告警；巡检任务处理 running 超时。所有写入幂等。
+
+      **查询**：`GET /jobs/{id}` 按 tenant 与 owner 过滤，返回状态、阶段、进度、错误原因；前端轮询带退避，或通过 SSE 订阅进度（worker 发布到 Redis Pub/Sub，Web 转发）。
+
+      **可观测性**：结构化日志统一带 job_id、document_id、tenant_id；指标包括队列积压长度、各阶段耗时、失败率与失败原因分布、Embedding Token 消耗；队列积压和失败率超阈值告警。
+    oral: |
+      我会把它分成提交、执行、查询三段。
+      提交时接口只做轻活：校验文件、存对象存储、在一个事务里写文档表和任务表，提交后才投递 Celery 任务，返回 202 和 job_id。
+      执行时 worker 先用条件更新抢占任务，然后解析、切片、分批向量化，最后在一个事务里先删旧切片再写入 pgvector，文档状态改成 ready 才能被检索到。每个阶段都会更新进度。超时和限流退避重试，文件损坏直接失败并给出可读原因，还有巡检处理卡死的任务。
+      查询接口按租户和用户过滤。日志里统一带 job_id，监控队列积压、失败率和 Token 消耗。
+  - id: d42-i5
+    kp: d42-k5
+    type: design
+    difficulty: 4
+    question: 随着业务增长，文档变更后需要同时更新向量索引、全文搜索索引和统计数据，且每天任务量从几千涨到几十万。你会如何演进现有的 Celery + Redis 架构？
+    key_points:
+      - {text: "区分命令型任务和事件型通知，指出一条任务消息只被一个 worker 消费的限制", dim: concept}
+      - {text: "提出用 Redis Streams 或 Kafka 做文档变更事件，多个消费组独立消费与回放", dim: principle}
+      - {text: "说明使用事务发件箱保证数据库变更与事件发布的一致性", dim: engineering}
+      - {text: "提出队列分离、按租户限速、自动扩缩容 worker 等扩展手段", dim: engineering}
+      - {text: "说明演进要渐进，评估运维成本并保留幂等与监控", dim: project}
+    reference: |
+      **问题分析**：现在的模式是「命令型任务」——一条消息由一个 worker 执行。新需求是「事件型通知」——一个「文档已变更」事件需要被三个下游各自处理，且下游宕机后要能补消费。在 Celery 里硬做，需要生产者知道所有下游并分别投递，耦合严重。
+
+      **演进方案**：
+      1. 保留 Celery 处理「入库」这类命令型长任务。
+      2. 新增事件总线：规模中等用 Redis Streams（消费组 + XACK + 待确认列表），规模大或需要长期保留和回放用 Kafka。向量索引、搜索索引、统计服务各一个消费组，独立确认进度。
+      3. 一致性：使用事务发件箱，文档表变更与 outbox 记录同一事务写入，由中继进程读取 outbox 发布事件，避免「库改了事件没发」。
+      4. 扩展：按任务类型和租户拆分队列，对大租户限速防止挤占；worker 根据队列积压自动扩缩容；Embedding 调用集中限流。
+      5. 消费者全部幂等（事件带版本号，旧版本事件直接丢弃）。
+
+      **权衡**：Kafka 运维成本高，没有明确需求前优先 Redis Streams；演进过程中双写对比、灰度切换，保持监控和告警。
+    oral: |
+      我会先区分两类消息：一类是「去把这个文档入库」，这是命令，一个 worker 做完就行，继续用 Celery；另一类是「文档变了」，这是事件，三个下游都要收到，还要能补消费，Celery 的队列不适合。
+      所以我会引入事件总线，量级没那么大时先用 Redis Streams，每个下游一个消费组；如果要长期保留和回放再考虑 Kafka。为了保证数据库改了事件一定发出去，用事务发件箱。
+      扩展方面，按租户拆队列和限速，worker 按积压自动扩容。所有消费者都要幂等，事件带版本号，旧事件直接丢掉。
+sources:
+  - {title: "FastAPI - Background Tasks", url: "https://fastapi.tiangolo.com/tutorial/background-tasks/"}
+  - {title: "Celery - Tasks 用户指南", url: "https://docs.celeryq.dev/en/stable/userguide/tasks.html"}
+  - {title: "Celery - PyPI", url: "https://pypi.org/project/celery/"}
+  - {title: "What's new in Celery 5.7", url: "https://docs.celeryq.dev/en/latest/history/whatsnew-5.7.html"}
+  - {title: "arq README", url: "https://github.com/python-arq/arq/blob/main/README.md"}

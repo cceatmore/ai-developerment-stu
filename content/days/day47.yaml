@@ -1,0 +1,975 @@
+day: 47
+phase: 5
+title: 性能与成本：延迟分解与首字时间、并发与限流、缓存与 Prompt Caching、模型路由与 Token 预算
+goals:
+  - 能把一次 RAG 或 Agent 请求的耗时拆成若干段，说清 TTFT、ITL、端到端延迟分别由什么决定、该怎么优化
+  - 能用 Little 定律估算并发，设计「用户 RPM + 租户 TPM + 上游并发」的多层限流，并正确处理 429
+  - 能按「静态在前、动态在后」组织 prompt 提高厂商缓存命中，并设计带租户和权限维度的应用层缓存
+  - 能写出 LLM 成本公式，用模型路由、Batch、Token 预算降本，并用评测证明质量没掉
+minutes: 75
+resources:
+  - title: "OpenAI Latency optimization 指南"
+    url: "https://platform.openai.com/docs/guides/latency-optimization"
+    kind: doc
+    lang: en
+    minutes: 20
+    note: "通读七条原则，重点看「Generate fewer tokens」「Use fewer input tokens」两节里的数量级对比，以及「Make your users wait less」的流式与展示步骤，对应 k1"
+  - title: "OpenAI Prompt caching 指南"
+    url: "https://platform.openai.com/docs/guides/prompt-caching"
+    kind: doc
+    lang: en
+    minutes: 15
+    note: "看「Structuring prompts」和计费说明：必须前缀完全一致、最少 1,024 token、usage 里的 cached_tokens 怎么看，对应 k3；具体倍率随模型变化，以页面为准"
+  - title: "NVIDIA：LLM Inference Benchmarking Fundamental Concepts"
+    url: "https://developer.nvidia.com/blog/llm-benchmarking-fundamental-concepts/"
+    kind: article
+    lang: en
+    minutes: 15
+    note: "看 TTFT、End-to-end latency、ITL、TPS 四个指标的定义图，以及「并发增加时吞吐和单请求延迟如何变化」那段，对应 k1 与 k2 的压测解读"
+knowledge_points:
+  - id: d47-k1
+    name: 延迟分解与首字时间（TTFT）
+    level: P0
+    summary: 用户感知的慢分两种：等第一个字（TTFT）和等全部说完（端到端）；输出 token 数决定总时长，流式和少生成最有效
+    analogy: |
+      **TTFT 就像前端的 FCP / LCP**：用户最在意「页面什么时候有东西」，而不是「所有资源什么时候加载完」。**逐字速度（ITL）像动画帧率**，卡顿一下用户就觉得慢。**骨架屏**对应 AI 里的「先展示检索中、先推送引用来源」。
+
+      **不一样的地方：**
+      - 前端资源大小是固定的，可以靠 CDN、预渲染把 FCP 压到几百毫秒；LLM 的 TTFT 有硬下限：**排队 + prefill（把整段 prompt 算一遍）+ 网络**，prompt 越长越慢。
+      - 页面加载完就结束了；LLM 的总时长**随输出 token 数线性增长**，回答写 800 字就是比 200 字慢 4 倍左右。
+      - Core Web Vitals 看 P75；后端 LLM 服务通常盯 **P95 / P99**，因为长尾请求往往就是那些上下文最长、最重要的请求。
+    why: |
+      「慢」是 AI 产品最常见的用户抱怨，也是面试高频场景题：「用户说你们的问答很慢，你怎么排查？」
+      不会拆分延迟的人只会说「换个更快的模型」；会拆分的人能指出**时间到底花在检索、改写、排队还是生成**，并给出按收益排序的优化方案。
+    problem: |
+      解决「**一次请求 8 秒，到底慢在哪、先优化哪一段**」。
+      RAG 和 Agent 请求是一条链：鉴权、改写、检索、重排、拼 prompt、模型生成、后处理，还可能有多轮工具调用。不拆开测量，优化就是瞎猜。
+    principle: |
+      **一、一次 RAG 请求的时间花在哪**
+
+      ```mermaid
+      flowchart LR
+        A["网关与鉴权"] --> B["问题改写 小模型"]
+        B --> C["向量加关键词检索"]
+        C --> D["重排 rerank"]
+        D --> E["拼接 prompt"]
+        E --> F["模型排队"]
+        F --> G["prefill 首字前"]
+        G --> H["逐 token 解码"]
+        H --> I["后处理 引用校验"]
+        B -. "可并行" .-> C
+      ```
+
+      **用户感知的首字时间 = 你的前置步骤 + 模型 TTFT**。前置步骤里任何一个串行的 LLM 调用（比如改写），都会直接加到首字时间上。
+
+      **二、四个核心指标**
+
+      | 指标 | 定义 | 主要由什么决定 |
+      |---|---|---|
+      | TTFT 首字时间 | 发出请求到收到第一个内容 token | 排队 + prefill（prompt 长度）+ 网络 |
+      | ITL / TPOT 字间延迟 | 相邻两个 token 的平均间隔 | 模型大小、服务端负载、并发数 |
+      | 端到端延迟 | 发出请求到最后一个 token | 约等于 TTFT + 输出 token 数 × ITL |
+      | TPS 吞吐 | 系统每秒生成的 token 总数 | 并发越高越大，直到饱和 |
+
+      ```mermaid
+      sequenceDiagram
+        participant U as 用户
+        participant S as 你的服务
+        participant M as 模型服务
+        U->>S: 提问
+        S->>S: 改写 检索 重排
+        S->>M: 发送 prompt
+        Note over M: 排队和 prefill 决定 TTFT
+        M-->>S: 第 1 个 token
+        S-->>U: 首字出现
+        M-->>S: 第 2 到第 N 个 token 间隔为 ITL
+        S-->>U: 持续流式输出
+        M-->>S: 结束 返回 usage
+      ```
+
+      **三、OpenAI 延迟优化的七条原则（按影响排序记忆）**
+
+      1. **少生成 token**：输出通常是延迟的大头，**输出减少一半，延迟大约减少一半**。手段：要求简洁、限制 `max_tokens`、结构化输出字段名短一点；
+      2. **少输入 token**：输入减半通常只改善**百分之一到五**，除非上下文非常长。所以「压缩 prompt」主要是省钱，不一定省时间；
+      3. **少发请求**：能合并成一次调用的不要拆成三次串行调用；
+      4. **并行**：检索和改写能并行就并行，甚至可以先用原问题检索、同时改写；
+      5. **让用户少等**：流式输出、先推送「正在检索 3 份文档」和引用来源、长任务给进度；
+      6. **处理得更快**：更小的模型、更快的推理服务；
+      7. **不要默认用 LLM**：意图是「查工单状态」这种，用规则或分类器就行。
+
+      **四、怎么测量**
+
+      - **服务端分段打点**：每一段都是一个 span（见 Day 43），看 P50、P95、P99，而不是平均值；
+      - **流式接口要测 TTFT**：只测端到端会掩盖「首字慢」的问题；TTFT 要在**收到第一个非空内容 token 时**记录；
+      - **压测用真实 prompt 分布**：长短问题混合，否则测出的数字偏乐观；
+      - **用 mock LLM 测你自己的瓶颈**：模拟固定的 TTFT 和 ITL，先排除厂商波动，看你的服务能撑多少并发。
+    scenarios: |
+      - **知识库问答首字慢**：trace 显示改写用了大模型、串行 1 秒多，换成小模型并与检索并行。
+      - **回答太啰嗦导致总时长长**：评测确认简洁版本质量不降后，在 prompt 里限制篇幅、设 `max_tokens`。
+      - **Agent 多步任务**：每一步推送「正在查询设备状态」这类步骤事件，用户感知等待明显缩短（可以用 A/B 或问卷验证）。
+      - **报表生成**：长任务改为异步任务 + 进度条，而不是让 HTTP 连接一直挂着。
+    code: |
+      ```python
+      import time
+      from openai import AsyncOpenAI
+
+      client = AsyncOpenAI(timeout=30, max_retries=1)
+
+      async def stream_answer(messages, span):
+          start = time.perf_counter()
+          first_token_at = None
+          n_chunks = 0
+          stream = await client.chat.completions.create(
+              model=MODEL, messages=messages, stream=True,
+              max_tokens=600, stream_options={"include_usage": True},
+          )
+          async for chunk in stream:
+              if chunk.choices and chunk.choices[0].delta.content:
+                  if first_token_at is None:
+                      first_token_at = time.perf_counter()  # 第一个非空内容才算首字
+                      span.set_attribute("llm.ttft_ms", (first_token_at - start) * 1000)
+                  n_chunks += 1
+                  yield chunk.choices[0].delta.content
+              if chunk.usage:
+                  span.set_attribute("llm.output_tokens", chunk.usage.completion_tokens)
+          end = time.perf_counter()
+          span.set_attribute("llm.e2e_ms", (end - start) * 1000)
+          if first_token_at and n_chunks > 1:
+              span.set_attribute("llm.itl_ms", (end - first_token_at) * 1000 / (n_chunks - 1))
+      ```
+    pitfalls: |
+      - **只看平均值**：平均 3 秒，但 P99 可能是 25 秒，抱怨都来自长尾。
+      - **在拿到流对象时就记 TTFT**：那只是响应头到了，第一个内容 token 可能还要再等。
+      - **以为压缩 prompt 能大幅提速**：输入减半通常只省百分之几的延迟，真正的大头是输出长度和串行调用。
+      - **前置步骤串行调用 LLM**：改写、分类、规划每一步都用大模型，首字时间叠加到好几秒。
+      - **SDK 默认超时过长**：OpenAI Python SDK 默认超时 10 分钟、自动重试 2 次，不改的话一个卡住的请求会占住连接很久。
+      - **没有流式就上线**：同样的端到端延迟，流式和非流式的主观体验差别很大。
+    interview_asks:
+      - question: "TTFT、ITL、端到端延迟分别是什么？用户说「慢」时你先看哪个？"
+        answer: "TTFT 是到第一个字的时间。ITL 是之后每个 Token 的间隔。端到端是整段结束。用户说慢，先看首字，因为那是他开始看到东西的时刻，再看是不是生成太长。"
+      - question: "为什么压缩输入 prompt 对延迟的改善有限？什么情况下例外？"
+        answer: "输出一个个 Token 生成，往往占掉大部分时间，输入只影响首字前的那一段。例外是输入特别长、检索特别慢，或者你把多轮历史堆得很大。先看时间拆在哪一段。"
+      - question: "你的 RAG 系统从提问到首字经过哪几步？怎么定位哪一步慢？"
+        answer: "改写、检索、重排、组装提示、模型 prefill，然后才出第一个字。每步打点。最慢的那一步才是优化对象。不要不看打点就去换模型。"
+    project_example: |
+      **p1 企业知识库问答的延迟治理（数字用你的压测结果填写）：**
+      - 每个环节一个 span：改写、检索、重排、模型 TTFT、生成、引用校验，在看板上看 P95；
+      - 改写从大模型换成小模型，并与「原问题检索」并行，首字前的串行步骤减少一次；
+      - 流式接口先推送 `status: retrieving` 和引用列表事件，再推送正文；
+      - prompt 要求「先给结论，最多 5 条要点」，并用评测集确认准确率没有下降。
+      面试表达：「我先用 trace 把延迟拆开，发现首字慢主要来自串行改写，而不是模型本身。」
+    freshness: |
+      2026-11 核实：OpenAI 延迟优化指南仍是七条原则，并给出「输出减半约等于延迟减半、输入减半通常只改善 1% 到 5%」的经验数量级。OpenAI Python SDK 默认请求超时 10 分钟、对部分错误自动重试 2 次。NVIDIA 的定义中 TTFT 包含排队、prefill 和网络时间。
+    sources:
+      - title: "OpenAI Latency optimization"
+        url: "https://platform.openai.com/docs/guides/latency-optimization"
+      - title: "NVIDIA LLM Inference Benchmarking Fundamental Concepts"
+        url: "https://developer.nvidia.com/blog/llm-benchmarking-fundamental-concepts/"
+      - title: "NVIDIA NIM Benchmarking Metrics"
+        url: "https://docs.nvidia.com/nim/benchmarking/llm/metrics"
+      - title: "openai-python README（Timeouts 与 Retries）"
+        url: "https://github.com/openai/openai-python"
+
+  - id: d47-k2
+    name: 并发、限流与背压
+    level: P0
+    summary: 并发数等于吞吐乘以平均耗时；按用户、租户、上游三层限流，用 Token 而不只是请求数计量，超限返回 429 并告知何时重试
+    analogy: |
+      **像你在前端用过的请求并发池（p-limit）和节流防抖**：同一时间最多发 6 个请求，按钮连点只算一次。
+
+      **不一样的地方：**
+      - 前端节流只管一个浏览器；服务端有多个副本，限流计数必须放在 **Redis 这类共享存储里，并且原子更新**，否则多副本各算各的。
+      - 前端按「请求次数」节流就够了；LLM 的成本和上游配额按 **Token** 计，一个请求可能 200 token，也可能 20 万 token。
+      - 前端被节流的请求直接丢掉也无所谓；服务端要返回 **429 + Retry-After**，让客户端知道多久后再试，还要区分「用户超限」和「平台过载」。
+    why: |
+      LLM 请求又慢又贵：一个请求占用连接 10 秒以上，上游厂商有 RPM、TPM 配额，费用按 Token 计。
+      没有限流时，一个写错循环的脚本或一个大租户的批量任务，就能把全平台的配额和预算打光，所有人一起 429。面试里「300 并发怎么扛」「怎么防止某个用户刷爆」都是常见场景题。
+    problem: |
+      解决三件事：**算清楚要多少并发资源**；**公平地分配有限的上游配额**；**过载时有序拒绝，而不是全部变慢然后一起超时**。
+    principle: |
+      **一、Little 定律：先算并发**
+
+      **在途请求数 = 吞吐（每秒请求数）× 平均耗时（秒）**
+
+      - 普通接口 50 QPS、每个 50 毫秒 → 在途 2.5 个；
+      - LLM 流式接口 50 QPS、每个 8 秒 → 在途 **400 个**。
+
+      所以 AI 后端必须用异步框架挂住大量长连接（见 Day 06），而且每一层的并发上限都要按这个数核对。
+
+      **二、连接池：最容易被忽略的上限**
+
+      数据库总连接数 = 副本数 × 每副本 worker 数 × 每个 worker 的连接池大小（含溢出）。
+      例：3 副本 × 4 worker × (pool_size 10 + max_overflow 10) = **240**，而 PostgreSQL 默认 `max_connections` 是 100，高峰时就会报 `too many clients`。解决：降低单 worker 池大小、加 PgBouncer、**别在等 LLM 时占着数据库连接**。
+
+      **三、多层限流**
+
+      ```mermaid
+      flowchart TD
+        A["请求进入"] --> B{"用户级 RPM 令牌桶"}
+        B -- "超限" --> X["429 加 Retry-After"]
+        B -- "通过" --> C{"租户级 TPM 与月度预算"}
+        C -- "超限" --> X
+        C -- "通过" --> D{"用户同时进行的流数"}
+        D -- "超限" --> X
+        D -- "通过" --> E{"全局上游信号量 有空位"}
+        E -- "等待超时" --> Y["503 或降级到备用模型"]
+        E -- "获得" --> F["调用模型"]
+        F --> G["按实际 usage 结算 Token"]
+      ```
+
+      | 层 | 目的 | 实现 |
+      |---|---|---|
+      | 用户 RPM | 防脚本刷接口 | Redis 令牌桶，Lua 脚本原子执行 |
+      | 租户 TPM + 预算 | 公平分配配额、控成本 | 预扣「输入 token + max_tokens」，结束后按 usage 多退少补 |
+      | 并发流数 | 防一个用户开几十个 SSE | Redis 计数，连接断开时释放 |
+      | 上游信号量 | 不超过厂商配额 | 每副本 `asyncio.Semaphore`，或在 LLM 网关统一控制 |
+
+      **四、令牌桶为什么适合**
+
+      桶里最多 B 个令牌，每秒补充 R 个，请求消耗令牌。它**允许短时突发、长期平均不超过 R**。固定窗口计数在窗口边界会出现「两倍突发」。
+      关键是「读取 → 计算 → 写回」要**原子执行**：用 Redis Lua 脚本一次完成，否则并发请求会读到同一个旧值，导致超发。
+
+      **五、429 的正确处理**
+
+      - 服务端返回 **429 + Retry-After**，响应体说明是哪一层超限；
+      - 客户端用**指数退避 + 随机抖动**，并设置最大次数；
+      - **只在一层做重试**：SDK 默认重试 2 次，你的代码再重试 3 次，网关再重试 2 次，一个失败会被放大成十几次请求；
+      - 上游 429 时不要立即重试，优先切换到备用模型或排队。
+
+      **六、背压与 fail-open / fail-closed**
+
+      - 排队要**有界**：等待信号量最多几秒，超时就拒绝，不要让请求在内存里无限堆积；
+      - Redis 挂了怎么办：**用户级 RPM 可以 fail-open**（放行并用本地内存限流兜底），**涉及预算和成本的检查应 fail-closed 或降级**，否则故障期间可能产生大额账单。
+    scenarios: |
+      - **知识库问答接口**：用户每分钟 20 次、同时最多 2 个流；租户按合同设 TPM 和月度 Token 预算。
+      - **批量入库**：Embedding 调用走独立的队列和配额，不和在线问答抢上游额度。
+      - **Agent 平台**：每个 Agent 任务也算一个「流」，长任务占用的并发要能在用户关闭页面后释放。
+      - **多个模型厂商**：LLM 网关（如 LiteLLM 这类代理）统一做虚拟 key、团队预算、TPM/RPM 限制和失败切换。
+    code: |
+      ```python
+      TOKEN_BUCKET = """
+      local key = KEYS[1]
+      local rate, burst, now, cost = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3]), tonumber(ARGV[4])
+      local s = redis.call('HMGET', key, 'tokens', 'ts')
+      local tokens = tonumber(s[1]) or burst
+      local ts = tonumber(s[2]) or now
+      tokens = math.min(burst, tokens + (now - ts) * rate)
+      local ok = 0
+      if tokens >= cost then tokens = tokens - cost; ok = 1 end
+      redis.call('HSET', key, 'tokens', tokens, 'ts', now)
+      redis.call('EXPIRE', key, math.ceil(burst / rate) * 2)
+      return {ok, tostring(tokens)}
+      """
+
+      upstream = asyncio.Semaphore(50)  # 每副本最多 50 个在途 LLM 请求
+
+      async def guarded_call(user_id: str, est_tokens: int, call):
+          ok, _ = await redis.eval(TOKEN_BUCKET, 1, f"rl:user:{user_id}", 1, 20, time.time(), 1)
+          if not int(ok):
+              raise HTTPException(429, "rate limited", headers={"Retry-After": "3"})
+          try:
+              async with asyncio.timeout(5):
+                  await upstream.acquire()      # 有界等待，超时就拒绝
+          except TimeoutError:
+              raise HTTPException(503, "busy", headers={"Retry-After": "5"})
+          try:
+              return await call()
+          finally:
+              upstream.release()
+      ```
+    pitfalls: |
+      - **只按请求数限流**：一个塞了 10 万 token 上下文的请求和一个 100 token 的请求算一样。
+      - **限流计数先读后写**：`HGETALL` 后在 Python 里算完再 `HSET`，并发时超发。
+      - **重试层层叠加**：SDK、业务代码、网关都在重试，故障时请求量成倍放大。
+      - **无界排队**：所有请求都在等信号量，最后一起超时，比直接拒绝更糟。
+      - **等 LLM 时占着数据库连接**：事务从查库一直开到流式结束，连接池很快被耗尽。
+      - **预算检查 fail-open**：Redis 故障时预算失控，月底账单才发现。
+    interview_asks:
+      - question: "LLM 接口平均 8 秒，要支撑 50 QPS，需要多大的并发能力？怎么算？"
+        answer: "并发大约是 QPS 乘以耗时。50 乘 8 是 400，也就是大约要同时扛 400 个在飞请求。这是排队论里的平均并发，还要留余量。不是开 50 个线程就够。"
+      - question: "你会在哪几层做限流？为什么按 Token 而不是按请求数？"
+        answer: "入口按用户限，调用模型前按配额限，上游 429 时再退让。贵的是 Token 不是请求条数，一次超长请求能顶很多短请求。只数请求会被长提示打穿配额。"
+      - question: "上游返回 429 时你的服务怎么处理？重试要注意什么？"
+        answer: "按响应里的等待时间退避，超过次数就快速失败或排队，不要立即循环重试。重试会把 429 变成更多 429。同时对自己的调用方返回明确的忙，而不是卡到超时。"
+      - question: "限流依赖的 Redis 挂了，放行还是拒绝？"
+        answer: "看这个接口的代价。调用模型、会花钱或有副作用的，Redis 挂了就拒绝或走本地的小上限。只读、可接受放量的才考虑放行。默认失败时收紧，不默认全放。"
+    project_example: |
+      **p1 / p2 共用的 LLM 调用层：**
+      - 所有模型调用都经过一个网关模块：用户 RPM 令牌桶（Lua 原子执行）、租户 TPM 预扣与结算、每副本信号量；
+      - SDK 设 `timeout=30, max_retries=1`，业务层不再重试，失败时切换备用模型；
+      - 数据库会话只在「查权限、取文档」时打开，开始流式生成前就归还连接；
+      - 压测时用 mock LLM 固定 TTFT 和 ITL，先测出自身服务的并发上限，再用真实模型测上游配额。
+      面试时讲清楚「我怎么算出并发上限」，比报一个 QPS 数字更有说服力。
+    freshness: |
+      2026-11 核实：OpenAI Python SDK 默认超时 10 分钟、自动重试 2 次；LiteLLM 代理支持按虚拟 key 和团队设置 max_budget、tpm_limit、rpm_limit 与 max_parallel_requests，并文档说明无数据库时预算检查不生效，需要按需配置。
+    sources:
+      - title: "openai-python README"
+        url: "https://github.com/openai/openai-python"
+      - title: "LiteLLM Proxy Users and Budgets"
+        url: "https://docs.litellm.ai/docs/proxy/users"
+      - title: "LiteLLM Proxy Reliability and Fallbacks"
+        url: "https://docs.litellm.ai/docs/proxy/reliability"
+
+  - id: d47-k3
+    name: 缓存：从 Embedding 缓存到厂商 Prompt Caching
+    level: P0
+    summary: 应用层缓存要带租户、权限和版本；厂商 Prompt 缓存要求前缀完全一致，静态内容放前面，省的是输入费用和首字时间
+    analogy: |
+      **像前端构建产物的 content hash 文件名**：`app.3f9a.js` 内容不变，浏览器就一直命中缓存；改了一个字节，hash 变了，缓存全部失效。**厂商的 Prompt 缓存也是按「前缀完全一致」命中的**，开头改一个字，后面全部失效。
+
+      **不一样的地方：**
+      - 浏览器缓存在你控制的客户端；Prompt 缓存在厂商服务器上，你**只能通过组织 prompt 的顺序**来提高命中，不能主动「写入」或「删除」。
+      - 静态资源缓存省的是下载时间；Prompt 缓存省的是**输入 token 费用和 prefill 时间**，输出 token 一分不省。
+      - 接口缓存通常按 URL 当 key；AI 答案缓存的 key 还必须包含**租户、权限范围、知识库版本**，否则就是越权（见 Day 46）。
+    why: |
+      RAG 和 Agent 的 prompt 里有大量重复内容：系统提示、工具定义、few-shot 示例，Agent 每一轮还会带上前面所有历史。
+      用好缓存能同时降低成本和首字时间；用错缓存会导致**答错**（语义缓存误命中）或**越权**（缓存 key 缺权限维度）。
+    problem: |
+      解决「**相同或相似的计算不要反复付费**」，同时保证缓存不会返回过期、错误或别人的内容。
+      难点在于：应用层缓存的 key 怎么设计才安全，厂商缓存又怎样组织 prompt 才能命中。
+    principle: |
+      **一、AI 应用的五层缓存**
+
+      | 层 | key 组成 | 风险 | 建议 |
+      |---|---|---|---|
+      | Embedding 缓存 | 模型名 + 版本 + 文本哈希 | 几乎没有 | 入库和查询都可以用 |
+      | 检索结果缓存 | 租户 + 权限范围哈希 + 知识库版本 + 规范化问题 | 权限变化后返回旧结果 | 权限或文档变化时提升版本号 |
+      | 答案缓存（精确匹配） | 上面的维度 + 模型和 prompt 版本 | 文档更新后答案过期 | 适合高频 FAQ，TTL 较短 |
+      | 语义缓存（相似匹配） | 问题向量相似度 | **相似问题不同答案** | 只用于公开、通用问题，评测误命中率 |
+      | 厂商 Prompt 缓存 | 厂商按前缀自动匹配 | 几乎没有安全风险 | 调整 prompt 结构提升命中 |
+
+      语义缓存的典型翻车：「合同 A 的付款条件是什么」和「合同 B 的付款条件是什么」向量非常相似，答案却完全不同。
+
+      **二、厂商 Prompt 缓存的工作方式**
+
+      - **前缀完全一致才命中**：从第一个 token 开始逐个比较，遇到第一个不同的 token，后面都要重新计算；
+      - OpenAI：默认开启，GPT-5.6 及以后的模型**最少 1,024 token** 才缓存；通过 `usage.input_tokens_details.cached_tokens`（Chat Completions 为 `prompt_tokens_details`）观察命中；
+      - Anthropic：用 `cache_control` 标记断点，默认 5 分钟有效、命中会续期，可选 1 小时；前缀顺序是 **tools → system → messages**；
+      - 计费：**读取缓存通常约为正常输入价的一成**；写入缓存可能有加价（Anthropic 5 分钟写入 1.25 倍、1 小时 2 倍；OpenAI GPT-5.6 及以后也引入了写入计费）。**具体倍率随模型变化，以官方文档为准**。
+
+      **三、按「静态在前、动态在后」组织 prompt**
+
+      ```mermaid
+      flowchart TD
+        A["工具定义 固定顺序"] --> B["系统提示 不含时间和用户名"]
+        B --> C["few-shot 示例"]
+        C --> D["长期不变的公共资料"]
+        D --> E["对话历史 只追加不改写"]
+        E --> F["本轮检索片段"]
+        F --> G["用户问题和当前时间"]
+        A -. "这一段越长越稳定 命中越多" .-> D
+      ```
+
+      常见的「缓存杀手」：
+      - 系统提示第一行写当前时间、用户名、请求 ID；
+      - 工具列表每次顺序不同，或按权限动态增减工具（可以固定全集，在执行层拦截无权工具）；
+      - 换模型、改结构化输出的 schema；
+      - 每轮都重写或摘要整段历史（摘要要有节奏地做，不要每轮都做）。
+
+      **四、Agent 场景的收益最大**
+
+      Agent 第 N 轮的输入 = 系统提示 + 工具定义 + 前 N-1 轮的全部历史 + 新的工具结果。只要历史**只追加不修改**，前 N-1 轮几乎都能命中缓存。
+
+      **五、一致性与失效**
+
+      - 知识库版本号进 key：文档更新、删除时版本号加 1，旧缓存自然失效；
+      - 权限变化（共享被撤销）时，该用户的权限范围哈希会变化，旧 key 不再被访问；
+      - 删除文档必须让包含它的答案缓存失效，否则「被删除的内容还能被问出来」。
+    scenarios: |
+      - **入库重跑**：文档只改了一页，未变化的分块命中 Embedding 缓存，不重复付费。
+      - **园区 Agent**：工具定义和系统提示有几千 token，放在最前面并保持顺序固定，多轮对话的输入大部分命中缓存。
+      - **员工手册 FAQ**：「年假怎么请」这类高频问题用精确答案缓存，TTL 一天，手册更新时提升版本。
+      - **p3 Coding Agent**：仓库说明和代码规范放在固定前缀，每轮只追加测试结果。
+    code: |
+      ```python
+      SYSTEM = load_text("prompts/kb_system_v3.md")   # 固定内容，不拼接时间和用户名
+      TOOLS = sorted(all_tools, key=lambda t: t["name"])  # 顺序固定
+
+      def build_input(history, chunks, question, now):
+          return [
+              *history,                                   # 只追加，不改写
+              {"role": "user", "content": render_chunks(chunks)},
+              {"role": "user", "content": f"当前时间 {now}\n问题：{question}"},
+          ]
+
+      resp = await client.responses.create(
+          model=MODEL, instructions=SYSTEM, tools=TOOLS,
+          input=build_input(history, chunks, question, now),
+      )
+      usage = resp.usage
+      metrics.observe("llm.cached_ratio",
+                      usage.input_tokens_details.cached_tokens / max(usage.input_tokens, 1))
+      ```
+    pitfalls: |
+      - **答案缓存 key 只有问题文本**：A 部门能看到的答案被 B 部门命中，等于越权。
+      - **语义缓存用于具体事实问题**：换了合同名、日期、设备编号，答案却被复用。
+      - **系统提示开头放时间戳**：厂商缓存命中率接近零，自己还不知道。
+      - **以为 Prompt 缓存能省输出费用**：它只影响输入部分。
+      - **按用户权限动态裁剪工具列表**：每个用户的前缀都不一样，缓存被打散；更好的方式是工具全集固定、执行时鉴权。
+      - **删除文档不清缓存**：被删除的内容仍能被问出来，在合规审查中是严重问题。
+    interview_asks:
+      - question: "你的 RAG 系统有哪几层缓存？答案缓存的 key 怎么设计？"
+        answer: "查询 Embedding、检索结果、相同问题的答案都可以缓存。答案的 key 要包含租户、权限范围、知识库版本、模型版本和问题本身。少一个就可能把旧答案或别人的答案发出去。"
+      - question: "Prompt caching 的原理是什么？怎么组织 prompt 才能提高命中率？"
+        answer: "供应商复用相同前缀已经算过的结果。把不变的系统提示和工具放最前，检索结果和用户问题放后面。前面任何改动都会让缓存失效。"
+      - question: "语义缓存有什么风险？你会在什么场景用？"
+        answer: "它按意思接近命中另一题的答案，可能张冠李戴，也会跨权限。只适合答案稳定、权限相同、错了也可接受的公开问答。企业权限数据不用语义缓存。"
+    project_example: |
+      **p2 园区 Agent 的缓存设计：**
+      - 工具定义和系统提示固定顺序放最前面，对话历史只追加，每轮的工具结果放最后；
+      - 在指标里记录 `cached_tokens / input_tokens`，上线前后对比命中率和单任务成本（用你的实测数据填写）；
+      - 设备台账这类低频变化数据做应用层缓存，key 带园区 ID 和数据版本；告警实时数据不缓存；
+      - 不使用语义缓存，因为园区问题大多带设备编号和时间，相似问题答案不同。
+      面试时可以说明：「缓存命中率我是从 usage 字段里看到的，不是估出来的。」
+    freshness: |
+      2026-11 核实：OpenAI Prompt 缓存默认开启，GPT-5.6 及以后的模型最小缓存长度 1,024 token，并对缓存写入单独计费；更早的模型使用 prompt_cache_retention 等参数控制保留时长。Anthropic 缓存默认 5 分钟、可选 1 小时，写入 1.25 倍或 2 倍、读取 0.1 倍。各家倍率随模型调整，使用前以官方定价页为准。
+    sources:
+      - title: "OpenAI Prompt caching"
+        url: "https://platform.openai.com/docs/guides/prompt-caching"
+      - title: "Anthropic Prompt caching"
+        url: "https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching"
+
+  - id: d47-k4
+    name: 模型路由、Token 预算与 Batch
+    level: P1
+    summary: 成本等于调用次数乘以 Token 乘以单价；先减少调用和 Token，再做路由和 Batch，每次降本都要用评测证明质量不降
+    analogy: |
+      **像前端的响应式图片和按需加载**：手机端加载小图、桌面端加载大图，不常用的模块懒加载。模型路由也是「简单任务用小模型，难任务用大模型」。
+
+      **不一样的地方：**
+      - 图片选错尺寸只是糊一点；模型选错是**答错**，而且不容易被发现，所以路由策略必须用评测集验证。
+      - 前端资源按字节计费几乎可以忽略；LLM 按 Token 线性计费，Agent 多轮调用时**每一轮都要重新付一遍历史的钱**。
+    why: |
+      很多 AI 项目能上线、却撑不住规模化，原因就是成本。面试中「成本超预算你怎么降」是区分「做过 Demo」和「做过生产」的问题。
+    problem: |
+      解决「**在质量不明显下降的前提下，把单次任务成本降下来，并且不会出现失控的账单**」。
+      关键是先知道钱花在哪，再按收益排序动手，而不是一上来就换最便宜的模型。
+    principle: |
+      **一、成本公式**
+
+      单次任务成本 = Σ 每次调用（输入 token × 输入单价 + 输出 token × 输出单价）− 缓存折扣
+
+      Agent 要特别注意：第 N 轮的输入包含前面所有轮的历史和工具结果，**总输入 token 随步数大致按平方增长**。一个 10 步的任务，成本可能是单轮问答的几十倍。
+
+      **二、降本杠杆，按优先级**
+
+      | 顺序 | 杠杆 | 做法 |
+      |---|---|---|
+      | 1 | 少调用 | 能用规则、分类器、SQL 的步骤不用 LLM；合并串行调用 |
+      | 2 | 少 Token | 检索 TopK 精简、工具结果截断或摘要、历史按节奏摘要、限制输出长度 |
+      | 3 | 缓存 | 见 k3 |
+      | 4 | 路由 | 意图分类、改写、抽取用小模型，最终生成用大模型 |
+      | 5 | Batch | 离线评测、批量摘要走 Batch API，通常五折 |
+      | 6 | 预算兜底 | 每租户、每任务的 Token 上限，Agent 最大步数 |
+
+      **三、模型路由的两种方式**
+
+      ```mermaid
+      flowchart TD
+        A["请求"] --> B{"规则或小模型判断任务类型"}
+        B -- "闲聊 FAQ 状态查询" --> C["小模型或模板回答"]
+        B -- "知识问答" --> D["中等模型 加 RAG"]
+        B -- "复杂分析 多步规划" --> E["大模型"]
+        C --> F{"置信度或校验通过"}
+        F -- "否" --> E
+        F -- "是" --> G["返回"]
+        D --> G
+        E --> G
+      ```
+
+      - **分类路由**：先判断类型再选模型，判断本身要便宜；
+      - **级联**：先让小模型答，校验不通过（格式错、引用缺失、置信度低）再升级到大模型；要监控「升级率」，太高说明小模型白调了。
+
+      **四、Batch API**
+
+      OpenAI Batch API：异步提交，**24 小时内完成，费用约五折，并有独立的更高限额**。适合离线评测（Day 41）、批量生成文档摘要、夜间数据标注；**不适合任何在线请求**。
+
+      **五、预算与失控保护**
+
+      - 每租户月度预算、每用户日预算，在网关预扣和结算；
+      - Agent：最大步数、单任务 Token 上限、重复调用同一工具相同参数时提前终止；
+      - 告警：单任务成本超过 P99 的若干倍时记录并通知。
+
+      **六、降本必须配评测**
+
+      每一次换模型、删上下文、改 prompt，都要跑评测集（见 Day 41、Day 44 的回归门禁），对比**质量、成本、延迟**三个数字，三者一起汇报。
+    scenarios: |
+      - **意图分类**：「查工单进度」「问制度」「闲聊」用小模型或规则分流，大模型只处理知识问答和复杂分析。
+      - **离线评测**：每晚 2000 条评测样本走 Batch API。
+      - **p3 Coding Agent 生成-测试-修复循环**：vitest 和 eslint 先在沙箱里跑（不用 LLM），只把失败用例的摘要发给模型，最多 5 轮，单任务 Token 上限。
+    pitfalls: |
+      - **直接全部换最便宜的模型**：没有评测，质量下降要等用户投诉才发现。
+      - **max_tokens 设到模型上限**：偶发的长回答拉高成本和延迟。
+      - **把完整工具输出塞回历史**：一次测试日志几万 token，之后每一轮都要为它付费。
+      - **级联不看升级率**：大部分请求最终都升级到大模型，反而比直接用大模型更贵、更慢。
+      - **在线请求用 Batch**：结果最长要等 24 小时。
+    interview_asks:
+      - question: "你的系统一次问答大概多少 Token、多少钱？怎么估算的？"
+        answer: "从线上日志取中位数：输入里系统提示、历史、检索各占多少，输出多少。乘单价得到一次的钱，再乘日调用量。用真实分布，不用拍一个 1000 Token。"
+      - question: "如果要求成本降 40%，你会按什么顺序做？怎么保证质量不降？"
+        answer: "先看账本里谁最贵。然后按缓存重复问题、缩短检索内容、简单任务换小模型、减少重试这个顺序做。每一步用评测集看正确率和拒答，掉出范围就停，不为了 40% 硬砍。"
+    project_example: |
+      **p3 前端 Coding Agent 的「生成-测试-修复」循环预算：**
+      - 每轮先在 Docker 沙箱里跑 vitest 和 eslint，把输出解析成「失败用例名 + 断言差异 + 相关文件片段」，截断后再交给模型；
+      - 最多 5 轮，单任务 Token 上限，连续两轮同样的失败就停止并请求人工介入；
+      - 生成补丁用大模型，失败日志的归类用小模型；
+      - 评测集在夜间走 Batch API，报告里同时给出通过率、平均 Token 和 P95 耗时（用你的评测结果填写）。
+    freshness: |
+      2026-11 核实：OpenAI Batch API 仍为 24 小时完成窗口、相对同步接口约五折，并使用独立的批量限额。LiteLLM 等网关可按虚拟 key 或团队配置预算与 TPM/RPM 限制。
+    sources:
+      - title: "OpenAI Batch API"
+        url: "https://platform.openai.com/docs/guides/batch"
+      - title: "LiteLLM Proxy Users and Budgets"
+        url: "https://docs.litellm.ai/docs/proxy/users"
+
+test:
+  - id: d47-t1
+    kp: d47-k1
+    type: single
+    question: 用户反馈：「点了发送后要等好几秒才出第一个字，出字以后倒是挺快的。」你首先应该关注哪个指标？
+    options:
+      - "TTFT 首字时间，以及它前面的检索、改写等串行步骤"
+      - "ITL 字间延迟，因为它决定了文字的输出速度"
+      - "系统总吞吐 TPS，看服务器是否算力不足"
+      - "端到端延迟的平均值，看整体是否超标"
+    answer: [0]
+    explain: |
+      「出字前很久、出字后很快」正是首字时间的问题。用户感知的首字时间包括你的前置步骤（改写、检索、重排）和模型自身的排队与 prefill。
+      ITL 决定出字后的速度，用户说这部分不慢；TPS 是系统总量指标，不直接对应单个请求的体验；平均端到端延迟会把问题稀释。
+  - id: d47-t2
+    kp: d47-k1
+    type: single
+    question: 一个问答接口的输入约 3000 token、输出约 800 token，端到端延迟偏高。按 OpenAI 延迟优化指南的经验，下列哪项**通常最能降低端到端延迟**？
+    options:
+      - "把输入压缩到 1500 token"
+      - "把模型调用的 temperature 调低"
+      - "在保证质量的前提下把输出控制在约 400 token"
+      - "把 HTTP 连接改成长连接"
+    answer: [2]
+    explain: |
+      生成阶段逐 token 进行，输出长度是端到端延迟的大头，输出减半大约让延迟减半；输入减半通常只改善百分之一到五，除非上下文非常长。temperature 不影响速度；长连接只省一次握手的时间。
+  - id: d47-t3
+    kp: d47-k1
+    type: multi
+    question: 对于一个 RAG 流式问答接口，下列哪些时间会计入**用户感知的首字时间**？
+    options:
+      - "模型服务端的排队时间"
+      - "模型对整段 prompt 做 prefill 的时间"
+      - "你的服务在调用模型之前做的问题改写和检索"
+      - "生成第 2 到最后一个 token 的时间"
+      - "客户端与模型服务之间的网络往返"
+    answer: [0, 1, 2, 4]
+    explain: |
+      第一个字出现前要经过：你的前置步骤、网络往返、模型排队和 prefill。第 2 个 token 之后的时间属于生成阶段，影响的是端到端延迟和 ITL，不影响首字。
+  - id: d47-t4
+    kp: d47-k1
+    type: judge
+    question: 端到端延迟主要由输入 prompt 的长度决定，所以压缩 prompt 是降低总延迟最有效的手段。
+    answer: false
+    explain: |
+      端到端延迟约等于 TTFT 加上「输出 token 数 × 字间延迟」。输入长度主要影响 prefill（也就是 TTFT），对多数请求只占总时长的一小部分；输出长度才通常是大头。压缩 prompt 的主要收益是省钱，以及在超长上下文时改善首字。
+  - id: d47-t5
+    kp: d47-k1
+    type: single
+    question: 同事这样统计流式接口的首字时间，问题在哪？
+    code: |
+      start = time.perf_counter()
+      stream = await client.chat.completions.create(
+          model=MODEL, messages=messages, stream=True,
+      )
+      metrics.observe("llm.ttft_ms", (time.perf_counter() - start) * 1000)
+      async for chunk in stream:
+          yield chunk.choices[0].delta.content or ""
+    options:
+      - "perf_counter 精度不够，应该用 time.time"
+      - "这里只等到了响应建立，第一个内容 token 可能还没到，测出的首字时间偏小"
+      - "流式模式下不能统计首字时间，只能统计端到端"
+      - "应该把统计放在 async for 循环结束之后"
+    answer: [1]
+    explain: |
+      create 返回流对象时，通常只是响应头到达、连接建立，第一个内容 token 可能还要再等。首字时间应在循环里收到第一个非空 delta.content 时记录。perf_counter 正是测耗时的推荐方式；放到循环结束后测到的是端到端延迟。
+  - id: d47-t6
+    kp: d47-k2
+    type: single
+    question: 一个 LLM 流式接口平均耗时 8 秒，目标支撑 50 QPS。根据 Little 定律，系统需要同时挂住的在途请求大约是：
+    options:
+      - "约 6 个"
+      - "约 50 个"
+      - "约 58 个"
+      - "约 400 个"
+    answer: [3]
+    explain: |
+      在途请求数等于吞吐乘以平均耗时，50 × 8 = 400。这也是 AI 后端必须用异步框架挂住大量长连接、并按这个数核对信号量和连接池上限的原因。
+  - id: d47-t7
+    kp: d47-k2
+    type: single
+    question: 下面的分布式限流代码在多副本、高并发下会出什么问题？
+    code: |
+      async def allow(user_id: str) -> bool:
+          key = f"rl:{user_id}"
+          state = await redis.hgetall(key)
+          tokens = refill(state, now=time.time())
+          if tokens < 1:
+              return False
+          await redis.hset(key, mapping={"tokens": tokens - 1, "ts": time.time()})
+          return True
+    options:
+      - "hgetall 返回的是字节串，tokens 比较会报类型错误"
+      - "读取和写回不是原子操作，并发请求读到同一个旧值，导致超发"
+      - "Redis 的 Hash 结构不适合存限流状态，应该改用 List"
+      - "没有设置过期时间，所以限流永远不会恢复"
+    answer: [1]
+    explain: |
+      多个请求同时执行 hgetall，读到同一个 tokens 值，各自判断通过后再写回，实际放行数超过限额。应把「读取、补充、扣减、写回」放进一个 Lua 脚本原子执行。没有设置过期时间会导致冷 key 堆积，但不会让限流失效；字节串问题可以通过解码解决，不是主要风险。
+  - id: d47-t8
+    kp: d47-k2
+    type: multi
+    question: 关于 AI 平台的限流设计，下列哪些做法是**合理**的？
+    options:
+      - "租户级按 Token 计量，请求前按「输入 token + max_tokens」预扣，结束后按 usage 结算"
+      - "超限时返回 429，并在 Retry-After 中告知客户端多久后重试"
+      - "每个副本用信号量限制同时发往上游的 LLM 请求数"
+      - "超限请求放进内存队列无限等待，保证一个请求都不丢"
+      - "限流只在前端做，后端信任前端不会多发"
+    answer: [0, 1, 2]
+    explain: |
+      Token 预扣与结算贴合 LLM 的真实成本，429 加 Retry-After 让客户端有序退避，上游信号量防止超过厂商配额。无界排队会导致内存上涨、所有请求一起超时；前端限流可以被直接绕过。
+  - id: d47-t9
+    kp: d47-k2
+    type: judge
+    question: 只要按请求数（RPM）限流，就足以控制 LLM 应用的成本和上游配额。
+    answer: false
+    explain: |
+      LLM 按 Token 计费，上游配额也有 TPM 维度。一个携带 10 万 token 上下文的请求和一个 100 token 的请求在 RPM 里都算 1 次，成本却差上千倍。需要在租户或用户层面按 Token 计量和设预算。
+  - id: d47-t10
+    kp: d47-k2
+    type: single
+    question: 服务部署 3 个副本，每个副本 4 个 worker，SQLAlchemy 连接池 pool_size=10、max_overflow=10，PostgreSQL 的 max_connections 为默认的 100。高峰期出现 `too many clients` 错误。最直接的原因是：
+    options:
+      - "PostgreSQL 不支持异步驱动的连接"
+      - "LLM 调用太慢导致 Redis 连接被耗尽"
+      - "理论最大连接数 3 × 4 × 20 = 240，超过了数据库上限"
+      - "SQLAlchemy 的连接池在多 worker 下会共享同一个连接"
+    answer: [2]
+    explain: |
+      每个 worker 进程有独立的连接池，总连接数等于副本数 × worker 数 ×（pool_size + max_overflow），最多 240 个，超过了 100 的上限。可以减小单 worker 池、使用 PgBouncer，并避免在等待 LLM 时占用数据库连接。
+  - id: d47-t11
+    kp: d47-k3
+    type: single
+    question: 系统提示有 4000 token，但 usage 显示 cached_tokens 一直是 0。查看代码发现系统提示的第一行是 `当前时间：{now}，用户：{user_name}`。最合适的改法是：
+    options:
+      - "把 temperature 设为 0，让每次请求完全一样"
+      - "改用更大的模型，大模型的缓存命中率更高"
+      - "把系统提示压缩到 1000 token 以内"
+      - "把时间和用户名移到 prompt 末尾，让前面的固定内容保持一致"
+    answer: [3]
+    explain: |
+      厂商缓存要求前缀从第一个 token 开始完全一致。第一行每次都变，后面 4000 token 都无法命中。把变化的内容放到最后，固定内容放在最前面即可。temperature 影响的是采样，不影响输入是否一致；压缩到 1000 token 以下反而可能低于最小缓存长度。
+  - id: d47-t12
+    kp: d47-k3
+    type: multi
+    question: 下列哪些做法会**明显降低**厂商 Prompt 缓存的命中率？
+    options:
+      - "工具定义列表每次请求的顺序不固定"
+      - "按当前用户权限动态删减工具列表"
+      - "把本轮检索到的文档片段放在系统提示之前"
+      - "只在消息末尾追加新的用户问题"
+      - "频繁切换不同的模型处理同一段对话"
+    answer: [0, 1, 2, 4]
+    explain: |
+      工具顺序变化、按用户裁剪工具、把每轮都不同的检索片段放到前面，都会让前缀在很早的位置就不同；缓存是按模型分开的，换模型也无法复用。只在末尾追加内容正是保持前缀稳定的正确做法。
+  - id: d47-t13
+    kp: d47-k3
+    type: judge
+    question: Prompt caching 命中后，输入 token 和输出 token 的费用都会大幅降低。
+    answer: false
+    explain: |
+      Prompt 缓存复用的是对输入前缀的计算结果，只影响输入部分的费用和 prefill 时间（首字时间）。输出 token 仍要逐个生成，费用不变。所以「少生成」和「用缓存」是两个独立的优化方向。
+  - id: d47-t14
+    kp: d47-k3
+    type: single
+    question: 团队想给企业知识库问答加语义缓存：问题向量相似度大于 0.95 就直接返回历史答案。你最担心的问题和建议是：
+    options:
+      - "相似问题可能答案不同，如合同名或日期不同；只用于公开通用问题并评测误命中率"
+      - "向量相似度计算太慢，反而会增加延迟，应改为精确匹配"
+      - "0.95 的阈值太低，提高到 0.99 就不会有问题了"
+      - "语义缓存会占用太多 Redis 内存，应改用本地内存缓存"
+    answer: [0]
+    explain: |
+      「合同 A 的付款条件」和「合同 B 的付款条件」相似度极高，答案却完全不同，提高阈值只能减少、无法消除这类误命中，还会让命中率骤降。语义缓存适合答案与具体实体无关的公开问题，并且要用评测集衡量误命中率，同时 key 仍然要带租户和权限维度。
+  - id: d47-t15
+    kp: d47-k3
+    type: single
+    question: 为多租户知识库设计「精确匹配答案缓存」的 key，下列哪种组成最合理？
+    options:
+      - "规范化后的问题文本，再加上缓存写入的日期"
+      - "用户 ID 加问题文本，每个用户各自独立缓存"
+      - "租户、权限范围哈希、知识库版本、prompt 版本加问题"
+      - "问题文本的向量，按相似度阈值匹配历史答案"
+    answer: [2]
+    explain: |
+      租户和权限范围保证不越权，知识库版本保证文档更新后不返回旧答案，模型和 prompt 版本保证升级后不复用旧答案。只用问题文本会串租户；按用户 ID 隔离安全但几乎没有复用价值；向量是语义缓存的做法。
+  - id: d47-t16
+    kp: d47-k4
+    type: single
+    question: 下列哪个任务**最适合**使用 OpenAI Batch API？
+    options:
+      - "知识库问答的在线流式回答"
+      - "每晚对 2000 条评测样本跑一次模型并打分"
+      - "Agent 在执行过程中的工具选择"
+      - "用户上传文件后实时展示的摘要"
+    answer: [1]
+    explain: |
+      Batch API 是异步的，最长 24 小时完成，费用约五折并有独立限额，适合离线、对时效不敏感的批量任务，比如夜间评测。在线问答、Agent 执行中的决策、用户等待中的摘要都需要即时结果。
+  - id: d47-t17
+    kp: d47-k4
+    type: multi
+    question: 为防止 Agent 任务的成本失控，下列哪些措施是**有效**的？
+    options:
+      - "设置最大步数和单任务 Token 上限"
+      - "工具输出过长时截断或摘要后再放回历史"
+      - "检测到连续用相同参数调用同一工具时提前终止"
+      - "把 max_tokens 设成模型上限，避免回答被截断后重试"
+      - "单任务成本超过历史 P99 的若干倍时记录并告警"
+    answer: [0, 1, 2, 4]
+    explain: |
+      步数和 Token 上限是硬兜底，截断工具输出控制每轮输入增长，重复调用检测能识别死循环，成本异常告警能及时发现问题。把 max_tokens 设到上限只会让偶发的长输出拉高成本和延迟。
+  - id: d47-t18
+    kp: d47-k4
+    type: judge
+    question: 模型路由上线前，只要确认小模型的单价更低就可以了，不需要单独跑评测。
+    answer: false
+    explain: |
+      单价低不代表总成本低：小模型答错会导致重试、升级到大模型或用户追问，质量下降也不会自动报警。路由策略上线前必须用评测集对比质量、成本、延迟三项，级联还要监控升级率。
+  - id: d47-t19
+    kp: d47-k4
+    type: single
+    question: 你做了「小模型先答，校验不通过再升级到大模型」的级联路由。上线一周后，最需要关注哪组数据来判断它是否真的划算？
+    options:
+      - "小模型与大模型的单价之比，以及厂商的折扣"
+      - "小模型的平均首字时间和字间延迟"
+      - "每天的总请求数和小模型处理的请求数"
+      - "升级率、评测质量变化、综合单次成本与延迟"
+    answer: [3]
+    explain: |
+      如果升级率很高，大部分请求先调小模型再调大模型，成本和延迟都会比直接用大模型更高；质量变化要用评测集确认。单价比、小模型首字时间、总请求数都只反映了局部。
+
+exam:
+  - id: d47-e1
+    kp: d47-k1
+    type: single
+    question: 一次知识库问答的 trace 显示：问题改写（大模型）2.1 秒、检索 0.3 秒、重排 0.4 秒、主模型 TTFT 0.9 秒、生成 6 秒。用户主要抱怨「出第一个字太慢」。你最先做的优化是：
+    options:
+      - "把向量数据库换成更快的产品"
+      - "把主模型的 prompt 压缩一半"
+      - "改写换小模型或与原问题检索并行，同时先推送检索进度"
+      - "给模型服务加更多 GPU"
+    answer: [2]
+    explain: |
+      首字前共约 3.7 秒，其中改写占 2.1 秒，是最大的串行开销。改用小模型、与原问题检索并行，并先推送进度事件，收益最大。检索只有 0.3 秒；压缩 prompt 对 0.9 秒的 TTFT 改善有限；用的是厂商模型时加 GPU 无从谈起，自建时也不是首要问题。
+  - id: d47-e2
+    kp: d47-k2
+    type: single
+    question: 限流和预算都依赖 Redis。某天 Redis 集群故障 10 分钟，下列策略中最合理的是：
+    options:
+      - "用户级 RPM 放行并用本地内存兜底，租户预算检查拒绝或降级"
+      - "所有检查一律放行，保证可用性优先"
+      - "所有请求一律拒绝，直到 Redis 恢复"
+      - "改为让前端临时控制请求频率"
+    answer: [0]
+    explain: |
+      用户级频率限制失效 10 分钟，风险是短时多一些请求，可以放行并用每副本的本地限流兜底；预算类检查直接关系到费用，故障期间放行可能产生大额账单，应拒绝或降级到便宜模型。一律放行或一律拒绝都过于粗暴；前端控制可以被绕过。
+  - id: d47-e3
+    kp: d47-k3
+    type: single
+    question: 园区 Agent 每轮请求的固定前缀（工具定义加系统提示）约 6000 token，动态部分约 1000 token，缓存读取按正常输入价的一成计费。缓存稳定命中后，单轮成本的变化最接近：
+    options:
+      - "输入费用大幅下降，输出费用不变"
+      - "输入和输出费用都下降约九成"
+      - "几乎没变化，缓存只影响延迟"
+      - "输入费用下降约一成"
+    answer: [0]
+    explain: |
+      未命中时输入按 7000 token 计费；命中后约为 6000 × 0.1 + 1000 = 1600 token 的等价费用，输入部分下降七成多（首次写入可能有加价）。输出不受缓存影响。缓存既省钱也能降低首字时间。
+  - id: d47-e4
+    kp: d47-k4
+    type: single
+    question: p3 前端 Coding Agent 的修复循环最多 10 轮，每轮把完整的 vitest 输出（约 2 万 token）追加到对话历史。账单显示单个任务成本远高于预期。最合理的改法是：
+    options:
+      - "把修复轮数上限从 10 轮提高到 20 轮，提高最终成功率"
+      - "只传失败用例和断言差异的摘要，限制轮数和 Token，重复失败就停止"
+      - "改用上下文窗口更大的模型，避免历史被截断"
+      - "每轮开启新对话，不保留任何历史"
+    answer: [1]
+    explain: |
+      每轮都追加 2 万 token，后面每一轮都要为前面所有日志重复付费，成本按平方增长。只传结构化摘要能大幅减少输入，轮数和 Token 上限是硬兜底，重复失败说明模型卡住了，继续跑只是浪费。增大窗口不省钱；完全不保留历史会让模型反复犯同样的错误。
+  - id: d47-e5
+    kp: d47-k2
+    type: multi
+    question: 你的服务调用模型时偶发上游 429。下列哪些处理是**正确**的？
+    options:
+      - "遵守上游返回的 Retry-After 或使用指数退避加随机抖动"
+      - "重试只在一层做，避免 SDK、业务代码、网关层层叠加"
+      - "持续 429 时切换到备用模型或进入有界排队"
+      - "立即重试直到成功，保证用户拿到结果"
+      - "把 SDK 的超时设为 10 分钟，给重试留足时间"
+    answer: [0, 1, 2]
+    explain: |
+      退避加抖动避免所有客户端同时重试；单层重试防止请求量成倍放大；备用模型和有界排队是过载时的有序降级。立即无限重试会加剧过载；10 分钟超时会让失败请求长期占用连接。
+  - id: d47-e6
+    kp: d47-k1
+    type: multi
+    question: 下列哪些手段**能降低首字时间（TTFT）**？
+    options:
+      - "把首字前串行的 LLM 调用换成规则或小模型，或改为并行"
+      - "保持长前缀稳定，提高厂商 Prompt 缓存命中"
+      - "精简超长的检索上下文"
+      - "把 max_tokens 从 1000 降到 300"
+      - "流式输出前先推送检索进度和引用，降低感知等待"
+    answer: [0, 1, 2, 4]
+    explain: |
+      减少前置串行步骤、缓存命中减少 prefill、超长上下文精简都直接缩短首字前的时间；先推送进度事件虽然不改变模型 TTFT，但能让用户更早看到内容，降低感知等待。max_tokens 限制的是输出长度，影响端到端延迟，不影响第一个字什么时候出现。
+  - id: d47-e7
+    kp: d47-k4
+    type: judge
+    question: Batch API 便宜一半，所以把在线客服问答也改成 Batch 提交，可以在不影响体验的情况下大幅降本。
+    answer: false
+    explain: |
+      Batch API 是异步处理，完成窗口最长 24 小时，没有实时性保证，只适合离线任务。在线客服需要秒级响应，应通过缓存、路由、精简上下文等手段降本。
+  - id: d47-e8
+    kp: d47-k1
+    type: judge
+    question: 在模型服务未饱和前提高并发，系统的总吞吐（TPS）通常会上升，但单个请求的首字时间和字间延迟往往会变差。
+    answer: true
+    explain: |
+      推理服务通过批处理同时服务更多请求，总吞吐上升；但每个请求分到的算力减少、排队时间增加，TTFT 和 ITL 变差。压测时要同时看吞吐和单请求延迟曲线，找到满足延迟目标的最大并发。
+  - id: d47-e9
+    kp: d47-k4
+    type: case
+    question: |
+      你负责的企业知识库 + Agent 平台本月模型费用是预算的 2 倍，老板要求下月降 40%，且不能明显降低质量。账单分析显示：
+      - 约 55% 费用来自 Agent 多轮对话，每轮都带着完整的工具输出历史；
+      - 约 20% 来自每天两次的离线评测；
+      - 意图分类也在用最贵的大模型；
+      - 系统提示开头带有当前时间，缓存命中率接近 0。
+      下列方案中最合理的是：
+    options:
+      - "所有调用统一换成最便宜的模型，当月就能立刻见效"
+      - "停掉离线评测，并把每个用户每天的提问限制为 10 次"
+      - "只把系统提示里的时间移到末尾，其余部分保持不变"
+      - "截断工具输出、分类换小模型、评测走 Batch、修缓存，评测后上线"
+    answer: [3]
+    explain: |
+      方案要针对账单里的每一项：工具输出截断和历史摘要处理最大的 55%，分类换小模型和修复缓存前缀几乎不影响质量，离线评测走 Batch 约省一半，最后用评测集对比质量、成本、延迟再上线。
+      全部换便宜模型没有评测保证质量；停掉评测等于去掉了质量护栏，限制提问次数伤害业务；只改缓存前缀不足以达到 40% 的目标。
+
+interview:
+  - id: d47-i1
+    kp: d47-k1
+    type: scenario
+    difficulty: 2
+    question: 用户反馈你们的知识库问答「点了发送后要等五六秒才出字」。你会怎么排查和优化？请按先后顺序说。
+    key_points:
+      - {text: "先区分首字慢还是整体慢，用 trace 把改写、检索、重排、排队、prefill、生成分段测量，看 P95 而不是平均", dim: engineering}
+      - {text: "解释首字时间由前置串行步骤加模型排队和 prefill 决定，输出长度影响的是总时长", dim: principle}
+      - {text: "按收益给方案：减少或并行化前置 LLM 调用、小模型改写、精简超长上下文、稳定前缀提升缓存命中", dim: engineering}
+      - {text: "体验层：流式输出、先推送检索进度和引用来源", dim: concept}
+      - {text: "用压测和评测验证：首字 P95 下降且准确率不降，结合项目说明", dim: project}
+    reference: |
+      **结论：** 先用 trace 把首字前的每一段量出来，通常最大的开销是**串行的前置 LLM 调用**或**超长上下文**，而不是模型本身。
+
+      **1. 定位**
+      - 确认是首字慢而不是总时长长：看 TTFT 的 P95 和端到端分开统计；
+      - 用 Day 43 的 trace 看每个 span：鉴权、改写、检索、重排、模型排队与 prefill；
+      - 注意 TTFT 要在第一个非空内容 token 时记录。
+
+      **2. 优化（按收益排序）**
+      - **前置串行调用**：改写用大模型的换小模型或规则；改写与「原问题检索」并行；能合并的调用合并；
+      - **上下文长度**：检索 TopK 过多、片段过长时精简，超长上下文时这对 prefill 影响明显；
+      - **缓存**：系统提示和工具定义放前面、保持固定，提高厂商缓存命中，减少 prefill；
+      - **排队**：如果是上游排队或限流，考虑更高配额、更近的区域或备用模型。
+
+      **3. 体验**
+      流式输出之前，先推送「正在检索」和引用来源事件，像前端骨架屏一样降低感知等待。
+
+      **4. 验证**
+      压测对比首字 P95，同时跑评测集确认准确率和引用正确率没有下降。
+    oral: |
+      我会先把首字慢和整体慢分开，用 trace 把首字前的每一段量出来，看 P95。
+      经验上最常见的原因是首字前有串行的大模型调用，比如问题改写，或者检索片段塞得太多，而不是主模型本身慢。优化顺序是：前置调用换小模型或者和检索并行，精简上下文，再把系统提示和工具定义固定在前面提高缓存命中。体验上先推送检索进度和引用，就像前端的骨架屏。
+      在知识库项目里，我就是从 trace 里发现改写占了首字前一半以上的时间，换成小模型并行之后首字 P95 明显下降，评测集准确率没有变化，具体数字我会以压测报告为准。
+  - id: d47-i2
+    kp: d47-k2
+    type: scenario
+    difficulty: 3
+    question: 知识库问答上线前压测 300 并发，出现三个现象：大量 429、部分请求报数据库 `too many clients`、P99 延迟到了 40 秒。你怎么分析和处理？
+    key_points:
+      - {text: "用 Little 定律解释：长耗时请求让在途数量很大，每一层的并发上限都要核对", dim: principle}
+      - {text: "429：区分是自身限流还是上游配额，上游信号量、单层重试与退避、备用模型", dim: engineering}
+      - {text: "数据库连接：副本 × worker × 池大小超过上限，等 LLM 时不占连接、减小池或加 PgBouncer", dim: engineering}
+      - {text: "P99：无界排队与重试放大导致长尾，改为有界等待并快速拒绝，设置合理超时", dim: principle}
+      - {text: "压测方法：真实 prompt 分布、mock LLM 先测自身上限，结合项目说明", dim: project}
+    reference: |
+      **结论：** 三个现象是同一个根因的不同表现：**长耗时请求让在途数量远超每一层的上限，且没有有界排队，于是层层堆积、重试放大**。
+
+      **1. 先算账：** 平均 8 秒、目标 40 QPS，在途请求就有约 320 个。逐层核对：上游厂商配额、每副本信号量、数据库连接池、uvicorn worker 数。
+
+      **2. 429**
+      - 看响应来源：是自己的限流还是上游厂商。上游的话，每副本加信号量控制在途数，超出时有界等待几秒再拒绝；
+      - 检查重试：SDK 默认重试 2 次，业务代码又重试，请求量被放大，统一只在一层重试，退避加抖动；
+      - 持续 429 时切换备用模型。
+
+      **3. too many clients**
+      - 3 副本 × 4 worker × (10 + 10) = 240，超过 PostgreSQL 默认 100；
+      - 根本问题是**等 LLM 的几秒里一直占着数据库连接**：查完权限和文档就释放连接，再开始流式生成；
+      - 再减小单 worker 池，或加 PgBouncer。
+
+      **4. P99 40 秒**
+      - 请求在信号量、连接池上无界排队，再叠加重试，长尾被拉长；
+      - 改成有界等待，超时直接返回 503 加 Retry-After；SDK 超时从默认 10 分钟改为 30 秒左右。
+
+      **5. 压测方法改进**
+      - 先用 mock LLM 固定 TTFT 和 ITL，测出自己服务的上限；
+      - 再用真实 prompt 分布、真实模型测上游配额，同时看吞吐和延迟曲线。
+    oral: |
+      我认为三个现象是一个根因：LLM 请求耗时长，在途数量远超每一层的上限，又没有有界排队，于是层层堆积，重试再把它放大。
+      处理上，429 先看是自己限流还是上游，上游的话加信号量、只在一层重试并退避，持续超限就切备用模型；数据库连接数是副本乘 worker 乘池大小，超了上限，关键是等模型时不要占着连接；P99 高是无界排队造成的，改成有界等待、超时快速拒绝。
+      在知识库项目里，我压测时先用 mock LLM 固定首字和字间延迟，测出服务自身的并发上限，再接真实模型测配额，这样能分清是我的问题还是上游的问题。
+  - id: d47-i3
+    kp: d47-k4
+    type: design
+    difficulty: 4
+    question: 你们的企业 AI 平台月度模型费用是预算的两倍，老板要求两个月内降 40%，且质量不能明显下降。请给出你的完整方案，包括怎么找到钱花在哪、怎么降、怎么证明质量没掉、怎么防止再次失控。
+    key_points:
+      - {text: "先归因：按租户、功能、模型、调用类型统计 Token 与费用，找出占比最大的几项", dim: engineering}
+      - {text: "按优先级降本：少调用、少 Token（截断工具输出、摘要历史、精简 TopK）、修复缓存前缀、路由小模型、离线任务走 Batch", dim: principle}
+      - {text: "说明 Agent 多轮成本随步数超线性增长的原因和对策", dim: concept}
+      - {text: "每项改动跑评测集对比质量、成本、延迟，灰度上线并设回滚条件", dim: engineering}
+      - {text: "防失控：租户与用户预算、单任务 Token 和步数上限、成本异常告警、网关统一计量", dim: engineering}
+      - {text: "结合 p2 或 p3 项目说明具体落地", dim: project}
+    reference: |
+      **结论：** 先归因，再按「少调用 → 少 Token → 缓存 → 路由 → Batch」的顺序降本，每一步用评测集证明质量不降，最后用预算和告警防止反弹。
+
+      **1. 找到钱花在哪**
+      - 所有调用经过 LLM 网关，按租户、功能（问答、Agent、评测、入库）、模型、调用类型统计输入、输出、缓存命中 Token；
+      - 通常会发现几个大头：Agent 长对话、离线任务、本可以用小模型的调用。
+
+      **2. 降本措施（按优先级）**
+      - **少调用**：意图分类、状态查询用规则或小模型；合并串行调用；
+      - **少 Token**：Agent 的工具输出截断或结构化摘要，历史按节奏摘要；检索 TopK 精简；限制输出长度。Agent 第 N 轮要重付前面所有历史，所以这一项对多轮任务收益最大；
+      - **缓存**：系统提示和工具定义固定放前面，去掉开头的时间戳，用 cached_tokens 监控命中率；
+      - **路由**：分类、改写、抽取用小模型，复杂生成用大模型；级联时监控升级率；
+      - **Batch**：离线评测、批量摘要走 Batch API，约五折。
+
+      **3. 证明质量没掉**
+      - 每项改动单独跑评测集，对比准确率、引用正确率（或 Agent 任务完成率）、成本、P95 延迟；
+      - 灰度发布，设回滚条件：例如质量指标下降超过预设阈值就回滚（阈值按业务约定）。
+
+      **4. 防止再次失控**
+      - 租户月度预算、用户日预算，网关预扣结算，预算检查 fail-closed；
+      - Agent 最大步数、单任务 Token 上限、重复调用检测；
+      - 成本看板和异常告警：单任务成本超过 P99 的若干倍、某租户日消耗突增。
+    oral: |
+      我的思路是先归因、再分优先级降本、每一步用评测证明、最后加预算兜底。
+      归因靠 LLM 网关按租户、功能、模型统计 Token，一般会发现 Agent 长对话、离线任务和本可以用小模型的调用是大头。降本按顺序做：能不调就不调，能少传就少传，尤其是 Agent 的工具输出要截断摘要，因为每一轮都要重付历史；再修复缓存前缀、分类换小模型、离线评测走 Batch。每项改动都跑评测集，同时看质量、成本、延迟，灰度上线。
+      在 Coding Agent 项目里，我把测试日志改成只传失败用例摘要，并限制轮数和 Token，单任务成本明显下降而通过率基本不变，具体数字以我的评测报告为准。最后用租户预算和成本告警防止反弹。

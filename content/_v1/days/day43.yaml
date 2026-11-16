@@ -1,0 +1,703 @@
+day: 43
+phase: 5
+title: 实时通信：SSE、WebSocket 与流式输出
+goals:
+  - "能写出 SSE 的报文格式，解释 event、id、retry 字段和基于 Last-Event-ID 的断线续传"
+  - "能解释 WebSocket 握手过程、帧类型与关闭码，并设计连接鉴权方案"
+  - "能根据场景在轮询、SSE、WebSocket、fetch 流式读取之间做选型并说明理由"
+  - "能定位「本地流式正常、上线后一次性返回」等问题，并设计客户端中断时取消上游 LLM 调用与背压控制"
+knowledge_points:
+  - id: d43-k1
+    name: SSE 协议格式与断线重连
+    level: P0
+    summary: SSE 是一个不结束的 HTTP 响应，按行发送 data、event、id、retry，空行分隔事件
+    why: |
+      ChatGPT 式的「逐字输出」几乎都基于 SSE：OpenAI、Anthropic 等 LLM API 的流式响应就是 SSE（Day 17），MCP 的 Streamable HTTP 传输也用到 SSE（Day 38）。作为 AI 后端，你既要**消费**上游的 SSE，又要把内容**再以 SSE 推给前端**。不懂协议细节，就处理不好断线、多行内容和结束标记。
+    problem: |
+      LLM 生成一段回答要几秒到几十秒，如果等全部生成完再返回，用户要盯着空白页面等很久。SSE 让服务器在**一个 HTTP 响应里持续推送多段数据**，首个 Token 生成后立刻可见；同时协议自带事件类型、事件 ID 和自动重连，比自己发明格式可靠。
+    principle: |
+      **一、本质：一个不结束的 HTTP 响应**
+
+      - 客户端发起普通 HTTP 请求，服务器返回 `Content-Type: text/event-stream`，然后**不关闭连接**，持续往响应体里写文本。
+      - 它是**单向**的：只能服务器 → 客户端。客户端要发新消息，只能另发一个 HTTP 请求。
+      - 因为就是 HTTP，所以天然兼容现有的鉴权（Cookie / Authorization 头）、负载均衡和 HTTP/2 多路复用。
+
+      **二、报文格式（UTF-8 文本，按行解析）**
+
+      ```text
+      : 这是注释行，常用作心跳
+
+      event: delta
+      id: 17
+      data: {"text": "你好"}
+
+      retry: 3000
+      data: 第一行
+      data: 第二行
+
+      ```
+
+      - 每行是 `字段名: 值`；**一个空行表示一个事件结束**。
+      - `data`：事件内容；同一事件多行 `data` 会用换行拼接。所以内容本身包含换行时要拆成多行 `data`，或者干脆发 JSON（JSON 字符串里的换行会被转义成 `\n`）。
+      - `event`：事件类型，浏览器端用 `addEventListener("delta", ...)` 接收；不写时默认是 `message`。
+      - `id`：事件 ID，浏览器会记住最后一个收到的 ID。
+      - `retry`：告诉浏览器断线后多少毫秒重连。
+      - 以 `:` 开头的行是注释，客户端忽略，常用来做**心跳**防止代理因空闲断开连接。
+
+      **三、自动重连与断点续传**
+
+      ```mermaid
+      sequenceDiagram
+        participant B as 浏览器EventSource
+        participant S as 服务器
+        B->>S: GET stream
+        S-->>B: id 1 data 你
+        S-->>B: id 2 data 好
+        Note over B,S: 网络中断
+        B->>B: 等待 retry 毫秒
+        B->>S: GET stream 带 Last-Event-ID 2
+        S-->>B: 从 id 3 继续推送
+      ```
+
+      浏览器原生的 `EventSource` 断线后会**自动重连**，并在请求头带上 `Last-Event-ID`。服务器据此从断点继续发送——前提是**服务器能找回 ID 之后的数据**（例如把生成的片段按序号缓存在 Redis 里）。如果服务器忽略这个头，重连后会从头再生成一遍，既浪费 Token 又让前端内容重复。
+
+      **四、EventSource 的限制**
+
+      - 只能发 **GET** 请求，**不能自定义请求头**（不能放 `Authorization: Bearer`），只能依赖 Cookie（`withCredentials`）或 URL 参数。
+      - 所以聊天场景常用 **`fetch` + `ReadableStream` 自己解析 SSE**：可以 POST 一个包含对话历史的 JSON 请求体、带 Authorization 头，但要自己实现重连。
+      - HTTP/1.1 下浏览器对同一域名的并发连接数有限（常见为 6 个），开多个标签页的 SSE 会占满；HTTP/2 下没有这个问题。
+
+      **五、FastAPI 中的实现**
+
+      FastAPI 0.135.0 起官方内置 SSE：`from fastapi.sse import EventSourceResponse, ServerSentEvent`，路由设置 `response_class=EventSourceResponse` 后直接 `yield`。它默认会：在无消息 15 秒时发送 `ping` 注释做保活；设置 `Cache-Control: no-cache`；设置 `X-Accel-Buffering: no` 防止 Nginx 缓冲。注意 `ServerSentEvent(data=...)` **总是做 JSON 编码**（字符串也会带引号），要发 `[DONE]` 这种原样文本需用 `raw_data`。
+    scenarios: |
+      - 知识库问答逐字输出：后端调用 LLM 流式接口，把每个增量包装成 `event: delta` 推给前端，最后发 `event: done` 带引用来源。
+      - 文档入库进度推送：worker 把进度发布到 Redis，Web 进程订阅后以 SSE 推给前端（替代轮询）。
+      - Agent 执行过程展示：分别用 `event: thought`、`event: tool_call`、`event: answer` 推送不同类型事件。
+    code: |
+      ```python
+      from collections.abc import AsyncIterable
+
+      from fastapi import FastAPI
+      from fastapi.sse import EventSourceResponse, ServerSentEvent
+      from pydantic import BaseModel
+
+      app = FastAPI()
+
+      class Ask(BaseModel):
+          question: str
+
+      async def fake_llm(question: str):
+          for word in ["根据", "制度", "第三条", "……"]:
+              yield word
+
+      @app.post("/chat/stream", response_class=EventSourceResponse)
+      async def chat_stream(body: Ask) -> AsyncIterable[ServerSentEvent]:
+          i = 0
+          async for delta in fake_llm(body.question):
+              i += 1
+              yield ServerSentEvent(data={"text": delta}, event="delta", id=str(i))
+          yield ServerSentEvent(raw_data="[DONE]", event="done")
+      ```
+    pitfalls: |
+      - **忘记事件末尾的空行**，客户端一直攒着不触发事件，看起来像「流式不工作」。
+      - **内容里有换行却直接写进一行 data**，客户端解析错乱；用 JSON 或拆成多行 data。
+      - **误区：EventSource 可以带 Authorization 头。** 原生 EventSource 不支持自定义请求头。
+      - **把 token 放在 URL 查询参数里**，会出现在 Nginx 访问日志和浏览器历史中，至少要用短期一次性票据。
+      - **忽略 Last-Event-ID**，重连后整段重新生成，重复计费且前端内容重复。
+      - **误区：FastAPI 的 data 传字符串会原样发送。** `data` 一律 JSON 编码，原样文本用 `raw_data`。
+    interview_asks:
+      - "SSE 的报文格式是怎样的？断线重连是怎么实现的？"
+      - "前端用 EventSource 还是 fetch 读取流？为什么？"
+      - "LLM 流式回答过程中网络断了，用户重连后你怎么处理？"
+    project_example: |
+      我们的问答接口最初用原生 EventSource，但需要 POST 对话历史并带 Authorization 头，于是改成前端 fetch 读取 ReadableStream 并自己解析 SSE。后端每个增量作为 `event: delta`，带递增 id；生成过程中把已发送的片段按序号写入 Redis（TTL 10 分钟）。前端断线重连时带上最后的 id，后端如果发现该消息仍在生成或已生成完毕，就从 Redis 补发后续片段，而不是重新调用 LLM。
+    freshness: |
+      核对于 2026-11：FastAPI 0.135.0（2026-03-01 发布）新增官方 SSE 支持，模块为 `fastapi.sse`，提供 `EventSourceResponse` 与 `ServerSentEvent`（字段 data、raw_data、event、id、retry、comment；data 与 raw_data 互斥）。官方文档说明：无消息时每 15 秒发送 ping 注释保活，自动设置 `Cache-Control: no-cache` 与 `X-Accel-Buffering: no`；支持 GET 与 POST；可通过 Header 参数读取 `Last-Event-ID` 实现续传。旧写法：在此之前通常使用第三方库 sse-starlette 或手写 `StreamingResponse(media_type="text/event-stream")`，二者仍可用但需自行处理心跳与响应头。
+    sources:
+      - {title: "FastAPI - Server-Sent Events (SSE)", url: "https://fastapi.tiangolo.com/tutorial/server-sent-events/"}
+      - {title: "FastAPI Reference - fastapi.sse", url: "https://fastapi.tiangolo.com/reference/sse/"}
+      - {title: "FastAPI 0.135.0 release", url: "https://github.com/fastapi/fastapi/releases/tag/0.135.0"}
+  - id: d43-k2
+    name: WebSocket 握手、双向通信与鉴权
+    level: P0
+    summary: WebSocket 先用 HTTP 请求升级协议，之后是长期双向的帧通信；鉴权必须在 accept 前完成
+    why: |
+      语音对话、多人协同编辑、Agent 执行中需要用户随时插话或中断、实时通知中心，这些场景要求**客户端和服务器都能随时主动发消息**，SSE 做不到。WebSocket 是这类场景的标准方案，也是面试中「SSE 和 WebSocket 区别」的另一半。
+    problem: |
+      HTTP 是「请求-响应」模型，服务器不能主动说话；用轮询模拟实时会浪费大量请求、延迟高。WebSocket 在一条 TCP 连接上提供全双工通信，开销小、延迟低。但它脱离了常规 HTTP 请求的处理链路，**鉴权、限流、负载均衡、断线重连都要重新设计**。
+    principle: |
+      **一、握手：从 HTTP 升级**
+
+      ```mermaid
+      sequenceDiagram
+        participant C as 客户端
+        participant S as 服务器
+        C->>S: GET ws 请求 带 Upgrade websocket 与 Sec-WebSocket-Key
+        S->>S: 校验 Origin 与身份
+        S-->>C: 101 Switching Protocols 带 Sec-WebSocket-Accept
+        Note over C,S: 之后不再是 HTTP 而是 WebSocket 帧
+        C->>S: 文本帧 用户消息
+        S-->>C: 文本帧 增量回答
+        S-->>C: Ping
+        C->>S: Pong
+        C->>S: Close 帧 1000
+        S-->>C: Close 帧
+      ```
+
+      - 客户端发起普通 HTTP GET，带 `Upgrade: websocket`、`Connection: Upgrade`、`Sec-WebSocket-Key`、`Sec-WebSocket-Version: 13`。
+      - 服务器同意后返回 **`101 Switching Protocols`**，并用 Key 计算出 `Sec-WebSocket-Accept`（证明服务器真的理解 WebSocket 协议）。
+      - 此后这条 TCP 连接不再走 HTTP，双方以**帧**为单位通信。
+
+      **二、帧与关闭码**
+
+      - 数据帧：文本帧（UTF-8）、二进制帧（音频、图片）。
+      - 控制帧：`Ping` / `Pong`（心跳检测连接是否存活）、`Close`（带关闭码）。
+      - 常用关闭码：`1000` 正常关闭；`1008` 策略违规（常用于鉴权失败）；`1011` 服务器内部错误。
+      - 客户端发往服务器的帧必须做掩码处理，这是协议为了防止中间缓存投毒而设计的，框架会自动处理。
+
+      **三、FastAPI 中的写法**
+
+      `@app.websocket("/ws")` 定义端点，`await websocket.accept()` 完成握手，`receive_text/receive_json` 和 `send_text/send_json` 收发消息。客户端断开时，`receive_*` 抛出 `WebSocketDisconnect`。WebSocket 端点里也可以用 `Depends`、`Query`、`Cookie`、`Header` 等依赖；鉴权失败应抛 `WebSocketException(code=status.WS_1008_POLICY_VIOLATION)`，而不是 `HTTPException`。
+
+      **四、鉴权：最容易出事的地方**
+
+      浏览器的 `new WebSocket(url)` **不能设置自定义请求头**，所以不能像普通接口那样带 `Authorization: Bearer`。常见方案：
+
+      | 方案 | 做法 | 注意 |
+      |---|---|---|
+      | Cookie | 握手请求自动带上会话 Cookie | 必须校验 `Origin`，防止跨站 WebSocket 劫持 |
+      | 一次性票据 | 先用 HTTP 接口换一个 30 秒有效、只能用一次的 ticket，放在 URL 参数里 | 票据短期、一次性，即使进日志也很快失效 |
+      | 首条消息鉴权 | 连接后第一条消息发送 token，服务器验证前不处理任何业务 | 要设置超时，未鉴权连接几秒内关闭 |
+
+      **核心原则**：身份必须由服务器从凭证中解析出来，**绝不能相信客户端消息里自带的 `user_id`**。鉴权失败用 1008 关闭。长连接期间 token 可能过期，需要定期重新校验或在过期时主动关闭连接。
+
+      **五、多实例部署**
+
+      WebSocket 连接绑定在某个具体进程上。FastAPI 官方示例里的 `ConnectionManager` 把连接放在进程内存列表中，**只在单进程下有效**。多实例时要通过 Redis Pub/Sub 等广播机制，把「发给用户 X 的消息」转发到持有其连接的实例；负载均衡层要支持 WebSocket 升级与长连接。
+    scenarios: |
+      - 语音助手：客户端持续上传音频二进制帧，服务器同时下发识别结果和合成语音。
+      - Agent 执行台：服务器推送每一步工具调用，用户可随时发送「停止」或「批准执行」消息（Day 40 的人工确认）。
+      - 协同标注平台：多人同时编辑同一批问答对，变更实时广播给其他人。
+    pitfalls: |
+      - **先 accept 再鉴权，甚至不鉴权**：任何人都能建立连接消耗资源，或冒充他人。
+      - **相信消息体里的 user_id、session_id**，可以直接读写别人的会话。
+      - **用 Cookie 鉴权却不校验 Origin**，恶意网站可以借用户浏览器建立连接（跨站 WebSocket 劫持）。
+      - **在 WebSocket 里抛 HTTPException**，握手后它没有意义，应使用 WebSocketException 和关闭码。
+      - **误区：进程内的连接列表能用于多实例广播。** 每个实例只知道自己持有的连接。
+      - **没有心跳**，连接已经死了服务器还在往里写，资源泄漏。
+    interview_asks:
+      - "WebSocket 的握手过程是怎样的？为什么要先走 HTTP？"
+      - "WebSocket 怎么做鉴权？浏览器端不能设置请求头怎么办？"
+      - "多实例部署时，WebSocket 消息怎么推送到正确的用户？"
+    project_example: |
+      我们的 Agent 执行台用 WebSocket：前端先调用 `POST /ws-ticket` 用 JWT 换取 30 秒有效的一次性票据（存 Redis，取用即删），再以 `wss://.../ws/agent?ticket=xxx` 建立连接；服务器在 accept 之前校验票据和 Origin，失败以 1008 关闭。连接建立后用户身份只来自票据解析结果。执行过程中服务器推送每个工具调用，高风险工具需要用户回复 approve 才继续。多实例下通过 Redis Pub/Sub 按 user_id 频道转发消息。
+    freshness: |
+      核对于 2026-11（FastAPI 官方 WebSockets 文档）：WebSocket 端点支持 Depends、Security、Cookie、Header、Path、Query；鉴权失败推荐 `raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION)`；断开时 receive 抛出 `WebSocketDisconnect`；文档明确示例中的内存 ConnectionManager 仅适用于单进程，并推荐 encode/broadcaster 等基于 Redis/PostgreSQL 的方案。使用前需安装 websockets 等 WebSocket 实现库。
+    sources:
+      - {title: "FastAPI - WebSockets", url: "https://fastapi.tiangolo.com/advanced/websockets/"}
+  - id: d43-k3
+    name: 实时通信方案选型
+    level: P1
+    summary: 只需服务器推就用 SSE，需要双向低延迟才上 WebSocket，低频状态用轮询就够
+    why: |
+      面试必问「为什么用 SSE 不用 WebSocket」。选型错误的代价很实际：用 WebSocket 做简单的流式问答，要多处理一堆连接管理、鉴权、代理配置问题；用轮询做逐字输出，体验和成本都很差。
+    problem: |
+      不同场景对「方向、频率、延迟、可靠性、基础设施兼容性」的要求不同。需要一个清晰的判断框架，而不是「WebSocket 更高级所以用它」。
+    principle: |
+      **方案对比**
+
+      | 方案 | 方向 | 连接 | 优点 | 缺点 | 典型场景 |
+      |---|---|---|---|---|---|
+      | 短轮询 | 客户端拉 | 每次新请求 | 最简单，无状态 | 延迟取决于间隔，浪费请求 | 任务进度（几秒一次） |
+      | 长轮询 | 客户端拉 | 请求挂起直到有数据 | 兼容性好 | 每条消息一次请求，实现繁琐 | 老系统的消息通知 |
+      | SSE | 服务器推 | 一个长 HTTP 响应 | 基于 HTTP，自动重连，事件 ID | 单向；原生 EventSource 只能 GET | LLM 流式输出、进度推送 |
+      | fetch 流式读取 | 服务器推 | 一个长 HTTP 响应 | 可 POST、可带任意头 | 重连需要自己实现 | 聊天接口带对话历史 |
+      | WebSocket | 双向 | 升级后的长连接 | 全双工、低开销、可二进制 | 鉴权和扩展要自己设计，部分网关需额外配置 | 语音、协同、可中断的 Agent |
+
+      ```mermaid
+      flowchart TD
+        A["实时需求"] --> B{"客户端需要在连接中频繁发消息吗"}
+        B -->|"是 如语音 协同 实时打断"| WS["WebSocket"]
+        B -->|"否"| C{"更新频率和延迟要求"}
+        C -->|"几秒一次即可"| P["短轮询"]
+        C -->|"逐条实时推送"| D{"需要 POST 请求体或自定义头吗"}
+        D -->|"是"| F["fetch 读取 SSE 流"]
+        D -->|"否"| E["EventSource 加 SSE"]
+      ```
+
+      **关于「中断生成」**：很多人以为要停止 LLM 生成就必须用 WebSocket。其实 SSE 下客户端直接**关闭连接**（`AbortController.abort()`），或调用一个 `POST /chat/{id}/cancel` 接口即可，服务器检测到断开后取消上游调用。
+
+      **AI 行业的事实标准**：主流 LLM API 的流式输出、MCP 的 Streamable HTTP 传输都基于 HTTP + SSE，而实时语音类接口多使用 WebSocket 或 WebRTC。
+    scenarios: |
+      - 知识库问答：fetch + SSE，POST 发送问题与会话 ID，逐字显示。
+      - 文档入库进度：短轮询即可，3 秒一次；体验要求高时改 SSE。
+      - 实时语音客服：WebSocket 传输音频帧。
+    pitfalls: |
+      - **误区：WebSocket 一定比 SSE 好。** 对单向推送，SSE 更简单、更容易通过代理和网关、天然支持 HTTP 鉴权。
+      - **误区：要支持「停止生成」就必须用 WebSocket。** 关闭 SSE 连接或调用取消接口即可。
+      - **用短轮询实现逐字输出**，请求量巨大且仍有延迟。
+      - **忽略企业网络环境**：某些公司代理对 WebSocket 支持不好，SSE 作为普通 HTTP 通过率更高。
+    interview_asks:
+      - "你们的 AI 对话为什么选 SSE 而不是 WebSocket？"
+      - "什么场景下你会选择 WebSocket？"
+    project_example: |
+      企业知识库助手的问答用 fetch + SSE，原因是只需要服务器推送、需要 POST 对话内容并带 JWT、能直接复用现有的 HTTP 鉴权、限流和网关配置；停止生成通过 AbortController 断开连接实现。后来新增的语音客服模块改用 WebSocket，因为客户端需要持续上传音频、服务器同时下发识别和合成结果，是真正的双向场景。文档入库进度仍然是 3 秒轮询，因为它更新慢，没必要维持长连接。
+  - id: d43-k4
+    name: 流式链路工程：代理缓冲、超时、取消与背压
+    level: P0
+    summary: 流式要整条链路都不缓冲；客户端断开要取消上游 LLM；生产快于消费时要有界缓冲
+    why: |
+      「本地逐字输出正常，部署后变成等十几秒一次性出来」是 AI 应用上线最常见的问题之一；「用户关掉页面了，后台还在调用 LLM 消耗 Token」是最常被忽视的成本漏洞。这两个问题都不在代码的业务逻辑里，而在**整条链路**上。
+    problem: |
+      流式数据要经过：LLM 供应商 → 你的后端 → 应用服务器 → Nginx/网关/CDN → 浏览器。任何一环做了缓冲，流式就失效；任何一环超时，长连接就被切断。同时连接断开的信号要能从浏览器传回后端、再传到上游 LLM 调用，否则会白白生成。生产者（LLM）和消费者（慢网络的客户端）速度不一致时，还要避免内存无限堆积。
+    principle: |
+      **一、链路全景**
+
+      ```mermaid
+      flowchart LR
+        L["LLM 供应商 SSE"] --> A["后端 async 生成器"]
+        A --> U["uvicorn ASGI"]
+        U --> N["Nginx 反向代理"]
+        N --> G["网关或 CDN"]
+        G --> B["浏览器 fetch 读取"]
+        N -.->|"proxy_buffering 默认开启"| X["攒满缓冲才转发"]
+        G -.->|"可能压缩或缓冲"| X
+      ```
+
+      **二、代理缓冲：流式失效的头号原因**
+
+      - Nginx 的 `proxy_buffering` **默认是 on**：它会尽快把上游响应读进缓冲区，再转发给客户端。对普通接口这是优化，对 SSE 意味着「攒够了才发」。
+      - 解决方式二选一：
+        1. 在对应 location 配置 `proxy_buffering off;`。
+        2. 应用在响应头里返回 `X-Accel-Buffering: no`，Nginx 会对这个响应关闭缓冲（除非配置了 `proxy_ignore_headers X-Accel-Buffering`）。FastAPI 的 `EventSourceResponse` 默认会设置这个头。
+      - 多层代理时（Nginx 前面还有一层 Nginx 或云负载均衡），**每一层**都要检查；内层 Nginx 默认不会把 `X-Accel-Buffering` 头转发给外层。
+      - 其他缓冲来源：gzip 压缩中间件（攒数据再压缩）、CDN、一些 API 网关的响应缓冲。
+
+      **三、超时：长连接被切断**
+
+      - Nginx 的 `proxy_read_timeout` 默认 60 秒：两次读取之间超过这个时间没有数据就断开。LLM 思考较久或 Agent 执行工具时可能长时间不输出。
+      - 解决：定期发送心跳（SSE 注释行，FastAPI 默认每 15 秒一次 ping），并按需调大超时。
+      - WebSocket 经过 Nginx 还需要 `proxy_http_version 1.1` 以及转发 `Upgrade` 和 `Connection` 头才能完成握手。
+
+      **四、客户端中断时取消上游 LLM 调用**
+
+      ```mermaid
+      sequenceDiagram
+        participant B as 浏览器
+        participant A as 后端
+        participant L as LLM
+        B->>A: POST chat stream
+        A->>L: 发起流式请求
+        L-->>A: token 1 2 3
+        A-->>B: delta 1 2 3
+        B->>A: 用户点击停止 连接关闭
+        A->>A: 检测到断开 生成器被取消
+        A->>L: 关闭上游 HTTP 流
+        A->>A: finally 中保存已生成部分并记录 Token
+      ```
+
+      - 浏览器端：`AbortController.abort()` 或关闭页面，连接断开。
+      - 服务器端：Starlette 的流式响应在检测到客户端断开时会取消正在运行的生成器（生成器在 `await` 处收到 `CancelledError`）；也可以在循环中显式检查 `await request.is_disconnected()`。具体检测时机与 ASGI 服务器版本有关，**一定要写测试验证**。
+      - **关键**：在 `try/finally` 中关闭上游流（`async with` 管理上游响应、或调用异步生成器的 `aclose()`），这样到 LLM 供应商的 HTTP 连接会被关闭。多数供应商在连接关闭后停止生成，但已生成部分仍计费（以供应商文档为准）。
+      - 不要吞掉 `CancelledError`：`except Exception` 不会捕获它（它继承自 `BaseException`），但写成 `except BaseException` 且不重新抛出会破坏取消机制。
+
+      **五、背压（Backpressure）**
+
+      - 含义：生产者比消费者快时，让生产者慢下来，而不是无限堆积在内存中。
+      - 在 `async for delta in llm: await send(delta)` 这种直连写法里，`await send` 在传输缓冲区满时会等待，天然形成一定背压。
+      - 危险写法：LLM 读取协程把数据塞进**无界** `asyncio.Queue`，另一个协程慢慢发——客户端网络慢时队列无限增长。应使用 `asyncio.Queue(maxsize=N)`。
+      - 广播场景（一条消息推给 1000 个连接）：对慢客户端设置发送超时，超时就断开或丢弃非关键消息，不能让一个慢连接拖住全部推送。
+    scenarios: |
+      - 上线后流式失效：检查 Nginx `proxy_buffering`、响应头 `X-Accel-Buffering`、gzip 中间件、外层负载均衡。
+      - Agent 调用慢工具时 60 秒断连：增加心跳，调整 `proxy_read_timeout`。
+      - 用户频繁点击「停止」：确认上游 LLM 调用被关闭，并用 Token 计量日志验证。
+    code: |
+      ```nginx
+      location /api/chat/stream {
+          proxy_pass http://app:8000;
+          proxy_http_version 1.1;
+          proxy_set_header Connection "";
+          proxy_buffering off;        # 或由应用返回 X-Accel-Buffering: no
+          proxy_read_timeout 300s;    # 配合心跳
+          gzip off;
+      }
+
+      location /api/ws/ {
+          proxy_pass http://app:8000;
+          proxy_http_version 1.1;
+          proxy_set_header Upgrade $http_upgrade;
+          proxy_set_header Connection "upgrade";
+          proxy_read_timeout 3600s;
+      }
+      ```
+    pitfalls: |
+      - **误区：代码里用了 yield 就一定是流式。** 链路上任何一层缓冲都会让它变成一次性返回。
+      - **只在本地直连 uvicorn 测试**，没有经过 Nginx 和网关，上线才发现问题。
+      - **客户端断开后继续调用 LLM**，Token 被白白消耗，并发高时还会占满供应商的速率限制。
+      - **在 except 中捕获取消信号后不再抛出**，导致生成器无法被正常取消。
+      - **用无界队列在生产者和消费者之间传递数据**，慢客户端导致内存暴涨。
+      - **对 SSE 接口开启 gzip**，压缩中间件攒数据导致输出卡顿。
+    interview_asks:
+      - "本地流式输出正常，部署到服务器后变成一次性返回，可能是什么原因？"
+      - "用户中途关闭页面，你的后端会继续调用 LLM 吗？怎么处理？"
+      - "什么是背压？在流式输出中怎么体现？"
+    project_example: |
+      我们的问答服务部署后流式失效，排查发现有两层：云负载均衡后面的 Nginx 开着 proxy_buffering，应用里还挂了 GZip 中间件。处理方式是对流式路由关闭 gzip、在应用响应头返回 X-Accel-Buffering: no、Nginx 对 /api/chat/stream 关闭缓冲并把读超时调到 300 秒，同时每 15 秒发心跳注释。另外我们发现用户点停止后上游仍在生成，原因是上游流没有在 finally 中关闭；修复后通过 Token 计量日志对比，被中断请求的平均输出 Token 明显下降。
+    freshness: |
+      核对于 2026-11：nginx 官方 ngx_http_proxy_module 文档说明 `proxy_buffering` 默认 on，可通过响应头 `X-Accel-Buffering: yes/no` 按响应开关缓冲，可用 `proxy_ignore_headers` 禁用该能力；`proxy_read_timeout` 默认 60s。FastAPI 0.135.0+ 的 EventSourceResponse 默认设置 `X-Accel-Buffering: no` 并每 15 秒发送 ping。Starlette 检测客户端断开的具体机制随版本与 ASGI 服务器变化，本文只描述行为，不保证具体实现细节。
+    sources:
+      - {title: "nginx - ngx_http_proxy_module（proxy_buffering）", url: "https://nginx.org/en/docs/http/ngx_http_proxy_module.html"}
+      - {title: "nginx issue - Buffering breaks event streams", url: "https://github.com/nginx/nginx/issues/1505"}
+      - {title: "FastAPI - Server-Sent Events (SSE)", url: "https://fastapi.tiangolo.com/tutorial/server-sent-events/"}
+quiz:
+  - id: d43-q1
+    kp: d43-k1
+    type: single
+    question: 关于 SSE，下列说法正确的是？
+    options:
+      - "SSE 需要先发送 HTTP Upgrade 请求把连接升级为新协议"
+      - "浏览器原生 EventSource 断线后会自动重连，并通过 Last-Event-ID 请求头告知最后收到的事件 ID"
+      - "SSE 中一个事件以 data 行结束，不需要空行分隔"
+      - "原生 EventSource 可以通过参数设置 Authorization 请求头"
+    answer: [1]
+    explain: |
+      EventSource 自带自动重连，重连时带上 Last-Event-ID，服务器可据此续传。需要 Upgrade 握手的是 WebSocket，SSE 就是普通 HTTP 响应。SSE 用空行表示一个事件结束，缺少空行客户端不会触发事件。原生 EventSource 不支持自定义请求头，需要用 Cookie 或改用 fetch 读取流。
+  - id: d43-q2
+    kp: d43-k4
+    type: judge
+    question: 只要后端路由使用了 yield 逐段返回数据，经过 Nginx 反向代理后，浏览器也一定能逐字看到输出。
+    answer: false
+    explain: |
+      Nginx 的 proxy_buffering 默认开启，会先把上游响应读进缓冲区再转发，流式内容可能被攒成一大块才发出。还需要关闭缓冲（proxy_buffering off 或响应头 X-Accel-Buffering: no），并排查 gzip 压缩、外层负载均衡、CDN 等其他缓冲环节。
+  - id: d43-q3
+    kp: d43-k2
+    type: multi
+    question: 关于 WebSocket 鉴权，以下哪些做法是正确的？（多选）
+    options:
+      - "在 accept 之前完成身份校验，失败时以 1008 关闭码拒绝"
+      - "使用 Cookie 鉴权时校验握手请求的 Origin，防止跨站 WebSocket 劫持"
+      - "先用 HTTP 接口换取短期一次性票据，再在连接 URL 中携带票据"
+      - "直接使用客户端每条消息里携带的 user_id 作为当前用户"
+      - "在 WebSocket 端点里鉴权失败时抛出 HTTPException(401)"
+    answer: [0, 1, 2]
+    explain: |
+      身份必须在 accept 前由服务器从凭证中解析，失败用 1008 关闭；Cookie 会被浏览器自动携带，必须校验 Origin；一次性短期票据可以避免长期 token 出现在 URL 日志中。客户端消息里的 user_id 可被任意伪造。握手完成后 HTTPException 没有意义，FastAPI 推荐抛 WebSocketException。
+  - id: d43-q4
+    kp: d43-k4
+    type: scenario
+    question: |
+      知识库问答在开发环境逐字输出正常。部署到生产（云负载均衡 → Nginx → uvicorn）后，用户反馈：要等十几秒答案才一次性出现；另外较长的 Agent 任务经常在 60 秒左右断开。请给出排查思路和修复方案。
+    key_points:
+      - {text: "指出 Nginx proxy_buffering 默认开启导致流式被缓冲", dim: principle}
+      - {text: "提出 proxy_buffering off 或返回 X-Accel-Buffering: no，并检查每一层代理", dim: engineering}
+      - {text: "提出排查 gzip 中间件、CDN、云负载均衡等其他缓冲点", dim: engineering}
+      - {text: "指出 60 秒断开对应 proxy_read_timeout 默认值，用心跳加调大超时解决", dim: principle}
+      - {text: "提出用 curl -N 逐层直连验证定位是哪一层在缓冲", dim: project}
+    reference: |
+      **排查思路**：逐层缩小范围。先在服务器上 `curl -N http://127.0.0.1:8000/chat/stream` 直连 uvicorn，确认后端本身是流式的；再 `curl -N` 经过 Nginx；最后经过负载均衡的公网地址。哪一层开始变成一次性返回，问题就在哪一层。同时检查响应头是否有 `Content-Encoding: gzip`。
+
+      **一次性返回的修复**：
+      - Nginx：对流式 location 设置 `proxy_buffering off;`，或应用返回 `X-Accel-Buffering: no`（FastAPI EventSourceResponse 默认会加）。
+      - 应用：流式路由排除 GZip 中间件。
+      - 外层：确认云负载均衡或 CDN 没有响应缓冲，多层 Nginx 时每层都要处理。
+
+      **60 秒断开的修复**：这对应 Nginx `proxy_read_timeout` 的默认 60 秒——Agent 执行工具期间长时间没有输出。每 15 秒发送一次 SSE 注释心跳，并把该 location 的读超时调大到合理值（如 300 秒），云负载均衡的空闲超时也要同步检查。
+    followup:
+      question: 如果不能修改 Nginx 配置，应用层能做什么？
+      key_points:
+        - 在响应头返回 X-Accel-Buffering no
+        - 定期发送心跳注释防止空闲超时
+      reference: |
+        应用可以在流式响应中返回 `X-Accel-Buffering: no`，Nginx 默认会遵从这个头为该响应关闭缓冲（除非运维配置了 proxy_ignore_headers）；同时定期发送 SSE 注释行作为心跳，让两次读取间隔小于 proxy_read_timeout，避免空闲断开。
+  - id: d43-q5
+    kp: d43-k3
+    type: short
+    question: 产品经理说「我们要做 AI 对话的停止生成按钮，所以必须把 SSE 改成 WebSocket」。你同意吗？请说明理由和你的实现方案。
+    key_points:
+      - {text: "指出停止生成不需要双向长连接，SSE 下关闭连接即可通知服务器", dim: concept}
+      - {text: "给出前端 AbortController 断开或调用独立取消接口的方案", dim: engineering}
+      - {text: "说明服务器检测断开后取消生成器并关闭上游 LLM 流", dim: principle}
+      - {text: "说明迁移到 WebSocket 会带来鉴权、代理、多实例连接管理等额外成本", dim: engineering}
+    reference: |
+      不同意。「停止生成」只是客户端发出一个一次性信号，不需要全双工长连接。
+
+      方案：前端用 fetch 读取 SSE 流，点击停止时调用 `AbortController.abort()` 断开连接；服务器的流式生成器在客户端断开时被取消（也可在循环中检查 `request.is_disconnected()`），在 finally 中关闭到 LLM 的上游流并保存已生成部分。如果需要在多实例下可靠取消（例如生成在后台任务中进行），可增加 `POST /chat/{message_id}/cancel` 接口，在 Redis 中写入取消标记，生成循环每收到一个片段检查一次。
+
+      改成 WebSocket 反而要重新设计鉴权（浏览器不能带 Authorization 头）、Nginx 升级配置、多实例消息路由和心跳，成本更高。只有当需要语音流、实时插话这类真正双向的交互时才值得迁移。
+  - id: d43-q6
+    kp: d43-k1
+    type: design
+    question: 设计一个支持「断线续传」的 LLM 流式问答接口：用户网络闪断后重新连接，能继续看到剩余内容，而不是重新生成。请说明数据如何存储、事件 ID 如何设计、重连时服务器的处理逻辑和资源清理。
+    key_points:
+      - {text: "每个回答分配 message_id，每个片段带递增序号作为 SSE id", dim: engineering}
+      - {text: "生成与推送解耦，生成过程把片段按序写入 Redis List 或 Stream 并设置 TTL", dim: principle}
+      - {text: "重连时读取 Last-Event-ID，从 Redis 补发后续片段，生成未完成则继续订阅", dim: engineering}
+      - {text: "说明生成完成写入完整消息并清理缓存，超时无人消费则取消生成", dim: engineering}
+      - {text: "校验 message_id 属于当前用户", dim: concept}
+    reference: |
+      **ID 设计**：用户提问时服务器创建 `message_id`；SSE 的 `id` 写成 `{message_id}:{seq}`，seq 从 1 递增。
+
+      **生成与推送解耦**：LLM 生成在后台协程或任务中进行，每收到一个片段就 `XADD chat:stream:{message_id}`（或 RPUSH 到 List），带 seq；整个 key 设置 10 分钟 TTL。SSE 处理函数只负责从 Redis 读取并推送，不直接持有 LLM 连接。
+
+      **首次连接**：从 seq 0 开始读取并阻塞等待新片段，逐条推送；收到结束标记后发送 `event: done`（含引用来源）。
+
+      **重连**：前端（或 EventSource 自动）带上 `Last-Event-ID: {message_id}:{seq}`，服务器校验 message_id 属于当前用户后，从 seq+1 开始补发已有片段，若生成尚未结束则继续阻塞读取。这样无需重新调用 LLM。
+
+      **清理**：生成完成后把完整回答写入数据库，Redis 中的片段保留到 TTL 到期以支持晚到的重连；如果生成过程中超过一定时间没有任何消费者在读取（用户真的离开了），并且产品策略允许，则取消上游生成以节省 Token。
+  - id: d43-q7
+    kp: d43-k4
+    type: short
+    question: |
+      下面的写法有什么问题？`async def pump(): async for d in llm_stream(): queue.put_nowait(d)`，另一个协程从 `queue = asyncio.Queue()` 中取数据发送给 WebSocket 客户端。客户端网络很慢时会发生什么？如何改进？
+    key_points:
+      - {text: "指出 asyncio.Queue 默认无界，put_nowait 永不阻塞", dim: principle}
+      - {text: "说明客户端慢时生产者持续写入，队列在内存中无限增长，没有背压", dim: concept}
+      - {text: "提出使用有界队列并 await put，让生产者在队列满时等待", dim: engineering}
+      - {text: "提出对慢客户端设置发送超时、断开连接或取消上游生成", dim: engineering}
+    reference: |
+      `asyncio.Queue()` 不传 maxsize 时是无界队列，`put_nowait` 永远不会阻塞。LLM 生成速度很快，而慢客户端的 `send` 很慢，数据会在队列里不断堆积，内存随连接数和回答长度线性增长；并发高时可能把进程内存撑爆。这就是**缺少背压**：消费者慢的信号没有传回生产者。
+
+      改进：
+      - `queue = asyncio.Queue(maxsize=64)`，生产者用 `await queue.put(d)`，队列满时生产者暂停读取上游，背压会继续传导到与 LLM 的 HTTP 连接。
+      - 消费者发送时设置超时（`asyncio.wait_for(ws.send_text(d), 5)`），连续超时就关闭连接，并取消生产者协程以关闭上游流。
+      - 如果没有必要解耦，最简单的是直接 `async for d in llm_stream(): await ws.send_text(d)`。
+code_reading:
+  id: d43-c1
+  kp: [d43-k2, d43-k4]
+  title: 基于 WebSocket 的流式对话端点
+  scenario: AI 助手的网页端通过 WebSocket 连接 `/ws/chat`，每发送一条消息，服务器加载会话历史、调用 LLM 流式生成，把增量逐条推送给前端，结束后保存回答。服务部署多个实例，前面有 Nginx。
+  language: python
+  code: |
+    import logging
+
+    from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+
+    from app.history import load_history, save_message
+    from app.llm import stream_chat  # async 生成器，逐个 yield 文本增量
+
+    logger = logging.getLogger(__name__)
+    router = APIRouter()
+
+    @router.websocket("/ws/chat")
+    async def chat_ws(websocket: WebSocket) -> None:
+        await websocket.accept()
+        try:
+            while True:
+                msg = await websocket.receive_json()
+                user_id = msg["user_id"]
+                session_id = msg["session_id"]
+                history = await load_history(session_id)
+                messages = history + [{"role": "user", "content": msg["text"]}]
+
+                parts: list[str] = []
+                async for delta in stream_chat(messages):
+                    parts.append(delta)
+                    await websocket.send_json({"type": "delta", "text": delta})
+                await websocket.send_json({"type": "done"})
+
+                await save_message(session_id, user_id, "user", msg["text"])
+                await save_message(session_id, user_id, "assistant", "".join(parts))
+        except WebSocketDisconnect:
+            logger.info("client disconnected")
+        except Exception:
+            logger.exception("chat ws error")
+  walkthrough:
+    function: |
+      建立 WebSocket 连接后进入循环：每收到一条 JSON 消息，就根据消息里的 session_id 加载历史，调用 LLM 流式生成，把每个增量以 `{"type":"delta"}` 推给客户端，结束时发送 done，然后把用户问题和完整回答保存到会话历史。客户端断开时记录日志退出。
+    key_functions: |
+      - `chat_ws`：WebSocket 端点，负责握手、收发消息和整个循环。
+      - `load_history`：按 session_id 读取历史消息（来自 Redis 或数据库）。
+      - `stream_chat`：调用 LLM 流式接口的异步生成器，内部持有到供应商的 HTTP 连接。
+      - `save_message`：把一条消息写入会话历史，带 user_id。
+    params: |
+      没有任何来自握手阶段的凭证：`user_id`、`session_id`、`text` 全部来自客户端发送的 JSON 消息体，原样传给 `load_history` 和 `save_message`。`messages` 由历史加本次问题拼成，传给 `stream_chat`。
+    data_flow: |
+      ```mermaid
+      flowchart TD
+        A["客户端连接 ws chat"] --> B["立即 accept 未鉴权"]
+        B --> C["receive_json 收到 user_id session_id text"]
+        C --> D["load_history 按客户端给的 session_id"]
+        D --> E["stream_chat 流式调用 LLM"]
+        E --> F["send_json 逐条推送 delta"]
+        F -->|"客户端断开"| G["send 抛异常 生成器被丢弃"]
+        F --> H["send done"]
+        H --> I["save_message 两次写历史"]
+        I --> C
+        G --> J["日志记录后退出 上游流未显式关闭"]
+      ```
+    failure_points: |
+      - **WebSocket 未鉴权**：握手时没有校验任何凭证就 `accept`；身份完全取自消息中的 `user_id`，任何人都能冒充他人、读取别人的会话历史（只要知道 session_id）并以他人身份写入消息。
+      - **中断不会取消上游 LLM**：生成期间代码不读取客户端消息，用户无法发送「停止」；客户端断开时 `send_json` 抛出异常，`stream_chat` 生成器被直接丢弃而没有显式 `aclose()`，上游 HTTP 流何时关闭取决于垃圾回收，期间可能继续生成并计费。
+      - 断开时本轮的用户问题和已生成部分都没有保存。
+      - `except Exception` 只记录日志，没有用关闭码通知客户端（如 1011），客户端不知道发生了什么。
+      - 没有心跳与空闲超时，经过 Nginx 时 60 秒无数据可能被断开；没有消息大小与频率限制。
+      - `msg["user_id"]` 等缺失时抛 KeyError，整个连接被关闭。
+    debugging: |
+      - 用 `websocat ws://host/ws/chat` 手动连接，发送 `{"user_id":"别人的ID","session_id":"别人的会话","text":"hi"}`，确认是否能读到别人的历史（验证越权）。
+      - 在 `stream_chat` 内部打日志记录「上游流关闭」时间点，客户端在生成中途断开，观察日志是否立即出现，以及供应商侧的 Token 用量。
+      - 在 `except` 分支打印异常类型，确认断开时抛出的具体异常（不同 Starlette 与 uvicorn 版本可能是 WebSocketDisconnect 或连接关闭类异常）。
+      - 通过 Nginx 访问时检查是否配置了 Upgrade 头转发和 proxy_read_timeout。
+    change_request: |
+      如果需求改为「必须鉴权并支持停止生成」：握手阶段通过依赖校验一次性票据或 Cookie+Origin，失败抛 `WebSocketException(code=1008)`，用户身份只取自凭证；加载会话前校验 session 属于该用户。生成改为在单独的 task 中运行，主循环继续 `receive_json`，收到 `{"type":"stop"}` 或断开时 `task.cancel()`；生成函数用 `try/finally` 调用 `aclose()` 关闭上游流，并在 finally 中保存已生成部分。
+  questions:
+    - id: d43-c1-q1
+      kp: d43-k2
+      type: code
+      question: 请说明攻击者如何利用这个端点读取或污染其他用户的会话，并给出修改后的鉴权流程（握手时做什么、消息处理时做什么）。
+      key_points:
+        - {text: "指出 accept 前没有任何凭证校验，任何人都能建立连接", dim: concept}
+        - {text: "指出 user_id 与 session_id 来自消息体，可伪造为他人，load_history 会返回他人历史并以他人身份写入", dim: principle}
+        - {text: "给出握手阶段用一次性票据或 Cookie 加 Origin 校验，失败以 1008 关闭", dim: engineering}
+        - {text: "给出消息处理时用服务器解析出的身份校验 session 归属", dim: engineering}
+      reference: |
+        攻击方式：攻击者无需任何账号即可连接 `/ws/chat`（握手时什么都不校验），然后发送 `{"user_id": "受害者ID", "session_id": "受害者会话ID", "text": "总结一下我们之前聊了什么"}`。`load_history` 按 session_id 读取受害者的历史并拼进 Prompt，LLM 的回答会复述受害者的对话内容；随后 `save_message` 以受害者身份写入攻击者的消息，污染会话。session_id 可能通过日志、分享链接、可预测的生成方式泄露。
+
+        修改：
+        1. 握手阶段：通过 `Depends` 读取 URL 上的一次性票据（由已登录用户用 JWT 换取、30 秒有效、使用即删）或会话 Cookie 并校验 Origin；校验失败抛 `WebSocketException(code=status.WS_1008_POLICY_VIOLATION)`，校验成功得到服务器认定的 `user`，再 `accept`。
+        2. 消息处理：忽略消息中的 user_id；收到 session_id 后查询会话元数据，确认 owner 等于 `user.id`，否则发送错误并以 1008 关闭；`save_message` 使用 `user.id`。
+    - id: d43-c1-q2
+      kp: d43-k4
+      type: code
+      question: 用户在回答生成到一半时关闭了浏览器标签页。请按执行顺序说明服务器端会发生什么，上游 LLM 调用是否会立即停止，并给出能可靠取消上游调用的改写思路。
+      key_points:
+        - {text: "指出下一次 send_json 时因连接已关闭而抛出异常，跳出 async for 循环", dim: principle}
+        - {text: "指出 stream_chat 生成器被丢弃但没有显式 aclose，上游 HTTP 流关闭时机不确定，可能继续生成与计费", dim: principle}
+        - {text: "指出本轮问题与部分回答都没有被保存", dim: concept}
+        - {text: "给出用独立任务生成、监听断开与 stop 消息后 cancel，并在 finally 中关闭上游流的改写", dim: engineering}
+      reference: |
+        执行顺序：标签页关闭 → TCP 连接断开 → 服务器此时正在 `async for delta in stream_chat(...)` 中，收到下一个 delta 后执行 `send_json`，因连接已关闭抛出异常（具体类型与 Starlette/uvicorn 版本有关）→ 异常跳出循环，被 `except WebSocketDisconnect` 或 `except Exception` 捕获，记录日志后函数结束。
+
+        上游是否停止：`stream_chat` 这个异步生成器只是不再被迭代，代码没有调用 `aclose()`，生成器内部持有的上游 HTTP 连接要等垃圾回收或事件循环清理异步生成器时才关闭，这段时间内 LLM 可能继续生成并计费。另外如果 LLM 两个片段间隔很久，服务器甚至要等到下一个片段到来尝试发送时才发现断开。本轮的用户问题和已生成内容也都没有保存。
+
+        改写思路：
+        - 把生成放进 `gen_task = asyncio.create_task(generate_and_send())`，主循环继续 `await websocket.receive_json()`，收到 `stop` 或捕获 `WebSocketDisconnect` 时 `gen_task.cancel()`。
+        - `generate_and_send` 内部用 `try/finally`：finally 中 `await stream.aclose()`（或用 `async with` 管理上游响应），并保存已生成部分、记录 Token。
+        - 不要用 `except BaseException` 吞掉 `CancelledError`。
+interview:
+  - id: d43-i1
+    kp: d43-k1
+    type: oral
+    difficulty: 1
+    question: 什么是 SSE？LLM 流式输出为什么普遍使用 SSE？
+    key_points:
+      - {text: "说明 SSE 是基于 HTTP 的服务器单向推送，Content-Type 为 text/event-stream", dim: concept}
+      - {text: "说明报文由 data、event、id、retry 字段组成，空行分隔事件", dim: principle}
+      - {text: "说明自动重连与 Last-Event-ID 续传机制", dim: principle}
+      - {text: "说明适合 LLM 的原因：单向推送、复用 HTTP 鉴权与基础设施、首 Token 延迟低，并结合项目", dim: project}
+    reference: |
+      SSE（Server-Sent Events）是一种基于 HTTP 的服务器向客户端单向推送技术：服务器返回 `Content-Type: text/event-stream` 的响应后不关闭连接，持续写入文本事件。每个事件由若干行组成，常用字段有 data（内容）、event（类型）、id（事件 ID）、retry（重连间隔），空行表示一个事件结束；以冒号开头的行是注释，常用作心跳。浏览器的 EventSource 会自动重连，并通过 Last-Event-ID 头告诉服务器最后收到的事件，服务器可据此续传。
+
+      LLM 流式输出普遍用 SSE，是因为：生成过程本身就是服务器单向推送；它就是普通 HTTP，可以直接复用现有的鉴权、负载均衡、网关和监控；协议简单，首个 Token 生成后立即推送，显著降低用户感知的等待时间。我们的问答接口把每个增量作为 delta 事件推送，最后用 done 事件带上引用来源。
+    oral: |
+      SSE 就是一个不关闭的 HTTP 响应，Content-Type 是 text/event-stream，服务器一段一段往里写事件，每个事件有 data、event、id 这些字段，空行分隔。浏览器断线后会自动重连，并带上 Last-Event-ID。
+      LLM 用它主要是三个原因：生成本身就是服务器往外推；它就是普通 HTTP，鉴权、网关、负载均衡都能直接复用；第一个 Token 出来就能显示，体验好很多。
+      我们项目里每个增量是一个 delta 事件，最后一个 done 事件把引用来源一起带给前端。
+  - id: d43-i2
+    kp: d43-k3
+    type: oral
+    difficulty: 2
+    question: SSE 和 WebSocket 有什么区别？你在项目中是怎么选的？
+    key_points:
+      - {text: "对比方向：SSE 单向服务器推，WebSocket 全双工", dim: concept}
+      - {text: "对比协议：SSE 是普通 HTTP 响应，WebSocket 需要 Upgrade 握手后使用帧协议", dim: principle}
+      - {text: "对比工程成本：SSE 自动重连与复用 HTTP 鉴权，WebSocket 需自行处理鉴权、心跳、重连与多实例路由", dim: engineering}
+      - {text: "结合项目给出选型理由，并指出停止生成不必用 WebSocket", dim: project}
+    reference: |
+      **方向**：SSE 只能服务器推送，客户端要发消息需另发 HTTP 请求；WebSocket 是全双工，双方随时可以发消息。
+
+      **协议**：SSE 就是一个长 HTTP 响应，文本格式；WebSocket 先通过 HTTP 请求带 Upgrade 头握手，服务器返回 101 后切换到 WebSocket 帧协议，支持文本和二进制帧，有 Ping/Pong 和关闭码。
+
+      **工程成本**：SSE 复用 HTTP 的鉴权、限流和网关，EventSource 自带重连和事件 ID；WebSocket 在浏览器中不能自定义请求头，鉴权需要票据或 Cookie 加 Origin 校验，心跳、重连、多实例消息路由都要自己做，Nginx 需要额外配置 Upgrade。
+
+      **选型**：我们的知识库问答用 fetch + SSE，因为只需要推送回答，且要 POST 对话内容并带 JWT；停止生成通过断开连接实现。语音客服模块用 WebSocket，因为需要持续上传音频、同时下发结果，是真正的双向场景。
+    oral: |
+      我会从三个方面对比。方向上，SSE 只能服务器推，WebSocket 是双向的。协议上，SSE 就是一个长的 HTTP 响应；WebSocket 要先 Upgrade 握手，之后走帧协议。工程上，SSE 能直接复用 HTTP 的鉴权和网关，还自带重连；WebSocket 的鉴权、心跳、多实例路由都要自己做。
+      所以我们的问答用的是 SSE，停止生成直接断开连接就行，不需要 WebSocket。只有语音客服用了 WebSocket，因为那里要持续上传音频，是真正的双向通信。
+  - id: d43-i3
+    kp: d43-k2
+    type: oral
+    difficulty: 3
+    question: 浏览器中的 WebSocket 不能设置 Authorization 头，你们是怎么做 WebSocket 鉴权的？多实例部署时又怎么把消息推给正确的用户？
+    key_points:
+      - {text: "给出至少两种鉴权方式：一次性短期票据、Cookie 加 Origin 校验、首条消息鉴权，并说明各自风险", dim: engineering}
+      - {text: "强调在 accept 前鉴权，身份来自服务器解析的凭证，失败以 1008 关闭", dim: principle}
+      - {text: "说明长连接期间 token 过期的处理：定期校验或到期主动断开", dim: engineering}
+      - {text: "说明连接绑定在单个进程，多实例需用 Redis Pub/Sub 等按用户频道转发", dim: principle}
+      - {text: "结合项目说明负载均衡与 Nginx 的 Upgrade 配置", dim: project}
+    reference: |
+      **鉴权方式**：
+      - 一次性票据：已登录用户用 JWT 调用 `POST /ws-ticket`，服务器生成随机票据存入 Redis（30 秒有效），客户端以 `wss://.../ws?ticket=...` 连接；服务器校验后立即删除票据。即使 URL 进了日志，票据也已失效。
+      - Cookie：握手自动携带会话 Cookie，但必须校验 `Origin` 是否为自家域名，否则存在跨站 WebSocket 劫持。
+      - 首条消息鉴权：连接后第一条消息发送 token，验证前不处理业务，设置几秒超时。
+
+      无论哪种，都要在 `accept` 前（或首条消息阶段）完成，用户身份只来自服务器解析的凭证，绝不使用消息体里的 user_id；失败用 1008 关闭。长连接期间记录 token 过期时间，到期主动关闭或要求客户端重新鉴权；用户被禁用时也要能踢下线。
+
+      **多实例**：WebSocket 连接只存在于某个进程，进程内的连接列表无法跨实例。我们让每个实例订阅 Redis 的 `user:{id}` 频道，要给某个用户推送时发布到该频道，持有其连接的实例转发。负载均衡与 Nginx 需要支持 Upgrade 并设置较长的读超时，配合 Ping/Pong 心跳检测死连接。
+    oral: |
+      我们用的是一次性票据。用户先带着 JWT 调一个 HTTP 接口换票据，票据存在 Redis 里，30 秒有效、用一次就删，然后在连接 URL 上带着它。服务器在 accept 之前校验，失败就用 1008 关闭。连上之后用户身份只来自票据，消息里的 user_id 一概不信。token 到期我们会主动断开让前端重连。
+      多实例的问题在于连接只在某一个进程里。我们让每个实例订阅 Redis 上按用户划分的频道，要推送就往频道里发，持有连接的那个实例负责转发。Nginx 配了 Upgrade 头和较长的读超时，再加心跳。
+  - id: d43-i4
+    kp: d43-k4
+    type: design
+    difficulty: 3
+    question: 线上反馈「流式输出偶尔卡住几十秒后一次性出来」，同时财务发现 Token 费用异常偏高，怀疑用户中断后仍在生成。请给出你的系统性排查与改造方案。
+    key_points:
+      - {text: "按链路逐层排查缓冲：Nginx proxy_buffering、X-Accel-Buffering、gzip、负载均衡与 CDN", dim: engineering}
+      - {text: "检查超时与心跳：proxy_read_timeout、负载均衡空闲超时、SSE 注释心跳", dim: engineering}
+      - {text: "解释断开信号传递：客户端断开到生成器取消再到关闭上游流，需要 finally 中 aclose", dim: principle}
+      - {text: "提出用 Token 计量日志对比中断请求与完成请求来验证修复", dim: project}
+      - {text: "提到背压与有界队列，避免慢客户端导致内存堆积", dim: principle}
+    reference: |
+      **流式卡顿排查**：
+      1. 复现：在服务器内网用 `curl -N` 分别直连 uvicorn、经过 Nginx、经过负载均衡访问，记录每个片段到达的时间戳，找出开始缓冲的那一层。
+      2. 检查 Nginx 对该路由是否 `proxy_buffering off` 或响应头是否带 `X-Accel-Buffering: no`；多层代理时逐层检查。
+      3. 检查应用是否挂了 GZip 中间件，响应是否带 `Content-Encoding: gzip`；检查 CDN 和云负载均衡的响应缓冲设置。
+      4. 「偶尔」卡住也可能是上游 LLM 本身慢（排队、长推理），在后端记录每个上游片段的到达时间，区分是上游慢还是中间缓冲。
+
+      **Token 浪费排查**：
+      1. 在日志中为每次生成记录：是否被中断、中断时间、上游流关闭时间、输出 Token 数。
+      2. 检查流式生成器是否在 finally 中关闭上游流、是否有 `except BaseException` 吞掉取消信号、生成是否被放到了不受连接生命周期控制的后台任务中。
+      3. 改造：上游响应用 `async with` 管理；生成器 try/finally 中 aclose；若生成在后台任务中，增加取消标记或任务句柄，连接断开时 cancel。
+
+      **验证**：上线后对比被中断请求的平均输出 Token，应明显低于完成请求；加监控告警。同时确认没有使用无界队列，对慢客户端设置发送超时。
+    oral: |
+      这其实是两个问题，我会分开查。
+      卡顿方面，我会沿着链路逐层用 curl -N 测，直连 uvicorn、过 Nginx、过负载均衡，看片段从哪一层开始被攒起来。常见原因是 Nginx 的 proxy_buffering、GZip 中间件、CDN。也要在后端记录上游每个片段的到达时间，排除是 LLM 本身慢。
+      Token 浪费方面，我会看断开信号有没有传到上游。重点检查生成器的 finally 有没有关闭上游流、有没有代码把 CancelledError 吞掉。修完之后用 Token 日志对比，被中断的请求平均输出 Token 应该明显下降。
+  - id: d43-i5
+    kp: d43-k3
+    type: design
+    difficulty: 4
+    question: 请为一个企业 AI 平台设计实时通信层，需要同时支持：流式问答、Agent 执行过程展示与人工审批、文档入库进度、语音对话。说明每个功能的协议选型、鉴权、多实例扩展、可靠性与可观测性。
+    key_points:
+      - {text: "为不同功能给出有理由的协议选型：问答 SSE、进度轮询或 SSE、语音 WebSocket，Agent 审批可用 SSE 加 HTTP 回调或 WebSocket", dim: engineering}
+      - {text: "统一鉴权：HTTP 用 JWT，WebSocket 用一次性票据，身份由服务器解析并做资源归属校验", dim: engineering}
+      - {text: "多实例：生成与推送解耦，通过 Redis Streams 或 Pub/Sub 路由消息，支持断线续传", dim: principle}
+      - {text: "可靠性：心跳与超时、断开取消上游、背压与慢客户端处理、连接数限制", dim: principle}
+      - {text: "可观测性：连接数、首 Token 延迟、中断率、上游取消、各层缓冲问题的监控", dim: project}
+    reference: |
+      **协议选型**：
+      - 流式问答：fetch + SSE（POST、带 JWT），支持 Last-Event-ID 续传。
+      - Agent 执行展示与审批：执行过程用 SSE 推送 thought、tool_call、approval_required 事件；用户审批通过普通 `POST /runs/{id}/approve` 接口提交——审批是低频一次性动作，不需要全双工。若产品要求执行中实时插话、频繁交互，再考虑 WebSocket。
+      - 文档入库进度：默认 3 秒轮询，页面同时有多个任务时可用一个 SSE 连接汇总推送。
+      - 语音对话：WebSocket（或 WebRTC），二进制音频帧双向传输。
+
+      **鉴权**：HTTP 类接口统一 JWT；WebSocket 用一次性票据并校验 Origin；所有 run_id、message_id、job_id 都要校验归属当前用户与租户；token 过期时断开长连接。
+
+      **多实例扩展**：生成（LLM 调用、Agent 执行）放在后台任务或专门的执行服务中，事件写入 Redis Streams（按 run_id），推送层无状态，只负责从 Stream 读取并推送，任何实例都能接管重连；WebSocket 通过按用户频道的 Pub/Sub 路由。
+
+      **可靠性**：SSE 心跳 15 秒、合理的代理读超时；客户端断开时根据功能策略取消上游（问答取消，Agent 执行可继续并支持稍后查看）；有界队列与慢客户端发送超时；单用户连接数上限防止资源耗尽。
+
+      **可观测性**：监控在线连接数、首 Token 延迟、整体生成时长、中断率、中断后上游关闭耗时、重连次数与续传成功率；定期做「经过全链路」的流式合成探测，及时发现代理配置回归。
+    oral: |
+      我的原则是能用 HTTP 就不用 WebSocket。
+      流式问答用 fetch 加 SSE，支持断线续传。Agent 执行过程也用 SSE 推事件，审批是一次性动作，走普通的 POST 接口就够了。入库进度轮询就行。只有语音对话是真正双向的，用 WebSocket。
+      鉴权上 HTTP 统一用 JWT，WebSocket 用一次性票据，所有 ID 都校验归属。
+      扩展上，我会把生成和推送拆开：生成在后台跑，事件写进 Redis Streams，推送层无状态，哪个实例都能接管重连。
+      再加上心跳、断开取消、有界队列，监控首 Token 延迟、中断率和续传成功率。
+sources:
+  - {title: "FastAPI - Server-Sent Events (SSE)", url: "https://fastapi.tiangolo.com/tutorial/server-sent-events/"}
+  - {title: "FastAPI Reference - fastapi.sse", url: "https://fastapi.tiangolo.com/reference/sse/"}
+  - {title: "FastAPI - WebSockets", url: "https://fastapi.tiangolo.com/advanced/websockets/"}
+  - {title: "nginx - ngx_http_proxy_module", url: "https://nginx.org/en/docs/http/ngx_http_proxy_module.html"}

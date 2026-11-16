@@ -1,0 +1,597 @@
+day: 1
+phase: 1
+title: Python 基础与运行机制
+goals:
+  - 能解释一段 Python 代码从源码到运行经历了哪些步骤（编译成字节码、虚拟机执行、.pyc 缓存）
+  - 能用「名字绑定对象」的模型解释赋值、is 与 == 的区别，以及对象何时被回收
+  - 能识别 AI 生成代码里常见的类型与真值判断错误（环境变量是字符串、0 被当成未配置、浮点精度）
+  - 能说清当前 Python 稳定版本和 3.13~3.15 的重要解释器变化，以及它们对后端项目选型的影响
+knowledge_points:
+  - id: d01-k1
+    name: Python 的定位与解释执行机制
+    level: P0
+    summary: Python 先把源码编译成字节码，再由虚拟机逐条执行；动态类型但强类型
+    why: |
+      你每天让 AI 生成的 FastAPI、LangChain、RAG 脚本都跑在 CPython 解释器上。**不懂它怎么执行，就看不懂报错发生在「导入时」还是「运行时」**，也解释不了为什么改了代码不生效、为什么某个错误要到调用那一刻才暴露。面试里「Python 是解释型语言吗」几乎是必问开场题。
+    problem: |
+      它解决的是「如何让开发者用最少的样板代码快速表达逻辑」：不需要提前编译链接、不需要声明类型，写完即可运行。代价是**很多错误只在运行到那一行时才出现**，性能也比编译型语言低，因此工程上需要类型注解、测试和静态检查来补位。
+    principle: |
+      **一、「解释型」其实分两步：先编译，再解释**
+
+      很多人说 Python 是解释型语言，这句话只对一半。官方实现 **CPython** 运行一个 `.py` 文件时：
+
+      1. **词法/语法分析**：把源码切成 Token，构造抽象语法树（AST）。语法错误（`SyntaxError`）在这一步就会报出来，**一行都不会执行**。
+      2. **编译成字节码**：AST 被编译成 **code object**，里面是一串平台无关的字节码指令（如 `LOAD_FAST`、`CALL`、`RETURN_VALUE`）。
+      3. **虚拟机执行**：CPython 的解释器循环（常被称为 PVM）逐条取出字节码执行。名字查找、类型检查、属性访问都发生在这一步。
+
+      ```mermaid
+      flowchart LR
+        A["源码 app.py"] --> B["词法与语法分析"]
+        B --> C["AST 抽象语法树"]
+        C --> D["编译为字节码 code object"]
+        D --> E["写入 __pycache__ 中的 .pyc 缓存"]
+        D --> F["解释器循环逐条执行字节码"]
+        F --> G["运行时错误 TypeError NameError 等"]
+        B --> H["SyntaxError 直接报错不执行"]
+      ```
+
+      **二、.pyc 缓存是什么**
+
+      被 `import` 的模块编译后会缓存到 `__pycache__/模块名.cpython-3XX.pyc`。下次导入时如果源码没变，就跳过编译直接加载字节码，所以**它只加速启动，不加速运行**。直接 `python main.py` 运行的入口脚本不会被缓存。你可以用标准库 `dis` 查看字节码：
+
+      ```python
+      import dis
+
+      def add(a, b):
+          return a + b
+
+      dis.dis(add)   # 能看到 LOAD_FAST 系列、BINARY_OP (+)、RETURN_VALUE 等指令，具体指令名随版本变化
+      ```
+
+      **三、动态类型 + 强类型（和 JS 对比）**
+
+      - **动态类型**：变量没有类型，**对象才有类型**。`x = 1` 之后可以 `x = "hi"`，类型检查推迟到运行时。这一点和 JS 一样。
+      - **强类型**：不同类型之间**不会偷偷隐式转换**。JS 里 `"1" + 1` 得到 `"11"`，Python 里直接抛 `TypeError`。这让 Python 的错误更早、更明确地暴露。
+
+      **四、为什么错误「运行到那一行才出现」**
+
+      字节码里 `a + b` 只是一条 `BINARY_OP` 指令，**编译时根本不知道 a、b 是什么类型**。只有执行到这里，虚拟机才去查对象的类型并决定调用哪个加法实现。所以一个从没被测试走到的分支，里面拼错的变量名（`NameError`）会一直潜伏到线上。这就是 Python 后端特别依赖**单元测试、类型检查工具（mypy/pyright）和 Pydantic 运行时校验**的根本原因。
+
+      **五、CPython 之外**
+
+      CPython 是官方参考实现，绝大多数 AI 库（NumPy、PyTorch、pydantic-core）都是针对它编译的 C/Rust 扩展。PyPy（带 JIT）等其他实现兼容性不如 CPython，AI 后端基本只用 CPython。
+
+      **不这样理解会怎样**：你会把「代码能启动」误当成「代码没问题」，忽略那些只有特定请求才会走到的分支；也会在面试中把 Python 说成「逐行翻译执行」而被追问卡住。
+    scenarios: |
+      - **排查「改了代码不生效」**：确认运行的是哪个解释器、是否有旧进程没重启（uvicorn `--reload` 只在开发时用）。
+      - **定位报错阶段**：`SyntaxError`/`IndentationError` 在启动或导入时就报；`TypeError`/`KeyError` 只在请求走到那一行时才报。
+      - **审查 AI 代码**：对很少执行的错误处理分支要特别小心，它们最容易藏着运行时才暴露的拼写和类型错误。
+    code: |
+      ```python
+      # 强类型：不会隐式转换
+      try:
+          "1" + 1
+      except TypeError as e:
+          print("TypeError:", e)   # can only concatenate str (not "int") to str
+
+      # 动态类型：错误分支要到运行时才暴露
+      def handle(event: str) -> str:
+          if event == "rare":
+              return undefined_name   # 编译不报错，只有 event == "rare" 时才 NameError
+          return "ok"
+
+      print(handle("normal"))  # ok，问题一直潜伏
+      ```
+    pitfalls: |
+      - **误区：Python 是逐行翻译执行的。** 实际是整个文件先编译成字节码，语法错误会让整个文件一行都不执行。
+      - **误区：有 .pyc 就运行更快。** .pyc 只省去编译时间，执行速度不变。
+      - **误区：加了类型注解 Python 就会检查类型。** 注解默认不在运行时强制，需要 mypy/pyright 或 Pydantic 才会起作用（见 Day 03）。
+      - **混淆：动态类型 ≠ 弱类型。** Python 是动态 + 强类型，JS 是动态 + 弱类型。
+    interview_asks:
+      - "Python 是解释型语言还是编译型语言？.pyc 文件是什么？"
+      - "为什么 Python 很多错误要到运行时才发现？工程上怎么弥补？"
+      - "动态类型和强类型分别是什么意思？用 Python 和 JavaScript 举例对比。"
+    project_example: |
+      在一个企业知识库问答服务里，「文档解析失败」的兜底分支里把 `logger` 拼成了 `loger`。由于该分支只有遇到加密 PDF 才会执行，服务上线两周都正常，直到某客户上传加密 PDF，接口直接 500，且原始错误被 `NameError` 掩盖。复盘后团队加上了 ruff 静态检查（能发现未定义名字）和覆盖异常分支的单元测试。
+    sources:
+      - {title: "Python 文档 - dis 字节码反汇编模块", url: "https://docs.python.org/3/library/dis.html"}
+
+  - id: d01-k2
+    name: 变量是名字绑定：引用、is 与 ==、对象回收
+    level: P0
+    summary: 变量只是贴在对象上的标签；赋值不复制对象，is 比身份，== 比值
+    why: |
+      AI 生成的后端代码里大量出现「把同一个 dict/list 传来传去再修改」。**如果你以为赋值会复制一份，就会看不懂为什么改了 A 却影响了 B**，也看不懂 `if x is None` 和 `if x == None` 的区别。这是理解 Day 02 可变对象、Day 03 参数传递的地基。
+    problem: |
+      Python 用「名字 → 对象」的引用模型统一了所有类型，避免了 C 语言那种值类型/指针类型的手动区分，也让内存由引用计数和垃圾回收自动管理。需要掌握它，才能正确判断**哪些操作会共享数据、对象何时被释放、资源为什么没及时关闭**。
+    principle: |
+      **一、变量 = 名字，对象 = 盒子**
+
+      在 Python 里，`x = [1, 2]` 的含义是：先在堆上创建一个 list 对象，然后让名字 `x` **指向（绑定）**这个对象。名字本身没有类型、不存数据，它只是命名空间（一个 dict）里的一个键。
+
+      ```mermaid
+      flowchart LR
+        subgraph NS["命名空间 名字表"]
+          X["x"]
+          Y["y"]
+        end
+        subgraph HEAP["堆上的对象"]
+          L["list 对象 id=0x7f01 值为 1, 2, 3"]
+        end
+        X --> L
+        Y --> L
+      ```
+
+      执行 `y = x` 后，`x` 和 `y` 指向**同一个对象**；`y.append(3)` 后通过 `x` 也能看到 3。这和 JS 里对象/数组的引用行为一致，但 **Python 里一切皆对象，连 int 和 str 也是**——只不过它们不可变，所以看起来像「值传递」。
+
+      **二、三个必须分清的概念**
+
+      - `id(obj)`：对象的身份（CPython 中是内存地址），对象存活期间不变。
+      - `a is b`：比较**身份**，是不是同一个对象。
+      - `a == b`：比较**值**，调用 `__eq__`，可以被类自定义。
+
+      **判断 None 一律用 `is None`**：`None` 是单例；而 `== None` 会调用对象的 `__eq__`，某些库（如 NumPy 数组、SQLAlchemy 列表达式）重载了 `==`，结果不是布尔值。
+
+      **三、小整数和字符串驻留是实现细节**
+
+      CPython 会缓存 -5 到 256 的小整数、驻留部分字符串，所以 `a = 256; b = 256; a is b` 可能是 True，换成 1000 就不一定。**这是实现细节，不是语言保证**。比较数值和字符串永远用 `==`。
+
+      **四、重新赋值 vs 原地修改**
+
+      - `x = x + [4]`：创建**新对象**，再让 x 指向它，其他名字不受影响。
+      - `x.append(4)` / `x += [4]`（对 list）：**原地修改**同一个对象，所有指向它的名字都能看到变化。
+
+      对不可变对象（int、str、tuple），任何「修改」都只能是创建新对象再重新绑定。
+
+      **五、对象什么时候被回收**
+
+      CPython 主要靠**引用计数**：每多一个名字/容器引用对象，计数 +1；引用消失计数 -1；降到 0 立即释放。`sys.getrefcount(obj)` 可以查看（结果会多 1，因为传参本身也是一次引用）。
+
+      引用计数解决不了**循环引用**（A 引用 B，B 引用 A），所以 CPython 还有一个**分代垃圾回收器**（`gc` 模块）定期扫描并清理循环垃圾。
+
+      ```mermaid
+      flowchart TB
+        A["创建对象 引用计数为 1"] --> B["新名字或容器引用 计数加 1"]
+        B --> C["名字被删除或重新赋值 计数减 1"]
+        C --> D{"计数是否为 0"}
+        D -->|"是"| E["立即释放内存"]
+        D -->|"否但存在循环引用"| F["分代 GC 周期性扫描并回收"]
+      ```
+
+      **工程意义**：文件、数据库连接这类资源**不要依赖对象回收来关闭**，因为在其他实现（或循环引用）下释放时机不确定，应该用 `with` 显式管理（见 Day 05）。
+
+      **不这样理解会怎样**：你会写出「以为复制了一份配置再修改，结果把全局默认配置改坏」的 bug；会在比较字符串时误用 `is` 导致偶发失败；还会因为依赖析构关闭连接而导致连接泄漏。
+    scenarios: |
+      - **请求间数据串号**：模块级的默认参数 dict 被某个请求原地修改，后续所有请求都受影响。
+      - **判断可选值**：`if user is None:` 判断是否查到用户，而不是 `if not user:`（空对象也会被当成没查到）。
+      - **内存排查**：大列表被某个全局缓存引用着，引用计数不为 0，内存一直不释放。
+    code: |
+      ```python
+      import sys
+
+      a = [1, 2]
+      b = a              # 不复制，同一个对象
+      b.append(3)
+      print(a, a is b)   # [1, 2, 3] True
+
+      c = a + [4]        # 新对象
+      print(a, c, a is c)  # [1, 2, 3] [1, 2, 3, 4] False
+
+      s1 = "".join(["ab", "c"])
+      s2 = "abc"
+      print(s1 == s2, s1 is s2)  # True，is 的结果取决于实现，不要依赖
+
+      print(sys.getrefcount(a))  # 引用计数（会比直觉多 1）
+      ```
+    pitfalls: |
+      - **误区：`y = x` 会复制一份。** 只是多了一个名字指向同一对象，需要复制得显式 `copy`（见 Day 02）。
+      - **误区：用 `is` 比较字符串或数字。** 小整数缓存和字符串驻留让它「有时对」，换个值就错，属于偶发 bug。
+      - **误区：`x += y` 永远创建新对象。** 对 list 是原地修改，对 int/str/tuple 才是新对象。
+      - **误区：对象没人用了，文件/连接就会自动关闭。** 释放时机不可依赖，必须显式关闭或用 `with`。
+    interview_asks:
+      - "Python 中 is 和 == 有什么区别？为什么判断 None 要用 is？"
+      - "Python 是值传递还是引用传递？变量和对象是什么关系？"
+      - "CPython 的内存是怎么回收的？引用计数解决不了什么问题？"
+    project_example: |
+      一个多租户 AI 客服后端在模块顶层定义了 `DEFAULT_PARAMS = {"temperature": 0.7}`，每个请求里写 `params = DEFAULT_PARAMS` 再根据租户 `params["temperature"] = 0`。结果第一个低温度租户请求之后，所有租户都变成了 0。原因是 `params` 和 `DEFAULT_PARAMS` 指向同一个 dict。修复为 `params = {**DEFAULT_PARAMS, **tenant_overrides}` 每次创建新 dict，并补了一个「连续两个租户请求互不影响」的测试。
+
+  - id: d01-k3
+    name: 内置数据类型与真值判断
+    level: P1
+    summary: int 无限精度、float 有误差、str 不可变且是 Unicode；空容器、0、None 都为假
+    why: |
+      AI 后端里到处是类型转换：环境变量读出来是字符串、JSON 解析出来是 dict、LLM 返回的 token 数是 int、相似度分数是 float。**类型判断错一处，就可能出现「配置了 false 却开启了调试」「temperature=0 被改成默认值」这类隐蔽 bug。**
+    problem: |
+      它帮你在读代码时快速判断：这个值实际是什么类型、`if x:` 在什么情况下为假、数值运算会不会有精度问题、文本和字节什么时候需要编解码。这些判断决定了配置解析、参数校验、计费统计是否正确。
+    principle: |
+      **一、数值类型**
+
+      - **int 无限精度**：不会像 JS 的 Number 那样超过 2^53 丢精度，大整数 ID 可以放心用 int（但序列化给前端时 JS 仍可能丢精度，常转成字符串）。
+      - **float 是 IEEE 754 双精度**：`0.1 + 0.2 == 0.3` 为 False。**金额、计费**用 `decimal.Decimal` 或用「分」为单位的整数；比较相似度分数用阈值而不是 `==`。
+      - **除法**：`/` 永远返回 float（`4 / 2 == 2.0`），`//` 是向下取整（`-7 // 2 == -4`）。
+      - **bool 是 int 的子类**：`True == 1`、`isinstance(True, int)` 为 True。写类型判断时要注意 `isinstance(x, int)` 会把布尔值也放进来。
+
+      **二、str 与 bytes**
+
+      - `str` 是**不可变的 Unicode 文本**；任何「修改」都会创建新字符串。循环里大量 `s += piece` 会反复创建对象，拼接大量片段用 `"".join(parts)`。
+      - `bytes` 是原始字节。网络传输、文件读写、哈希签名处理的是 bytes；`text.encode("utf-8")` 转 bytes，`data.decode("utf-8")` 转回文本。中文乱码几乎都源于编解码使用了不同编码。
+
+      **三、None**
+
+      `None` 表示「没有值」，相当于 JS 的 `null`（Python 没有 `undefined`，访问不存在的变量直接 `NameError`，访问不存在的 dict 键是 `KeyError`）。
+
+      **四、真值判断（Truthiness）**
+
+      `if x:` 时，以下值为假：`False`、`None`、`0`、`0.0`、`""`、`[]`、`{}`、`set()`、`()`。其他一般为真。**与 JS 的关键差异：Python 中空列表 `[]` 和空字典 `{}` 是假，JS 中是真。**
+
+      **五、环境变量与配置的类型陷阱**
+
+      `os.getenv("X")` 只会返回 **str 或 None**。`"false"`、`"0"` 都是非空字符串，**真值判断为 True**。这正是很多「关不掉的调试模式」的来源。工程上应使用 pydantic-settings 之类的工具按类型解析配置，或者显式比较 `value.lower() in {"1", "true", "yes"}`。
+
+      **不这样理解会怎样**：会把 `temperature=0`、`top_k=0`、空字符串这些**合法值**当成「没传」而替换成默认值；会用 float 直接累加费用导致对账差几分钱。
+    scenarios: |
+      - **配置解析**：`DEBUG=false` 读出来是字符串 `"false"`，必须显式转换。
+      - **参数默认值**：`temperature = req.temperature or 0.7` 会把用户显式传的 0 改成 0.7，应写 `if req.temperature is None`。
+      - **计费统计**：token 单价相乘累加用 Decimal，避免浮点误差。
+      - **文本处理**：读取上传文件时明确 `encoding="utf-8"`，处理 HTTP 原始响应时区分 bytes 和 str。
+    code: |
+      ```python
+      import os
+      from decimal import Decimal
+
+      os.environ["APP_DEBUG"] = "false"
+      print(bool(os.getenv("APP_DEBUG")))          # True！非空字符串为真
+      debug = os.getenv("APP_DEBUG", "").lower() in {"1", "true", "yes"}
+      print(debug)                                  # False
+
+      temperature = 0.0
+      print(temperature or 0.7)                     # 0.7，合法的 0 被吞了
+      print(0.7 if temperature is None else temperature)  # 0.0
+
+      print(0.1 + 0.2 == 0.3)                       # False
+      print(Decimal("0.1") + Decimal("0.2") == Decimal("0.3"))  # True
+      ```
+    pitfalls: |
+      - **误区：`bool("false")` 是 False。** 任何非空字符串都是 True。
+      - **误区：`x or default` 可以安全设置默认值。** 当 0、空字符串、空列表是合法值时会被错误替换，应用 `is None` 判断。
+      - **误区：空列表在 if 中为真（JS 习惯）。** Python 中为假。
+      - **混淆：`Decimal(0.1)` 和 `Decimal("0.1")`。** 前者会把 float 的误差一起带进来，应传字符串。
+    interview_asks:
+      - "Python 中哪些值在 if 判断里是假？和 JavaScript 有什么不同？"
+      - "为什么 0.1 + 0.2 != 0.3？涉及金额的计算你怎么处理？"
+      - "从环境变量读取布尔配置时有什么坑？"
+    project_example: |
+      一个 RAG 服务的检索接口参数 `score_threshold` 用 `threshold = body.get("score_threshold") or 0.5` 设置默认值。运营想临时放开阈值传了 0，结果仍被替换成 0.5，召回数一直上不去。排查时通过日志打印 `repr(threshold)` 才发现问题。修复改为 Pydantic 模型 `score_threshold: float | None = None`，在业务代码里用 `is None` 判断。
+
+  - id: d01-k4
+    name: Python 版本现状与 3.13~3.15 解释器变化
+    level: P2
+    summary: 截至 2026-11 最新稳定版是 3.15；free-threading 已官方支持但仍是可选构建
+    why: |
+      面试官常问「你们用哪个 Python 版本、为什么」「听说 Python 去掉 GIL 了吗」。项目选型时，版本决定了能用哪些语法、依赖库是否有现成的 wheel、还能获得多久的安全更新。**答错版本事实会显得对生态不了解。**
+    problem: |
+      帮你在新项目或升级时做出有依据的版本选择：知道哪些版本还在维护、哪些新特性真正可用、free-threading 和 JIT 目前是什么状态、升级时有哪些行为变化（如默认编码）需要注意。
+    principle: |
+      **一、版本维护状态（核对于 2026-11，python.org 下载页）**
+
+      - **3.15**：最新稳定版，2026-10-09 发布，处于 bugfix 阶段（已到 3.15.2）。
+      - **3.14**：bugfix 阶段（3.14.10）。
+      - **3.13 / 3.12 / 3.11**：只接受安全修复。
+      - **3.10**：已于 2026-10 结束支持（EOL）。
+      - 3.16 处于预发布，计划 2027-10 发布。每个版本约有 5 年支持期。
+
+      **二、free-threading（无 GIL 构建）的演进**
+
+      - **3.13**：首次提供实验性的 free-threaded 构建（PEP 703）。
+      - **3.14**：PEP 779 被接受，free-threaded 构建**正式受支持、不再是实验性**，但仍是**可选的独立构建**（通常名为 `python3.14t`），默认构建依然有 GIL。官方文档称单线程性能损失约 5%~10%。
+      - **3.15**：为 free-threaded 构建提供稳定 ABI（`abi3t`，PEP 803），方便 C 扩展适配；官方 macOS 安装包默认安装 free-threading 支持。导入未声明支持 free-threading 的 C 扩展时，GIL 可能会被自动重新启用。
+      - 是否把 free-threading 变成默认构建，官方表示**尚未决定**。GIL 的原理放在 Day 07 详细讲。
+
+      **三、其他与后端相关的变化**
+
+      - **3.14**：注解延迟求值（PEP 649/749）、模板字符串 t-string（PEP 750）、`finally` 中 `return` 会发出 SyntaxWarning（PEP 765）；官方 Windows/macOS 二进制包含实验性 JIT，需 `PYTHON_JIT=1` 开启，不建议生产使用。
+      - **3.15**：**默认编码改为 UTF-8**（PEP 686），`open()` 不指定 encoding 时不再使用系统 locale（Windows 中文系统以前是 GBK/cp936）；显式 `lazy import`（PEP 810）用于加速启动；新增内置 `frozendict`（PEP 814）；Windows 64 位官方包启用尾调用解释器提升性能。
+
+      **四、选型建议**
+
+      生产项目的版本不是越新越好，而是取决于**关键依赖（pydantic-core、numpy、数据库驱动、向量库客户端）是否发布了对应版本的 wheel**。常见做法：新项目选 3.13/3.14 这类已稳定一段时间的版本，在 CI 里增加 3.15 测试矩阵，确认依赖就绪后再升级。
+    scenarios: |
+      - **新项目选型**：在 `pyproject.toml` 的 `requires-python` 中写明下限，并用 `uv python pin` 固定开发版本。
+      - **升级评估**：从 3.12 升到 3.15 前，检查依赖兼容性和 UTF-8 默认编码带来的文件读写差异。
+      - **面试表达**：准确区分「GIL 被移除」和「提供可选的无 GIL 构建」。
+    pitfalls: |
+      - **误区：Python 3.13 已经去掉了 GIL。** 只是提供了可选的 free-threaded 构建，默认构建仍有 GIL。
+      - **误区：最新版本最适合生产。** 关键依赖没有 wheel 时会被迫源码编译甚至无法安装。
+      - **误区：开了 JIT 一定更快。** 3.14 文档写明效果从慢 10% 到快 20% 不等，仍是实验特性。
+      - **混淆：3.15 的 UTF-8 默认只影响未指定 encoding 的场景**，显式写 `encoding="utf-8"` 仍是最稳妥的跨版本写法。
+    interview_asks:
+      - "你们项目用的 Python 版本是什么？升级 Python 版本你会关注什么？"
+      - "Python 现在还有 GIL 吗？free-threading 是什么状态？"
+    project_example: |
+      某团队把一个文档解析服务从 3.12 升级到 3.15 时，发现 Windows 测试机上读取历史 GBK 编码的 txt 知识库文件开始报 `UnicodeDecodeError`。原因是 3.15 起 `open()` 默认使用 UTF-8，而旧代码依赖了系统 locale 编码。修复方式是对这批历史文件显式指定 `encoding="gbk"`，并在入库流程中统一转码为 UTF-8。
+    freshness: |
+      核对于 2026-11：python.org 显示 3.15 为最新稳定版（3.15.0 于 2026-10-09 发布，当前 3.15.2），3.14 处于 bugfix，3.13 及以下仅安全修复，3.10 已 EOL。free-threading：3.13 实验性 → 3.14 正式支持但可选（PEP 779）→ 3.15 新增 abi3t 稳定 ABI。旧说法「Python 3.13 移除了 GIL」不准确。3.15 起默认编码为 UTF-8（PEP 686），旧行为依赖系统 locale。
+    sources:
+      - {title: "Python.org - Download / Active Python releases", url: "https://www.python.org/downloads/"}
+      - {title: "What's new in Python 3.14", url: "https://docs.python.org/3/whatsnew/3.14.html"}
+      - {title: "What's new in Python 3.15", url: "https://docs.python.org/3.15/whatsnew/3.15.html"}
+      - {title: "Python HOWTO - Python support for free threading", url: "https://docs.python.org/3.15/howto/free-threading-python.html"}
+
+quiz:
+  - id: d01-q1
+    kp: d01-k1
+    type: single
+    question: 一个 `.py` 文件第 80 行有语法错误（少了冒号），第 1~79 行是正常的 print 语句。直接运行这个文件，会发生什么？
+    options:
+      - "先执行前 79 行的 print，运行到第 80 行时报 SyntaxError"
+      - "一行都不执行，直接报 SyntaxError"
+      - "跳过第 80 行继续执行后面的代码，最后给出警告"
+      - "只有第 80 行所在的函数被调用时才会报错"
+    answer: [1]
+    explain: |
+      CPython 会先把整个文件解析、编译成字节码，再交给虚拟机执行。语法错误在编译阶段就会被发现，所以一行都不会执行。A 是「逐行翻译执行」的常见误解；C 不存在这种容错；D 描述的是运行时错误（如 NameError）的行为，不适用于语法错误。
+  - id: d01-q2
+    kp: d01-k2
+    type: multi
+    question: 下面哪些说法是正确的？
+    options:
+      - "`b = a` 之后 `b.append(1)`，通过 `a` 也能看到这个 1（a 是 list）"
+      - "判断变量是否为 None 推荐写 `x is None`"
+      - "`a = 1000; b = 1000` 时 `a is b` 一定为 True"
+      - "对 list 执行 `x += [1]` 会原地修改，其他指向同一 list 的名字也能看到变化"
+      - "`x = x + [1]` 和 `x += [1]` 对 list 来说效果完全一样"
+    answer: [0, 1, 3]
+    explain: |
+      A 正确，赋值只是多一个名字指向同一对象。B 正确，None 是单例，用 is 不受 __eq__ 重载影响。C 错误，小整数缓存只覆盖 -5~256，且属于实现细节，1000 不保证是同一对象。D 正确，list 的 += 调用 __iadd__ 原地扩展。E 错误，`x + [1]` 会创建新列表再绑定给 x，原对象和其他名字不受影响。
+  - id: d01-q3
+    kp: d01-k3
+    type: judge
+    question: 环境变量 `APP_DEBUG=false` 时，`if os.getenv("APP_DEBUG"):` 条件为假，调试模式不会开启。
+    answer: false
+    explain: |
+      os.getenv 只返回 str 或 None，"false" 是非空字符串，真值判断结果为 True，所以调试模式会被打开。正确做法是显式比较，如 `os.getenv("APP_DEBUG", "").lower() in {"1", "true", "yes"}`，或用 pydantic-settings 按 bool 类型解析。
+  - id: d01-q4
+    kp: d01-k1
+    type: short
+    question: 用你自己的话解释「Python 是动态类型、强类型语言」，并分别用一个和 JavaScript 对比的例子说明。
+    key_points:
+      - {text: "说明动态类型指变量本身没有类型、对象才有类型，类型检查推迟到运行时", dim: concept}
+      - {text: "说明强类型指不同类型之间不做隐式转换，例如 \"1\" + 1 抛 TypeError", dim: concept}
+      - {text: "指出 JS 同为动态类型但属于弱类型，\"1\" + 1 得到 \"11\"", dim: principle}
+      - {text: "指出动态类型导致部分错误只在运行到该行时暴露，需要测试或静态检查补位", dim: engineering}
+    reference: |
+      动态类型是指变量（名字）本身没有类型，它可以先指向 int 再指向 str，类型属于对象，类型检查发生在运行时。强类型是指运算时不会在不同类型之间偷偷转换。比如 Python 中 "1" + 1 直接抛 TypeError，而 JavaScript 同样是动态类型，但会把 1 隐式转成字符串得到 "11"，所以 JS 是弱类型。工程影响是：Python 的类型错误虽然明确，但要运行到那一行才暴露，所以需要单元测试、mypy/pyright 和 Pydantic 校验来提前发现问题。
+  - id: d01-q5
+    kp: d01-k2
+    type: scenario
+    question: |
+      多租户 AI 客服后端里有如下代码，上线后发现：只要有一个租户把 temperature 设为 0，之后所有租户的回答都变得非常死板。请分析原因并给出修复方案。
+
+      ```python
+      DEFAULT_PARAMS = {"model": "chat-default", "temperature": 0.7}
+
+      def build_params(tenant_cfg: dict) -> dict:
+          params = DEFAULT_PARAMS
+          for k, v in tenant_cfg.items():
+              params[k] = v
+          return params
+      ```
+    key_points:
+      - {text: "指出 params = DEFAULT_PARAMS 没有复制，两个名字指向同一个 dict", dim: principle}
+      - {text: "指出对 params 的原地修改污染了模块级全局默认值，影响后续所有请求", dim: concept}
+      - {text: "给出每次创建新 dict 的修复，例如 {**DEFAULT_PARAMS, **tenant_cfg} 或 dict(DEFAULT_PARAMS)", dim: engineering}
+      - {text: "提出补充测试：连续两个不同租户调用，结果互不影响", dim: engineering}
+    reference: |
+      根因是 Python 的赋值只是名字绑定：`params = DEFAULT_PARAMS` 并没有复制字典，params 和 DEFAULT_PARAMS 指向同一个对象。随后 `params[k] = v` 是原地修改，等于直接改了模块级的全局默认配置。模块只会被导入一次，这个 dict 在整个进程生命周期内被所有请求共享，所以第一个设置 temperature=0 的租户之后，所有租户都拿到 0。修复：`params = {**DEFAULT_PARAMS, **tenant_cfg}` 每次创建新 dict（注意如果值里有嵌套的 list/dict，还需要深拷贝，见 Day 02）；更好的做法是用不可变的 Pydantic 模型或 `MappingProxyType` 保护默认值。最后补一个测试：先用租户 A（temperature=0）调用，再用租户 B 调用，断言 B 仍为 0.7。
+    followup:
+      question: 为什么这个 bug 在本地单人测试时很难发现？
+      key_points: ["本地通常只测一个租户或每次重启进程", "全局状态在进程内跨请求共享，需多次连续请求才暴露"]
+      reference: 本地调试经常每次改代码都重启进程，全局 dict 会被重新创建，而且一般只用一个租户测试，所以看不到跨请求污染。线上进程长时间运行、处理多个租户的连续请求，共享的全局状态才会暴露问题。
+  - id: d01-q6
+    kp: d01-k3
+    type: code
+    question: |
+      说出下面代码每一行 print 的输出，并解释第 3 行为什么不符合直觉、应该如何修改。
+
+      ```python
+      req = {"temperature": 0.0, "top_k": 0}
+      print(req.get("temperature") or 0.7)
+      print(req.get("top_k") or 5)
+      print([] == False, bool([]))
+      ```
+    key_points:
+      - {text: "第 2 行输出 0.7，因为 0.0 为假被 or 替换", dim: principle}
+      - {text: "第 3 行输出 5，用户显式传的 top_k=0 被错误替换成默认值", dim: principle}
+      - {text: "第 4 行输出 False False，空列表不等于 False 但真值为假", dim: concept}
+      - {text: "给出用 is None 判断缺省值的修改方式", dim: engineering}
+    reference: |
+      第 2 行输出 0.7：`0.0 or 0.7` 中 0.0 为假，所以返回右侧的 0.7。第 3 行输出 5：top_k=0 同样被当成假值替换，这是不符合直觉的地方——用户明确传了 0，代码却悄悄改成 5。第 4 行输出 `False False`：`[] == False` 比较的是值，list 和 bool 不相等所以为 False；但 `bool([])` 是空容器的真值判断，结果为 False。修改方式：区分「没传」和「传了假值」，写成 `v = req.get("top_k"); top_k = 5 if v is None else v`，或在 Pydantic 模型里声明 `top_k: int | None = None` 再用 `is None` 判断。
+
+code_reading:
+  id: d01-c1
+  kp: [d01-k3, d01-k1, d01-k2]
+  title: LLM 服务的配置加载模块
+  scenario: |
+    这是一个 AI 问答后端的 `config.py`，服务启动时调用 `load_llm_config()` 读取环境变量，得到的配置 dict 会被所有请求共享，用于调用大模型接口。运维反馈：明明设置了 `APP_DEBUG=false`，日志里还是打印了完整配置；产品反馈：把 `LLM_TEMPERATURE` 设成 0 后回答依旧很发散。
+  language: python
+  code: |
+    import logging
+    import os
+    import sys
+
+    logger = logging.getLogger(__name__)
+
+    DEFAULT_MODEL = "chat-default"
+    DEFAULT_TEMPERATURE = 0.7
+
+
+    def load_llm_config() -> dict:
+        model = os.getenv("LLM_MODEL", DEFAULT_MODEL)
+        max_tokens = int(os.getenv("LLM_MAX_TOKENS", "1024"))
+        temperature = float(os.getenv("LLM_TEMPERATURE", str(DEFAULT_TEMPERATURE)))
+        timeout = os.getenv("LLM_TIMEOUT")          # 可能是 None 或字符串
+        debug = os.getenv("APP_DEBUG", False)
+
+        if not temperature:
+            temperature = DEFAULT_TEMPERATURE
+
+        config = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "timeout": float(timeout) if timeout is not None else 30.0,
+            "api_key": os.environ["LLM_API_KEY"],
+        }
+        if debug:
+            logger.info("LLM config loaded: %s", config)
+        return config
+
+
+    def runtime_info() -> dict:
+        gil_check = getattr(sys, "_is_gil_enabled", None)
+        return {
+            "python": sys.version.split()[0],
+            "gil_enabled": gil_check() if gil_check else True,
+        }
+
+
+    if __name__ == "__main__":
+        logging.basicConfig(level=logging.INFO)
+        print(runtime_info())
+        print(load_llm_config())
+  walkthrough:
+    function: |
+      从环境变量读取大模型调用所需的配置（模型名、最大 token、温度、超时、API Key），转换成正确的类型后组装成一个 dict 返回；`runtime_info()` 返回当前 Python 版本以及 GIL 是否启用，方便在启动日志里确认运行环境。
+    key_functions: |
+      - `load_llm_config()`：逐项读取环境变量并做类型转换，`LLM_API_KEY` 用 `os.environ[...]` 读取，缺失时直接抛 `KeyError`，属于「启动即失败」的必填项。
+      - `runtime_info()`：用 `getattr(sys, "_is_gil_enabled", None)` 兼容旧版本（该函数 3.13 起才有），不存在时默认认为 GIL 启用。
+      - `if __name__ == "__main__"`：只有直接运行该文件时才执行自检，被 import 时不执行。
+    params: |
+      函数本身没有参数，输入全部来自进程环境变量 `os.environ`。所有环境变量读出来都是 **str 或 None**，因此 `max_tokens` 用 `int()`、`temperature` 用 `float()` 转换；`timeout` 先判断 `is not None` 再转换。返回的 dict 由调用方持有并在请求间共享。
+    data_flow: |
+      ```mermaid
+      flowchart TB
+        ENV["进程环境变量 全部是 str 或 None"] --> M["LLM_MODEL 缺省用默认模型名"]
+        ENV --> T["LLM_MAX_TOKENS 经 int 转换"]
+        ENV --> TP["LLM_TEMPERATURE 经 float 转换"]
+        ENV --> D["APP_DEBUG 未转换 仍是字符串"]
+        ENV --> K["LLM_API_KEY 缺失则 KeyError"]
+        TP --> CHK{"if not temperature"}
+        CHK -->|"0.0 被判为假"| DEF["被改回 0.7"]
+        M --> CFG["config 字典"]
+        T --> CFG
+        DEF --> CFG
+        K --> CFG
+        D --> LOG{"if debug"}
+        CFG --> LOG
+        LOG -->|"字符串 false 也为真"| OUT["日志打印完整配置 含 api_key"]
+      ```
+    failure_points: |
+      - **问题一（值得审查）：`debug = os.getenv("APP_DEBUG", False)`** 没有做布尔转换，`"false"`、`"0"` 都是非空字符串，判断为真，导致调试日志被打开，而且日志里**包含 api_key，属于敏感信息泄露**。
+      - **问题二（值得审查）：`if not temperature`** 把合法的 0.0 当成「未配置」，改回 0.7，所以产品设置 0 不生效。
+      - `int("1024.0")`、`float("abc")` 会在启动时抛 `ValueError`，错误信息里不会告诉你是哪个环境变量。
+      - `LLM_API_KEY` 缺失会抛 `KeyError`，这是有意的快速失败，但最好给出更清楚的错误提示。
+    debugging: |
+      - 在本地用 `$env:APP_DEBUG="false"; $env:LLM_TEMPERATURE="0"; python config.py`（PowerShell）复现。
+      - 在 `if debug:` 前打印 `repr(debug)` 和 `type(debug)`，会看到 `'false' <class 'str'>`。
+      - 对 temperature 打印 `repr(temperature)`，确认读取时是 0.0、判断后变成 0.7。
+      - 检查日志平台中是否已经出现 api_key，必要时轮换密钥。
+    change_request: |
+      如果需求改成「配置项增加到 20 个且都要类型校验」，不应继续手写 `int()/float()`，而应改用 pydantic-settings 定义一个 `Settings(BaseSettings)` 类，字段写成 `app_debug: bool = False`、`llm_temperature: float = 0.7`，由库负责把 `"false"` 解析为 False；api_key 用 `SecretStr` 类型，打印时自动脱敏。调用方只需把 `load_llm_config()` 替换成 `Settings()`。
+  questions:
+    - id: d01-c1-q1
+      kp: d01-k3
+      type: code
+      question: 假设环境变量为 `APP_DEBUG=false`、`LLM_TEMPERATURE=0`、`LLM_API_KEY=sk-xxx`，其余未设置。按执行顺序说明 `load_llm_config()` 中 debug、temperature、timeout 三个变量的值和类型变化，以及最终日志是否会打印。
+      key_points:
+        - {text: "debug 的值是字符串 false，类型为 str，未经转换", dim: principle}
+        - {text: "temperature 先被 float 转成 0.0，再被 if not temperature 改成 0.7", dim: principle}
+        - {text: "timeout 为 None，最终配置中取默认值 30.0", dim: concept}
+        - {text: "因为非空字符串为真，日志会打印包含 api_key 的完整配置，存在泄露风险", dim: engineering}
+      reference: |
+        执行顺序：model 取默认值 "chat-default"；max_tokens 由字符串 "1024" 转为 int 1024；temperature 由字符串 "0" 经 float 变成 0.0；timeout 是 None；debug 是字符串 "false"（str，因为环境变量存在，所以默认值 False 没被使用）。接着 `if not temperature` 判断 0.0 为假，temperature 被改成 0.7。组装 config 时 timeout 为 None，所以取 30.0，api_key 为 "sk-xxx"。最后 `if debug` 判断字符串 "false" 为真，日志打印完整 config，其中包含 api_key，造成敏感信息写入日志。
+    - id: d01-c1-q2
+      kp: d01-k1
+      type: code
+      question: 如果在 `runtime_info()` 函数体里把 `sys.version` 误写成 `sys.verison`，这个错误会在什么时候暴露？`python config.py` 和在 FastAPI 中 `from config import load_llm_config` 两种情况分别会怎样？
+      key_points:
+        - {text: "指出这不是语法错误，编译阶段不会报错", dim: principle}
+        - {text: "直接运行文件时会执行 __main__ 分支调用 runtime_info，抛 AttributeError", dim: concept}
+        - {text: "被 import 时 __main__ 分支不执行，只要没人调用 runtime_info 就不会暴露", dim: principle}
+        - {text: "提出用静态检查或单元测试覆盖该函数以提前发现", dim: engineering}
+      reference: |
+        `sys.verison` 是合法的属性访问语法，编译成字节码时不会检查 sys 有没有这个属性，所以不会报 SyntaxError。直接运行 `python config.py` 时，`__name__ == "__main__"` 成立，会调用 runtime_info()，执行到这一行时抛出 AttributeError: module 'sys' has no attribute 'verison'。在 FastAPI 中 import 这个模块时，顶层代码只会定义函数、创建 logger，`__main__` 分支不执行；只要应用里没有调用 runtime_info()，这个错误会一直潜伏。这正是动态语言「运行到才报错」的特点，可以用 pyright/mypy 静态检查或给该函数写单元测试提前发现。
+    - id: d01-c1-q3
+      kp: d01-k2
+      type: code
+      question: 服务启动时调用一次 `load_llm_config()` 并保存为模块级变量 `LLM_CONFIG`，某个接口里写了 `cfg = LLM_CONFIG; cfg["temperature"] = req.temperature`。请解释这会带来什么后果，并说明应该怎么写。
+      key_points:
+        - {text: "指出 cfg 和 LLM_CONFIG 指向同一个 dict，修改是原地进行的", dim: principle}
+        - {text: "指出全局配置被单个请求修改，影响后续所有请求，且并发时结果不可预测", dim: engineering}
+        - {text: "给出每次创建新 dict 的写法，如 {**LLM_CONFIG, \"temperature\": req.temperature}", dim: engineering}
+      reference: |
+        `cfg = LLM_CONFIG` 只是让 cfg 也指向同一个 dict 对象，并没有复制。随后 `cfg["temperature"] = ...` 是原地修改，等于直接改了全局配置。之后所有请求读到的都是上一个请求设置的 temperature；在多线程/并发场景下，不同请求交替修改，还会出现「A 请求用了 B 请求的温度」的不可预测行为。正确写法是每次构造新的 dict：`cfg = {**LLM_CONFIG, "temperature": req.temperature}`，或者把全局配置做成只读对象（Pydantic 的 frozen 模型），每次请求只在局部变量里组合参数。
+
+interview:
+  - id: d01-i1
+    kp: d01-k1
+    type: oral
+    difficulty: 1
+    question: Python 是解释型语言吗？一段 Python 代码是怎么被执行的？
+    key_points:
+      - {text: "说明 CPython 先把源码编译成字节码，再由虚拟机解释执行", dim: principle}
+      - {text: "说明 .pyc 是被导入模块的字节码缓存，只加速启动不加速执行", dim: concept}
+      - {text: "说明语法错误在编译阶段报出，类型和名字错误在运行时才暴露", dim: principle}
+      - {text: "结合项目说明如何用静态检查和测试弥补运行时才报错的问题", dim: engineering}
+    reference: |
+      严格来说 Python 是「先编译成字节码、再由虚拟机解释执行」。CPython 读取源码后进行词法和语法分析生成 AST，再编译成 code object 中的字节码；被导入的模块会把字节码缓存在 __pycache__ 下的 .pyc 文件，源码不变时跳过编译，所以只加快启动。真正执行由解释器循环逐条执行字节码，名字查找、类型判断都在这一步进行。因此语法错误在编译阶段就让整个文件不执行，而 NameError、TypeError 只有运行到那一行才出现。工程上我们用 ruff/pyright 做静态检查、用单元测试覆盖异常分支、用 Pydantic 在接口边界做运行时校验来弥补。
+    oral: |
+      我的理解是：Python 不是逐行翻译，而是先编译再解释。CPython 会先把源码解析成语法树、编译成字节码，导入的模块还会缓存成 __pycache__ 里的 .pyc；然后虚拟机逐条执行字节码。所以语法错误会让整个文件跑不起来，但类型错误、变量名写错要等运行到那一行才暴露。我之前做知识库项目时就遇到过异常分支里变量名拼错、两周后才触发的问题，后来我们在 CI 里加了 ruff 和 pyright，并给异常分支补了单元测试。
+  - id: d01-i2
+    kp: d01-k2
+    type: oral
+    difficulty: 2
+    question: Python 中 is 和 == 有什么区别？Python 的参数传递是值传递还是引用传递？
+    key_points:
+      - {text: "说明 is 比较对象身份（id），== 比较值，可被 __eq__ 重载", dim: concept}
+      - {text: "说明判断 None 用 is None，因为 None 是单例且不受 __eq__ 重载影响", dim: principle}
+      - {text: "说明变量是名字绑定，传参是传对象引用（call by sharing），可变对象在函数内修改会影响外部", dim: principle}
+      - {text: "指出小整数缓存和字符串驻留是实现细节，不能用 is 比较值", dim: engineering}
+      - {text: "举出共享可变对象导致请求间数据污染的项目例子", dim: project}
+    reference: |
+      is 判断两个名字是否指向同一个对象，本质是比较 id；== 判断值是否相等，会调用 __eq__，类可以自定义。None 是单例，所以判断 None 用 is None，避免像 NumPy 数组、SQLAlchemy 列这类重载了 == 的对象返回非布尔值。参数传递方面，Python 既不是纯粹的值传递也不是 C++ 意义的引用传递，而是「传对象引用」：函数形参是一个新名字，绑定到调用方传入的同一个对象。如果对象可变（list、dict），在函数里原地修改会影响调用方；如果在函数里重新赋值，只是让形参指向新对象，不影响外部。另外 CPython 缓存 -5~256 的小整数并驻留部分字符串，所以有时 is 比较数字碰巧为 True，这是实现细节，比较值必须用 ==。项目中我遇到过把模块级默认参数 dict 直接赋值给局部变量再修改，导致所有租户配置被污染的问题。
+    oral: |
+      is 比的是身份，也就是是不是同一个对象；== 比的是值，会走 __eq__。所以判断 None 我一律写 is None。参数传递我会说是「传对象引用」：形参是新名字，但指向同一个对象，所以在函数里 append 一个列表，外面能看到；但如果在函数里重新赋值，外面不受影响。还有一个坑是小整数缓存，256 以内 is 可能碰巧为真，这只是实现细节。我在多租户客服项目里就踩过共享默认参数 dict 被某个请求改掉、影响所有租户的问题，后来改成每次构造新 dict 并加了回归测试。
+  - id: d01-i3
+    kp: d01-k3
+    type: oral
+    difficulty: 2
+    question: 从环境变量和请求参数中读取配置时，你会注意哪些类型和真值判断上的问题？
+    key_points:
+      - {text: "指出环境变量只返回 str 或 None，\"false\" 和 \"0\" 都是真值", dim: concept}
+      - {text: "指出 x or default 会把 0、空字符串等合法值替换成默认值，应使用 is None 判断", dim: principle}
+      - {text: "提到浮点误差，金额计费用 Decimal 或整数单位", dim: principle}
+      - {text: "提出用 pydantic-settings 或 Pydantic 模型统一做类型解析和校验，敏感字段用 SecretStr", dim: engineering}
+    reference: |
+      第一，环境变量读出来只有 str 或 None，所以布尔配置不能直接 if，"false" 是非空字符串会被判为真，需要显式比较或交给 pydantic-settings 解析成 bool。第二，请求参数的缺省值处理要区分「没传」和「传了假值」，像 temperature=0、top_k=0、空字符串 query 都可能是合法值，用 `x or default` 会被悄悄替换，应该用 `is None` 判断。第三，数值上 float 存在二进制精度误差，涉及 token 计费、金额对账用 Decimal（从字符串构造）或以最小单位的整数存储。第四，工程上我倾向于在边界层统一校验：配置用 pydantic-settings 的 BaseSettings，请求体用 Pydantic 模型声明 `float | None`，API Key 用 SecretStr 防止被打印到日志。
+    oral: |
+      我主要注意三件事。第一，环境变量都是字符串，APP_DEBUG=false 直接 if 会是真，我之前就见过调试日志关不掉、还把 API Key 打到日志里的情况。第二，默认值不要用 or，temperature 传 0 会被替换成默认值，要用 is None 判断。第三，计费相关用 Decimal 而不是 float。现在我的做法是把这些都交给 pydantic-settings 和 Pydantic 模型在边界统一解析，密钥字段用 SecretStr，这样业务代码里拿到的就是类型正确的值。
+  - id: d01-i4
+    kp: d01-k4
+    type: oral
+    difficulty: 3
+    question: 现在 Python 还有 GIL 吗？如果让你为一个新的 AI 后端项目选择 Python 版本，你会怎么考虑？
+    key_points:
+      - {text: "准确说明 3.13 引入实验性 free-threaded 构建，3.14 起正式支持但仍为可选构建，默认构建仍有 GIL", dim: concept}
+      - {text: "说明 free-threaded 构建有单线程性能开销，未适配的 C 扩展可能重新启用 GIL", dim: principle}
+      - {text: "说明版本选择以关键依赖的 wheel 支持和维护周期为准，而不是盲目追新", dim: engineering}
+      - {text: "提到升级时需关注行为变化，例如 3.15 默认 UTF-8 编码，并用 CI 多版本矩阵验证", dim: engineering}
+      - {text: "说明 AI 后端多为 IO 密集型，GIL 对其影响通常小于对 CPU 密集任务的影响", dim: project}
+    reference: |
+      默认的 CPython 构建仍然有 GIL。3.13 首次提供实验性的 free-threaded（无 GIL）构建；3.14 通过 PEP 779 正式支持，不再是实验性，但它是可选的独立构建；3.15 又为它提供了 abi3t 稳定 ABI，方便 C 扩展适配。是否成为默认构建官方尚未决定。free-threaded 构建单线程有一定性能开销，并且导入未声明支持的 C 扩展时 GIL 可能被重新启用。选版本时我会看：一是维护周期，截至 2026-11 最新稳定版是 3.15，3.14 在 bugfix 期，3.10 已经 EOL；二是关键依赖（pydantic-core、数据库驱动、向量库客户端、tokenizer 等）是否有对应版本的 wheel；三是升级带来的行为变化，比如 3.15 起 open() 默认用 UTF-8。AI 后端大多是等待 LLM 和数据库的 IO 密集型任务，主要靠 asyncio 提升并发，GIL 影响有限；CPU 密集的解析和向量计算通常交给多进程或 C 扩展。我会选一个依赖已就绪的版本（如 3.13/3.14），在 CI 中加 3.15 矩阵，验证后再升级。
+    oral: |
+      先说结论：默认的 CPython 还是有 GIL 的。3.13 推出了实验性的无 GIL 构建，3.14 开始正式支持，但它是可选的单独构建，比如 python3.14t，默认版本没变。选版本我看三点：维护周期、关键依赖有没有对应 wheel、升级的行为变化。比如 3.15 默认编码改成 UTF-8，我们读历史 GBK 文件就要显式指定编码。另外 AI 后端主要是等模型和数据库响应，IO 密集，靠 asyncio 就够了，GIL 不是主要瓶颈。所以我一般会选依赖已经稳定支持的版本，在 CI 里多跑一个新版本矩阵，确认没问题再升级。
+
+sources:
+  - {title: "Python.org - Download / Active Python releases", url: "https://www.python.org/downloads/"}
+  - {title: "What's new in Python 3.15", url: "https://docs.python.org/3.15/whatsnew/3.15.html"}

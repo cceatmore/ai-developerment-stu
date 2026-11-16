@@ -1,0 +1,854 @@
+day: 45
+phase: 5
+title: 后端安全：认证、JWT、RBAC 与接口权限
+goals:
+  - "能区分认证与授权，比较 Session 与 JWT 两种方案的状态管理、吊销与扩展性差异"
+  - "能解释 JWT 的结构与签名校验过程，指出未校验算法、过期、签发方等常见漏洞，并设计刷新与吊销方案"
+  - "能读懂并审查 FastAPI 中 OAuth2 password flow + PyJWT + pwdlib 的实现"
+  - "能设计 RBAC 与资源级权限校验，识别并修复越权（IDOR/BOLA）问题"
+knowledge_points:
+  - id: d45-k1
+    name: 认证与授权；Session 与 Token 方案
+    level: P0
+    summary: 认证回答「你是谁」，授权回答「你能做什么」；Session 状态在服务端，JWT 状态在令牌里
+    why: |
+      几乎所有安全事故都可以归到两类：**冒充了别人（认证失效）**或**做了不该做的事（授权失效）**。AI 应用把企业文档、对话记录、工具调用能力都暴露在接口后面，任何一个接口的鉴权漏洞都可能导致整个知识库泄露。面试中「Session 和 JWT 的区别」是后端必考题。
+    problem: |
+      HTTP 是无状态的，服务器需要一种机制在后续请求中识别「这是刚才登录的那个用户」（认证），再判断这个用户能否执行当前操作（授权）。不同的会话方案在**吊销能力、横向扩展、跨域与移动端支持、安全风险**上各有取舍，必须根据场景选择。
+    principle: |
+      **一、两个概念**
+
+      | | 认证（Authentication） | 授权（Authorization） |
+      |---|---|---|
+      | 回答的问题 | 你是谁？ | 你能对这个资源做这个操作吗？ |
+      | 失败时的状态码 | **401 Unauthorized**（名字有误导，实际含义是「未认证」） | **403 Forbidden**（已知身份但无权限；有时为不暴露资源存在而返回 404） |
+      | 典型手段 | 密码、短信验证码、SSO、API Key | 角色、权限、资源归属、租户隔离 |
+
+      顺序永远是**先认证、再授权**。很多漏洞就出在「只做了认证，以为登录了就能访问一切」。
+
+      **二、Session 方案（有状态）**
+
+      ```mermaid
+      sequenceDiagram
+        participant B as 浏览器
+        participant A as 应用
+        participant S as Session存储Redis
+        B->>A: 用户名 密码
+        A->>S: 写入 session_id 对应 用户信息 TTL
+        A-->>B: Set-Cookie session_id HttpOnly Secure
+        B->>A: 后续请求自动带 Cookie
+        A->>S: 按 session_id 查询
+        S-->>A: 用户信息
+        A-->>B: 响应
+      ```
+
+      - 服务器生成随机 session_id，**用户状态存在服务端**（内存、Redis、数据库），客户端只持有一个无意义的 ID。
+      - **优点**：随时可吊销（删除服务端记录即可）；令牌本身不含信息，泄露的危害有限。
+      - **缺点**：每次请求要查存储；多实例需要共享存储（Day 41 的 Redis）；跨域、移动端、服务间调用使用 Cookie 不方便；需要防 CSRF。
+
+      **三、Token（JWT）方案（无状态）**
+
+      - 登录后服务器签发一个**自包含**的令牌，里面写着用户 ID、过期时间、角色等声明，并用密钥签名。客户端每次在 `Authorization: Bearer <token>` 头中携带。
+      - 服务器**只需验证签名和声明**，不用查存储，天然适合多实例、微服务、移动端和第三方调用。
+      - **代价**：令牌在过期前一直有效，服务器**无法主动让它失效**（除非额外引入黑名单等状态，见 d45-k2）；令牌里的角色在签发后就固定了，权限变更不能立即生效。
+
+      **四、怎么选**
+
+      - 传统的 Web 后台、单域名、对「立即踢人下线」要求高 → Session + HttpOnly Cookie。
+      - 前后端分离、移动端、多服务共享身份、开放 API → 短期 JWT access token + 服务端保存的 refresh token。
+      - 实际很多系统是**混合**的：JWT 负责无状态校验，Redis 保存少量状态（refresh token、黑名单、token_version），兼顾性能与可吊销。
+
+      **五、令牌放在前端哪里**
+
+      - `localStorage`：JS 可读，一旦有 XSS，令牌直接被窃取。
+      - `HttpOnly + Secure + SameSite` Cookie：JS 读不到，能抵御 XSS 窃取，但要考虑 CSRF（SameSite 能缓解大部分）。
+      - 没有完美方案，关键是缩短令牌寿命 + 防 XSS + 必要时防 CSRF。
+    scenarios: |
+      - 企业知识库后台：员工用 SSO 登录，网关签发短期 JWT，各微服务独立校验签名。
+      - 管理员禁用离职员工：需要立即生效，配合 token_version 或黑名单。
+      - 开放给第三方系统调用的问答 API：使用 API Key 或 OAuth2 客户端凭证，按调用方授权。
+    pitfalls: |
+      - **混淆 401 和 403**：未登录或令牌无效返回 401，已登录但无权限返回 403。
+      - **误区：JWT 比 Session 更安全。** 两者安全性取决于实现；JWT 的主要优势是无状态扩展，代价是难以吊销。
+      - **误区：用了 JWT 就不需要任何服务端状态。** 刷新、吊销、强制下线都需要状态。
+      - **只做认证不做授权**，登录用户可以访问任何资源。
+      - **把令牌存在 localStorage 且页面存在 XSS**，令牌被批量窃取。
+    interview_asks:
+      - "认证和授权有什么区别？401 和 403 分别什么时候返回？"
+      - "Session 和 JWT 有什么区别？你们项目为什么选这种？"
+      - "前端的令牌应该存在哪里？"
+    project_example: |
+      我们的知识库系统采用混合方案：登录后签发 15 分钟有效的 JWT access token，和存在 HttpOnly Cookie 中的 refresh token（服务端在 Redis 中保存其哈希，7 天有效）。各服务通过中间件验证 access token 签名，不查数据库；用户被管理员禁用或修改密码时，递增数据库中的 token_version 并删除其 refresh token，access token 最长 15 分钟后自然失效，对高风险操作（导出、删除知识库）则实时查询 token_version 立即拦截。
+  - id: d45-k2
+    name: JWT 的结构、签名校验、过期刷新与吊销
+    level: P0
+    summary: JWT 是签名而非加密；校验必须固定算法并验证 exp、iss、aud；短期令牌加刷新令牌弥补无法吊销
+    why: |
+      JWT 是 AI 应用最常用的身份令牌，但「会用 jwt.encode/decode」和「安全地使用」差距很大：不固定算法、不校验过期、把敏感信息放进 payload、令牌永不过期，这些都是真实存在、反复出现的漏洞。代码审查和安全面试中，这是最容易被追问的地方。
+    problem: |
+      需要让服务器在不查存储的情况下确认：这个令牌是我（或受信任的签发方）签发的、没有被篡改、还在有效期内、是发给我这个服务的。同时还要解决：令牌泄露后怎么止损、用户权限变化后怎么生效、长时间使用如何不频繁重新登录。
+    principle: |
+      **一、结构：三段 Base64URL，用点连接**
+
+      `xxxxx.yyyyy.zzzzz` = Header . Payload . Signature
+
+      - **Header**：`{"alg": "HS256", "typ": "JWT"}`，声明签名算法。
+      - **Payload**：声明（claims）。标准声明有 `iss`（签发方）、`sub`（主体，通常是用户 ID）、`aud`（受众）、`exp`（过期时间）、`nbf`（生效时间）、`iat`（签发时间）、`jti`（令牌唯一 ID），也可以加自定义声明如 `tenant_id`、`roles`。
+      - **Signature**：对 `Header.Payload` 用密钥计算的签名。
+
+      **关键认识：Base64URL 只是编码，不是加密。** 任何人拿到令牌都能解码看到 payload（贴到任意 JWT 解码网站即可）。所以**不能在 payload 里放密码、手机号、身份证号等敏感信息**。签名只保证「没被篡改」，不保证「看不到」。
+
+      **二、签名算法**
+
+      - **HS256（HMAC + SHA-256）**：对称，签发和校验用同一个密钥。适合同一个服务签发并校验。密钥必须足够长且随机，泄露即可伪造任意令牌。
+      - **RS256 / ES256**：非对称，签发方持有私钥，其他服务只持有公钥校验。适合多服务或第三方校验（公钥常通过 JWKS 地址发布）。下游服务被攻破也无法伪造令牌。
+
+      **三、校验流程与常见漏洞**
+
+      ```mermaid
+      flowchart TD
+        T["收到 Bearer 令牌"] --> A{"算法在服务端白名单内"}
+        A -->|"否"| R["401"]
+        A -->|"是"| S{"签名校验通过"}
+        S -->|"否"| R
+        S -->|"是"| E{"exp nbf 有效"}
+        E -->|"否"| R
+        E -->|"是"| I{"iss aud 匹配"}
+        I -->|"否"| R
+        I -->|"是"| C{"必需声明存在 用户存在且未禁用"}
+        C -->|"否"| R
+        C -->|"是"| OK["得到当前用户 进入授权检查"]
+      ```
+
+      - **算法必须由服务端固定**：`jwt.decode(token, key, algorithms=["HS256"])`。如果从令牌头读取 alg 再传给 decode，就把选择权交给了攻击者——这是历史上真实出现过的「none 算法」和「算法混淆」（把 RS256 公钥当作 HS256 密钥）漏洞类型。PyJWT 2.x 校验签名时要求显式传入 `algorithms`。
+      - **必须校验过期**：PyJWT 默认会校验 `exp`（如果存在），但**令牌里没有 exp 时不会报错**。应通过 `options={"require": ["exp", "sub"]}` 要求必需声明；任何 `verify_exp: False` 都是严重问题。
+      - **校验 iss 和 aud**：多个系统共用密钥时，防止 A 系统的令牌被拿到 B 系统使用。
+      - **所有失败统一返回 401**：不要告诉客户端是签名错还是过期了，减少信息泄露。
+
+      **四、过期与刷新：双令牌**
+
+      ```mermaid
+      sequenceDiagram
+        participant C as 客户端
+        participant A as 认证服务
+        participant R as Redis
+        C->>A: 登录
+        A->>R: 保存 refresh 令牌哈希 7 天
+        A-->>C: access 15 分钟 与 refresh
+        C->>A: access 过期后用 refresh 换新
+        A->>R: 校验并作废旧 refresh 写入新 refresh
+        A-->>C: 新 access 与新 refresh
+        Note over A,R: 旧 refresh 被再次使用 视为被盗 作废该用户全部会话
+      ```
+
+      - **access token** 短期（如 15 分钟），每次请求携带，无状态校验。
+      - **refresh token** 长期（如 7 天），只用于换取新 access token，**服务端保存其哈希**，因此可以吊销。
+      - **轮换（rotation）**：每次刷新都签发新的 refresh token 并作废旧的；如果已作废的 refresh token 被再次使用，说明可能被盗，作废该用户所有会话。
+
+      **五、JWT 无法主动吊销的应对**
+
+      令牌签出后，在 exp 之前签名一直有效。可选方案（引入少量状态）：
+      - **缩短 access token 寿命**：泄露的损失窗口最多 15 分钟。
+      - **黑名单**：吊销时把 `jti` 写入 Redis，TTL 设为令牌剩余有效期；校验时多查一次 Redis。
+      - **token_version**：用户表存一个版本号，签发时写进令牌；改密码、禁用、权限变更时版本号加一，校验时比对（需要查库或缓存）。
+      - 对高风险操作（删除知识库、导出数据）实时查询用户状态，普通操作接受短暂延迟。
+    scenarios: |
+      - 员工离职：管理员禁用账号，token_version 加一并删除 refresh token，高风险接口立即拦截，其他接口最多 15 分钟后失效。
+      - 多个微服务校验身份：认证服务用 RS256 私钥签发，其他服务通过 JWKS 获取公钥校验。
+      - 移动端长期免登录：refresh token 轮换，检测到旧 refresh 被重用就强制重新登录。
+    code: |
+      ```python
+      from datetime import datetime, timedelta, timezone
+      import uuid
+
+      import jwt
+
+      SECRET_KEY = "从环境变量或密钥管理服务读取"
+      ALGORITHM = "HS256"
+      ISSUER = "kb-auth"
+      AUDIENCE = "kb-api"
+
+      def create_access_token(user_id: str, tenant_id: str, token_version: int) -> str:
+          now = datetime.now(timezone.utc)
+          payload = {
+              "sub": user_id, "tenant_id": tenant_id, "ver": token_version,
+              "iss": ISSUER, "aud": AUDIENCE, "iat": now,
+              "exp": now + timedelta(minutes=15), "jti": uuid.uuid4().hex,
+          }
+          return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+      def decode_access_token(token: str) -> dict:
+          # 失败时抛出 jwt.InvalidTokenError 的子类，调用方统一转成 401
+          return jwt.decode(
+              token, SECRET_KEY,
+              algorithms=[ALGORITHM],           # 服务端固定，不从令牌头读取
+              issuer=ISSUER, audience=AUDIENCE,
+              options={"require": ["exp", "sub", "iat"]},
+          )
+      ```
+    pitfalls: |
+      - **误区：JWT 是加密的，可以放敏感信息。** payload 只是 Base64URL 编码，任何人可解码。
+      - **从令牌头读取 alg 传给 decode**，或者在 algorithms 中允许 none。
+      - **关闭过期校验或签发不带 exp 的令牌**，令牌一旦泄露永久有效。
+      - **HS256 密钥过短或硬编码在代码中**，可被暴力破解或随代码泄露。
+      - **把角色写进令牌后以为权限变更立即生效**，实际上要等令牌过期。
+      - **refresh token 不轮换、不保存服务端状态**，被盗后长期可用且无法察觉。
+    interview_asks:
+      - "JWT 由哪几部分组成？签名的作用是什么？JWT 是加密的吗？"
+      - "JWT 签发后无法吊销，你们怎么解决用户被禁用或令牌泄露的问题？"
+      - "校验 JWT 时需要检查哪些东西？"
+      - "access token 和 refresh token 为什么要分开？"
+    project_example: |
+      安全审计时我们发现旧版代码的 access token 有效期是 30 天，且 decode 时传入了 `options={"verify_exp": False}`，原因是早期为了「解决用户总被登出」临时改的。整改为：access token 15 分钟，refresh token 7 天并轮换、服务端存哈希；decode 固定 HS256 并要求 exp、sub、iat，同时校验 iss 和 aud；新增 token_version 字段，管理员禁用账号时加一。上线前把所有旧令牌对应的密钥轮换，强制全员重新登录一次。
+    freshness: |
+      核对于 2026-11：FastAPI 官方安全教程（OAuth2 with Password and hashing, Bearer with JWT tokens）使用 PyJWT：`import jwt`、`from jwt.exceptions import InvalidTokenError`，签发 `jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)`，校验 `jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])`。旧教程常用 python-jose，属于旧写法。`issuer`、`audience`、`options={"require": [...]}` 为 PyJWT 的 decode 参数；具体版本特性以 PyJWT 官方文档为准。
+    sources:
+      - {title: "FastAPI - OAuth2 with Password (and hashing), Bearer with JWT tokens", url: "https://fastapi.tiangolo.com/tutorial/security/oauth2-jwt/"}
+  - id: d45-k3
+    name: FastAPI 中的 OAuth2 password flow 与密码哈希
+    level: P0
+    summary: 用 OAuth2PasswordRequestForm 登录换令牌、OAuth2PasswordBearer 提取令牌、依赖注入当前用户；密码用 Argon2 慢哈希
+    why: |
+      FastAPI 是 Python AI 后端的主流框架（Day 09），它的安全模块把 OAuth2 规范、OpenAPI 文档和依赖注入结合在一起。你需要读懂 AI 生成的登录代码，知道每个依赖做了什么、哪里容易写错。同时，**密码存储方式**是安全审查的第一项，用错哈希算法会让一次拖库变成全部账号失守。
+    problem: |
+      需要实现：用户用用户名和密码登录拿到令牌；受保护接口能统一地取出并校验令牌、拿到当前用户；Swagger 文档里能直接点 Authorize 调试；数据库里的密码即使被盗也很难被还原。
+    principle: |
+      **一、password flow 的三个组件**
+
+      ```mermaid
+      sequenceDiagram
+        participant C as 客户端
+        participant T as token 接口
+        participant D as 依赖 get_current_user
+        participant E as 业务接口
+        C->>T: 表单 username password
+        T->>T: 查用户 Argon2 校验密码
+        T-->>C: access_token 与 token_type bearer
+        C->>E: Authorization Bearer 令牌
+        E->>D: Depends 触发
+        D->>D: OAuth2PasswordBearer 取出令牌
+        D->>D: jwt.decode 校验 查用户
+        D-->>E: 当前用户对象
+        E-->>C: 业务响应
+      ```
+
+      - **`OAuth2PasswordRequestForm`**：登录接口的依赖，按 OAuth2 规范以**表单**（不是 JSON）接收 `username` 和 `password`，因此需要安装 `python-multipart`。
+      - **`OAuth2PasswordBearer(tokenUrl="token")`**：一个依赖，从请求头 `Authorization: Bearer xxx` 中取出令牌字符串；没有这个头时直接返回 401。`tokenUrl` 让 Swagger UI 知道去哪里登录。它**只负责取令牌，不负责校验**。
+      - **`get_current_user`**：你自己写的依赖，依赖上一步得到的 token，执行 `jwt.decode` 并查询用户，任何失败抛 `HTTPException(401, headers={"WWW-Authenticate": "Bearer"})`。业务接口只要声明 `user: Annotated[User, Depends(get_current_user)]` 就完成了认证。
+      - 还可以叠加 `get_current_active_user` 检查是否被禁用，或用 `Security` + `SecurityScopes` 实现基于 scope 的权限。
+
+      依赖注入的价值：认证逻辑写一次，所有接口复用；漏写依赖的接口一眼就能在代码审查中看出来。
+
+      **二、密码哈希：为什么必须是「慢哈希 + 盐」**
+
+      - **不能明文存储，也不能可逆加密**：数据库泄露 = 全部密码泄露，而且用户常在多个网站复用密码。
+      - **不能用 MD5/SHA-256 直接哈希**：它们设计得很快，攻击者用 GPU 每秒可以尝试数十亿次，常见密码瞬间被撞出来；没有盐时还能用彩虹表直接查。
+      - **应使用专门的密码哈希算法**：Argon2（推荐 Argon2id）、bcrypt、scrypt。它们**故意慢**且（Argon2/scrypt）**消耗内存**，让暴力破解代价巨大；并为每个密码生成**随机盐**，相同密码得到不同哈希。
+      - 哈希结果中包含算法和参数，例如 `$argon2id$v=19$m=65536,t=3,p=4$<盐>$<哈希>`，以后提高参数时旧哈希仍能验证，并可在用户登录时重新哈希升级。
+
+      **三、FastAPI 官方当前推荐**
+
+      官方教程使用 **PyJWT** 处理令牌，使用 **pwdlib** 处理密码哈希（`uv add "pwdlib[argon2]"`）：`password_hash = PasswordHash.recommended()`，`password_hash.hash(pw)` 生成哈希，`password_hash.verify(pw, hashed)` 校验。
+
+      **四、防用户名枚举的时序攻击**
+
+      如果「用户不存在」时立刻返回，而「用户存在但密码错」时要花几十毫秒做 Argon2 校验，攻击者通过响应时间就能判断哪些用户名存在。官方示例的做法是：用户不存在时**也对一个预先生成的假哈希 `DUMMY_HASH` 做一次校验**，让两种情况耗时接近；并且两种情况返回同样的错误信息「用户名或密码错误」。
+    scenarios: |
+      - 内部知识库管理后台：password flow 登录，Swagger 文档中直接用 Authorize 按钮调试受保护接口。
+      - 从旧系统迁移用户：旧系统使用 SHA-256 无盐哈希，用户下次登录成功时用 Argon2 重新哈希并替换。
+      - 登录接口防爆破：按 IP 和账号双维度限流（Day 41 的 Redis 计数），配合 DUMMY_HASH 防枚举。
+    code: |
+      ```python
+      from typing import Annotated
+
+      import jwt
+      from fastapi import Depends, FastAPI, HTTPException, status
+      from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+      from jwt.exceptions import InvalidTokenError
+      from pwdlib import PasswordHash
+
+      from app.security import SECRET_KEY, ALGORITHM, create_access_token
+      from app.users import User, get_user_by_name, get_user_by_id
+
+      password_hash = PasswordHash.recommended()
+      DUMMY_HASH = password_hash.hash("dummypassword")
+      oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+      app = FastAPI()
+
+      CREDENTIALS_ERROR = HTTPException(
+          status_code=status.HTTP_401_UNAUTHORIZED,
+          detail="Could not validate credentials",
+          headers={"WWW-Authenticate": "Bearer"},
+      )
+
+      @app.post("/token")
+      def login(form: Annotated[OAuth2PasswordRequestForm, Depends()]) -> dict:
+          user = get_user_by_name(form.username)
+          if user is None:
+              password_hash.verify(form.password, DUMMY_HASH)  # 拉平耗时
+              raise HTTPException(status_code=401, detail="Incorrect username or password")
+          if not password_hash.verify(form.password, user.hashed_password):
+              raise HTTPException(status_code=401, detail="Incorrect username or password")
+          token = create_access_token(user.id, user.tenant_id, user.token_version)
+          return {"access_token": token, "token_type": "bearer"}
+
+      def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]) -> User:
+          try:
+              payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM],
+                                   options={"require": ["exp", "sub"]})
+          except InvalidTokenError:
+              raise CREDENTIALS_ERROR
+          user = get_user_by_id(payload["sub"])
+          if user is None or user.disabled or user.token_version != payload.get("ver"):
+              raise CREDENTIALS_ERROR
+          return user
+      ```
+    pitfalls: |
+      - **误区：OAuth2PasswordBearer 会校验令牌。** 它只从请求头取出字符串，校验要在 get_current_user 里做。
+      - **登录接口用 JSON 接收用户名密码却声明了 OAuth2PasswordRequestForm**，或忘记安装 python-multipart。
+      - **用 SHA-256、MD5 存密码，或使用固定盐**。
+      - **「用户不存在」和「密码错误」返回不同提示或耗时差异明显**，导致用户名被枚举。
+      - **登录接口不限流**，被撞库攻击。
+      - **沿用旧教程的 python-jose 与 passlib**：FastAPI 官方教程已改用 PyJWT 与 pwdlib。
+    interview_asks:
+      - "FastAPI 里是怎么实现登录鉴权的？OAuth2PasswordBearer 做了什么？"
+      - "密码应该怎么存储？为什么不能用 SHA-256？"
+      - "登录接口有哪些安全注意事项？"
+    project_example: |
+      我们把认证逻辑集中在 app/security 模块：登录接口使用 OAuth2PasswordRequestForm，密码用 pwdlib 的 Argon2 校验；用户不存在时也对 DUMMY_HASH 做一次校验，错误提示统一。登录接口按 IP 每分钟 10 次、按账号每小时 20 次限流，超过后要求图形验证码。get_current_user 作为依赖挂在所有业务路由上，CI 中有一个测试遍历 app.routes，确保除白名单外的接口都依赖了 get_current_user，防止新接口漏写鉴权。
+    freshness: |
+      核对于 2026-11：FastAPI 官方安全教程使用 PyJWT 与 pwdlib（安装 `pwdlib[argon2]`，推荐算法 Argon2），示例中 `PasswordHash.recommended()`、`DUMMY_HASH = password_hash.hash("dummypassword")`，并在用户不存在时校验 DUMMY_HASH 以防时序攻击枚举用户名；文档说明 pwdlib 也支持 bcrypt，但不包含旧算法，处理旧哈希时建议使用 passlib。旧写法：python-jose + passlib 的 `CryptContext`。
+    sources:
+      - {title: "FastAPI - OAuth2 with Password (and hashing), Bearer with JWT tokens", url: "https://fastapi.tiangolo.com/tutorial/security/oauth2-jwt/"}
+  - id: d45-k4
+    name: RBAC 与资源级权限：防止越权（IDOR/BOLA）
+    level: P0
+    summary: RBAC 管「这类操作谁能做」，资源级校验管「这条数据是不是你的」；两者缺一不可
+    why: |
+      越权是 API 安全中**最常见、最容易被利用**的漏洞：OWASP API Security Top 10（2023）把「对象级授权失效（BOLA，即常说的 IDOR）」列为第一位，「功能级授权失效（BFLA）」列为第五位。AI 应用里的知识库、会话、文档、入库任务、Agent 执行记录全部通过 ID 访问，每个接口都可能存在越权。
+    problem: |
+      认证只确认了「你是谁」。授权需要回答两层问题：**功能级**——你的角色是否允许调用这个接口（普通员工能不能删除知识库）；**对象级**——即使允许，这条具体的数据是否属于你或你的租户（能不能删除别的部门的知识库）。只做第一层，就会出现「换个 ID 就能看到别人数据」。
+    principle: |
+      **一、RBAC：用户 → 角色 → 权限**
+
+      ```mermaid
+      erDiagram
+        USER ||--o{ USER_ROLE : has
+        ROLE ||--o{ USER_ROLE : grants
+        ROLE ||--o{ ROLE_PERMISSION : contains
+        PERMISSION ||--o{ ROLE_PERMISSION : in
+        TENANT ||--o{ USER : owns
+        TENANT ||--o{ KNOWLEDGE_BASE : owns
+        USER {
+          string id
+          string tenant_id
+          int token_version
+        }
+        PERMISSION {
+          string code
+        }
+        KNOWLEDGE_BASE {
+          string id
+          string tenant_id
+          string owner_id
+        }
+      ```
+
+      - 权限是细粒度的动作，如 `kb:read`、`kb:write`、`kb:delete`、`user:manage`。
+      - 角色是权限的集合，如 viewer、editor、admin。用户可以有多个角色。
+      - **代码里检查权限而不是角色**：写 `require_permission("kb:delete")`，而不是 `if "admin" in roles`。这样调整角色包含的权限时不需要改代码。
+      - **默认拒绝**：没有显式授予的权限一律拒绝；新接口忘记配置权限时应该是「不可访问」而不是「所有人可访问」。
+
+      **二、资源级（对象级）授权**
+
+      RBAC 告诉你「editor 可以删除知识库」，但没告诉你「可以删除哪一个」。每个接收资源 ID 的接口都要校验：
+
+      - **租户隔离**：资源的 `tenant_id` 必须等于当前用户的 `tenant_id`。
+      - **归属或共享关系**：资源的 `owner_id` 是当前用户，或资源被共享给了用户所在的组。
+      - 最可靠的写法是**把条件放进查询本身**：`WHERE id = :id AND tenant_id = :tenant_id`，而不是先查出来再在代码里判断（容易漏写）。
+      - **不存在和无权访问都返回 404**，避免攻击者通过状态码差异探测资源是否存在。
+      - ID 使用 UUID 可以增加枚举难度，**但这不是授权**：ID 可能通过日志、链接、截图泄露。
+
+      ```mermaid
+      flowchart TD
+        R["请求 DELETE kb kb_id"] --> AU{"认证 令牌有效"}
+        AU -->|"否"| E401["401"]
+        AU -->|"是"| FN{"功能级 拥有 kb:delete 权限"}
+        FN -->|"否"| E403["403"]
+        FN -->|"是"| OB{"对象级 kb 属于同一租户且有管理关系"}
+        OB -->|"否"| E404["404"]
+        OB -->|"是"| DO["执行删除 并写审计日志"]
+      ```
+
+      **三、AI 场景里容易漏掉的越权点**
+
+      - **RAG 检索**：向量检索必须带权限过滤（Day 30），否则模型回答里会出现用户无权查看的文档内容——这是「通过 LLM 间接越权」。
+      - **缓存**：缓存 key 不含权限维度导致串号（Day 41）。
+      - **异步任务和 WebSocket**：状态查询接口、WebSocket 消息里的 session_id 同样要校验归属（Day 42、43）。
+      - **Agent 工具调用**：工具以「服务账号」的高权限执行时，要把当前用户的身份传下去并在工具内校验，避免用户借 Agent 之手越权（Day 40）。
+      - **批量接口与导出接口**：一次传入一组 ID，要逐个校验，或用查询条件整体过滤。
+
+      **四、工程化落地**
+
+      - 把授权写成**可复用的依赖**：`Depends(require_permission("kb:delete"))` 做功能级；`get_kb_for_user(kb_id, user)` 做对象级，查询条件里带租户和归属。
+      - **自动化越权测试**：为每个资源接口准备两个用户 A、B，用 B 的令牌访问 A 的资源，断言 404；把它放进 CI。
+      - 敏感操作写审计日志：谁、什么时间、对哪个资源、做了什么。
+    scenarios: |
+      - 多租户知识库：所有查询强制带 tenant_id，仓储层统一封装，业务代码无法绕过。
+      - 部门共享：知识库与部门组关联，用户通过所在组获得 kb:read，跨部门访问返回 404。
+      - 管理后台：用户管理接口只允许拥有 user:manage 权限的角色调用，并在 CI 中用普通账号扫描所有管理接口断言 403。
+    pitfalls: |
+      - **误区：登录了就是授权了。** 认证通过只说明身份可信，不说明可以访问这条数据。
+      - **误区：ID 用 UUID 就不会越权。** UUID 只是难猜，不是权限控制。
+      - **只在前端隐藏按钮**，后端接口没有权限校验，直接调接口即可绕过。
+      - **在代码里硬编码角色名判断**，角色调整时到处改代码且容易遗漏。
+      - **先查出资源再在代码中判断归属**，某个分支忘写判断就越权；更好是写进查询条件。
+      - **只校验读接口，忘了更新、删除、导出接口**。
+    interview_asks:
+      - "什么是 IDOR（越权访问）？你在项目中怎么防止？"
+      - "RBAC 是什么？代码里应该检查角色还是检查权限？"
+      - "多租户系统中，你怎么保证 A 租户看不到 B 租户的数据？"
+      - "RAG 系统里有哪些可能导致越权的地方？"
+    project_example: |
+      渗透测试报告指出我们的 `GET /conversations/{id}` 存在越权：任何登录用户把 ID 换成别人的就能看到完整对话。排查发现接口只依赖了 get_current_user，查询时只按 ID 过滤。整改时我们在仓储层封装了 `scoped_query(model, user)`，自动附加 tenant_id 与 owner 条件，并规定业务代码不得直接 `db.get`；同时补齐了 RBAC 权限码，功能级校验用依赖实现。CI 中新增越权测试：遍历所有带 `{id}` 路径参数的接口，用另一个用户的令牌访问，必须返回 404。
+    freshness: |
+      核对于 2026-11：OWASP API Security Top 10 当前版本为 2023 版，API1:2023 为 Broken Object Level Authorization（BOLA），API5:2023 为 Broken Function Level Authorization（BFLA）；OWASP 指出每个接收对象 ID 的接口都应执行对象级授权检查。
+    sources:
+      - {title: "OWASP API Security Project", url: "https://owasp.org/projects/api-security-project"}
+      - {title: "API1:2023 Broken Object Level Authorization", url: "https://github.com/OWASP/API-Security/blob/9c9a808215fcbebda9f657c12f3e572371697eb2/editions/2023/en/0xa1-broken-object-level-authorization.md"}
+      - {title: "API5:2023 Broken Function Level Authorization", url: "https://github.com/OWASP/API-Security/blob/master/editions/2023/en/0xa5-broken-function-level-authorization.md"}
+  - id: d45-k5
+    name: 接口安全加固清单
+    level: P2
+    summary: HTTPS、登录限流、严格 CORS、统一错误信息、敏感日志脱敏，是鉴权之外的基础防线
+    why: |
+      再严谨的 JWT 和 RBAC，如果令牌通过 HTTP 明文传输、登录接口能被无限次尝试、CORS 允许任意来源携带凭证、日志里打印了令牌，依然会被攻破。面试官常用「除了鉴权，你还做了哪些安全措施」来考察工程素养。
+    problem: |
+      认证授权解决「谁能做什么」，但还需要防住传输窃听、暴力破解、跨站滥用、信息泄露等外围攻击面。这些措施实现成本低，却经常被遗漏。
+    principle: |
+      **基础清单**
+
+      - **全站 HTTPS**：令牌、Cookie、密码都在请求中传输，HTTP 明文会被中间人截获；Cookie 设置 `Secure`。
+      - **登录与敏感接口限流**：按 IP 和账号双维度限流（Redis 计数，Day 41），多次失败后要求验证码或临时锁定，防撞库和爆破。
+      - **CORS 白名单**：只允许自己的前端域名；`allow_origins=["*"]` 与 `allow_credentials=True` 不能一起用（浏览器规范也不允许通配来源携带凭证），应明确列出来源。
+      - **统一错误信息**：认证失败统一 401 和固定文案；生产环境不返回堆栈和 SQL 错误。
+      - **日志脱敏**：不记录 Authorization 头、密码、完整令牌、API Key；必要时只记录令牌的 jti 或前几位。
+      - **最小权限的服务账号**：数据库账号、模型 API Key 按服务拆分、只授予必要权限（Day 44 的非 root 同理）。
+      - **依赖与密钥轮换**：定期更新依赖修复漏洞；密钥有轮换机制，泄露时能快速更换。
+    scenarios: |
+      - 上线检查表：HTTPS、限流、CORS、错误信息、日志脱敏逐项确认。
+      - 发现日志中打印了完整的 Bearer 令牌：增加日志过滤器，清理历史日志，轮换签名密钥。
+      - 外部合作方调用问答 API：独立 API Key、独立限流配额、独立审计。
+    pitfalls: |
+      - **CORS 配置为允许所有来源并允许携带凭证**，或者认为 CORS 是服务端的访问控制（它只约束浏览器）。
+      - **认为内网就不需要 HTTPS**，内网横向移动时令牌被嗅探。
+      - **访问日志记录了完整 URL**，而 URL 中带着令牌或票据。
+      - **生产环境开启 debug**，异常时返回堆栈、配置和环境变量。
+    interview_asks:
+      - "除了认证和授权，你的接口还做了哪些安全防护？"
+      - "CORS 是什么？它能防止接口被非法调用吗？"
+    project_example: |
+      上线前安全检查中我们发现三个问题：CORS 配置为允许任意来源且允许凭证；访问日志会记录 Authorization 头；登录接口没有限流。整改为 CORS 只允许两个前端域名；在日志中间件中删除 Authorization 与 Cookie 头，只记录用户 ID 和令牌 jti；登录接口按 IP 和账号双维度限流，连续 5 次失败后要求验证码。同时把签名密钥做了一次轮换，因为历史日志里已经存在完整令牌。
+quiz:
+  - id: d45-q1
+    kp: d45-k1
+    type: single
+    question: 用户携带了一个签名有效、未过期的 JWT，请求删除一个不属于他所在部门的知识库。最合适的处理是？
+    options:
+      - "返回 401，因为用户没有权限"
+      - "返回 403 或 404，因为身份已确认但无权操作该资源；为不暴露资源存在可返回 404"
+      - "直接执行删除，因为令牌有效说明用户已认证"
+      - "返回 500，因为业务逻辑出错"
+    answer: [1]
+    explain: |
+      令牌有效说明认证通过，问题出在授权：用户无权操作这个资源。401 表示未认证或令牌无效，不适用于此。对象级越权时常返回 404，避免攻击者通过 403 与 404 的差异探测资源是否存在；返回 403 也符合语义。认证通过就执行删除正是越权漏洞，500 则掩盖了问题本质。
+  - id: d45-q2
+    kp: d45-k2
+    type: judge
+    question: JWT 的 payload 经过了签名，因此是加密的，可以放心在其中存放用户手机号和身份证号等敏感信息。
+    answer: false
+    explain: |
+      JWT（JWS）的 Header 和 Payload 只是 Base64URL 编码，任何拿到令牌的人都能直接解码查看内容。签名的作用是防篡改，保证内容没有被修改、来源可信，并不提供保密性。敏感信息不应放入 payload，只放用户 ID、租户、版本号等必要的非敏感声明。
+  - id: d45-q3
+    kp: d45-k2
+    type: multi
+    question: 以下关于 JWT 校验的做法，哪些是正确的？（多选）
+    options:
+      - "在服务端固定 algorithms 白名单，例如 algorithms=[\"HS256\"]"
+      - "要求令牌必须包含 exp 与 sub，并校验 iss 和 aud"
+      - "从令牌头读取 alg 字段，再传给 jwt.decode 作为算法"
+      - "签名错误、过期、用户不存在都统一返回 401"
+      - "为了减少用户被登出，在 decode 时关闭过期校验"
+    answer: [0, 1, 3]
+    explain: |
+      算法由服务端固定，必需声明和签发方、受众都要校验，各种失败统一返回 401 减少信息泄露，这些都是正确做法。从令牌头读取 alg 等于让攻击者选择算法，属于 none 算法和算法混淆一类漏洞；关闭过期校验会让泄露的令牌永久有效，正确做法是短期 access token 加 refresh token。
+  - id: d45-q4
+    kp: d45-k4
+    type: scenario
+    question: |
+      某 AI 知识库平台的接口 `GET /api/conversations/{id}` 只依赖了 `get_current_user`，查询语句为 `db.get(Conversation, id)`。渗透测试人员用自己的账号，把 id 从 1001 改成 1002、1003……，读到了其他公司员工的完整对话。请分析漏洞类型、影响范围，给出修复方案和防止再次发生的工程措施。
+    key_points:
+      - {text: "指出这是对象级授权失效 IDOR 或 BOLA，接口只做了认证没有做资源归属校验", dim: concept}
+      - {text: "指出自增 ID 可枚举，且对话可能包含企业敏感信息，影响跨租户", dim: principle}
+      - {text: "提出查询条件加入 tenant_id 与 owner 或共享关系，不存在与无权都返回 404", dim: engineering}
+      - {text: "提出仓储层统一封装带作用域的查询，禁止业务代码直接按 ID 获取", dim: engineering}
+      - {text: "提出 CI 中的双用户越权自动化测试与上线后的日志排查和安全通报", dim: project}
+    reference: |
+      **漏洞类型**：对象级授权失效（OWASP API1:2023 BOLA，常称 IDOR）。接口通过 `get_current_user` 确认了身份，但取数据时只按 ID 查询，没有校验这条对话是否属于当前用户或其租户。
+
+      **影响**：ID 是自增整数，可以批量枚举；对话内容可能包含合同、薪酬、客户信息等，且是**跨租户**泄露，属于严重安全事件。
+
+      **修复**：
+      1. 查询改为 `select(Conversation).where(Conversation.id == id, Conversation.tenant_id == user.tenant_id, Conversation.owner_id == user.id)`（若支持共享，再加共享关系条件）。
+      2. 不存在和无权访问统一返回 404。
+      3. 对外暴露的 ID 改用 UUID 增加枚举难度（不能替代授权）。
+
+      **防止再犯**：
+      - 仓储层封装 `scoped_get(model, id, user)`，自动附加租户与归属条件；代码规范和静态检查禁止在路由中直接 `db.get`。
+      - CI 中为所有带资源 ID 的接口自动生成越权测试：用户 B 访问用户 A 的资源必须返回 404。
+      - 上线后排查访问日志中是否存在大量连续 ID 访问，评估实际泄露范围，按流程通报客户。
+    followup:
+      question: 如果管理员需要能查看本租户所有对话用于审计，如何在不破坏隔离的前提下实现？
+      key_points:
+        - 使用独立的审计权限码进行功能级校验
+        - 查询仍强制限定在管理员所属租户内并记录审计日志
+      reference: |
+        为审计员授予 `conversation:audit` 权限，审计接口通过 `require_permission("conversation:audit")` 做功能级校验；查询放宽 owner 条件但仍强制 `tenant_id == user.tenant_id`，保证不能跨租户；每次审计访问都写入审计日志（谁在何时查看了哪条对话），并最好与普通接口分开，便于单独监控。
+  - id: d45-q5
+    kp: d45-k3
+    type: short
+    question: 有同事说「我们用 SHA-256 加一个全局固定的盐来存密码，SHA-256 很安全」。请指出问题，并说明正确的密码存储方式和登录接口的配套措施。
+    key_points:
+      - {text: "指出 SHA-256 是快速哈希，GPU 可高速暴力破解，不适合存密码", dim: principle}
+      - {text: "指出固定全局盐使相同密码哈希相同，可整体预计算攻击", dim: principle}
+      - {text: "给出使用 Argon2id 或 bcrypt 等慢哈希、每个密码随机盐的方案，如 pwdlib 的 PasswordHash.recommended", dim: engineering}
+      - {text: "提到登录限流、统一错误提示、DUMMY_HASH 防用户名枚举、旧哈希登录时升级", dim: engineering}
+    reference: |
+      **问题**：SHA-256 是为速度设计的通用哈希，攻击者拿到数据库后可以用 GPU 每秒尝试海量候选密码，常见密码很快被撞出。全局固定盐只能防止直接查现成的彩虹表，但所有用户共用同一个盐，相同密码的哈希相同，攻击者针对这个盐做一次预计算就能攻击全部用户。
+
+      **正确方式**：使用专门的密码哈希算法 Argon2id（或 bcrypt、scrypt），它们故意慢且消耗内存，并为每个密码生成随机盐，盐和参数随哈希一起保存。FastAPI 官方推荐 pwdlib：`PasswordHash.recommended()` 使用 Argon2，`hash()` 生成、`verify()` 校验。
+
+      **配套措施**：登录接口按 IP 和账号限流并在多次失败后加验证码；用户不存在时也对 DUMMY_HASH 做一次校验并返回统一错误，防止通过响应内容和耗时枚举用户名；对旧的 SHA-256 哈希，在用户下次登录验证成功时用 Argon2 重新哈希替换。
+  - id: d45-q6
+    kp: d45-k2
+    type: design
+    question: 你的系统使用 JWT，现在有三个需求：用户修改密码后其他设备立即失效；管理员能强制某员工下线；access token 泄露后损失可控且不能频繁让用户重新登录。请设计令牌方案。
+    key_points:
+      - {text: "使用短期 access token 与长期 refresh token 的双令牌方案", dim: concept}
+      - {text: "refresh token 服务端保存哈希并轮换，检测旧令牌重用时作废全部会话", dim: engineering}
+      - {text: "使用 token_version 或 jti 黑名单实现主动失效，并说明需要查缓存的代价", dim: principle}
+      - {text: "说明高风险操作实时校验、普通操作接受最长一个 access 有效期的延迟", dim: engineering}
+      - {text: "说明 refresh token 存放在 HttpOnly Secure Cookie 中", dim: engineering}
+    reference: |
+      **双令牌**：access token 15 分钟有效，无状态校验；refresh token 7 天有效，存在 HttpOnly、Secure、SameSite Cookie 中，只用于 `/auth/refresh` 接口。服务端在 Redis 中保存 refresh token 的哈希及所属用户、设备。
+
+      **轮换**：每次刷新签发新的 refresh token 并作废旧的；若已作废的 refresh token 再次被使用，判定为被盗，作废该用户全部 refresh token。
+
+      **主动失效**：用户表增加 `token_version`，签发 access token 时写入 `ver` 声明。修改密码或管理员强制下线时：版本号加一，并删除该用户所有 refresh token。校验 access token 时比对 `ver` 与当前版本——为避免每次查库，把用户版本号缓存在 Redis 中（变更时同步更新）。
+
+      **分级**：如果不希望每个请求都查缓存，可以只在高风险操作（导出、删除、修改权限）时实时比对版本，普通请求接受最多 15 分钟的延迟。需要精确吊销单个令牌时，把 jti 加入 Redis 黑名单，TTL 为令牌剩余有效期。
+
+      **泄露控制**：access token 泄露最多可用 15 分钟；refresh token 不暴露给 JS，降低 XSS 窃取风险。
+  - id: d45-q7
+    kp: d45-k4
+    type: short
+    question: 请说明在一个 RAG 知识库系统中，除了常规的增删改查接口，还有哪些环节容易出现越权，并给出对应的防护方式。
+    key_points:
+      - {text: "指出向量检索未做权限过滤会让 LLM 回答泄露无权文档", dim: principle}
+      - {text: "指出缓存 key 不含权限维度会导致回答串号", dim: engineering}
+      - {text: "指出异步任务状态接口与 WebSocket 会话 ID 未校验归属", dim: engineering}
+      - {text: "指出 Agent 工具以高权限服务账号执行会被用户借用越权，需传递用户身份并在工具内校验", dim: engineering}
+    reference: |
+      1. **检索层**：向量检索如果只按相似度取 Top-K，不加 `tenant_id`、部门、文档 ACL 的元数据过滤，无权文档的片段会进入 Prompt，LLM 的回答就把内容「转述」给了用户。防护：入库时写入权限元数据，检索时强制过滤（Day 30）。
+      2. **缓存层**：LLM 回答缓存的 key 只用问题文本，高权限用户的回答被低权限用户命中。防护：key 中包含租户和权限组哈希（Day 41）。
+      3. **异步与实时通道**：`GET /jobs/{id}` 只按 ID 查询；WebSocket 消息中的 session_id、user_id 直接被信任。防护：所有 ID 都校验归属，身份只来自服务器解析的凭证（Day 42、43）。
+      4. **Agent 工具**：工具调用使用拥有全部数据权限的服务账号执行，用户可以通过提示让 Agent 查询他本无权访问的数据。防护：把当前用户身份和权限传入工具上下文，工具内部做同样的授权校验，高风险操作需要人工确认（Day 40）。
+      5. **导出与批量接口**：一次传入多个 ID，要整体按租户和归属过滤。
+code_reading:
+  id: d45-c1
+  kp: [d45-k2, d45-k4, d45-k3]
+  title: 一段待审查的 FastAPI 鉴权与文档接口
+  scenario: 多租户企业知识库的文档服务。用户登录后携带 Bearer 令牌访问 `/documents/{doc_id}` 读取文档、拥有 editor 角色的用户可以删除文档。令牌由同一服务用 HS256 签发。
+  language: python
+  code: |
+    import os
+    from typing import Annotated
+
+    import jwt
+    from fastapi import Depends, FastAPI, HTTPException, status
+    from fastapi.security import OAuth2PasswordBearer
+    from sqlalchemy.orm import Session
+
+    from app.db import get_session
+    from app.models import Document, User
+
+    SECRET_KEY = os.environ["JWT_SECRET"]
+    oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
+    app = FastAPI()
+
+    def get_current_user(
+        token: Annotated[str, Depends(oauth2_scheme)],
+        db: Annotated[Session, Depends(get_session)],
+    ) -> User:
+        try:
+            header = jwt.get_unverified_header(token)
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[header["alg"]],
+                                 options={"verify_exp": False})
+        except jwt.InvalidTokenError:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid token",
+                                headers={"WWW-Authenticate": "Bearer"})
+        user = db.get(User, payload["sub"])
+        if user is None:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "user not found")
+        return user
+
+    def require_role(role: str):
+        def checker(user: Annotated[User, Depends(get_current_user)]) -> User:
+            if role not in user.roles:
+                raise HTTPException(status.HTTP_403_FORBIDDEN, "forbidden")
+            return user
+        return checker
+
+    @app.get("/documents/{doc_id}")
+    def read_document(doc_id: int, user: Annotated[User, Depends(get_current_user)],
+                      db: Annotated[Session, Depends(get_session)]) -> dict:
+        doc = db.get(Document, doc_id)
+        if doc is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "not found")
+        return {"id": doc.id, "title": doc.title, "content": doc.content}
+
+    @app.delete("/documents/{doc_id}", status_code=204)
+    def delete_document(doc_id: int, user: Annotated[User, Depends(require_role("editor"))],
+                        db: Annotated[Session, Depends(get_session)]) -> None:
+        doc = db.get(Document, doc_id)
+        if doc is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "not found")
+        db.delete(doc)
+        db.commit()
+  walkthrough:
+    function: |
+      实现文档服务的认证与授权：`get_current_user` 从 Bearer 令牌解析用户；`require_role` 生成一个检查角色的依赖；`read_document` 按 ID 返回文档内容；`delete_document` 要求 editor 角色后按 ID 删除文档。
+    key_functions: |
+      - `oauth2_scheme`：从 Authorization 头取出 Bearer 令牌，缺失时返回 401。
+      - `get_current_user`：读取未经验证的令牌头获取 alg，再用它 decode，并关闭了过期校验；按 sub 查用户。
+      - `require_role`：依赖工厂，检查角色名是否在用户角色列表中，失败返回 403。
+      - `read_document` / `delete_document`：只按 doc_id 调用 `db.get`，没有任何租户或归属条件。
+    params: |
+      令牌经 `oauth2_scheme` 传入 `get_current_user`；`header["alg"]` 来自**未验证的令牌头**，被当作 algorithms 白名单传给 decode；`payload["sub"]` 作为主键查询用户。`doc_id` 来自 URL 路径，为自增整数；`user` 对象被注入接口，但在查询文档时没有被使用。
+    data_flow: |
+      ```mermaid
+      flowchart TD
+        A["请求 带 Bearer 令牌"] --> B["oauth2_scheme 取令牌"]
+        B --> C["读取未验证的 header alg"]
+        C --> D["jwt.decode 算法由令牌决定 不校验过期"]
+        D --> E["db.get User by sub"]
+        E --> F{"接口"}
+        F -->|"GET"| G["db.get Document by id 不校验租户"]
+        F -->|"DELETE"| H["require_role editor"]
+        H --> I["db.get Document by id 不校验租户"]
+        I --> J["删除并提交"]
+        G --> K["返回全文内容"]
+      ```
+    failure_points: |
+      - **JWT 未固定算法且未校验过期**：algorithms 取自令牌头，把算法选择权交给了攻击者（none 算法、算法混淆一类风险；即便当前库版本对部分组合有防护，也不应依赖）；`verify_exp: False` 让过期或泄露的令牌永久可用，用户被禁用前签发的令牌也一直有效。
+      - **对象级越权（IDOR/BOLA）**：读取和删除都只按 doc_id 查询，任何登录用户可以枚举自增 ID 读取其他租户的文档全文；任何租户的 editor 都能删除别的租户的文档。
+      - 没有校验 iss、aud，没有要求 exp、sub 必须存在；`payload["sub"]` 缺失时抛 KeyError 返回 500。
+      - 没有检查用户是否被禁用；令牌与用户状态无关联（无 token_version），无法强制下线。
+      - `require_role` 硬编码角色名，而不是检查权限码。
+      - 删除操作没有审计日志，也没有软删除，误删或恶意删除无法追溯和恢复。
+    debugging: |
+      - 用 PyJWT 生成一个 `exp` 为昨天的令牌，请求接口，确认是否仍返回 200（验证过期校验缺失）。
+      - 准备两个不同租户的测试用户 A、B，用 B 的令牌请求 A 租户的 doc_id，确认是否返回了内容；对 DELETE 做同样测试（在测试库中）。
+      - 构造缺少 sub 的令牌，观察是否返回 500 而不是 401。
+      - 检查访问日志中是否存在同一用户在短时间内访问大量连续 doc_id 的记录。
+    change_request: |
+      如果要求「令牌校验符合规范并实现多租户隔离」：`get_current_user` 固定 `algorithms=["HS256"]`，传入 issuer、audience 与 `options={"require": ["exp", "sub"]}`，删除 `verify_exp: False`，检查 disabled 与 token_version；`require_role` 改为 `require_permission("doc:delete")`；两个接口的查询改为 `select(Document).where(Document.id == doc_id, Document.tenant_id == user.tenant_id)`（删除再加归属或管理关系条件），不存在与无权统一 404；删除写审计日志并改为软删除。
+  questions:
+    - id: d45-c1-q1
+      kp: d45-k2
+      type: code
+      question: |
+        请逐行说明 `get_current_user` 中 `get_unverified_header` 与 `jwt.decode(..., algorithms=[header["alg"]], options={"verify_exp": False})` 的执行过程，指出存在的安全问题，并写出修改后的 decode 调用以及还需要补充的检查。
+      key_points:
+        - {text: "指出 get_unverified_header 读取的是未经验证、攻击者可控的令牌头，用它决定算法等于让令牌自选算法", dim: principle}
+        - {text: "说明这属于 none 算法或算法混淆一类漏洞，且系统未来改为非对称算法时风险更直接", dim: principle}
+        - {text: "指出关闭过期校验后泄露或过期的令牌永久有效", dim: concept}
+        - {text: "给出固定 algorithms、校验 iss 与 aud、require exp 与 sub 的 decode 写法，并补充禁用状态与 token_version 检查", dim: engineering}
+      reference: |
+        执行过程：`jwt.get_unverified_header(token)` 只是把令牌第一段 Base64URL 解码成字典，**不做任何签名校验**，内容完全由提交令牌的人决定。随后把其中的 `alg` 作为允许的算法列表传给 `jwt.decode`，于是「用什么算法验签」由攻击者说了算。这正是历史上 none 算法、算法混淆（把 RS256 公钥当作 HS256 密钥）漏洞的成因类型。即使当前 PyJWT 版本对某些组合会拒绝，安全性也不应依赖库的偶然行为；而且一旦系统将来改用 RS256 并传入公钥，风险会更直接。
+
+        `options={"verify_exp": False}` 关闭了过期校验：被窃取的令牌、离职员工的令牌永久有效，短期令牌的设计完全失效。
+
+        修改：
+        ```python
+        payload = jwt.decode(
+            token, SECRET_KEY,
+            algorithms=["HS256"],
+            issuer="kb-auth", audience="kb-api",
+            options={"require": ["exp", "sub", "iat"]},
+        )
+        ```
+        补充检查：`sub` 用 `payload["sub"]` 前已由 require 保证存在；查到用户后检查 `user.disabled`；比对 `payload["ver"]` 与 `user.token_version`，不一致返回 401；所有失败使用统一的 401 响应。
+    - id: d45-c1-q2
+      kp: d45-k4
+      type: code
+      question: 假设租户 A 的普通员工（无 editor 角色）和租户 B 的 editor 分别调用这两个接口。请按执行顺序说明各自能做到什么，指出越权类型，并给出修改后的查询与授权代码。
+      key_points:
+        - {text: "说明 A 租户普通员工可通过 GET 枚举 doc_id 读取任意租户文档全文", dim: principle}
+        - {text: "说明 B 租户 editor 通过 require_role 后可删除任意租户的文档", dim: principle}
+        - {text: "指出这是对象级授权失效 BOLA 或 IDOR，功能级检查存在但对象级检查缺失", dim: concept}
+        - {text: "给出查询条件加入 tenant_id 与归属，改为权限码检查，不存在与无权统一 404 并加审计", dim: engineering}
+      reference: |
+        **A 租户普通员工调用 GET**：`get_current_user` 通过 → `read_document` 执行 `db.get(Document, doc_id)`，只按主键查询 → 无论文档属于哪个租户都返回标题和全文。doc_id 是自增整数，写个循环就能把全平台文档拉取一遍。调用 DELETE 时，`require_role("editor")` 返回 403，功能级检查生效。
+
+        **B 租户 editor 调用 DELETE**：`require_role` 通过 → `db.get` 按 ID 取到 A 租户的文档 → 直接删除并提交。功能级授权（是否能删除）通过了，但对象级授权（能否删除这一篇）完全缺失。
+
+        这是典型的对象级授权失效（OWASP API1:2023 BOLA，即 IDOR）。修改：
+        ```python
+        def get_doc_scoped(db: Session, doc_id: int, user: User) -> Document:
+            doc = db.scalar(select(Document).where(
+                Document.id == doc_id, Document.tenant_id == user.tenant_id))
+            if doc is None:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "not found")
+            return doc
+
+        @app.delete("/documents/{doc_id}", status_code=204)
+        def delete_document(doc_id: int,
+                            user: Annotated[User, Depends(require_permission("doc:delete"))],
+                            db: Annotated[Session, Depends(get_session)]) -> None:
+            doc = get_doc_scoped(db, doc_id, user)
+            audit_log(user, "doc:delete", doc.id)
+            doc.deleted_at = func.now()
+            db.commit()
+        ```
+        读取接口同样使用 `get_doc_scoped`；如文档还有部门级 ACL，在作用域查询中继续加条件。不存在和无权都返回 404。
+interview:
+  - id: d45-i1
+    kp: d45-k1
+    type: oral
+    difficulty: 1
+    question: 认证和授权有什么区别？Session 和 JWT 各有什么优缺点？
+    key_points:
+      - {text: "说明认证确认身份、授权判断能否操作资源，以及 401 与 403 的区别", dim: concept}
+      - {text: "说明 Session 状态在服务端、可随时吊销但需共享存储", dim: principle}
+      - {text: "说明 JWT 自包含、无状态校验易扩展，但签发后难以吊销、权限变更不能立即生效", dim: principle}
+      - {text: "结合项目说明选型或混合方案", dim: project}
+    reference: |
+      认证回答「你是谁」，例如校验用户名密码、令牌签名；授权回答「你能不能对这个资源做这个操作」，例如角色权限和资源归属。未认证或令牌无效返回 401，已认证但无权限返回 403（对象级越权时为不暴露资源存在可返回 404）。
+
+      Session 方案在服务端存储会话状态，客户端只持有随机的 session_id（通常放在 HttpOnly Cookie）。优点是可以随时吊销、令牌本身不含信息；缺点是每次请求要查存储，多实例需要 Redis 等共享存储，跨域和移动端使用不便，需要防 CSRF。
+
+      JWT 把用户 ID、过期时间等声明写在令牌里并签名，服务器只需验签即可识别用户，无需查存储，适合多实例、微服务和移动端。缺点是在过期前无法主动失效，写在令牌里的角色在变更后不会立即生效，payload 可被解码不能放敏感信息。
+
+      我们的项目采用混合方案：15 分钟的 JWT access token 做无状态校验，refresh token 存在服务端 Redis 中可吊销，用户禁用时通过 token_version 让令牌失效。
+    oral: |
+      认证是确认你是谁，授权是判断你能不能做这件事。没登录或令牌无效返回 401，登录了但没权限返回 403。
+      Session 是把状态存在服务端，客户端只拿一个 session_id，好处是随时能踢人下线，坏处是要查存储、多实例要共享 Redis。JWT 是把信息写进令牌里签名，服务端验签就行，扩展性好，但签出去之后在过期前没法收回。
+      我们项目是混合的：access token 用 15 分钟的 JWT，refresh token 存在 Redis 里可以吊销，用户被禁用时靠 token_version 让旧令牌失效。
+  - id: d45-i2
+    kp: d45-k2
+    type: oral
+    difficulty: 2
+    question: 讲讲 JWT 的结构，以及服务端校验 JWT 时必须检查哪些内容？
+    key_points:
+      - {text: "说明 Header、Payload、Signature 三段 Base64URL 结构，payload 可解码不是加密", dim: concept}
+      - {text: "说明标准声明 iss、sub、aud、exp、iat、jti 的含义", dim: concept}
+      - {text: "说明 HS256 与 RS256 的区别与适用场景", dim: principle}
+      - {text: "列出校验项：固定算法、签名、exp、iss 与 aud、必需声明、用户状态，并说明不固定算法的风险", dim: engineering}
+    reference: |
+      JWT 由三段 Base64URL 编码的内容用点连接：Header 声明算法和类型；Payload 是声明，标准声明包括 iss 签发方、sub 主体（用户 ID）、aud 受众、exp 过期时间、nbf 生效时间、iat 签发时间、jti 令牌 ID，也可以有 tenant_id 等自定义声明；Signature 是对前两段的签名。Base64URL 只是编码，任何人都能解码 payload，所以签名只防篡改不防查看。
+
+      算法上，HS256 是对称签名，签发和校验共用密钥，适合单一服务；RS256/ES256 是非对称签名，签发方用私钥，其他服务用公钥校验，适合多服务，下游服务被攻破也无法伪造令牌。
+
+      校验必须包括：算法在服务端固定的白名单中（绝不能从令牌头读取 alg，否则会出现 none 算法或算法混淆一类漏洞）；签名正确；exp 未过期、nbf 已生效；iss 和 aud 与本系统匹配；必需声明存在；最后根据 sub 加载用户并检查是否被禁用、token_version 是否一致。所有失败统一返回 401。在 PyJWT 中就是 `jwt.decode(token, key, algorithms=["HS256"], issuer=..., audience=..., options={"require": ["exp", "sub"]})`。
+    oral: |
+      JWT 是三段 Base64URL 用点连起来：Header 写算法，Payload 写声明，比如 sub 用户 ID、exp 过期时间、iss 签发方、aud 受众，最后是签名。要注意 payload 是能直接解码的，签名只防篡改不防看。
+      校验时我会检查这几项：算法必须是服务端固定的，不能从令牌头读，否则就是算法混淆那类漏洞；签名对不对；有没有过期；iss 和 aud 对不对；必需的声明在不在；最后查用户是不是被禁用了。任何一步失败都统一返回 401。
+      算法上我们单服务用 HS256，如果多个服务要校验就会换成 RS256，只把公钥给下游。
+  - id: d45-i3
+    kp: d45-k4
+    type: oral
+    difficulty: 3
+    question: 什么是越权漏洞？你在项目中是怎么设计权限体系、防止越权的？
+    key_points:
+      - {text: "区分水平越权（访问同级他人资源，BOLA 或 IDOR）与垂直越权（调用高权限功能，BFLA）", dim: concept}
+      - {text: "说明 RBAC 的用户、角色、权限模型，代码检查权限码且默认拒绝", dim: principle}
+      - {text: "说明对象级校验写进查询条件，租户隔离，不存在与无权统一 404", dim: engineering}
+      - {text: "提出越权自动化测试、仓储层封装、审计日志等工程措施", dim: engineering}
+      - {text: "结合 AI 场景说明检索过滤、缓存隔离或 Agent 工具权限", dim: project}
+    reference: |
+      越权分两类：**水平越权**是访问同级别其他用户的资源，例如把 URL 中的对话 ID 改成别人的，对应 OWASP API1:2023 BOLA（常称 IDOR）；**垂直越权**是普通用户调用了管理员功能，对应 API5:2023 BFLA。
+
+      **权限体系**：采用 RBAC，用户关联角色，角色关联权限码（kb:read、kb:write、kb:delete、user:manage）。接口通过 `Depends(require_permission("kb:delete"))` 做功能级校验，代码中只检查权限码不检查角色名，默认拒绝。
+
+      **对象级校验**：所有带资源 ID 的查询都在仓储层统一附加 `tenant_id = 当前租户` 和归属或共享条件，业务代码禁止直接按主键获取；查不到统一 404。ID 使用 UUID，但不依赖它做安全控制。
+
+      **工程措施**：CI 中自动化越权测试，为每个资源接口用另一租户用户的令牌访问并断言 404，用普通用户访问所有管理接口并断言 403；敏感操作写审计日志；前端隐藏按钮只是体验，不作为安全控制。
+
+      **AI 场景**：向量检索按 ACL 元数据过滤；回答缓存 key 含权限组；入库任务状态和 WebSocket 会话校验归属；Agent 工具执行时带上当前用户身份并在工具内二次校验。
+    oral: |
+      越权分两种：水平越权是改个 ID 就看到同级别别人的数据，也就是 IDOR；垂直越权是普通用户调到了管理员接口。
+      我们的设计是两层校验。第一层是 RBAC，用户对应角色，角色对应权限码，接口用依赖检查权限码，默认拒绝。第二层是对象级，所有查询在仓储层统一带上租户和归属条件，查不到就返回 404。
+      工程上我们在 CI 里自动跑越权测试，用另一个租户的令牌访问每个带 ID 的接口，必须是 404。
+      AI 场景还要多注意几处：向量检索要按权限过滤，缓存 key 要带权限组，Agent 的工具也要用当前用户的身份去校验。
+  - id: d45-i4
+    kp: d45-k2
+    type: design
+    difficulty: 3
+    question: JWT 签发后无法主动吊销，你们如何实现「修改密码后所有设备下线」和「管理员强制踢人」？请说明方案及其性能与一致性的权衡。
+    key_points:
+      - {text: "使用短期 access token 加服务端可吊销的 refresh token", dim: concept}
+      - {text: "使用 token_version 或 jti 黑名单实现主动失效，并说明 TTL 设置为令牌剩余有效期", dim: engineering}
+      - {text: "说明每次请求查缓存的性能代价，以及只在高风险操作实时校验的折中", dim: principle}
+      - {text: "说明 refresh token 轮换与重用检测", dim: engineering}
+      - {text: "结合项目给出具体参数与效果", dim: project}
+    reference: |
+      **基础**：access token 15 分钟，无状态校验；refresh token 7 天，服务端在 Redis 中保存哈希，可以直接删除。这样即使什么都不做，access token 最多 15 分钟后自然失效。
+
+      **立即失效的两种方式**：
+      - **token_version**：用户表存版本号，签发时写入令牌。修改密码或被强制下线时版本号加一，同时删除该用户所有 refresh token。校验时比对令牌中的版本与当前版本。为避免每次查数据库，把版本号缓存在 Redis，更新时同步刷新。
+      - **jti 黑名单**：需要精确吊销某一个令牌（如某台设备）时，把 jti 写入 Redis，TTL 等于令牌剩余有效期，过期自动清除，黑名单不会无限增长。
+
+      **权衡**：两种方式都让 JWT 重新带上了「查一次状态」的开销，削弱了无状态的优势。折中做法是分级：普通读接口只验签，接受最多 15 分钟的延迟；导出、删除、修改权限等高风险操作实时比对版本号。Redis 不可用时，高风险操作应当拒绝（fail closed），普通操作可以降级只验签。
+
+      **refresh token 轮换**：每次刷新换新 refresh token、作废旧的；旧 refresh 被重用时视为被盗，作废该用户所有会话并告警。
+
+      在我们的项目里，管理员禁用账号后，高风险接口立即拦截，其他接口最长 15 分钟内失效，满足了安全团队的要求。
+    oral: |
+      我们的思路是先把损失窗口变小，再对关键操作补上实时校验。
+      access token 只有 15 分钟，refresh token 存在 Redis 里，删掉就不能再续。要立即失效时用 token_version：改密码或被踢下线，版本号加一，同时删掉这个用户所有的 refresh token，校验时比对版本。版本号缓存在 Redis，避免每次查库。
+      这样会让 JWT 又多了一次状态查询，所以我们分级处理：普通接口只验签，最多延迟 15 分钟；导出、删除这类高风险操作实时比对版本，Redis 挂了就直接拒绝。
+      refresh token 每次都轮换，旧的被重用就判定被盗，全部下线。
+  - id: d45-i5
+    kp: d45-k4
+    type: design
+    difficulty: 4
+    question: 请为一个多租户企业 AI 平台（知识库问答 + Agent 工具调用 + 管理后台）设计完整的认证与授权架构，覆盖身份来源、令牌、权限模型、数据隔离、AI 特有的权限风险和审计。
+    key_points:
+      - {text: "身份来源：企业 SSO 或 password flow，统一认证服务签发令牌，多服务用非对称算法与 JWKS 校验", dim: engineering}
+      - {text: "令牌策略：短期 access 加可吊销 refresh、token_version、固定算法与 iss aud 校验", dim: principle}
+      - {text: "权限模型：RBAC 权限码加资源级 ACL，租户隔离在数据访问层强制执行", dim: principle}
+      - {text: "AI 风险：检索 ACL 过滤、缓存按权限隔离、Agent 工具以用户身份执行并对高风险操作人工确认", dim: engineering}
+      - {text: "审计与测试：敏感操作审计日志、越权自动化测试、监控异常访问模式", dim: project}
+    reference: |
+      **身份与令牌**：员工通过企业 SSO（OIDC）或平台账号（OAuth2 password flow + Argon2 密码哈希）登录，由统一认证服务签发令牌。access token 用 RS256 签名、15 分钟有效，包含 sub、tenant_id、ver、iss、aud、jti；各业务服务通过 JWKS 获取公钥校验，固定算法并要求必需声明。refresh token 7 天、轮换、服务端存哈希。禁用、改密时 token_version 加一。
+
+      **权限模型**：RBAC 定义权限码（kb:read、kb:write、agent:run、tool:email:send、user:manage 等），角色按租户配置；资源级 ACL 处理「某个知识库共享给某个部门」。功能级校验用依赖实现，对象级校验在数据访问层强制附加 tenant_id 与 ACL 条件，业务代码无法绕过；PostgreSQL 还可以启用行级安全（RLS）作为纵深防御。
+
+      **AI 特有风险**：
+      - 检索：向量库每个切片带 tenant_id 与 ACL 元数据，检索时强制过滤。
+      - 缓存：key 包含租户与权限组哈希；不缓存个人数据类问题。
+      - Agent：工具执行携带当前用户身份与权限，工具内部重新授权，不使用全权限服务账号；发送邮件、删除数据等高风险工具需要用户确认（Day 40）；工具参数中的资源 ID 同样做对象级校验。
+      - 实时与异步：WebSocket 使用一次性票据，任务与会话 ID 校验归属。
+
+      **审计与验证**：登录、权限变更、导出、删除、Agent 高风险工具调用全部写审计日志；CI 中运行越权测试矩阵（跨租户、跨角色）；监控单用户短时间访问大量不同资源 ID 等异常模式并告警；定期权限复核与渗透测试。
+    oral: |
+      我会分成四层来设计。
+      身份层：员工走企业 SSO 或平台账号登录，统一认证服务签发 RS256 的短期 access token，各服务用公钥校验；refresh token 可吊销，token_version 处理禁用和改密。
+      权限层：RBAC 管功能，权限码粒度；资源级 ACL 管「这个知识库共享给谁」；租户隔离在数据访问层强制执行，数据库还可以开行级安全兜底。
+      AI 层是最容易漏的：检索按 ACL 过滤，缓存按权限组隔离，Agent 工具用当前用户的身份执行，高风险工具要人工确认。
+      最后是审计和验证：敏感操作都有审计日志，CI 跑跨租户越权测试，监控异常的批量访问。
+sources:
+  - {title: "FastAPI - OAuth2 with Password (and hashing), Bearer with JWT tokens", url: "https://fastapi.tiangolo.com/tutorial/security/oauth2-jwt/"}
+  - {title: "OWASP API Security Project", url: "https://owasp.org/projects/api-security-project"}
+  - {title: "OWASP API1:2023 Broken Object Level Authorization", url: "https://github.com/OWASP/API-Security/blob/9c9a808215fcbebda9f657c12f3e572371697eb2/editions/2023/en/0xa1-broken-object-level-authorization.md"}

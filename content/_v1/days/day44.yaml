@@ -1,0 +1,766 @@
+day: 44
+phase: 5
+title: Docker：镜像、容器、Compose 编排与部署
+goals:
+  - "能解释镜像分层、构建缓存与容器可写层的关系，并据此优化 Dockerfile 的指令顺序"
+  - "能审查一个 Dockerfile 的安全与体积问题：多阶段构建、.dockerignore、非 root 用户、健康检查、密钥泄露"
+  - "能用 Compose 编排 FastAPI + PostgreSQL(pgvector) + Redis，正确处理服务发现、启动顺序和数据卷"
+  - "能说清配置与密钥在构建期和运行期的注入方式，以及一次镜像发布到上线的流程"
+knowledge_points:
+  - id: d44-k1
+    name: 镜像、容器与分层缓存
+    level: P0
+    summary: 镜像是只读的分层模板，容器是镜像加一层可写层的运行进程；层缓存决定构建速度
+    why: |
+      「在我电脑上能跑」是交付中最常见的扯皮。Docker 把代码、依赖、系统库一起打包，保证开发、测试、生产运行的是**同一个东西**。AI 应用依赖多（Python 版本、解析库的系统依赖、模型客户端），更需要它。
+      你做过部署和现场调试，懂原理之后，才能看懂「为什么镜像 3GB」「为什么改一行代码要重装半小时依赖」「为什么容器删了数据就没了」。
+    problem: |
+      要解决三个问题：**环境一致**（依赖和系统库随应用一起分发）；**隔离**（多个服务在同一台机器上互不干扰）；**快速、可复现地构建和分发**。镜像分层机制让相同的层只存一份、只传一次，并能复用构建缓存。
+    principle: |
+      **一、镜像 vs 容器（用前端类比）**
+
+      - **镜像（Image）**：只读模板，像打包好的 `dist` + `node_modules` + 运行时，加上一份「怎么启动」的说明。
+      - **容器（Container）**：镜像运行起来的**进程**，在镜像之上加了一层**可写层**。同一个镜像可以启动多个容器。
+      - 容器**不是虚拟机**：它共享宿主机内核，只是用 Linux 的 namespace（隔离进程、网络、文件系统视图）和 cgroups（限制 CPU、内存）把进程隔离起来，所以启动是秒级的。
+
+      **二、分层：每条构建指令产生一层**
+
+      ```mermaid
+      flowchart BT
+        L1["基础层 python 3.12 slim"] --> L2["安装系统依赖"]
+        L2 --> L3["复制依赖清单并安装依赖"]
+        L3 --> L4["复制应用代码"]
+        L4 --> RW["容器可写层 运行时写入的文件"]
+      ```
+
+      - `FROM`、`RUN`、`COPY`、`ADD` 等指令各自产生一层，层是**只读**的、按内容寻址。多个镜像共用同一个基础层时，磁盘和网络上只存一份。
+      - 运行时通过联合文件系统（如 overlayfs）把各层叠起来呈现成一个完整目录树；容器里修改文件时，先把文件复制到可写层再改（写时复制）。
+      - **后面的层删除文件，不会让镜像变小**：文件仍存在于之前的层里。所以「先 COPY 进密钥文件、再 RUN rm 删掉」的做法，密钥依然可以从镜像中提取出来。
+      - 容器删除后可写层随之消失，**容器里写的数据默认不持久**，需要数据卷（见 d44-k4）。
+
+      **三、构建缓存：顺序决定速度**
+
+      - 构建时，Docker 对每条指令检查缓存：指令文本相同、且 `COPY` 涉及的文件内容未变，就复用缓存。
+      - **一旦某一层缓存失效，它之后的所有层都要重新构建。**
+      - 所以要**把变化少的放前面、变化多的放后面**：先复制依赖清单（`pyproject.toml`、`uv.lock`）并安装依赖，再复制业务代码。这样改代码只重建最后一层，依赖安装命中缓存。
+
+      ```mermaid
+      flowchart LR
+        subgraph BAD["错误顺序"]
+          B1["COPY 全部代码"] --> B2["安装依赖"]
+        end
+        subgraph GOOD["正确顺序"]
+          G1["COPY 依赖清单"] --> G2["安装依赖 命中缓存"] --> G3["COPY 代码"]
+        end
+        C["只改了一行代码"] --> B1
+        C --> G3
+      ```
+
+      错误顺序下，改一行代码就让「安装依赖」重新执行，几分钟起步；正确顺序下只重新复制代码，几秒完成。
+
+      **四、常用命令速查**
+
+      - `docker build -t kb-api:1.4.2 .`：构建镜像。
+      - `docker run -d -p 8000:8000 --name api kb-api:1.4.2`：后台运行，宿主机 8000 映射到容器 8000。
+      - `docker logs -f api`、`docker exec -it api sh`：看日志、进容器排查。
+      - `docker history kb-api:1.4.2`：查看每层大小与产生它的指令（也能暴露写进镜像的敏感信息）。
+    scenarios: |
+      - 新同事入职：`docker compose up` 一条命令起齐 API、数据库、Redis，不用逐个安装。
+      - CI 构建：依赖层命中缓存，改业务代码的构建从 8 分钟降到 1 分钟以内。
+      - 现场部署：内网服务器无法联网，把镜像 `docker save` 成文件拷过去 `docker load`。
+    pitfalls: |
+      - **误区：容器就是轻量虚拟机。** 容器共享宿主机内核，隔离强度低于虚拟机。
+      - **误区：在后面的 RUN 里删除文件可以缩小镜像或清除密钥。** 文件仍在之前的层里。
+      - **`COPY . .` 放在安装依赖之前**，每次改代码都重装依赖。
+      - **在容器里写数据（上传文件、SQLite）却不挂卷**，容器重建后数据丢失。
+      - **使用 `latest` 标签**，不知道线上到底跑的是哪个版本，也无法可靠回滚。
+    interview_asks:
+      - "镜像和容器有什么区别？容器和虚拟机有什么区别？"
+      - "Docker 镜像的分层是怎么回事？怎样利用构建缓存？"
+      - "为什么在 Dockerfile 里删除文件不会让镜像变小？"
+    project_example: |
+      我们的知识库 API 镜像最初每次构建要 9 分钟，原因是 Dockerfile 一开始就 `COPY . .` 再安装依赖，任何代码改动都让依赖层失效。调整为先复制 pyproject.toml 和 uv.lock、安装依赖，再复制代码后，日常构建降到 40 秒左右。另外通过 `docker history` 发现有一层 400MB，是构建时下载的模型测试文件，移到 .dockerignore 后镜像体积明显下降。
+  - id: d44-k2
+    name: 生产级 Dockerfile：多阶段构建、.dockerignore、非 root 与健康检查
+    level: P0
+    summary: 多阶段只带运行所需，.dockerignore 挡住密钥与垃圾，USER 降权，HEALTHCHECK 暴露健康状态
+    why: |
+      靠 AI 生成的 Dockerfile 往往「能跑」，但常见三大问题：**镜像巨大**（带着编译器和缓存）、**以 root 运行**、**把 .env 和 .git 打进镜像**。这些问题在安全审计和面试代码审查里一眼就会被指出。你需要能读懂并审查每一行。
+    problem: |
+      生产镜像要做到：体积小（拉取快、攻击面小）；不包含源码管理信息和密钥；容器被攻破时攻击者权限尽量低；编排系统能判断服务是否真的可用；构建可复现。这些都靠 Dockerfile 的具体写法来保证。
+    principle: |
+      **一、多阶段构建：构建工具留在构建阶段**
+
+      一个 Dockerfile 里写多个 `FROM`，前面的阶段负责安装依赖、编译，最后的阶段**只复制运行需要的产物**（如虚拟环境 `.venv`）。编译器、构建缓存、uv 本身都不进入最终镜像。
+
+      ```mermaid
+      flowchart LR
+        subgraph S1["builder 阶段"]
+          A["python slim 加 uv"] --> B["安装依赖到 app venv"] --> C["复制代码并同步项目"]
+        end
+        subgraph S2["runtime 阶段"]
+          D["干净的 python slim"] --> E["只复制 venv 与代码"] --> F["切换非 root 用户"] --> G["HEALTHCHECK 与 CMD"]
+        end
+        C -->|"COPY --from=builder"| E
+      ```
+
+      **二、一个符合实践的示例**
+
+      ```dockerfile
+      # syntax=docker/dockerfile:1
+      FROM python:3.12-slim AS builder
+      COPY --from=ghcr.io/astral-sh/uv:0.13.7 /uv /uvx /bin/
+      ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=0
+      WORKDIR /app
+      RUN --mount=type=cache,target=/root/.cache/uv \
+          --mount=type=bind,source=uv.lock,target=uv.lock \
+          --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+          uv sync --locked --no-install-project --no-dev
+      COPY . /app
+      RUN --mount=type=cache,target=/root/.cache/uv uv sync --locked --no-dev
+
+      FROM python:3.12-slim
+      RUN groupadd --system app && useradd --system --gid app --no-create-home app
+      WORKDIR /app
+      COPY --from=builder --chown=app:app /app /app
+      ENV PATH="/app/.venv/bin:$PATH"
+      USER app
+      EXPOSE 8000
+      HEALTHCHECK --interval=30s --timeout=3s --start-period=20s --retries=3 \
+        CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)"
+      CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+      ```
+
+      逐项理解：
+      - `RUN --mount=type=cache`：BuildKit 的缓存挂载，uv 的下载缓存跨构建复用，又不会写进镜像层。
+      - 先只挂载 `uv.lock` 和 `pyproject.toml` 安装依赖（`--no-install-project`），再复制代码——就是 d44-k1 讲的缓存顺序。
+      - 固定 uv 和基础镜像版本，构建可复现（对可复现要求更高时可以固定到 digest）。
+
+      **三、.dockerignore：决定哪些文件进入构建上下文**
+
+      `COPY . .` 复制的是「构建上下文」中的全部文件。没有 `.dockerignore`，就会把这些东西打进镜像：
+
+      ```text
+      .env
+      .env.*
+      .git
+      .venv
+      __pycache__/
+      *.pyc
+      data/
+      tests/
+      ```
+
+      - `.env` 进镜像 = **密钥随镜像分发**，任何能拉取镜像的人都能看到。
+      - `.venv` 是本机平台的虚拟环境，混进镜像会导致奇怪的二进制兼容错误（uv 官方文档也建议把 `.venv` 加入 .dockerignore）。
+      - `.git` 让镜像变大并泄露提交历史。
+
+      **四、非 root 运行**
+
+      容器默认以 root 运行。一旦应用存在漏洞（例如 Agent 的代码执行工具被 Prompt Injection 利用，Day 40），攻击者在容器里就是 root，可以改写应用文件、更容易利用内核或挂载配置的漏洞逃逸。创建专用用户并 `USER app`，让应用只拥有必要权限。注意：非 root 用户不能监听 1024 以下端口，所以容器内用 8000 这类端口。
+
+      **五、HEALTHCHECK 与优雅退出**
+
+      - `HEALTHCHECK` 让 Docker 定期执行检查命令，容器状态显示为 healthy / unhealthy；Compose 的 `depends_on: condition: service_healthy` 依赖它。slim 镜像里通常没有 curl，可以用 Python 自带的 urllib。
+      - 健康检查接口要轻量：检查进程活着、关键依赖可连即可，不要在里面调 LLM。
+      - `CMD` 用 **exec 形式**（JSON 数组）：应用是 PID 1，能直接收到 `docker stop` 发出的 SIGTERM 并优雅关闭（处理完正在进行的请求）。shell 形式（`CMD uvicorn ...`）会被 `/bin/sh -c` 包一层，信号可能传不到应用，等超时后被强制 SIGKILL。
+    scenarios: |
+      - 安全审计要求：容器不得以 root 运行、镜像中不得包含密钥——通过 USER 和 .dockerignore 满足。
+      - 镜像体积从 1.8GB 降到 300MB 左右，内网现场部署拷贝时间大幅缩短。
+      - 发布时正在处理的流式请求能在 SIGTERM 后正常收尾，而不是被直接中断。
+    code: |
+      ```bash
+      # 检查镜像以什么用户运行、是否混入了 .env
+      docker run --rm kb-api:1.4.2 id
+      docker run --rm kb-api:1.4.2 ls -la /app
+      docker history --no-trunc kb-api:1.4.2 | head
+      # 查看健康状态
+      docker inspect --format '{{.State.Health.Status}}' api
+      ```
+    pitfalls: |
+      - **没有 .dockerignore 就 `COPY . .`**，把 .env、.git、.venv 全部打进镜像。
+      - **用 `ENV OPENAI_API_KEY=...` 或 `ARG` 传密钥**，值会留在镜像元数据或构建历史中，`docker history`/`docker inspect` 可见。
+      - **误区：容器隔离了，root 也没关系。** 容器共享内核，root 显著扩大被攻破后的影响。
+      - **HEALTHCHECK 用 curl 但镜像里没装 curl**，容器永远 unhealthy。
+      - **CMD 写成 shell 形式**，收不到 SIGTERM，每次发布都等 10 秒后被强杀。
+      - **最终镜像里带着 gcc、构建缓存**，体积大且增加攻击面。
+    interview_asks:
+      - "你会怎么优化一个 Python 应用的 Dockerfile？"
+      - "为什么容器不建议用 root 运行？"
+      - "多阶段构建解决了什么问题？"
+      - "密钥应该怎么传给容器？能不能写在 Dockerfile 里？"
+    project_example: |
+      审查外包交付的知识库服务镜像时发现：基础镜像是完整版 python 镜像，体积约 1.6GB；容器以 root 运行；`docker run --rm 镜像 cat /app/.env` 能直接读出生产数据库密码和模型 API Key。整改为多阶段构建、slim 基础镜像、增加 .dockerignore、创建 app 用户运行，密钥改为部署时通过环境变量注入；同时立即轮换了已泄露的所有密钥，并在 CI 中加了镜像扫描，检测镜像中是否存在 .env 文件和以 root 运行。
+    freshness: |
+      核对于 2026-11：Docker 官方 Build best practices 推荐多阶段构建、使用 .dockerignore、固定基础镜像版本（可固定到 digest）。uv 官方 Docker 指南推荐 `COPY --from=ghcr.io/astral-sh/uv:<版本> /uv /uvx /bin/` 并固定 uv 版本（文档示例版本为 0.13.7）、使用 cache mount 与 `uv sync --locked --no-install-project` 分离依赖层、把 `.venv` 加入 .dockerignore、多阶段时可只复制 `.venv`。示例中的具体版本号仅作演示，以实际项目锁定版本为准。
+    sources:
+      - {title: "Docker Docs - Building best practices", url: "https://docs.docker.com/build/building/best-practices/"}
+      - {title: "uv - Using uv in Docker", url: "https://docs.astral.sh/uv/guides/integration/docker/"}
+  - id: d44-k3
+    name: Docker Compose 编排 app、PostgreSQL 与 Redis
+    level: P0
+    summary: compose.yaml 声明一组服务、网络和卷；服务名即主机名，健康检查控制启动顺序
+    why: |
+      一个 AI 应用至少有 API、worker、PostgreSQL(pgvector)、Redis 四个组件。手动 `docker run` 一个个启动、配网络、记参数，既容易出错又无法复现。Compose 用一个文件描述整套环境，是本地开发、测试环境和小规模私有化部署的标准方式，也是项目交付文档的核心。
+    problem: |
+      多容器协作要解决：容器之间怎么找到彼此（服务发现）；谁先启动、怎么确认依赖已就绪（启动顺序）；数据存在哪里、重建后是否还在（持久化）；配置怎么注入（环境变量）。Compose 用声明式的 YAML 把这些统一管理。
+    principle: |
+      **一、命令与文件名（注意新旧写法）**
+
+      - 现在使用 **`docker compose`**（空格，Compose v2 起作为 Docker CLI 插件，用 Go 编写）；旧的 `docker-compose`（连字符，Python 编写的 v1）已经停止维护。
+      - 默认文件名优先 **`compose.yaml`**，仍兼容 `docker-compose.yml`。
+      - 文件顶部的 **`version: "3.8"` 已经过时**：Compose 规范是滚动更新的，`version` 字段只是信息性的，写了会收到「obsolete」警告，Compose 总是用最新的规范来解析文件。新文件直接从 `services:` 开始。
+
+      **二、一个完整示例**
+
+      ```yaml
+      name: kb
+      services:
+        api:
+          build: .
+          image: registry.example.com/kb-api:1.4.2
+          ports:
+            - "8000:8000"
+          env_file: .env.prod
+          environment:
+            DATABASE_URL: postgresql+psycopg://kb:${DB_PASSWORD}@db:5432/kb
+            REDIS_URL: redis://redis:6379/0
+          depends_on:
+            db:
+              condition: service_healthy
+            redis:
+              condition: service_healthy
+          restart: unless-stopped
+        worker:
+          image: registry.example.com/kb-api:1.4.2
+          command: ["celery", "-A", "app.worker", "worker", "-Q", "ingest", "--concurrency=4"]
+          env_file: .env.prod
+          depends_on:
+            db:
+              condition: service_healthy
+            redis:
+              condition: service_healthy
+        db:
+          image: pgvector/pgvector:pg17
+          environment:
+            POSTGRES_USER: kb
+            POSTGRES_DB: kb
+            POSTGRES_PASSWORD: ${DB_PASSWORD}
+          volumes:
+            - pgdata:/var/lib/postgresql/data
+          healthcheck:
+            test: ["CMD-SHELL", "pg_isready -U kb -d kb"]
+            interval: 5s
+            timeout: 3s
+            retries: 10
+        redis:
+          image: redis:8
+          command: ["redis-server", "--appendonly", "yes"]
+          volumes:
+            - redisdata:/data
+          healthcheck:
+            test: ["CMD", "redis-cli", "ping"]
+            interval: 5s
+            retries: 10
+      volumes:
+        pgdata:
+        redisdata:
+      ```
+
+      **三、服务发现：服务名就是主机名**
+
+      Compose 为项目创建一个默认网络，每个服务以**服务名**作为 DNS 名。API 连接数据库写 `db:5432`，不是 `localhost:5432`——在容器里，`localhost` 指的是**容器自己**。
+
+      ```mermaid
+      flowchart LR
+        U["浏览器或 Nginx"] -->|"宿主机 8000"| API["api 容器"]
+        subgraph NET["Compose 默认网络 kb_default"]
+          API -->|"db 5432"| DB[("db pgvector")]
+          API -->|"redis 6379"| R[("redis")]
+          WK["worker 容器"] --> DB
+          WK --> R
+        end
+        DB --- V1[("命名卷 pgdata")]
+        R --- V2[("命名卷 redisdata")]
+      ```
+
+      `ports` 是把容器端口**暴露到宿主机**。数据库和 Redis 只需要在内部网络中被访问，**不应该配置 ports**，否则就暴露在宿主机网卡上（云服务器上可能直接暴露到公网）。
+
+      **四、启动顺序：depends_on 加健康条件**
+
+      - 只写 `depends_on: [db]`，Compose 只保证 db **容器已启动**，不保证 PostgreSQL 已经能接受连接。API 启动时立刻连库，可能报「connection refused」后崩溃。
+      - 写成 `condition: service_healthy`，Compose 会等 db 的 healthcheck 通过后才创建 api。
+      - 即便如此，应用自己也应该**对数据库连接做重试**：生产中数据库可能在运行期间重启。
+
+      **五、常用命令**
+
+      `docker compose up -d --build`（构建并后台启动）、`docker compose ps`、`docker compose logs -f api`、`docker compose exec db psql -U kb`、`docker compose down`（删除容器和网络，**默认保留命名卷**）、`docker compose down -v`（连卷一起删，**数据会丢**）。
+    scenarios: |
+      - 本地开发：一条命令起 API、worker、pgvector、Redis，配合 `develop.watch` 热同步代码。
+      - 客户私有化部署：交付镜像 + compose.yaml + .env 模板 + 部署文档。
+      - 集成测试：CI 中用 Compose 起依赖服务，测试完成后 `down -v` 清理。
+    pitfalls: |
+      - **在容器里用 localhost 连数据库**，连的是容器自己。
+      - **只写 depends_on 不加健康条件**，应用偶发启动失败，重启几次又好了。
+      - **给 db 和 redis 配置 ports 映射到宿主机**，加上弱密码，数据库直接暴露。
+      - **继续写 `version: "3.x"` 和 `docker-compose` 命令**，属于旧写法。
+      - **误用 `docker compose down -v`**，生产数据卷被删除。
+      - **混淆两种 .env**：项目目录下的 `.env` 用于 compose 文件里 `${VAR}` 的变量替换；`env_file` 是把变量注入容器环境，两者用途不同。
+    interview_asks:
+      - "Compose 中服务之间是怎么通信的？为什么不能用 localhost？"
+      - "depends_on 能保证数据库可用后再启动应用吗？"
+      - "你们的项目是怎么用 Docker Compose 部署的？"
+    project_example: |
+      客户私有化部署知识库时，我们交付 compose.yaml，包含 api、worker、db（pgvector）、redis 四个服务和一个 Nginx。第一次部署时 api 偶发启动失败，日志是数据库连接被拒绝，原因是 depends_on 没有加健康条件；加上 pg_isready 健康检查和 service_healthy 条件，并在应用启动时对数据库连接重试 5 次后解决。安全检查时发现 Redis 的 6379 映射到了宿主机且没有密码，随即删除了 ports，只在内部网络访问。
+    freshness: |
+      核对于 2026-11：Docker 官方文档与 Compose Specification 说明顶层 `version` 字段已过时（obsolete），仅为向后兼容保留、使用时会给出警告，Compose 总是使用最新规范校验文件；默认文件名首选 `compose.yaml`，兼容 `docker-compose.yml`。Compose v1（Python，`docker-compose` 命令）为历史版本；当前受支持的是 Compose v2 与 Compose v5（v5 于 2025 年发布，功能与 v2 一致，主要新增官方 Go SDK，版本号跳到 5 是为避免与旧文件格式 v2/v3 混淆），命令均为 `docker compose`。`depends_on` 支持 `service_started`、`service_healthy`、`service_completed_successfully` 条件。
+    sources:
+      - {title: "Docker Docs - Version and name top-level elements", url: "https://docs.docker.com/reference/compose-file/version-and-name/"}
+      - {title: "Docker Docs - History and development of Docker Compose", url: "https://docs.docker.com/compose/intro/history"}
+      - {title: "Compose Specification", url: "https://compose-spec.github.io/compose-spec/spec.html"}
+  - id: d44-k4
+    name: 配置、密钥与数据持久化
+    level: P1
+    summary: 配置运行期注入不进镜像；密钥用 secret 或环境注入并可轮换；数据放命名卷而非容器可写层
+    why: |
+      同一个镜像要能部署到开发、测试、生产、客户私有环境，配置必须与镜像分离。密钥处理不当是最常见的安全事故来源之一；数据卷配置错误则可能让客户的知识库数据在一次重建后全部消失。
+    problem: |
+      需要回答三个问题：配置（数据库地址、模型名称）在哪里注入；密钥（API Key、数据库密码）如何避免出现在镜像、代码仓库和日志里；数据库文件、上传的文档存在哪里才能在容器重建、升级后保留。
+    principle: |
+      **一、配置：构建期 vs 运行期**
+
+      - **镜像应当与环境无关**：同一个镜像在所有环境运行，差异只通过运行期的环境变量或配置文件注入（十二要素应用的「配置」原则）。
+      - 应用侧用 pydantic-settings 之类从环境变量读取配置并校验（Day 09 的 Pydantic），缺少必填项时启动即失败，而不是运行到一半才报错。
+      - `ARG` 是构建期参数，`ENV` 会写进镜像——**两者都不能用来放密钥**，Docker 官方文档也明确提示 ARG/ENV 不适合传递密钥，值可通过 `docker history` 或 `docker inspect` 看到。
+
+      **二、密钥的几种注入方式（按安全性递增）**
+
+      1. **环境变量**（`env_file`、`environment`）：简单、通用；缺点是 `docker inspect` 能看到，进程崩溃转储或调试接口可能打印出来。
+      2. **Compose secrets / 文件挂载**：密钥以文件形式挂载到容器的 `/run/secrets/<名称>`，应用读取文件；不出现在环境变量中。
+      3. **外部密钥管理**（云厂商 KMS/Secrets Manager、Vault）：集中管理、审计、自动轮换，适合生产。
+      4. **构建期需要的密钥**（如拉取私有依赖的 token）：使用 BuildKit 的 `RUN --mount=type=secret`，只在该条指令执行时可见，不写入镜像层。
+
+      无论哪种，`.env` 文件都不能提交到 Git（提交 `.env.example` 模板），也不能打进镜像。
+
+      **三、数据持久化：三种挂载**
+
+      ```mermaid
+      flowchart TD
+        C["容器"] --> W["可写层 容器删除即消失"]
+        C --> NV["命名卷 由 Docker 管理 适合数据库数据"]
+        C --> BM["绑定挂载 宿主机目录 适合开发时挂代码或配置文件"]
+        C --> TM["tmpfs 内存 适合临时敏感文件"]
+      ```
+
+      - **命名卷**：`pgdata:/var/lib/postgresql/data`，生命周期独立于容器，`docker compose down` 默认保留。数据库、Redis AOF、上传文件都应放在卷里。
+      - **绑定挂载**：把宿主机目录挂进容器，开发时挂代码方便热更新；生产中注意宿主机目录的权限与容器用户（非 root）匹配。
+      - 没有声明卷时，官方 postgres 镜像会使用匿名卷；`down` 之后再 `up` 会创建新的匿名卷，旧数据看起来「丢了」（实际留在一个无人引用的孤立卷里）。
+      - **卷不是备份**：仍然需要定期 `pg_dump` 或快照，并演练恢复。
+    scenarios: |
+      - 一个镜像，开发环境连本地 db，生产环境通过 env_file 注入云数据库地址。
+      - 数据库密码通过 Compose secrets 挂载为文件，应用启动时读取。
+      - 知识库原始文件存放在命名卷或对象存储中，升级 API 镜像不影响已上传文档。
+    pitfalls: |
+      - **把 .env 提交到 Git 或打进镜像**，密钥泄露后必须全部轮换。
+      - **误区：环境变量是绝对安全的。** `docker inspect` 和日志都可能泄露，敏感场景用 secret 文件或密钥管理服务。
+      - **数据库不挂命名卷**，重建容器后数据「消失」。
+      - **把卷当备份**，宿主机磁盘损坏时数据一起丢失。
+      - **非 root 容器挂载宿主机目录时权限不匹配**，应用写文件报 Permission denied。
+    interview_asks:
+      - "API Key 这类密钥你们是怎么注入到容器中的？"
+      - "容器重启或重建后数据会丢吗？怎么保证数据持久化？"
+    project_example: |
+      我们统一了配置规范：仓库只提交 .env.example；开发环境用本地 .env；生产环境的模型 API Key 和数据库密码存放在云厂商的密钥管理服务中，部署脚本在启动前拉取并以 secret 文件挂载到 /run/secrets，应用通过 pydantic-settings 读取并在缺失时启动失败。PostgreSQL 与上传文件分别使用命名卷，并每天凌晨 pg_dump 到对象存储，每季度做一次恢复演练。
+  - id: d44-k5
+    name: 镜像发布与部署流程
+    level: P2
+    summary: CI 构建并推送不可变标签的镜像，部署只拉取指定版本，日志输出到标准输出
+    why: |
+      面试官问「你们怎么上线的」，答「在服务器上 git pull 然后重启」会显得很不工程化。了解一条标准的镜像发布流水线，能体现你对可复现、可回滚的理解，也能和你以往的部署、现场调试经验结合起来讲。
+    problem: |
+      要保证：上线的版本可追溯；任何时候都能快速回滚到上一个版本；构建一次、多环境复用同一个镜像；不同 CPU 架构的服务器都能运行；问题出现时能看到日志。
+    principle: |
+      **标准流程**
+
+      ```mermaid
+      flowchart LR
+        A["提交代码"] --> B["CI 测试"]
+        B --> C["构建镜像 标签为 git sha 或版本号"]
+        C --> D["镜像扫描"]
+        D --> E["推送到镜像仓库"]
+        E --> F["测试环境拉取该标签部署"]
+        F --> G["生产环境部署同一标签"]
+        G -->|"异常"| H["回滚到上一标签"]
+      ```
+
+      - **不可变标签**：用 `1.4.2` 或 `git-3f9c2ab`，同一个标签永远指向同一个镜像；`latest` 只作为便利标签，不用于生产部署。
+      - **构建一次，到处部署**：测试通过的那个镜像直接部署到生产，不重新构建。
+      - **多架构**：在 Apple Silicon（arm64）电脑上构建的镜像，到 x86_64 服务器上运行会报 `exec format error`。CI 用 `docker buildx build --platform linux/amd64,linux/arm64` 构建多架构镜像，或明确指定目标平台。
+      - **日志**：应用把日志写到标准输出/标准错误，由 Docker 或日志采集系统收集，不要写在容器内的文件里。
+      - **规模更大时**：从 Compose 迁移到 Kubernetes 等编排平台，获得滚动更新、自动扩缩容、自愈能力，但概念（镜像、健康检查、配置注入、卷）是相通的。
+    scenarios: |
+      - 线上发现回答引用异常，5 分钟内把镜像标签改回上一版本并重新部署。
+      - 客户内网部署：CI 产出镜像文件，通过 `docker save`/`docker load` 交付。
+      - 开发用 Mac 构建，生产 x86 服务器运行，CI 统一构建 amd64 镜像。
+    pitfalls: |
+      - **生产使用 latest 标签**，无法确定运行版本，回滚困难。
+      - **每个环境各自重新构建**，测试过的和上线的不是同一个镜像。
+      - **在 arm64 电脑上构建后直接推到 x86 服务器**，启动报 exec format error。
+      - **日志写进容器内文件**，容器重建即丢失，也无法集中检索。
+    interview_asks:
+      - "你们的服务是怎么构建和上线的？出问题怎么回滚？"
+      - "为什么生产环境不建议用 latest 标签？"
+    project_example: |
+      我们的流水线是：合并到 main 后 CI 跑测试，构建 linux/amd64 镜像并打上版本号和 git sha 两个标签，经过镜像漏洞扫描后推送到私有仓库；测试环境自动部署，验收通过后在生产服务器上修改 compose 中的镜像标签并执行 docker compose up -d。上次一个版本的 Prompt 改动导致引用格式错误，我们把标签改回上一版本，3 分钟完成回滚。
+quiz:
+  - id: d44-q1
+    kp: d44-k1
+    type: judge
+    question: 在 Dockerfile 中先用 `COPY secrets.json /app/` 复制密钥文件、使用完后再写一条 `RUN rm /app/secrets.json`，最终镜像中就不再包含这个密钥文件的内容。
+    answer: false
+    explain: |
+      镜像由只读层叠加而成，COPY 那一层已经包含了 secrets.json，后面的 RUN rm 只是在新的一层里把它标记为删除。拿到镜像的人可以导出各层，从之前那一层中提取文件内容。构建期需要的密钥应使用 BuildKit 的 RUN --mount=type=secret，它不会写入任何镜像层。
+  - id: d44-q2
+    kp: d44-k1
+    type: single
+    question: 下面哪种 Dockerfile 指令顺序最能利用构建缓存，使「只修改业务代码」时构建最快？
+    options:
+      - "COPY . . → 安装依赖 → CMD"
+      - "COPY pyproject.toml uv.lock → 安装依赖 → COPY . . → CMD"
+      - "安装依赖 → COPY pyproject.toml uv.lock → COPY . . → CMD"
+      - "COPY . . → COPY pyproject.toml uv.lock → 安装依赖 → CMD"
+    answer: [1]
+    explain: |
+      缓存按层判断，某一层失效后其后所有层都要重建。先只复制依赖清单并安装依赖，依赖不变时这一层命中缓存，改业务代码只影响最后的 COPY。选项一和四一开始就复制全部代码，任何改动都会让依赖安装重新执行；选项三在没有依赖清单时无法安装依赖。
+  - id: d44-q3
+    kp: d44-k2
+    type: multi
+    question: 审查一个 Python 服务的生产镜像时，以下哪些属于应当指出的问题？（多选）
+    options:
+      - "没有 .dockerignore，`COPY . .` 把 .env 和 .git 复制进了镜像"
+      - "最后阶段没有 USER 指令，容器以 root 运行"
+      - "使用 `ENV OPENAI_API_KEY=sk-...` 在 Dockerfile 中设置密钥"
+      - "使用多阶段构建，最终镜像只包含 .venv 和应用代码"
+      - "CMD 使用 exec 形式 `[\"uvicorn\", \"app.main:app\"]`"
+    answer: [0, 1, 2]
+    explain: |
+      .env 和 .git 进入镜像会泄露密钥与历史；以 root 运行会扩大被攻破后的影响；ENV 设置的值写进镜像元数据，docker inspect 或 history 即可看到。多阶段构建只保留运行产物是推荐做法；exec 形式的 CMD 让应用作为 PID 1 直接接收 SIGTERM，也是推荐做法。
+  - id: d44-q4
+    kp: d44-k3
+    type: scenario
+    question: |
+      同事用 Compose 部署了 api、db、redis。现象：1）api 容器启动后偶尔报 `connection refused` 退出，手动重启又正常；2）api 日志显示连接 `localhost:5432` 失败；3）安全扫描发现服务器公网 6379 端口可访问。请逐一分析原因并给出修改。
+    key_points:
+      - {text: "指出 depends_on 只保证容器启动不保证数据库就绪，应加 healthcheck 与 service_healthy", dim: principle}
+      - {text: "指出容器中 localhost 是容器自身，应使用服务名 db 作为主机名", dim: concept}
+      - {text: "指出 redis 配置了 ports 映射到宿主机，应删除映射只在内部网络访问并设置密码", dim: engineering}
+      - {text: "提出应用自身对数据库连接做重试，应对运行期的数据库重启", dim: engineering}
+    reference: |
+      **1）偶发 connection refused**：`depends_on: [db]` 只保证 db 容器先启动，PostgreSQL 初始化需要几秒，api 启动时数据库可能还没准备好接受连接。修改：给 db 加 `healthcheck: test: ["CMD-SHELL", "pg_isready -U kb -d kb"]`，api 使用 `depends_on: db: condition: service_healthy`；同时应用启动时对数据库连接做有限次数的重试，因为运行期间数据库也可能重启。
+
+      **2）连接 localhost:5432**：在容器里 localhost 指的是 api 容器自己，里面没有数据库。Compose 默认网络中服务名就是主机名，应改为 `DATABASE_URL=...@db:5432/kb`。
+
+      **3）公网 6379 可访问**：redis 服务配置了 `ports: ["6379:6379"]`，把端口映射到了宿主机所有网卡。api 通过内部网络就能访问 `redis:6379`，不需要映射。修改：删除 ports；生产中为 Redis 设置密码或 ACL；云服务器安全组只开放 Nginx 的 80/443。
+    followup:
+      question: 如果开发时确实需要在本机用图形工具连接数据库，怎么做更安全？
+      key_points:
+        - 只绑定到 127.0.0.1 而不是所有网卡
+        - 放在仅用于开发的 override 文件中
+      reference: |
+        可以写成 `ports: ["127.0.0.1:5432:5432"]`，只监听宿主机回环地址，外部无法访问；并把这段放在 `compose.override.yaml` 或开发专用的配置文件中，生产部署不加载它。也可以用 `docker compose exec db psql` 直接进容器操作。
+  - id: d44-q5
+    kp: d44-k2
+    type: short
+    question: 请解释为什么生产容器不建议以 root 用户运行，并说明在 Dockerfile 中如何改为非 root 运行、以及改完后可能遇到的问题。
+    key_points:
+      - {text: "说明容器共享宿主机内核，root 被攻破后能修改应用文件并扩大逃逸风险", dim: principle}
+      - {text: "结合 AI 场景说明 Agent 代码执行或 Prompt Injection 被利用时 root 的危害", dim: project}
+      - {text: "给出创建系统用户、COPY --chown、USER 指令的写法", dim: engineering}
+      - {text: "指出非 root 不能绑定 1024 以下端口及挂载目录写权限问题", dim: engineering}
+    reference: |
+      容器不是虚拟机，它与宿主机共享内核。以 root 运行时，一旦应用被攻破（例如 Agent 的代码执行工具被 Prompt Injection 诱导执行任意命令），攻击者在容器内拥有最高权限：可以篡改应用代码、读取所有挂载的文件，并且更容易利用内核漏洞或错误的挂载配置（如挂载了 docker.sock）逃逸到宿主机。最小权限原则要求应用只拥有运行所需的权限。
+
+      改法：在最终阶段 `RUN groupadd --system app && useradd --system --gid app --no-create-home app`，复制文件时 `COPY --from=builder --chown=app:app /app /app`，然后 `USER app`，之后的 CMD 以该用户运行。
+
+      可能的问题：非 root 用户不能绑定 1024 以下端口，容器内监听 8000，由 Nginx 或端口映射对外提供 80/443；应用需要写入的目录（上传临时目录、挂载卷）要保证 app 用户有写权限，否则报 Permission denied；启动时不能再执行 apt-get 之类需要 root 的操作。
+  - id: d44-q6
+    kp: d44-k4
+    type: design
+    question: 你要把知识库系统交付到客户内网，客户要求：密钥不能出现在镜像和代码仓库里、升级版本不能丢数据、出问题能快速回滚。请设计镜像、配置、密钥、数据和升级回滚方案。
+    key_points:
+      - {text: "镜像与环境无关，使用不可变版本标签，通过 docker save 与 load 交付", dim: engineering}
+      - {text: "配置通过 env_file 运行期注入，仓库只提交 .env.example 模板", dim: engineering}
+      - {text: "密钥通过 secret 文件挂载或客户的密钥管理系统注入，不使用 ARG 或 ENV 写入镜像", dim: principle}
+      - {text: "数据库与上传文件使用命名卷，并有定期备份与恢复演练", dim: engineering}
+      - {text: "升级前备份并保留上一版本镜像，数据库迁移考虑向后兼容，回滚改回旧标签", dim: project}
+    reference: |
+      **镜像**：CI 构建 linux/amd64 镜像，标签使用版本号（如 1.4.2），扫描后 `docker save` 成离线包交付；镜像中不包含 .env、.git、测试数据（.dockerignore），以非 root 运行。
+
+      **配置**：同一镜像适用所有环境，客户现场的地址、模型名等写在 `.env.prod`（由客户运维维护），通过 `env_file` 注入；仓库只提交 `.env.example`。应用启动时用 pydantic-settings 校验，缺失即报错。
+
+      **密钥**：数据库密码、模型 API Key 由客户运维写入宿主机受限权限的文件，通过 Compose `secrets` 挂载到 `/run/secrets/`，应用读取文件；若客户有 Vault 等系统，则启动前从中拉取。绝不使用 ARG/ENV 写进镜像。
+
+      **数据**：PostgreSQL 数据、Redis AOF、上传原始文件分别用命名卷；每日 pg_dump 到客户指定的备份位置，交付时一起演练恢复。
+
+      **升级与回滚**：升级前执行备份；`docker load` 新镜像，修改 compose 中的标签后 `docker compose up -d`；数据库迁移采用向后兼容的方式（先加字段、不立即删旧字段），保证回滚到旧版本时仍可运行；出现问题时把标签改回上一版本重新 up，必要时恢复备份。
+  - id: d44-q7
+    kp: d44-k3
+    type: single
+    question: 关于当前的 Docker Compose，下列说法正确的是？
+    options:
+      - "compose 文件必须以 `version: \"3.8\"` 开头，否则无法解析"
+      - "推荐使用 `docker compose`（空格）命令，默认文件名首选 compose.yaml，顶层 version 字段已过时"
+      - "`docker compose down` 默认会删除所有命名卷，因此数据库数据会丢失"
+      - "`depends_on` 默认就会等待数据库健康检查通过后再启动依赖它的服务"
+    answer: [1]
+    explain: |
+      当前 Compose 规范中顶层 version 仅为向后兼容保留，写了会收到 obsolete 警告，命令为 docker compose，首选文件名 compose.yaml。docker compose down 默认只删除容器和网络，保留命名卷，加 -v 才删除卷。depends_on 默认只保证依赖容器已启动，需要显式写 condition: service_healthy 才会等待健康检查。
+code_reading:
+  id: d44-c1
+  kp: [d44-k2, d44-k3, d44-k4]
+  title: 一份待审查的 Dockerfile 与 compose.yaml
+  scenario: 知识库 API 项目的部署文件，由同事用 AI 生成后直接提交。项目根目录有 `.env`（含模型 API Key 和数据库密码）、`.git`、本地 `.venv`，没有 `.dockerignore`。下面把两个文件放在一起展示，用注释分隔。
+  language: dockerfile
+  code: |
+    # ===== Dockerfile =====
+    FROM python:3.12
+    WORKDIR /app
+    COPY . .
+    RUN pip install uv && uv sync --frozen
+    EXPOSE 8000
+    CMD uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+    # ===== compose.yaml =====
+    version: "3.8"
+    services:
+      api:
+        build: .
+        ports:
+          - "8000:8000"
+        environment:
+          DATABASE_URL: postgresql+psycopg://kb:kb123@db:5432/kb
+          REDIS_URL: redis://redis:6379/0
+        depends_on:
+          - db
+          - redis
+      db:
+        image: pgvector/pgvector:pg17
+        environment:
+          POSTGRES_USER: kb
+          POSTGRES_PASSWORD: kb123
+          POSTGRES_DB: kb
+      redis:
+        image: redis:8
+        ports:
+          - "6379:6379"
+  walkthrough:
+    function: |
+      Dockerfile 基于完整版 python:3.12 镜像，把整个项目目录复制进去，用 uv 安装依赖，以 shell 形式启动 uvicorn。compose.yaml 定义 api、db（pgvector）、redis 三个服务，api 通过服务名连接 db 和 redis，并把 8000 端口暴露到宿主机；redis 也把 6379 暴露到宿主机。
+    key_functions: |
+      - `COPY . .`：把构建上下文全部复制进镜像——由于没有 .dockerignore，包括 .env、.git、.venv。
+      - `RUN pip install uv && uv sync --frozen`：安装 uv 并按锁文件安装依赖，位于 COPY 全部代码之后。
+      - `CMD`（shell 形式）：通过 /bin/sh -c 启动 uv run uvicorn，以 root 运行。
+      - `depends_on`：只声明启动顺序，没有健康条件；db 没有 healthcheck 也没有数据卷。
+    params: |
+      数据库密码 `kb123` 以明文同时写在 api 的 DATABASE_URL 和 db 的 POSTGRES_PASSWORD 中，并随 compose.yaml 提交到仓库；`.env` 中的模型 API Key 没有通过 env_file 在运行期注入，而是随 `COPY . .` 进入了镜像文件系统，应用若用 python-dotenv 加载 .env 就会读到镜像里的那份。
+    data_flow: |
+      ```mermaid
+      flowchart TD
+        CTX["构建上下文 含 .env .git .venv"] -->|"COPY 全部"| IMG["镜像层 包含 .env"]
+        IMG --> DEP["uv sync 每次改代码都重跑"]
+        DEP --> RUNC["容器以 root 运行"]
+        RUNC -->|"db 5432"| DB[("db 无卷 无健康检查")]
+        RUNC -->|"redis 6379"| R[("redis")]
+        R -->|"ports 映射"| PUB["宿主机所有网卡 6379"]
+        DB -.->|"down 后再 up"| LOST["新匿名卷 旧数据不可见"]
+      ```
+    failure_points: |
+      - **以 root 运行且 .env 被打进镜像**：没有 USER 指令；没有 .dockerignore 导致 .env（API Key、数据库密码）、.git、.venv 进入镜像，任何能拉取镜像的人都能 `cat /app/.env`。
+      - **depends_on 没有健康条件**：db 只是「容器已启动」，api 可能在数据库就绪前连接失败而退出。
+      - 依赖安装位于 `COPY . .` 之后，任何代码改动都会让依赖重新安装；本地 .venv 被复制进来可能和 uv sync 产生冲突。
+      - shell 形式的 CMD 使应用不是 PID 1，可能收不到 SIGTERM，`docker stop` 等待超时后被强杀。
+      - db 没有命名卷，数据只在匿名卷中，`down` 后重新 `up` 会使用新卷，旧数据看起来丢失。
+      - redis 端口映射到宿主机且无密码；数据库密码明文写在仓库中。
+      - 顶层 `version` 为过时写法；基础镜像使用完整版 python，体积大。
+    debugging: |
+      - `docker run --rm 镜像 id` 查看运行用户；`docker run --rm 镜像 cat /app/.env` 验证密钥泄露。
+      - `docker history 镜像` 查看每层大小和指令；`docker image ls` 对比 slim 版本体积。
+      - `docker compose up` 时观察 api 日志中的连接错误时间点与 db 的「ready to accept connections」日志先后。
+      - `docker compose down && docker compose up -d` 后查询数据表，再用 `docker volume ls` 观察是否多出匿名卷。
+      - 从另一台机器 `redis-cli -h 服务器IP ping` 验证 6379 是否暴露。
+    change_request: |
+      如果要求「镜像不含任何密钥、以非 root 运行、数据库就绪后才启动 api」：新增 .dockerignore（排除 .env、.git、.venv 等）；Dockerfile 改为多阶段，先复制 pyproject.toml 和 uv.lock 安装依赖再复制代码，最终阶段创建 app 用户并 `USER app`，CMD 改为 exec 形式并增加 HEALTHCHECK；compose 中删除 version 和 redis 的 ports，api 用 env_file 或 secrets 注入密钥，db 增加 pg_isready 健康检查与命名卷，api 的 depends_on 改为 `condition: service_healthy`。
+  questions:
+    - id: d44-c1-q1
+      kp: d44-k2
+      type: code
+      question: 请按 Dockerfile 的执行顺序，说明 `.env` 文件是如何进入最终镜像的、谁能读到它、以及仅仅「事后加一行 RUN rm /app/.env」为什么不够。最后给出完整的修复步骤（包括已泄露密钥的处理）。
+      key_points:
+        - {text: "指出没有 .dockerignore 时构建上下文包含 .env，COPY . . 将其写入镜像层", dim: principle}
+        - {text: "指出任何能拉取镜像或运行容器的人都能读取，且镜像推送到仓库会扩散", dim: concept}
+        - {text: "指出 RUN rm 只是在新层标记删除，原层仍保留文件内容", dim: principle}
+        - {text: "给出 .dockerignore、运行期注入、立即轮换已泄露密钥的修复", dim: engineering}
+      reference: |
+        执行过程：`docker build .` 时，Docker 把当前目录（构建上下文）发送给构建器；由于没有 .dockerignore，.env、.git、.venv 都在上下文里。`COPY . .` 把它们全部写入一个镜像层，于是 `/app/.env` 成为镜像的一部分。之后镜像被推送到仓库、分发给测试和客户，任何能拉取镜像的人执行 `docker run --rm 镜像 cat /app/.env` 就能看到模型 API Key 和数据库密码；容器以 root 运行，被攻破时攻击者同样能直接读取。
+
+        加 `RUN rm /app/.env` 不够：镜像是只读层的叠加，rm 只在新层中把文件标记为删除，COPY 那一层仍然完整保存了文件内容，导出镜像各层即可恢复。
+
+        修复：
+        1. 新增 .dockerignore，排除 `.env`、`.env.*`、`.git`、`.venv`、`__pycache__` 等。
+        2. 密钥改为运行期注入：compose 中用 `env_file: .env.prod` 或 `secrets` 挂载，应用从环境变量或 `/run/secrets` 读取。
+        3. **把已泄露的 API Key 和数据库密码全部轮换**，删除仓库中包含旧镜像的标签，并检查访问日志。
+        4. CI 中增加镜像检查：镜像内不得存在 .env 文件。
+    - id: d44-c1-q2
+      kp: d44-k3
+      type: code
+      question: 执行 `docker compose up -d` 后，api 有时启动失败、有时正常。请结合 compose.yaml 说明启动时各服务的实际先后关系，为什么会偶发失败，以及你会如何修改 compose.yaml 和应用代码。
+      key_points:
+        - {text: "说明 depends_on 列表形式只保证 db 与 redis 容器先于 api 启动", dim: principle}
+        - {text: "指出 PostgreSQL 初始化需要时间，api 连接时数据库可能尚未就绪，取决于时序所以偶发", dim: principle}
+        - {text: "给出 db 的 pg_isready 健康检查与 api 的 condition service_healthy 写法", dim: engineering}
+        - {text: "提出应用启动时对数据库连接做有限重试，并为 db 增加命名卷", dim: engineering}
+      reference: |
+        实际顺序：Compose 先创建并启动 db 和 redis 容器，「容器进程已启动」后立即启动 api。但 PostgreSQL 容器启动后还要初始化数据目录（首次启动时更久）、启动服务，才开始监听 5432。api 一启动就创建数据库连接池或执行迁移，如果此时数据库还没就绪，就会得到 connection refused 并退出。是否失败取决于宿主机负载和是否首次初始化，所以表现为「偶发」。
+
+        修改 compose.yaml：
+        ```yaml
+        db:
+          image: pgvector/pgvector:pg17
+          volumes: [pgdata:/var/lib/postgresql/data]
+          healthcheck:
+            test: ["CMD-SHELL", "pg_isready -U kb -d kb"]
+            interval: 5s
+            retries: 10
+        api:
+          depends_on:
+            db: {condition: service_healthy}
+            redis: {condition: service_healthy}
+        ```
+        redis 同样加 `redis-cli ping` 健康检查；顶层增加 `volumes: {pgdata: {}}`，并删除过时的 version 字段。
+
+        修改应用：启动时对数据库连接做有限次数的指数退避重试（例如 5 次），因为生产运行期间数据库也可能重启；配合 `restart: unless-stopped` 让偶发失败可自动恢复。
+interview:
+  - id: d44-i1
+    kp: d44-k1
+    type: oral
+    difficulty: 1
+    question: 镜像和容器有什么区别？容器和虚拟机又有什么区别？
+    key_points:
+      - {text: "说明镜像是只读分层模板，容器是镜像加可写层的运行实例", dim: concept}
+      - {text: "说明容器共享宿主机内核，依靠 namespace 与 cgroups 隔离，虚拟机有独立内核", dim: principle}
+      - {text: "说明由此带来的差异：启动速度、资源占用、隔离强度", dim: principle}
+      - {text: "结合项目说明容器可写层数据不持久需用卷", dim: project}
+    reference: |
+      镜像是一个只读的模板，由多层组成，包含应用代码、依赖、运行时和启动命令；容器是镜像运行起来的进程实例，在镜像之上加了一层可写层，同一个镜像可以启动多个容器。容器删除时可写层也会消失，所以需要持久化的数据要放在卷里。
+
+      容器和虚拟机的核心区别在于内核：虚拟机通过 Hypervisor 虚拟出完整硬件，每台虚拟机运行自己的操作系统内核；容器共享宿主机内核，只是用 Linux namespace 隔离进程、网络、文件系统视图，用 cgroups 限制 CPU 和内存。因此容器启动是秒级、资源开销小、密度高，但隔离强度低于虚拟机——这也是容器内不建议以 root 运行的原因。
+
+      在我们的项目中，API、worker 都是无状态容器，可以随时重建；PostgreSQL 的数据放在命名卷中。
+    oral: |
+      镜像是只读的模板，一层一层叠起来，里面有代码、依赖和启动命令；容器是镜像跑起来的进程，在上面多了一层可写层，容器删了这层也就没了。
+      容器和虚拟机最大的区别是内核：虚拟机有自己的操作系统内核，容器共享宿主机内核，靠 namespace 隔离、cgroups 限制资源。所以容器启动快、开销小，但隔离没虚拟机强。
+      在我们项目里，API 和 worker 容器是无状态的，随时可以重建，数据库数据都放在命名卷里。
+  - id: d44-i2
+    kp: d44-k2
+    type: oral
+    difficulty: 2
+    question: 如果让你优化一个 Python AI 服务的 Dockerfile，你会从哪些方面入手？
+    key_points:
+      - {text: "利用层缓存：先复制依赖清单安装依赖，再复制代码，并使用缓存挂载", dim: principle}
+      - {text: "多阶段构建与 slim 基础镜像，最终镜像只保留运行产物", dim: engineering}
+      - {text: "安全：.dockerignore 排除 .env 与 .git、非 root 运行、不用 ARG 或 ENV 传密钥", dim: engineering}
+      - {text: "运行：exec 形式 CMD 优雅退出、HEALTHCHECK、固定版本", dim: engineering}
+      - {text: "结合项目说明优化前后的体积或构建时间变化", dim: project}
+    reference: |
+      **构建速度**：先 `COPY pyproject.toml uv.lock` 安装依赖，再复制代码，让依赖层命中缓存；用 `RUN --mount=type=cache` 复用 uv 下载缓存。
+
+      **体积**：多阶段构建，builder 阶段安装依赖与构建，最终阶段基于 slim 镜像只复制 `.venv` 和代码；不在最终镜像中保留编译器和缓存；.dockerignore 排除测试数据和本地文件。
+
+      **安全**：.dockerignore 排除 `.env`、`.git`、`.venv`；创建专用用户并 `USER app`；密钥在运行期通过环境变量或 secret 注入，构建期的私有 token 用 `--mount=type=secret`；固定基础镜像和工具版本，CI 中做镜像扫描。
+
+      **运行**：CMD 使用 exec 形式让应用成为 PID 1，正确处理 SIGTERM 实现优雅关闭；增加轻量的 HEALTHCHECK 接口供编排系统使用；日志输出到 stdout。
+
+      我们按这个思路改造后，镜像从 1.6GB 降到约 300MB，日常构建从 9 分钟降到 1 分钟以内，并消除了镜像中的密钥泄露。
+    oral: |
+      我会从四个方面优化。第一是构建速度，先复制依赖清单装依赖，再复制代码，这样改代码不会重装依赖，再加上 uv 的缓存挂载。第二是体积，用多阶段构建，最终镜像基于 slim，只带 .venv 和代码。第三是安全，.dockerignore 排除 .env 和 .git，用非 root 用户跑，密钥运行时注入。第四是运行，CMD 用 exec 形式让应用能收到 SIGTERM 优雅退出，再加健康检查。
+      我们之前一个镜像 1.6GB、构建 9 分钟，还能直接读出 .env。改完之后大约 300MB，构建一分钟以内。
+  - id: d44-i3
+    kp: d44-k3
+    type: oral
+    difficulty: 2
+    question: 讲讲你们项目是怎么用 Docker Compose 编排的？服务之间怎么通信、怎么保证启动顺序和数据不丢？
+    key_points:
+      - {text: "列出服务组成：api、worker、db（pgvector）、redis，可选 Nginx", dim: project}
+      - {text: "说明默认网络中以服务名作为主机名通信，容器内 localhost 指自己", dim: principle}
+      - {text: "说明 depends_on 加 service_healthy 与健康检查，以及应用侧重试", dim: engineering}
+      - {text: "说明命名卷持久化、down 与 down -v 的区别，以及只暴露必要端口", dim: engineering}
+      - {text: "提到 docker compose 新写法与 version 字段已过时", dim: concept}
+    reference: |
+      我们的 compose.yaml 包含 api、worker（同一个镜像，不同 command）、db（pgvector/pgvector 镜像）、redis，以及前面的 Nginx。
+
+      **通信**：Compose 为项目创建默认网络，服务名就是 DNS 主机名，api 用 `db:5432`、`redis:6379` 连接；容器内的 localhost 指容器自己。只有 Nginx 映射 80/443 到宿主机，数据库和 Redis 不映射端口。
+
+      **启动顺序**：db 配置 `pg_isready` 健康检查，redis 配置 `redis-cli ping`，api 和 worker 使用 `depends_on: condition: service_healthy`；应用启动时仍会对数据库连接做重试，以应对运行期间依赖重启。
+
+      **数据持久化**：PostgreSQL 和 Redis 都使用命名卷，`docker compose down` 默认保留卷，只有 `down -v` 才删除；另外每天 pg_dump 备份。
+
+      **规范**：使用 `docker compose` 命令和 compose.yaml，不再写过时的 version 字段；配置通过 env_file 注入，密钥使用 secrets。
+    oral: |
+      我们的 Compose 里有 api、worker、pgvector 数据库、Redis，前面还有一个 Nginx。api 和 worker 用的是同一个镜像，只是启动命令不同。
+      服务之间通过服务名通信，比如 api 连 db:5432，因为容器里的 localhost 指的是它自己。对外只有 Nginx 暴露端口，数据库和 Redis 都不映射。
+      启动顺序靠健康检查，db 用 pg_isready，api 写 condition: service_healthy，应用自己也会重试连接。数据库和 Redis 都挂命名卷，down 不会丢数据，另外每天还有 pg_dump 备份。
+  - id: d44-i4
+    kp: d44-k4
+    type: oral
+    difficulty: 3
+    question: 容器化部署中，配置和密钥应该怎么管理？如果发现密钥被打进了镜像，你会怎么处理？
+    key_points:
+      - {text: "说明镜像与环境无关，配置运行期通过环境变量或配置文件注入并校验", dim: principle}
+      - {text: "比较环境变量、secret 文件挂载、外部密钥管理的安全性差异", dim: engineering}
+      - {text: "说明 ARG 与 ENV 会留在镜像元数据中，构建期密钥应使用 secret mount", dim: principle}
+      - {text: "泄露处理：立即轮换密钥、删除受影响镜像、修复 .dockerignore 与流水线检查", dim: engineering}
+      - {text: "结合项目给出具体做法", dim: project}
+    reference: |
+      **原则**：同一个镜像部署到所有环境，环境差异全部在运行期注入。应用用 pydantic-settings 等从环境变量读取并校验，缺失配置启动即失败。
+
+      **密钥注入方式**：环境变量最简单，但 `docker inspect`、调试接口、崩溃日志都可能泄露；Compose secrets 以文件挂载到 `/run/secrets`，不进入环境变量，更安全；生产环境推荐使用云厂商密钥管理服务或 Vault，集中管理、审计并支持自动轮换。构建期需要的私有仓库 token 用 BuildKit `--mount=type=secret`，不能用 ARG 或 ENV，它们会出现在镜像元数据或构建历史中。仓库只提交 `.env.example`。
+
+      **泄露处理**：
+      1. 立即轮换所有泄露的密钥（模型 API Key、数据库密码），这是第一优先级——镜像可能已经被拉取，删除镜像不能收回泄露。
+      2. 检查对应服务的访问日志与账单，评估是否被滥用。
+      3. 从镜像仓库删除受影响的标签，通知已拉取的环境更新。
+      4. 修复根因：增加 .dockerignore，密钥改为运行期注入；CI 中增加镜像扫描，检测 .env 文件和常见密钥格式。
+    oral: |
+      我的原则是镜像不带任何环境信息，配置和密钥都在运行时注入。普通配置用 env_file，应用启动时用 pydantic-settings 校验。密钥在生产上我们用密钥管理服务，启动前拉下来以文件挂载到 /run/secrets，不放环境变量，因为 docker inspect 能看到环境变量。ARG 和 ENV 也绝不能放密钥。
+      如果发现密钥进了镜像，第一件事是立刻轮换密钥，因为镜像可能已经被别人拉走了，删镜像没用。然后查访问日志和账单，删除问题镜像，最后补上 .dockerignore 并在 CI 里加镜像扫描。
+  - id: d44-i5
+    kp: d44-k5
+    type: design
+    difficulty: 4
+    question: 请设计知识库系统从代码提交到生产上线的完整容器化交付流程，要求可追溯、可回滚、支持多架构服务器，并说明上线过程中如何保证正在进行的流式问答和入库任务不被粗暴中断。
+    key_points:
+      - {text: "CI 流程：测试、构建、扫描、使用不可变标签推送镜像仓库，构建一次多环境复用", dim: engineering}
+      - {text: "多架构：buildx 构建 amd64 与 arm64 或明确目标平台", dim: engineering}
+      - {text: "回滚：保留历史标签、数据库迁移向后兼容、改回旧标签重新部署", dim: engineering}
+      - {text: "优雅关闭：exec 形式 CMD 接收 SIGTERM，uvicorn 停止接收新请求并等待在途请求，设置足够的停止宽限时间", dim: principle}
+      - {text: "worker 侧：Celery 收到 SIGTERM 后完成当前任务再退出，配合 acks_late 与幂等防止丢失或重复", dim: project}
+    reference: |
+      **CI/CD**：合并到 main → 单元与集成测试（Compose 起依赖服务）→ `docker buildx build --platform linux/amd64,linux/arm64` 构建多架构镜像 → 漏洞与密钥扫描 → 以 `版本号` 和 `git sha` 两个不可变标签推送到私有仓库 → 测试环境自动部署并跑冒烟测试 → 人工批准后生产部署同一个标签。
+
+      **可追溯与回滚**：部署记录中保存每次上线的镜像标签和 git sha；数据库迁移采用「扩展-收缩」方式，先加字段、新旧版本都能运行，确认稳定后再删除旧字段，保证回滚不破坏数据；回滚即把 compose 中的标签改回上一版本并 `docker compose up -d`。
+
+      **优雅上线**：
+      - API：CMD 使用 exec 形式，`docker stop` 发送 SIGTERM 时 uvicorn 停止接受新连接，等待在途请求完成；compose 中设置 `stop_grace_period`（例如 60s）给流式问答留出收尾时间，超过才被 SIGKILL。前端对 SSE 断开有重连与续传机制兜底。多实例时通过 Nginx 先摘除流量再停止旧实例。
+      - Worker：Celery 收到 SIGTERM 后进行温和关闭，不再取新任务、等待当前任务完成；长任务超过宽限时间被杀时，依靠 acks_late 让任务重新投递，并依靠任务幂等避免重复数据。
+
+      **可观测**：上线后监控错误率、首 Token 延迟、任务失败率，异常时自动或人工回滚。
+    oral: |
+      我的流程是：合并代码后 CI 跑测试，用 buildx 构建 amd64 和 arm64 的镜像，扫描漏洞和密钥，然后用版本号加 git sha 两个不可变标签推到私有仓库。测试环境自动部署，验收后生产部署同一个标签，不重新构建。
+      回滚就是把标签改回去，前提是数据库迁移要向后兼容，先加字段，稳定后再删旧字段。
+      上线不中断的关键是优雅关闭。API 的 CMD 用 exec 形式，收到 SIGTERM 后停止接新请求，等在途请求结束，我们设了 60 秒宽限期，前端还有 SSE 续传兜底。worker 收到信号后做完当前任务再退出，万一被强杀，靠 acks_late 重投加幂等兜底。
+sources:
+  - {title: "Docker Docs - Building best practices", url: "https://docs.docker.com/build/building/best-practices/"}
+  - {title: "Docker Docs - Version and name top-level elements", url: "https://docs.docker.com/reference/compose-file/version-and-name/"}
+  - {title: "Docker Docs - History and development of Docker Compose", url: "https://docs.docker.com/compose/intro/history"}
+  - {title: "Compose Specification", url: "https://compose-spec.github.io/compose-spec/spec.html"}
+  - {title: "uv - Using uv in Docker", url: "https://docs.astral.sh/uv/guides/integration/docker/"}

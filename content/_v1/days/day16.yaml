@@ -1,0 +1,668 @@
+day: 16
+phase: 2
+title: 模型参数
+goals:
+  - 能用「logits → softmax → 截断 → 采样」的流程解释 Temperature 和 Top-P 如何改变输出
+  - 能按任务类型（信息抽取、客服问答、文案创作、代码生成）给出参数配置并说明理由
+  - 能解释为什么 temperature=0 或固定 seed 也不能保证完全可复现
+  - 能排查「改了参数没效果」「传了 temperature 报 400」这类线上问题
+knowledge_points:
+  - id: d16-k1
+    name: 采样原理：logits、softmax 与 Temperature
+    level: P0
+    summary: 模型每步只给出下一个 Token 的概率分布，Temperature 通过缩放 logits 改变分布的尖锐程度
+    why: |
+      几乎所有 LLM API 都有 `temperature` 参数，它是你**最常调、也最常被问到**的参数。
+      不懂它的原理，你只能靠「感觉」调：抽取结果不稳定就盲目调低，文案太死板就盲目调高，
+      出了问题也讲不清为什么。面试中「temperature 是什么、设成 0 会怎样」几乎是必考题。
+    problem: |
+      同一个 Prompt，模型每次的回答可能不同——这不是 Bug，而是**采样**的结果。
+      Temperature 解决的是「**输出的随机程度可控**」这个问题：
+      - 需要稳定、可预期的场景（抽取字段、分类、生成 SQL），把随机性压低；
+      - 需要多样性的场景（头脑风暴、广告文案），把随机性放开。
+    principle: |
+      **一、模型每一步到底输出什么？**
+
+      回顾 Day 11~13：LLM 是「下一个 Token 预测器」。每生成一个 Token，模型最后一层会对**词表里每个 Token** 打一个分，这个原始分数叫 **logits**（可以是任意实数，有正有负）。
+
+      logits 不是概率，要经过 **softmax** 变成概率：
+
+      - softmax(z_i) = exp(z_i) / Σ exp(z_j)
+      - 效果：分数越高的 Token 概率越大，所有概率加起来等于 1。
+
+      然后从这个概率分布里**抽一个 Token** 作为输出，拼到上下文后面，再预测下一个。这就是「自回归生成」。
+
+      ```mermaid
+      flowchart LR
+        A["上下文 Token 序列"] --> B["Transformer 前向计算"]
+        B --> C["词表每个 Token 的 logits"]
+        C --> D["除以 Temperature"]
+        D --> E["softmax 得到概率分布"]
+        E --> F["Top-P 或 Top-K 截断"]
+        F --> G["按概率随机抽一个 Token"]
+        G --> H["拼回上下文 继续下一步"]
+        H --> A
+      ```
+
+      **二、Temperature 做了什么？**
+
+      Temperature（记作 T）在 softmax **之前**把 logits 统一除以 T：`softmax(z_i / T)`。
+
+      举例：三个候选 Token「好 / 不错 / 棒」的 logits 是 [4, 3, 1]：
+
+      | T | 好 | 不错 | 棒 | 效果 |
+      |---|---|---|---|---|
+      | 0.5 | 0.88 | 0.12 | 0.002 | 分布变**尖**，几乎总选「好」 |
+      | 1.0 | 0.71 | 0.26 | 0.035 | 原始分布 |
+      | 2.0 | 0.55 | 0.33 | 0.12 | 分布变**平**，小概率词也有机会 |
+
+      - **T < 1**：放大分数差距 → 高分 Token 更占优 → 输出更稳定、更保守。
+      - **T > 1**：缩小分数差距 → 低分 Token 被抬高 → 输出更多样，但也更容易「跑偏」、出错别字或胡言乱语。
+      - **T → 0**：退化为**贪心解码**（每步选概率最高的），实现上通常直接取 argmax。
+
+      **三、为什么 temperature=0 也不一定完全一样？**
+
+      直觉上贪心解码是确定的，但工程上有几个来源会引入差异：
+      - GPU 并行计算的**浮点误差**：加法顺序不同，结果末位可能不同，两个 logits 很接近时会翻转排名。
+      - 服务端**批处理**：你的请求和别人的请求拼在一个 batch 里，batch 组成不同可能影响数值。
+      - 后端模型或推理配置**更新**（OpenAI 用 `system_fingerprint` 提示这类变化）。
+      - 一旦某一步选了不同的 Token，后续整段都会分叉（蝴蝶效应）。
+
+      所以官方文档的说法是「更聚焦、更确定」，而不是「完全确定」。
+
+      **四、不这样做会怎样？**
+
+      - 抽取类任务用默认 T=1：同一张发票，字段时有时无，格式时变时不变，下游解析偶发失败。
+      - 创作类任务用 T=0：每次文案几乎一样，A/B 生成多个候选毫无意义。
+      - 把 T 调到 1.5 以上：长文本后半段容易语无伦次，因为每一步的小概率错误会**累积**。
+
+      **五、取值范围与默认值**
+
+      以 OpenAI Chat Completions 为例：`temperature` 范围 0~2，默认 1；文档建议**调 temperature 或 top_p 其中一个，不要两个都调**。其他厂商范围可能不同（例如有的是 0~1），以各自文档为准。
+    scenarios: |
+      - **信息抽取 / 分类 / 生成 SQL**：T 设 0~0.2，追求稳定；再配合结构化输出（Day 19）。
+      - **客服问答 / RAG 回答**：T 设 0.2~0.5，表达自然但不胡编。
+      - **营销文案 / 起标题 / 头脑风暴**：T 设 0.8~1.2，并一次生成多个候选供人挑选。
+      - **评测与回归测试**：固定低温度 + 固定 Prompt，减少噪声，方便比较版本差异。
+    code: |
+      ```python
+      import math
+
+      def softmax_with_temperature(logits: list[float], t: float) -> list[float]:
+          """演示 temperature 对分布的影响（真实 API 在服务端完成这一步）。"""
+          if t <= 0:
+              # T→0 等价于贪心：最高分 Token 概率为 1
+              best = max(range(len(logits)), key=lambda i: logits[i])
+              return [1.0 if i == best else 0.0 for i in range(len(logits))]
+          scaled = [z / t for z in logits]
+          m = max(scaled)                      # 减去最大值，防止 exp 溢出
+          exps = [math.exp(z - m) for z in scaled]
+          s = sum(exps)
+          return [e / s for e in exps]
+
+      for t in (0.5, 1.0, 2.0):
+          probs = softmax_with_temperature([4.0, 3.0, 1.0], t)
+          print(t, [round(p, 3) for p in probs])
+      ```
+    pitfalls: |
+      - **误区：temperature=0 就完全可复现。** 只是「更确定」，浮点误差、批处理和后端更新都可能带来差异，评测要多跑几次看分布。
+      - **误区：temperature 越低回答越准确。** 低温只是让模型更坚持「它认为最可能的答案」，如果模型本身知识错了，低温会**稳定地错**。准确性靠 Prompt、RAG、校验，不靠温度。
+      - **误区：temperature 控制回答长度。** 长度由 `max_tokens`、Prompt 要求和停止条件决定，温度只影响每一步选哪个 Token。
+      - **混淆：temperature 和 top_p 同时大幅调整。** 两者作用叠加，效果难以预测，官方建议只调一个。
+      - **推理模型陷阱**：很多推理模型不支持自定义 temperature，传了会 400 或被忽略（见 d16-k4）。
+    interview_asks:
+      - temperature 参数的原理是什么？设成 0 和设成 1.5 分别会怎样？
+      - 为什么 temperature=0 时，同样的请求有时还会得到不同的结果？
+      - 你们项目里不同任务的 temperature 是怎么定的？
+    project_example: |
+      在一个「工单自动分类」项目中，最初直接用默认 temperature=1，同一批 500 条工单跑两次，**约 6% 的分类结果不一致**，运营质疑系统不可靠。
+      排查后把 temperature 改为 0，并把类别限制为枚举（结构化输出），不一致率降到 1% 以下；剩余差异集中在「两个类别都说得通」的模糊工单上，
+      于是改为输出 `confidence` 字段，低置信度的转人工复核。这个案例说明：**温度只能降低随机性，不能消除业务本身的歧义**。
+
+  - id: d16-k2
+    name: Top-P（核采样）与 Top-K 截断
+    level: P0
+    summary: Top-P 只保留累计概率达到 p 的最小候选集合再采样，用来砍掉「长尾胡言乱语」
+    why: |
+      Temperature 只能整体拉尖或拉平分布，但**不会把小概率 Token 彻底排除**。词表有几万到十几万个 Token，
+      长尾里的每个 Token 概率很小，加起来却不小，偶尔抽中就会出现乱码、错别字或跑题。
+      Top-P 是 API 中第二常见的采样参数，面试常与 temperature 对比着问。
+    problem: |
+      解决「**既要有多样性，又不能抽到离谱 Token**」的问题：
+      - 只用高温度 → 多样，但长尾垃圾 Token 也被抬高；
+      - 只用贪心 → 稳定，但死板、容易重复。
+      Top-P 先按概率截掉长尾，只在「靠谱的候选」里随机，兼顾两者。
+    principle: |
+      **一、Top-K：固定只留前 K 个**
+
+      把候选按概率从高到低排序，只保留前 K 个，其余概率置 0，再重新归一化后采样。
+
+      问题：K 是固定的。模型很确定时（第一名 0.95），K=50 仍然留了 49 个垃圾候选；模型很犹豫时（前 100 个都差不多），K=50 又砍掉了合理候选。
+
+      **二、Top-P（Nucleus Sampling，核采样）：按累计概率动态截断**
+
+      做法：
+      1. 按概率从高到低排序；
+      2. 从第一名开始累加概率，直到累计值**首次达到 p**；
+      3. 只保留这部分候选（称为「核」），重新归一化后随机抽取。
+
+      举例：候选概率排序后为 [0.50, 0.25, 0.15, 0.06, 0.04]
+
+      | top_p | 保留的候选 | 重新归一化后 |
+      |---|---|---|
+      | 1.0 | 全部 5 个 | 不变 |
+      | 0.8 | 前 3 个（累计 0.90） | 0.56 / 0.28 / 0.17 |
+      | 0.5 | 只有第 1 个（累计 0.50） | 1.0，等价于贪心 |
+
+      **关键优势：候选数量是自适应的**——模型确定时核很小（可能只有 1 个），模型犹豫时核自动变大。
+
+      ```mermaid
+      flowchart TD
+        A["softmax 后的概率分布"] --> B["按概率从高到低排序"]
+        B --> C["从高到低累加概率"]
+        C --> D{"累计值达到 top_p 了吗"}
+        D -- "没有" --> C
+        D -- "达到" --> E["截断 只保留核内候选"]
+        E --> F["核内重新归一化"]
+        F --> G["按新分布随机采样"]
+      ```
+
+      **三、和 Temperature 的组合**
+
+      - 常见开源实现（如 Hugging Face transformers 的 logits processor）先做温度缩放，再做 Top-K/Top-P 截断；闭源 API 的内部顺序**没有公开**，不要在面试中断言。
+      - 两者都在调「随机性」：temperature 改分布形状，top_p 改候选范围。同时调会叠加，难以归因，所以 OpenAI 文档建议**二选一调整**，另一个保持默认（top_p 默认 1，即不截断）。
+
+      **四、不这样做会怎样？**
+
+      - 高温度 + top_p=1：长文本生成里偶发「中英混杂、乱码、突然换话题」。
+      - top_p 设得太小（如 0.1）：效果接近贪心，多样性丢失，还可能陷入重复循环。
+
+      **五、各家支持情况**
+
+      OpenAI 兼容接口普遍有 `top_p`；`top_k` 不是 OpenAI 标准参数，部分厂商（如阿里云百炼）通过额外参数支持。是否生效还取决于模型模式——例如 DeepSeek 文档说明部分模型在某些模式下 top_p 被固定、传入值被忽略。**以所用模型的文档为准**。
+    scenarios: |
+      - **创意写作**：temperature 保持默认，top_p 设 0.9 左右，砍掉长尾但保留多样性。
+      - **需要稳定的业务输出**：一般直接压低 temperature，top_p 保持默认，不必两个都动。
+      - **开源模型自部署（vLLM 等）**：可同时配 top_k 和 top_p，作为生成质量的兜底防线。
+      - **排查「偶发乱码 / 胡言乱语」**：先检查是不是温度过高且没有 top_p 截断。
+    pitfalls: |
+      - **误区：top_p=0.1 表示「只保留 10% 的 Token」。** 是保留**累计概率达到 10%** 的最少候选，往往只有 1 个 Token，不是词表数量的 10%。
+      - **误区：top_p 越小越准确。** 和温度一样，它只降低随机性，不提升模型知识的正确性。
+      - **混淆 Top-K 和 Top-P**：K 是固定个数，P 是累计概率阈值，后者自适应。
+      - **以为所有模型都支持**：推理模型或某些模式下 top_p 会报错或被忽略，改参数前先看文档、再看返回效果。
+    interview_asks:
+      - Top-P 和 Top-K 有什么区别？为什么 Top-P 更常用？
+      - temperature 和 top_p 能同时调吗？你会怎么选？
+    project_example: |
+      在一个「商品营销文案生成」功能里，产品希望文案多样，于是把 temperature 调到 1.3。上线后运营反馈约 2% 的文案出现「突然冒出英文单词、品牌名写错」。
+      复盘时发现长尾 Token 被高温抬高后偶尔被抽中。调整方案是：temperature 回到 1.0，top_p 设为 0.9，并一次生成 3 个候选，
+      再用规则过滤含敏感词或品牌名错误的候选。多样性没有明显下降，异常文案基本消失。
+
+  - id: d16-k3
+    name: 其他生成参数：max tokens、stop、penalty、n 与 seed
+    level: P1
+    summary: max tokens 管长度和成本，stop 管终止，penalty 管重复，seed 只是尽力复现
+    why: |
+      线上很多问题不是温度导致的，而是这些「不起眼」的参数：回答被截断、JSON 少半截、模型反复说同一句话、
+      成本突然翻倍。理解它们的作用和 `finish_reason`，是排查生成问题的基础。
+    problem: |
+      - 控制输出**长度与成本上限**，防止模型无限输出；
+      - 控制**在哪里停**（遇到特定字符串就停止）；
+      - 抑制**重复**；
+      - 在评测、调试时尽量让结果**可复现**。
+    principle: |
+      **一、长度上限：max_tokens / max_completion_tokens / max_output_tokens**
+
+      - 限制的是**输出** Token 数，不是上下文长度。
+      - 在 OpenAI Chat Completions 中，`max_tokens` 已标注为 deprecated，推荐 `max_completion_tokens`（包含推理模型的推理 Token）；Responses API 用 `max_output_tokens`。其他厂商名称可能不同。
+      - 输出达到上限时，返回的 `finish_reason` 是 **`length`**（Responses API 中表现为 `status: incomplete`）。这时内容是**被截断的**，如果是 JSON 就一定解析失败。
+
+      **二、finish_reason：每次都要看**
+
+      | 值 | 含义 | 处理 |
+      |---|---|---|
+      | stop | 正常结束或命中 stop 序列 | 正常处理 |
+      | length | 达到长度上限 | 不能当完整结果用 |
+      | tool_calls | 模型要调用工具 | 走工具调用流程（Day 18） |
+      | content_filter | 被内容过滤 | 提示用户或降级 |
+
+      **三、stop 序列**：生成到指定字符串时停止（该字符串不会出现在输出里），常用于「只要第一段」「遇到分隔符停止」。
+
+      **四、presence_penalty / frequency_penalty**：对已出现过的 Token 降低 logits。presence 只看「出现过没有」，frequency 按出现次数累加惩罚。用于缓解复读，但过大会让模型刻意换词、用词怪异。
+
+      **五、n**：一次请求生成多个候选，输出 Token 按候选数**成倍计费**。
+
+      **六、seed 与 system_fingerprint**
+
+      OpenAI Chat Completions 的 `seed` 标注为 **Beta**：相同 seed 和参数下「尽力」采样一致，但**不保证确定性**；需要配合响应中的 `system_fingerprint` 判断后端是否变化。Responses API 没有 seed 参数。
+
+      ```mermaid
+      flowchart LR
+        A["发起请求"] --> B["生成 Token"]
+        B --> C{"停止条件"}
+        C -- "模型输出结束符" --> D["finish_reason 为 stop"]
+        C -- "命中 stop 序列" --> D
+        C -- "达到长度上限" --> E["finish_reason 为 length 内容被截断"]
+        C -- "要调用工具" --> F["finish_reason 为 tool_calls"]
+        C -- "继续" --> B
+      ```
+    scenarios: |
+      - **JSON 抽取**：max tokens 留足余量，并检查 finish_reason，length 时按截断处理（重试或报错）。
+      - **成本控制**：给每类任务设合理的输出上限，防止个别请求输出几千 Token。
+      - **长文摘要复读**：适度加 frequency_penalty（如 0.3~0.5）缓解重复。
+      - **离线评测**：固定 seed + 低温度降低噪声，同时记录 system_fingerprint。
+    pitfalls: |
+      - **只读 content 不看 finish_reason**：length 截断的半截 JSON 被当作完整结果，下游报错却找不到原因。
+      - **把 max_tokens 当成上下文长度**：它只限制输出；输入过长报的是另一类错误（上下文超长，Day 17）。
+      - **推理模型 max tokens 设太小**：推理 Token 也计入上限，可能推理还没结束就耗尽额度，可见输出为空。
+      - **以为 seed 能保证完全复现**：官方明确只是 best effort。
+      - **n>1 忘了成本翻倍**。
+    interview_asks:
+      - finish_reason 有哪些取值？length 出现时你怎么处理？
+      - seed 参数能保证输出可复现吗？
+    project_example: |
+      一个合同条款抽取服务偶发「JSON 解析失败」，日志里只记录了 content。补充记录 `finish_reason` 和 `usage` 后发现，失败请求全部是 `length`：
+      长合同的条款列表超过了 max_tokens=1024。修复方式：按条款数量估算并提高上限到 4096；finish_reason 为 length 时不再尝试解析，
+      而是拆分合同分段抽取再合并。此后解析失败率从 3% 降到接近 0。
+
+  - id: d16-k4
+    name: 参数选型与模型差异：推理模型、兼容接口的参数限制
+    level: P1
+    summary: 参数不是越多越好，先看模型支不支持；推理模型多用推理强度而非温度来控制输出
+    why: |
+      实际项目往往同时接 OpenAI、DeepSeek、通义千问等多家模型，还会在普通模型和推理模型之间切换。
+      同一份参数配置在 A 模型正常、在 B 模型报 400 或「静默失效」，是最常见的线上坑之一。
+    problem: |
+      解决「**一套业务配置如何安全地适配多个模型**」的问题：哪些参数要按模型裁剪、
+      推理模型用什么替代 temperature、参数被忽略时如何发现。
+    principle: |
+      **一、按任务选参数的基本思路**
+
+      | 任务 | 建议 | 理由 |
+      |---|---|---|
+      | 抽取、分类、SQL | 低温度 + 结构化输出 | 要稳定、可解析 |
+      | 客服、RAG 问答 | 低到中温度 | 自然但不发散 |
+      | 文案、创意 | 中高温度或 top_p 0.9 + 多候选 | 要多样性 |
+      | 复杂推理、规划 | 选推理模型，调推理强度 | 质量主要来自推理过程 |
+
+      **二、推理模型对采样参数的限制（时效性内容，2026-11 核对）**
+
+      - OpenAI 推理指南：推理强度参数在 Responses 中为 `reasoning.effort`，在 Chat Completions 中为 `reasoning_effort`，可选值因模型而异（如 none / minimal / low / medium / high / xhigh / max）。
+      - OpenAI 对多个 GPT-5 系列模型的说明是：`temperature`、`top_p`、`logprobs` **只在推理强度为 none 时支持**；更早的 gpt-5 / gpt-5-mini / gpt-5-nano 带这些字段会直接报错；2026-09 changelog 中 GPT-6 Astra 明确**不支持自定义 temperature / top_p**。
+      - DeepSeek 文档：思考模式不支持 temperature 等参数，但为兼容**不会报错，只是不生效**；top_p 的生效范围也因模型和模式而异。
+
+      所以同样是「不支持」，有的厂商**报 400**，有的**静默忽略**——后者更危险，因为你以为配置生效了。
+
+      **三、工程做法：模型能力表 + 参数裁剪**
+
+      ```mermaid
+      flowchart TD
+        A["业务层传入任务类型"] --> B["查参数预设"]
+        B --> C["查模型能力表"]
+        C --> D{"是推理模型 或 该模式不支持采样参数"}
+        D -- "是" --> E["移除 temperature 和 top_p 改设推理强度"]
+        D -- "否" --> F["保留采样参数"]
+        E --> G["记录实际发送的参数到日志"]
+        F --> G
+        G --> H["调用模型 API"]
+      ```
+
+      **四、不这样做会怎样？**
+
+      - 切换模型后全部请求 400，故障面大。
+      - 网关「好心」统一删除参数，导致本来支持的模型也丢了温度设置，输出变得不稳定却没有任何报错。
+    scenarios: |
+      - **多模型网关**：维护每个模型的能力表（是否推理模型、支持哪些参数、默认推理强度），发送前裁剪。
+      - **模型升级**：从普通模型切到推理模型时，回归测试要覆盖「参数是否被接受」。
+      - **成本与延迟敏感场景**：推理模型调低推理强度，而不是试图调温度。
+    pitfalls: |
+      - **把默认值 1 显式传给推理模型「保险一点」**：有的模型对该字段**任何值**都拒绝，正确做法是不传。
+      - **只看 HTTP 200 就认为参数生效**：兼容接口可能静默忽略，要对照文档并观察输出分布。
+      - **把参数写死在业务代码里**：换模型时到处改，应集中在配置或网关层。
+      - **用温度替代推理强度**：推理模型的质量与时延主要由推理强度和 Prompt 决定。
+    interview_asks:
+      - 为什么有的模型传 temperature 会报错？你们怎么兼容多种模型的参数差异？
+      - 推理模型不能调温度，你用什么手段控制它的输出稳定性和成本？
+    project_example: |
+      团队把「合同风险审查」从普通模型切换到推理模型，代码沿用 `temperature=0.2`，上线后所有请求 400，报错指向 temperature 参数。
+      紧急回滚后，在 LLM 网关增加了模型能力表：推理模型自动移除采样参数，改用推理强度配置；同时把「实际发送参数」写入请求日志。
+      之后再接入 DeepSeek 思考模式时，能力表标注「采样参数静默忽略」，避免了团队误以为温度生效。
+    freshness: |
+      核对于 2026-11：
+      - OpenAI 推理模型指南列出 reasoning effort 可选值依模型而定（none 到 max），GPT-5.6 与 GPT-6 Sol/Luna 默认 medium，GPT-6 Astra 不支持 none。
+      - OpenAI 2026-09-08 changelog：GPT-6 Astra 不支持自定义 temperature、top_p、logprobs。GPT-5.1/5.2 系列仅在推理强度为 none 时接受这些参数（来自官方迁移指南引用，具体以各模型页面为准）。
+      - OpenAI Chat Completions 参考：temperature 0~2 默认 1，top_p 默认 1，建议二选一调整；max_tokens 已被 max_completion_tokens 取代；seed 为 Beta 且不保证确定性。
+      - DeepSeek 思考模式：temperature、presence_penalty、frequency_penalty 不报错但不生效。
+      - 旧写法：给所有模型统一传 temperature；新写法：按模型能力裁剪，推理模型用推理强度控制。
+    sources:
+      - {title: "OpenAI Docs - Reasoning models", url: "https://developers.openai.com/api/docs/guides/reasoning"}
+      - {title: "OpenAI API Changelog (2026-09-08 GPT-6 Astra)", url: "https://developers.openai.com/api/docs/changelog.md?entry=2026-09-08-3922e216050f6857"}
+      - {title: "OpenAI API Reference - Chat", url: "https://developers.openai.com/api/reference/resources/chat"}
+      - {title: "DeepSeek API Docs - Thinking Mode", url: "https://api-docs.deepseek.com/guides/thinking_mode.md"}
+quiz:
+  - id: d16-q1
+    kp: d16-k1
+    type: judge
+    question: 把 temperature 设为 0 后，同一个请求无论调用多少次，模型输出都一定逐字相同。
+    answer: false
+    explain: |
+      temperature=0 近似贪心解码，只是让输出「更确定」。GPU 浮点计算顺序、服务端批处理组合、后端模型或配置更新都可能让两个接近的 logits 排名翻转，
+      一旦某一步选了不同 Token，后续文本就会分叉。OpenAI 文档对 seed 也只承诺 best effort，并用 system_fingerprint 提示后端变化。
+  - id: d16-q2
+    kp: d16-k2
+    type: single
+    question: 某一步候选 Token 概率排序后为 [0.50, 0.25, 0.15, 0.06, 0.04]，设置 top_p=0.8 时，参与采样的候选有几个？
+    options:
+      - "1 个，因为只保留前 80% 中概率最高的那个"
+      - "3 个，累计到第 3 个时首次达到 0.8"
+      - "4 个，词表的 80% 对应前 4 个"
+      - "5 个，top_p 只在 temperature 大于 1 时才生效"
+    answer: [1]
+    explain: |
+      Top-P 按概率从高到低累加，直到累计值首次达到 p：0.50 → 0.75 → 0.90，第 3 个时超过 0.8，所以保留 3 个并重新归一化。
+      它不是按 Token 数量比例截断（排除第三项），也和温度大小无关（排除第四项）；只保留 1 个是 top_p≤0.5 时的情况。
+  - id: d16-q3
+    kp: d16-k1
+    type: multi
+    question: 把 temperature 从 0.2 调到 1.5，下列哪些变化是合理预期？
+    options:
+      - "softmax 后的概率分布变得更平，低分 Token 被选中的机会增加"
+      - "同一 Prompt 多次调用的输出差异变大"
+      - "模型的事实准确性随之提高"
+      - "长文本中出现跑题、错别字或乱码的概率上升"
+      - "每次回答的长度一定变长"
+    answer: [0, 1, 3]
+    explain: |
+      温度升高等于把 logits 除以更大的数，分布变平，随机性和多样性增加，长尾 Token 更容易被抽中，所以长文本更易跑偏。
+      温度不改变模型掌握的知识，不会提高准确性；输出长度由 max tokens、Prompt 和停止条件决定，温度不直接控制长度。
+  - id: d16-q4
+    kp: d16-k2
+    type: short
+    question: 为什么 OpenAI 文档建议「调整 temperature 或 top_p 其中一个，而不是两个都调」？请从原理上解释。
+    key_points:
+      - {text: "指出两者都在控制随机性：temperature 改变分布形状，top_p 改变候选范围", dim: principle}
+      - {text: "指出同时调整会叠加作用，难以判断效果来自哪个参数", dim: engineering}
+      - {text: "说明 top_p 默认 1 即不截断，只调 temperature 时行为更可预测", dim: concept}
+    reference: |
+      temperature 在 softmax 之前缩放 logits，决定分布有多尖或多平；top_p 在得到概率后按累计概率截断长尾，决定在多大的候选集合里采样。
+      两者都作用于「随机性」这一件事，同时调整时效果会叠加：例如低温度本来已经让分布很尖，再配一个小 top_p 几乎等于贪心；
+      高温度配大 top_p 又会让长尾充分暴露。调参时如果两个都动，就无法归因到底是哪个参数导致了变化，也很难复现。
+      因此实践中一般固定一个（top_p 保持默认 1 表示不截断），只调另一个，并通过评测集观察输出分布的变化。
+  - id: d16-q5
+    kp: d16-k4
+    type: scenario
+    question: |
+      你负责的「发票字段抽取」服务原来用普通模型、temperature=1（默认），偶发字段缺失且格式不一致。
+      同事建议直接换成最新的推理模型，并保留 `temperature=0` 的配置。上线后所有请求返回 400。
+      请分析两个问题的原因，并给出完整的改进方案。
+    key_points:
+      - {text: "指出默认温度下采样随机导致字段时有时无，抽取任务应降低随机性", dim: principle}
+      - {text: "指出推理模型可能不支持自定义 temperature，传入即报 400，应移除而非改值", dim: concept}
+      - {text: "提出用结构化输出或 Schema 约束字段，而不是只靠温度保证格式", dim: engineering}
+      - {text: "提出维护模型能力表，在网关层按模型裁剪参数并记录实际发送参数", dim: engineering}
+    reference: |
+      第一个问题：抽取任务需要稳定输出，但默认 temperature=1 时每一步都有一定概率选到非最优 Token，字段名、格式、是否输出某个字段都会随机波动。
+      降低温度能改善，但格式稳定的根本手段是结构化输出（JSON Schema 约束，Day 19），再加 Pydantic 校验。
+      第二个问题：很多推理模型不支持自定义 temperature/top_p（例如 OpenAI 部分 GPT-5/GPT-6 模型在推理强度不为 none 时会拒绝这些字段），
+      所以保留 temperature=0 会导致 400。正确做法是从请求中删除该字段，用推理强度、Prompt 和结构化输出来控制稳定性。
+      改进方案：在统一的模型调用层维护模型能力表，发送前按模型裁剪不支持的参数；切换模型前跑回归测试；
+      日志记录实际发送的参数、finish_reason 和 usage，便于发现「参数被静默忽略」这类问题。
+    followup:
+      question: 如果换成的是一个「不支持但不报错、静默忽略 temperature」的兼容接口，你如何发现参数没生效？
+      key_points: [对照官方文档的参数说明, 同一输入多次调用观察输出分布, 在能力表中标注静默忽略的参数]
+      reference: 先查文档确认该模式下参数是否生效；再用固定样本多次调用，比较不同温度下输出差异是否有变化；最终把结论写入能力表，避免后人误以为配置有效。
+  - id: d16-q6
+    kp: d16-k3
+    type: short
+    question: 你要对两个 Prompt 版本做离线对比评测，希望减少随机性带来的干扰。你会如何设置参数？seed 能解决全部问题吗？
+    key_points:
+      - {text: "提出固定低温度并保持其他参数完全一致", dim: engineering}
+      - {text: "说明 seed 只是尽力复现，不保证确定性，需关注 system_fingerprint", dim: concept}
+      - {text: "提出每个样本多次运行看分布或通过率，而不是只跑一次", dim: engineering}
+      - {text: "提出记录 finish_reason，排除被截断的样本", dim: engineering}
+    reference: |
+      评测时应固定模型版本、temperature（通常 0 或很低）、max tokens 等所有参数，只改变 Prompt 版本，这样差异才能归因到 Prompt。
+      可以设置相同的 seed 来进一步降低随机性，但 OpenAI 文档明确说明 seed 是 Beta、只做 best effort，确定性不被保证，
+      后端更新时 system_fingerprint 会变化，结果可能随之变化；推理模型往往不支持采样参数，Responses API 也没有 seed。
+      因此更稳妥的方法是每个样本跑多次，统计通过率或得分分布，再比较两个版本；同时检查 finish_reason，把 length 截断的样本单独处理，避免把截断当成 Prompt 差异。
+code_reading:
+  id: d16-c1
+  kp: [d16-k1, d16-k3, d16-k4]
+  title: 按任务类型配置生成参数的 LLM 调用封装
+  scenario: |
+    公司内部的 AI 中台提供一个 `generate()` 函数，客服问答、工单分类、营销文案三个业务都调用它，
+    通过 `task` 参数选择预设的生成参数。最近营销文案偶发被截断，分类结果有时又变得不稳定，你被要求审查这段代码。
+  language: python
+  code: |
+    import logging
+    import os
+
+    from openai import OpenAI
+
+    logger = logging.getLogger(__name__)
+    client = OpenAI(api_key=os.environ["LLM_API_KEY"], base_url=os.getenv("LLM_BASE_URL"))
+    MODEL = os.getenv("LLM_MODEL", "gpt-5.5")
+
+    TASK_PRESETS: dict[str, dict] = {
+        "classify": {"temperature": 0.0, "max_completion_tokens": 50},
+        "qa": {"temperature": 0.3, "max_completion_tokens": 800},
+        "copywriting": {"temperature": 1.0, "top_p": 0.9, "max_completion_tokens": 300},
+    }
+
+
+    def generate(task: str, system: str, user: str, **overrides) -> str:
+        params = TASK_PRESETS[task]          # 取出该任务的预设参数
+        params.update(overrides)             # 调用方可以覆盖个别参数
+        resp = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            **params,
+        )
+        choice = resp.choices[0]
+        logger.info("task=%s usage=%s", task, resp.usage)
+        return choice.message.content or ""
+  walkthrough:
+    function: |
+      为多个业务提供统一的文本生成入口：根据任务类型选择一组预设参数（温度、top_p、输出上限），
+      允许调用方覆盖个别参数，然后调用 Chat Completions 接口并返回第一条候选的文本内容。
+    key_functions: |
+      - `TASK_PRESETS`：模块级字典，保存每类任务的默认参数，是「参数选型」的集中配置点。
+      - `generate()`：取预设、合并覆盖参数、组装 messages、调用 API、记录 usage、返回文本。
+      - `client.chat.completions.create()`：OpenAI SDK 的同步调用，`**params` 把字典展开成关键字参数。
+    params: |
+      调用方传入 `task`、`system`、`user` 和任意关键字参数 `overrides`（例如 `temperature=0.8`）。
+      `params` 字典经 `**params` 展开后作为 `temperature`、`top_p`、`max_completion_tokens` 等参数传给 SDK；
+      模型名来自环境变量 `LLM_MODEL`，API Key 与 base_url 来自环境变量，便于切换到兼容接口。
+    data_flow: |
+      ```mermaid
+      flowchart LR
+        A["业务调用 generate"] --> B["按 task 取 TASK_PRESETS"]
+        B --> C["update 合并 overrides"]
+        C --> D["组装 messages"]
+        D --> E["chat.completions.create"]
+        E --> F["choices 0"]
+        F --> G["记录 usage 日志"]
+        G --> H["返回 content 文本"]
+      ```
+    failure_points: |
+      - **共享字典被原地修改（值得审查的问题 1）**：`params = TASK_PRESETS[task]` 拿到的是同一个字典对象的引用，`update()` 会永久改写全局预设。
+        某次文案调用传了 `max_completion_tokens=100`，之后所有文案请求都被截断；有人给分类传了 `temperature=0.7`，之后分类就一直不稳定。多线程下还会互相干扰。
+      - **不检查 finish_reason（值得审查的问题 2）**：达到输出上限时返回的是半截内容，函数照样当完整结果返回。
+      - 推理模型不支持 temperature/top_p：如果 `LLM_MODEL` 换成推理模型，会直接 400；兼容接口可能静默忽略。
+      - 未知 task 抛 KeyError；`content` 为 None（例如模型发起工具调用）时返回空串，调用方无法区分。
+    debugging: |
+      - 在调用前打印 `id(params)` 与 `params` 内容，或在测试中连续调用两次比较预设是否被改写。
+      - 日志补充 `finish_reason`、实际发送的参数和模型名，截断问题一眼可见。
+      - 写单元测试：调用 `generate("copywriting", ..., max_completion_tokens=10)` 后断言 `TASK_PRESETS["copywriting"]` 未变化。
+      - 400 错误时捕获 `openai.BadRequestError`，查看错误体中的 `param` 字段定位是哪个参数不被支持。
+    change_request: |
+      如果需求改为「支持切换到推理模型」：在 `generate()` 中先复制预设（`params = {**TASK_PRESETS[task], **overrides}`），
+      再根据模型能力表移除 temperature/top_p 并设置推理强度；同时在返回前检查 `choice.finish_reason`，为 length 时抛出自定义异常或返回带截断标记的结果，
+      让调用方决定重试还是提示用户。
+  questions:
+    - id: d16-c1-q1
+      kp: d16-k3
+      type: code
+      question: |
+        假设服务启动后先后发生两次调用：
+        1. `generate("copywriting", sys, u1, max_completion_tokens=60)`
+        2. `generate("copywriting", sys, u2)`
+        请按执行顺序说明第二次调用实际使用的参数是什么、为什么，以及用户会看到什么现象。
+      key_points:
+        - {text: "指出 params 与 TASK_PRESETS 中的字典是同一个对象引用", dim: principle}
+        - {text: "指出第一次 update 把全局预设的 max_completion_tokens 永久改为 60", dim: principle}
+        - {text: "推断第二次调用文案被截断且 finish_reason 为 length", dim: engineering}
+        - {text: "给出修复：先复制再合并，例如字典解包生成新字典", dim: engineering}
+      reference: |
+        第一次调用时，`params = TASK_PRESETS["copywriting"]` 并没有复制字典，只是让 params 指向全局预设里的同一个 dict 对象；
+        随后 `params.update(overrides)` 把这个对象的 `max_completion_tokens` 从 300 改成了 60，全局预设被永久修改。
+        第二次调用没有传覆盖参数，但取到的仍是这个已被改写的字典，所以实际参数是 temperature=1.0、top_p=0.9、max_completion_tokens=60。
+        结果是文案在 60 个 Token 处被截断，finish_reason 为 length，而函数不检查它，用户看到的是半句话。
+        修复方式是 `params = {**TASK_PRESETS[task], **overrides}` 或 `copy.deepcopy`，并在返回前检查 finish_reason。
+    - id: d16-c1-q2
+      kp: d16-k4
+      type: code
+      question: |
+        运维把环境变量 `LLM_MODEL` 改成了一个推理模型（该模型在默认推理强度下不支持自定义采样参数）。
+        请说明 `generate("classify", ...)` 的执行过程会在哪一步出错、错误长什么样，以及你会如何改造这段代码。
+      key_points:
+        - {text: "指出 temperature 通过 params 展开传给 SDK，请求发到服务端后被拒绝", dim: principle}
+        - {text: "指出 SDK 抛出 BadRequestError，对应 HTTP 400，错误体指明不支持的参数", dim: concept}
+        - {text: "提出按模型能力表裁剪参数，推理模型改用推理强度", dim: engineering}
+        - {text: "提出记录实际发送参数并在切换模型前做回归测试", dim: engineering}
+      reference: |
+        执行到 `client.chat.completions.create(**params)` 时，temperature=0.0 作为请求体字段发送到服务端；
+        该推理模型在当前推理强度下不接受自定义 temperature，服务端返回 400，SDK 抛出 `openai.BadRequestError`，
+        错误体中通常会指出是哪个参数（例如 param 为 temperature）不被支持。由于 400 属于请求本身错误，重试不会成功。
+        改造方式：增加模型能力配置（是否推理模型、支持哪些参数），在 generate 中复制预设后按能力删除 temperature/top_p，
+        为推理模型设置合适的推理强度；日志记录实际发送的参数和模型名；切换模型前用回归用例验证参数兼容性。
+    - id: d16-c1-q3
+      kp: d16-k1
+      type: code
+      question: 分类任务预设 `temperature=0.0`，为什么线上仍偶尔出现同一工单两次分类结果不同？结合这段代码和采样原理，列出可能原因和排查手段。
+      key_points:
+        - {text: "说明 temperature=0 只是近似贪心，浮点误差和批处理可能导致不同", dim: principle}
+        - {text: "指出共享预设可能已被其他调用方覆盖成更高温度", dim: engineering}
+        - {text: "提出记录实际参数和 system_fingerprint 或模型版本来排查", dim: engineering}
+      reference: |
+        原因可能有两类。第一类是采样本身：temperature=0 近似贪心，但 GPU 浮点运算顺序、服务端批处理组合和后端版本更新都可能让两个接近的 logits 翻转，
+        对模糊工单（两个类别概率接近）尤其明显。第二类是这段代码的 Bug：TASK_PRESETS 是共享字典，如果某个调用方传过 `temperature=0.7` 覆盖，
+        全局分类预设就被改成 0.7，此后随机性显著增加。排查时在日志中记录每次实际发送的参数、模型名和 system_fingerprint（如果有），
+        对比结果不同的两次请求；修复共享字典问题后，再对剩余差异样本输出置信度或转人工处理。
+interview:
+  - id: d16-i1
+    kp: d16-k1
+    type: oral
+    difficulty: 1
+    question: 什么是 temperature？它是怎么影响模型输出的？
+    key_points:
+      - {text: "说明模型每步输出 logits，经 softmax 变成概率后采样", dim: principle}
+      - {text: "说明 temperature 在 softmax 前除以 logits，低温变尖、高温变平", dim: principle}
+      - {text: "说明低温适合抽取分类，高温适合创作", dim: concept}
+      - {text: "结合项目说明自己如何为不同任务设定温度", dim: project}
+    reference: |
+      模型生成每个 Token 时，会对词表中每个候选输出一个分数 logits，经过 softmax 转成概率分布，再从分布中采样一个 Token。
+      temperature 是在 softmax 之前把所有 logits 除以 T：T 小于 1 会放大分数差距，分布更尖，模型更倾向选最高概率的词，输出稳定保守；
+      T 大于 1 会缩小差距，分布更平，小概率词更容易被选中，输出多样但更容易跑偏；T 趋近 0 时退化为贪心解码。
+      工程上抽取、分类、生成 SQL 等任务用 0~0.2，问答用 0.2~0.5，创意文案用 0.8 以上并生成多个候选。
+      需要注意温度不提升准确性，也不能保证完全可复现，并且很多推理模型不支持自定义温度。
+    oral: |
+      我理解 temperature 是控制采样随机性的旋钮。模型每一步会给词表里每个 Token 打分，也就是 logits，再用 softmax 变成概率，然后抽一个 Token。
+      temperature 就是在 softmax 之前把分数除以 T：T 小，高分和低分差距被放大，模型几乎总选最可能的词，输出稳定；T 大，差距被压平，输出更有变化，但也更容易跑题。
+      在我做的工单分类项目里，一开始用默认温度 1，同一批工单两次分类有约 6% 不一致，后来改成 0 并加枚举约束，不一致率降到 1% 以下。
+      另外我会提醒团队：低温度只是让模型稳定地输出它认为最可能的答案，如果知识本身错了它会稳定地错，准确性还是要靠 Prompt、RAG 和校验。
+  - id: d16-i2
+    kp: d16-k2
+    type: oral
+    difficulty: 2
+    question: Top-P 和 Temperature 有什么区别？Top-P 和 Top-K 又有什么区别？实际项目中你怎么选？
+    key_points:
+      - {text: "说明 temperature 改变分布形状，top_p 按累计概率截断候选范围", dim: principle}
+      - {text: "说明 Top-K 固定个数，Top-P 自适应候选数量", dim: principle}
+      - {text: "说明官方建议二者调其一，另一个保持默认", dim: concept}
+      - {text: "给出项目中的组合方式或排查长尾乱码的经验", dim: project}
+    reference: |
+      temperature 在 softmax 之前缩放 logits，改变的是整个分布的尖锐程度，但不会把长尾候选彻底排除。
+      top_p（核采样）在得到概率后按从高到低累加，只保留累计概率首次达到 p 的最小集合，重新归一化后采样，作用是砍掉长尾。
+      Top-K 是固定保留前 K 个，缺点是不随分布变化：模型很确定时仍保留很多垃圾候选，很犹豫时又可能砍掉合理候选；Top-P 的候选数会随模型确定程度自动变化，所以更常用。
+      实践中两者都在控制随机性，同时调整难以归因，OpenAI 文档建议只调其中一个。我的做法是：稳定性任务只压低温度；创意任务温度保持默认、top_p 设 0.9 左右砍掉长尾，并生成多个候选再过滤。
+      需要注意 top_k 并非 OpenAI 标准参数，部分厂商通过扩展参数支持，推理模型或特定模式下 top_p 可能不生效。
+    oral: |
+      先说结论：temperature 改分布的形状，top_p 改候选的范围。temperature 把分数整体拉尖或拉平，但长尾的词仍有机会被抽到；
+      top_p 是按概率从高到低累加，只保留累计到 p 的那一小撮，长尾直接砍掉。Top-K 是固定留前 K 个，不够灵活，Top-P 会根据模型有多确定自动调整候选数量。
+      我做营销文案时遇到过温度调到 1.3 后约 2% 文案冒出英文和错别字，后来温度回到 1.0、top_p 设 0.9、一次生成三个候选再规则过滤，问题基本消失。
+      平时我遵循官方建议，两者只调一个，否则效果叠加很难归因；另外切模型前会先确认这个参数在该模型上是否生效。
+  - id: d16-i3
+    kp: d16-k3
+    type: oral
+    difficulty: 2
+    question: 线上一个 JSON 抽取接口偶发解析失败，你会从生成参数的角度怎么排查？
+    key_points:
+      - {text: "首先检查 finish_reason 是否为 length，即输出被截断", dim: engineering}
+      - {text: "检查温度等采样参数是否过高导致格式不稳定", dim: principle}
+      - {text: "提出使用结构化输出与校验，而不只靠调参", dim: engineering}
+      - {text: "提出日志记录实际参数、usage、finish_reason 以便定位", dim: project}
+    reference: |
+      第一步看 finish_reason：如果是 length，说明达到输出上限被截断，半截 JSON 必然解析失败，要提高 max tokens 或拆分输入，并且 length 时不应尝试解析。
+      推理模型尤其要注意推理 Token 也计入上限，可能导致可见输出为空或很短。
+      第二步看采样参数：抽取任务如果用了默认温度 1，格式和字段会随机波动，应降低温度。
+      第三步从根本上改用结构化输出（JSON Schema + strict），再用 Pydantic 校验，失败时有重试或降级策略。
+      第四步完善可观测性：日志记录模型名、实际发送的参数、finish_reason、usage 和原始输出（脱敏），便于按失败类型统计。
+      还要留意是否有代码层面的问题，例如共享参数字典被其他调用方改写。
+    oral: |
+      我会先看 finish_reason，这是最容易被忽略的。我遇到过合同抽取偶发解析失败，日志里只记了 content，补上 finish_reason 后发现失败的全是 length，
+      也就是长合同的条款列表超过了输出上限被截断。修复是提高上限，并且 length 时不再解析，改成分段抽取再合并，失败率从 3% 降到接近 0。
+      然后我会检查温度，抽取任务应该是低温；再往根上走，就是用结构化输出加 Pydantic 校验，而不是靠调参保证格式。
+      最后是日志，我要求每次调用都记录模型、实际参数、finish_reason 和 usage，这样问题能按类型统计，而不是靠猜。
+  - id: d16-i4
+    kp: d16-k1
+    type: oral
+    difficulty: 3
+    question: 为什么 temperature=0 甚至固定 seed 时，大模型输出仍可能不一样？在做评测和回归测试时你怎么应对？
+    key_points:
+      - {text: "说明浮点非结合性、GPU 并行和批处理组合会带来数值差异", dim: principle}
+      - {text: "说明一处 Token 分叉会导致后续整段不同", dim: principle}
+      - {text: "说明 seed 只是 best effort，需配合 system_fingerprint 观察后端变化", dim: concept}
+      - {text: "提出多次运行看分布、用断言式或评分式评测而非逐字比对", dim: engineering}
+    reference: |
+      temperature=0 近似贪心解码，但工程上存在多种不确定来源：GPU 并行计算中浮点加法不满足结合律，计算顺序不同会造成末位差异；
+      服务端会把多个用户请求拼成 batch，batch 组成不同可能影响数值；MoE 等结构可能因数值差异走不同路由；服务端模型或推理配置也会更新。
+      当两个候选 logits 很接近时，微小差异就会让排名翻转，而自回归生成中一处分叉会导致后续全部不同。
+      OpenAI 文档对 seed 的定义是 Beta、尽力确定、不保证，需结合 system_fingerprint 判断后端变化；推理模型通常不支持采样参数，Responses API 也没有 seed。
+      评测时应固定模型版本和所有参数，每个样本跑多次统计通过率；用结构化字段断言、规则校验或评分模型评估，而不是逐字比对；记录模型版本与指纹，变化时重新建立基线。
+    oral: |
+      我的理解是，temperature=0 只是「尽量确定」。底层原因有几层：GPU 并行时浮点加法顺序不同，末位会有差异；服务端会把我的请求和别人的拼成一个 batch，也会影响数值；
+      当两个候选分数非常接近时，这点差异就能让排名翻转，而生成是一个词接一个词的，一处分叉后面就全不同了。seed 官方也只说是 best effort，要看 system_fingerprint 是否变了。
+      所以我做回归测试时不用逐字比对，而是每个样本跑三到五次看通过率，断言结构化字段和关键事实；同时记录模型版本，版本一变就重新建立基线。
+  - id: d16-i5
+    kp: d16-k4
+    type: design
+    difficulty: 4
+    question: |
+      公司同时接入了 OpenAI、DeepSeek、通义千问，包含普通模型和推理模型。请设计一个「生成参数管理」方案，
+      保证业务方只关心任务类型，而参数在不同模型上都能正确生效、出错可追踪。
+    key_points:
+      - {text: "提出任务预设与模型能力表分离，发送前合并并按能力裁剪", dim: engineering}
+      - {text: "说明推理模型移除采样参数、改用推理强度，且不能传默认值保险", dim: concept}
+      - {text: "区分报 400 与静默忽略两类不兼容，并有对应发现机制", dim: principle}
+      - {text: "提出记录实际发送参数、模型版本、finish_reason、usage 并做回归测试", dim: engineering}
+      - {text: "结合项目说明切换模型时如何灰度和回滚", dim: project}
+    reference: |
+      设计分三层。第一层是业务层：业务只传任务类型（抽取、问答、文案）和输入，不直接写 temperature。
+      第二层是配置层：任务预设定义期望行为（稳定、自然、多样）和对应参数；模型能力表记录每个模型是否推理模型、支持哪些参数、参数范围、不支持时是报错还是静默忽略、默认推理强度、扩展参数（如需通过 extra_body 传的思考开关）。
+      第三层是网关层：发送前复制预设、合并覆盖值、按能力表裁剪——推理模型删除 temperature/top_p（不能传默认值「保险」，因为有的模型对任何值都拒绝），改设推理强度；范围不同的参数做映射或截断。
+      可观测性：每次请求记录模型名与版本、实际发送参数、finish_reason、usage、request id；对静默忽略的厂商，在能力表中标注并在评测中验证。
+      上线流程：切换模型前跑参数兼容性与效果回归；按流量比例灰度，监控 400 比例、截断比例、输出质量指标，异常时一键回滚到旧模型配置。
+    oral: |
+      我会把它拆成三层。业务方只传任务类型，比如「抽取」「文案」，不碰具体参数。中间是配置层，一份任务预设，一份模型能力表，能力表写清楚每个模型是不是推理模型、支持哪些参数、不支持时是报 400 还是静默忽略。
+      最下面是网关，发送前复制预设、合并覆盖值、按能力表裁剪，推理模型就删掉温度改设推理强度，而且不传默认值，因为有的模型对任何值都拒绝。
+      我们之前把合同审查切到推理模型，沿用 temperature 导致全量 400，加了能力表后这类问题就没再出现；接 DeepSeek 思考模式时，能力表还标注了「温度静默忽略」，避免大家误以为配置生效。
+      最后是可观测和灰度：日志记录实际参数、finish_reason 和 usage，换模型先跑回归再按比例灰度，指标异常就回滚。
+sources:
+  - {title: "OpenAI API Reference - Chat Completions 参数（temperature、top_p、seed）", url: "https://developers.openai.com/api/reference/resources/chat"}
+  - {title: "OpenAI Docs - Advanced usage（Reproducible outputs）", url: "https://developers.openai.com/api/docs/guides/advanced-usage"}
+  - {title: "OpenAI Docs - Reasoning models", url: "https://developers.openai.com/api/docs/guides/reasoning"}
+  - {title: "DeepSeek API Docs - Thinking Mode", url: "https://api-docs.deepseek.com/guides/thinking_mode.md"}

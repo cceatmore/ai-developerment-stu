@@ -1,0 +1,766 @@
+day: 34
+phase: 4
+title: LangChain：核心组件、Runnable 与链式调用
+goals:
+  - 能说清 LangChain 1.x 的包结构（langchain-core、langchain、provider 包、langchain-classic、langgraph）以及各自负责什么
+  - 能解释 Runnable 接口（invoke / stream / batch 及异步版本）和 LCEL 管道 `|` 的执行机制
+  - 能读懂一条由 Prompt 模板、模型、输出解析、并行分支组成的链，并指出批处理中的失败点
+  - 能客观评价 LangChain：它解决了什么问题、被诟病什么、什么时候该直接调 SDK
+knowledge_points:
+  - id: d34-k1
+    name: LangChain 的定位、包结构与 v1 变化
+    level: P0
+    summary: LangChain 是模型与工具的统一抽象层；1.x 把核心抽象放在 langchain-core，旧链迁到 langchain-classic，Agent 统一用 create_agent
+    why: |
+      LangChain 是 AI 应用岗位 JD 里出现最多的框架名，但它在 2025 年 10 月发布 1.0 后结构变化很大。
+      面试官常问「你用的 LangChain 哪个版本」「LLMChain 还能用吗」。网上大量教程是 0.x 写法，**分不清新旧写法会直接暴露你没有跟进生态**。
+    problem: |
+      不用框架时，每接一个模型厂商都要写一套调用、消息格式、流式解析、工具调用转换；换模型就要改一堆代码。
+      LangChain 想解决的是：**用统一接口对接各家模型、向量库、工具**，并提供可组合的构建块。
+      但 0.x 时代包越做越大、抽象层层嵌套，v1 的核心就是瘦身和收敛。
+    principle: |
+      **一、包结构（2026-11 核对）**
+
+      | 包 | 负责什么 | 典型导入 |
+      |---|---|---|
+      | **langchain-core** | 核心抽象：Runnable、消息、Prompt 模板、输出解析、工具基类、ChatModel 基类 | `from langchain_core.prompts import ChatPromptTemplate` |
+      | **langchain** | 面向应用的入口：`create_agent`、中间件、`init_chat_model`、消息和工具的再导出 | `from langchain.agents import create_agent` |
+      | **provider 包** | 具体厂商实现 | `from langchain_openai import ChatOpenAI` |
+      | **langchain-classic** | 旧功能兼容：LLMChain、旧 retrievers、hub、AgentExecutor 等 | `from langchain_classic.chains import LLMChain` |
+      | **langgraph** | 有状态的图运行时（Day 35） | `from langgraph.graph import StateGraph` |
+
+      ```mermaid
+      flowchart TD
+        APP["你的应用"] --> LC["langchain：create_agent、中间件、init_chat_model"]
+        APP --> LG["langgraph：StateGraph 自定义编排"]
+        LC --> LG
+        LC --> CORE["langchain-core：Runnable、消息、Prompt、工具基类"]
+        LG --> CORE
+        CORE --> P1["langchain-openai"]
+        CORE --> P2["langchain-anthropic 等其他 provider"]
+        OLD["langchain-classic：旧链和 AgentExecutor"] -.-> CORE
+      ```
+
+      **关键关系**：`create_agent` **构建在 LangGraph 之上**（它返回的是一个编译好的图）。所以 LangChain 是「快速起步的高层 API」，LangGraph 是「需要自定义编排时下沉的运行时」。
+
+      **二、v1 的主要变化**
+
+      1. **包瘦身**：`langchain` 只保留 agents、messages、tools、chat models、embeddings 等核心；旧链、旧检索器、索引 API、hub 移到 `langchain-classic`。
+      2. **Agent 入口统一**：`langchain.agents.create_agent` 取代 `langgraph.prebuilt.create_react_agent`（参数 `prompt` 改名为 `system_prompt`），旧的 `initialize_agent` / `AgentExecutor` 仅在 classic 中保留，并标记 2.0 移除。
+      3. **中间件**：用中间件替代 pre/post model hook，实现动态 Prompt、摘要、人工确认、调用次数限制、重试等。
+      4. **标准内容块**：消息新增 `content_blocks`，跨厂商统一表示文本、推理、工具调用等；`message.text` 现在是**属性**（旧版本是方法 `.text()`）。
+      5. **Python 版本**：1.0 起要求 Python 3.10+；本次核对的 langchain 1.5.0、langchain-core 1.8.0 在 PyPI 上声明要求 Python 3.11+。
+
+      **三、版本号现状（PyPI，2026-11-12 查询）**
+
+      langchain 1.5.0、langchain-core 1.8.0、langchain-openai 1.7.4、langchain-classic 1.0.8、langgraph 1.2.20。各包版本号**独立演进**，不要求相同。
+
+      **四、不这样区分会怎样**
+
+      照着旧教程写 `from langchain.chains import LLMChain` 或 `initialize_agent`，在 1.x 下会导入失败或得到弃用警告；面试中说「我用 AgentExecutor 做 Agent」，面试官会判断你的经验停留在 2024 年。
+    scenarios: |
+      - **新项目**：`langchain` + 对应 provider 包；需要自定义流程时加 `langgraph`。
+      - **老项目升级**：先把旧链改为从 `langchain_classic` 导入保证能跑，再逐步迁移到 LCEL 或 create_agent。
+      - **只调一个模型、逻辑简单**：可以不用 LangChain，直接用厂商 SDK。
+    code: |
+      ```bash
+      uv add langchain langchain-openai        # 新项目常见组合
+      uv add langgraph                         # 需要自定义图编排时
+      uv add langchain-classic                 # 仅老代码兼容需要
+      ```
+
+      ```python
+      # 旧写法（LangChain 0.x，1.x 中已移入 langchain-classic）
+      # from langchain.chains import LLMChain
+      # from langchain.agents import initialize_agent, AgentExecutor
+
+      # 新写法（LangChain 1.x）
+      from langchain.agents import create_agent
+      from langchain.chat_models import init_chat_model
+      from langchain_core.prompts import ChatPromptTemplate
+      ```
+    pitfalls: |
+      - **误区：langchain 和 langchain-core 版本号必须一致。** 它们独立发版，按依赖约束安装即可。
+      - **误区：LangGraph 是 LangChain 的替代品。** 两者是分层关系，create_agent 就运行在 LangGraph 上。
+      - **混用新旧导入**：同一项目里既有 `langchain.chains` 又有 `create_agent`，升级时容易出现导入错误，应统一迁移路径。
+      - **把 `.text()` 当方法调用**：在 langchain-core 1.x 中 `text` 是属性。
+    interview_asks:
+      - 你用的 LangChain 是哪个版本？1.0 有哪些主要变化？
+      - LangChain 和 LangGraph 是什么关系？
+      - LLMChain、AgentExecutor 现在还推荐用吗？
+    project_example: |
+      接手一个 2024 年写的知识库项目，大量使用 LLMChain 和 initialize_agent。升级依赖到 1.x 后启动即报导入错误。
+      我们分两步：第一步把导入改为 `langchain_classic`，一天内恢复服务；第二步把问答链改写为 `prompt | model | parser` 的 LCEL 形式，把 Agent 改为 `create_agent` 并加上 `ModelCallLimitMiddleware` 限制调用次数。迁移后依赖体积变小，旧的文本解析错误也随之消失。
+    freshness: |
+      核对于 2026-11-12：PyPI 最新版本 langchain 1.5.0（requires_python >=3.11）、langchain-core 1.8.0、langchain-openai 1.7.4、langchain-classic 1.0.8、langgraph 1.2.20，并在本地安装后验证了 `from langchain.agents import create_agent`、`from langchain.chat_models import init_chat_model`、`from langchain.messages import ...` 等导入。v1 迁移指南：旧链、retrievers、indexing、hub 移入 langchain-classic；`create_react_agent` → `create_agent`，`prompt` → `system_prompt`；pre/post model hook → 中间件。`initialize_agent` 参考文档标注「Will be removed in version 2.0.0」。旧写法：`from langchain.chains import LLMChain`、`initialize_agent`、`AgentExecutor`、`langgraph.prebuilt.create_react_agent`。
+    sources:
+      - {title: "LangChain v1 migration guide", url: "https://docs.langchain.com/oss/python/migrate/langchain-v1"}
+      - {title: "LangChain Blog - LangChain and LangGraph 1.0", url: "https://www.langchain.com/blog/langchain-langgraph-1dot0"}
+      - {title: "LangChain Reference - initialize_agent（classic，已弃用）", url: "https://reference.langchain.com/python/langchain-classic/agents/initialize/initialize_agent"}
+      - {title: "PyPI - langchain", url: "https://pypi.org/project/langchain/"}
+
+  - id: d34-k2
+    name: 核心组件：模型、消息、Prompt 模板、输出解析
+    level: P1
+    summary: ChatModel 统一各家模型调用，消息统一对话格式，Prompt 模板负责填变量，输出解析和结构化输出把文本变成程序可用的数据
+    why: |
+      无论用 LCEL 链还是 create_agent，底下都是这几个组件。读别人的 LangChain 代码，第一步就是认出每一行属于哪个组件、输入输出是什么类型。
+    problem: |
+      不同厂商的消息格式、参数名、流式事件格式都不一样；Prompt 里的变量拼接容易出错；模型返回的是文本，程序需要字典或对象。
+      这些组件分别解决「调用」「格式」「填充」「解析」四件事。
+    principle: |
+      **一、四个组件和它们的输入输出**
+
+      | 组件 | 输入 | 输出 | 代表类 / 函数 |
+      |---|---|---|---|
+      | Prompt 模板 | dict（变量） | 消息列表（PromptValue） | `ChatPromptTemplate.from_messages` |
+      | Chat Model | 消息列表 | `AIMessage` | `init_chat_model`、`ChatOpenAI` |
+      | 输出解析器 | `AIMessage` | str / dict / 对象 | `StrOutputParser` |
+      | 结构化输出 | 消息列表 | Pydantic 对象或 dict | `model.with_structured_output(Schema)` |
+
+      ```mermaid
+      flowchart LR
+        V["变量字典 text 等"] --> P["ChatPromptTemplate"]
+        P --> M["消息列表：System 加 Human"]
+        M --> C["ChatModel"]
+        C --> A["AIMessage：content、tool_calls、usage"]
+        A --> O["StrOutputParser 得到字符串"]
+        M --> S["with_structured_output 得到 Pydantic 对象"]
+      ```
+
+      **二、消息类型**
+
+      `SystemMessage`、`HumanMessage`、`AIMessage`、`ToolMessage`（对应 Day 15 的角色）。`AIMessage` 上还有 `tool_calls`（工具调用列表）和用量元数据。1.x 新增 `content_blocks` 统一不同厂商的内容结构。
+
+      **三、init_chat_model**
+
+      `init_chat_model("openai:模型名")` 按「provider:model」字符串初始化模型，背后加载对应 provider 包。官方文档列出 `timeout`、`max_retries` 等参数可以直接作为关键字传入（文档写明 max_retries 默认 6，网络错误、429、5xx 会自动指数退避重试，401/404 不重试）。
+
+      **四、结构化输出**
+
+      `with_structured_output(PydanticModel)` 会利用模型的原生结构化输出或工具调用能力，直接返回校验过的对象（Day 19 的原理）。它比「Prompt 要求输出 JSON + 解析器」可靠得多。在 create_agent 中对应 `response_format=ToolStrategy(...)` 或 `ProviderStrategy(...)`。
+    scenarios: |
+      - 工单分类：`prompt | model.with_structured_output(TicketLabel)` 直接得到分类对象。
+      - 生成回复文案：`prompt | model | StrOutputParser()` 得到字符串。
+      - 多厂商切换：用 `init_chat_model` 和环境变量配置模型名，业务代码不变。
+    pitfalls: |
+      - **Prompt 模板里的花括号**：模板用 `{变量}` 占位，要输出字面花括号（比如 JSON 示例）必须写成双花括号，否则报缺少变量。
+      - **误区：StrOutputParser 能保证 JSON。** 它只取文本，要结构化请用 with_structured_output。
+      - **误区：换模型只改模型名。** 不同模型对工具调用、结构化输出、参数（如 temperature）的支持不同，需要回归测试。
+    interview_asks:
+      - LangChain 的核心组件有哪些？一条链的数据类型是怎么变化的？
+      - with_structured_output 和输出解析器有什么区别？
+    project_example: |
+      做工单分类时，第一版用 Prompt 要求「只输出 JSON」再用解析器解析，约 3% 的输出带了多余说明文字导致解析失败。
+      改为 `model.with_structured_output(TicketLabel)` 后，类别字段用 Literal 枚举约束，解析失败基本消失；剩余的少量失败（模型拒答等）在批处理中单独捕获记录。
+    freshness: |
+      核对于 2026-11：LangChain Models 文档以 `from langchain.chat_models import init_chat_model` 为推荐入口，文档列出 `max_retries` 默认 6、`timeout` 可配置；本地验证 langchain-core 1.8.0 中 `AIMessage.text` 是 property，`with_structured_output(schema, *, include_raw=False, **kwargs)` 签名存在。
+    sources:
+      - {title: "LangChain Docs - Models", url: "https://docs.langchain.com/oss/python/langchain/models"}
+
+  - id: d34-k3
+    name: Runnable 接口与 LCEL 管道
+    level: P0
+    summary: 所有组件都实现 Runnable 的 invoke / stream / batch；用 | 串成 RunnableSequence，用字典并行成 RunnableParallel，组合后自动具备同步、异步、批量、流式能力
+    why: |
+      Runnable 是 langchain-core 最核心的抽象，模型、Prompt、解析器、工具、甚至 LangGraph 编译后的图都实现了它。
+      理解它，你就能看懂任何 LangChain 代码的执行顺序，也能解释「为什么一条链能直接 stream」「batch 为什么会整体失败」这类问题。
+    problem: |
+      手写调用链时，每一步的同步、异步、批量、流式版本都要自己写一遍；并行分支要自己管理线程或协程；追踪每一步耗时也要自己埋点。
+      Runnable 用一个统一接口解决这些重复工作。
+    principle: |
+      **一、Runnable 统一接口**
+
+      | 方法 | 作用 | 异步版本 |
+      |---|---|---|
+      | `invoke(input, config)` | 单个输入 → 单个输出 | `ainvoke` |
+      | `batch(inputs, config)` | 多个输入并行处理 | `abatch` |
+      | `stream(input, config)` | 边生成边返回块 | `astream` |
+      | `astream_events` | 流式返回中间步骤事件 | — |
+
+      官方参考文档说明：`batch` 默认实现**用线程池并行调用 invoke**；`a` 前缀方法默认把同步版本放到线程池执行，子类可重写为原生异步。所有方法都接收 `config`（tags、metadata、callbacks、`max_concurrency` 等）。
+
+      **二、LCEL：用运算符组合 Runnable**
+
+      - `a | b | c` 生成 **RunnableSequence**：前一个的输出作为后一个的输入。
+      - 字典 `{"x": r1, "y": r2}` 在链中自动变为 **RunnableParallel**：同一输入同时送给 r1、r2，输出合成字典。
+      - 普通函数会被自动包装成 **RunnableLambda**。
+      - `RunnablePassthrough.assign(k=...)`：保留输入字典并新增字段。
+
+      ```mermaid
+      flowchart LR
+        IN["输入 dict"] --> CL["RunnableLambda 清洗"]
+        CL --> PAR{"RunnableParallel"}
+        PAR --> S1["summary 分支：Prompt、模型、StrOutputParser"]
+        PAR --> S2["label 分支：Prompt、结构化输出模型"]
+        PAR --> S3["ticket_id 分支：直接取值"]
+        S1 --> OUT["合并为一个 dict"]
+        S2 --> OUT
+        S3 --> OUT
+      ```
+
+      **三、组合后自动获得的能力**
+
+      - **流式**：`chain.stream()` 时，能流式的步骤（模型、StrOutputParser）会逐块向后传，用户更早看到首字。
+      - **批量**：`chain.batch([...], config={"max_concurrency": 8})` 并发处理多个输入。
+      - **异步**：`await chain.ainvoke(...)`，适合 FastAPI 异步接口（Day 9）。
+      - **可观测**：每个步骤自动产生回调事件，接入 LangSmith 等追踪工具能看到每步输入输出和耗时。
+      - **容错包装**：`with_retry(...)` 给某一步加重试，`with_fallbacks([...])` 主模型失败时切到备用模型。
+
+      **四、batch 的失败语义（重要）**
+
+      `batch` 默认 `return_exceptions=False`：**任何一个输入失败，整个 batch 调用抛出异常**，已经成功的结果也拿不到。批处理离线任务应使用 `return_exceptions=True`，逐个检查结果是否为异常。
+
+      **五、LCEL 在 1.x 中的定位**
+
+      Runnable 和 LCEL 原语仍在 langchain-core 中导出并可用（本地 1.8.0 已验证），但 1.x 官方文档的重心已转向 create_agent 和 LangGraph，LCEL 不再是首页主推内容。实践建议：**简单、确定的「Prompt → 模型 → 解析」流水线用 LCEL；有循环、状态、人工确认的流程用 LangGraph。**
+
+      **六、用 JavaScript 类比**
+
+      `|` 像 Promise 链里的 `.then()`，或 RxJS 的 `pipe`；RunnableParallel 像 `Promise.all` 返回对象；`batch` 像对数组做带并发上限的 `Promise.all`，而且默认是「一个 reject 全部 reject」的语义。
+    scenarios: |
+      - **批量处理工单 / 评论**：`chain.batch(items, config={"max_concurrency": 8}, return_exceptions=True)`。
+      - **聊天接口流式输出**：`async for chunk in chain.astream(...)` 配合 SSE（Day 17、43）。
+      - **主备模型**：`primary.with_fallbacks([backup])`，主模型限流时自动切换。
+      - **RAG 问答链**：`{"context": retriever, "question": RunnablePassthrough()} | prompt | model | parser`。
+    code: |
+      ```python
+      import os
+
+      from langchain.chat_models import init_chat_model
+      from langchain_core.output_parsers import StrOutputParser
+      from langchain_core.prompts import ChatPromptTemplate
+
+      model = init_chat_model(os.environ["CHAT_MODEL"], temperature=0, timeout=30)  # 例如 openai:模型名
+      prompt = ChatPromptTemplate.from_messages([
+          ("system", "你是客服主管，用不超过 50 字总结工单要点。"),
+          ("human", "{text}"),
+      ])
+      chain = prompt | model | StrOutputParser()      # RunnableSequence
+
+      print(chain.invoke({"text": "我昨天买的耳机今天还没发货"}))
+      for chunk in chain.stream({"text": "退款三天了还没到账"}):
+          print(chunk, end="", flush=True)
+      results = chain.batch(
+          [{"text": "账号被锁"}, {"text": "发票抬头错了"}],
+          config={"max_concurrency": 4},
+          return_exceptions=True,                     # 单个失败不影响其他
+      )
+      ```
+    pitfalls: |
+      - **误区：batch 中一个失败只影响它自己。** 默认会整体抛异常，需要 `return_exceptions=True`。
+      - **误区：ainvoke 一定是真异步。** 默认实现是把同步方法放进线程池，只有组件重写了异步方法才是原生异步。
+      - **误区：整条链都能流式。** 中间如果有不支持流式的步骤（例如必须拿到完整文本才能解析的步骤），流式会在那里「攒齐」再往后传。
+      - **LCEL 写复杂逻辑**：用 LCEL 硬写循环和条件分支，可读性迅速变差，应该换 LangGraph。
+    interview_asks:
+      - 讲讲 LangChain 的 Runnable 接口和 LCEL。
+      - "`prompt | model | parser` 这行代码执行时发生了什么？"
+      - batch 处理 1000 条数据时有一条失败，会怎样？
+    project_example: |
+      每天凌晨要对前一天约 2 万条用户评论做摘要和情感标注。用 `chain.batch(..., config={"max_concurrency": 16})`，第一次上线跑到一半因为某条评论触发内容审核拒答，整个批次抛异常，前面的结果全部丢失。
+      改为每 200 条一批、`return_exceptions=True`，失败条目写入重试表，主模型加 `with_fallbacks` 切换备用模型。之后每天任务稳定完成，失败率约 0.2%，次日自动重试。
+    freshness: |
+      核对于 2026-11：langchain-core Runnable 参考文档写明 `batch` 默认用线程池并行调用 invoke、`a` 前缀方法默认在线程池中执行同步版本；`batch(inputs, config=None, *, return_exceptions=False, **kwargs)`。本地 langchain-core 1.8.0 验证 `with_retry`、`with_fallbacks`、`astream_events`、`batch_as_completed` 存在，`RunnableParallel` / `RunnableLambda` / `RunnablePassthrough` 可导入，并实测 batch 默认遇错整体抛出、`return_exceptions=True` 时异常作为结果返回。LCEL 已不在 1.x 官方文档首页主推（以 docs.langchain.com 当前内容为准）。
+    sources:
+      - {title: "LangChain Reference - Runnable", url: "https://reference.langchain.com/python/langchain-core/runnables/Runnable"}
+      - {title: "LangChain Reference - RunnableParallel", url: "https://reference.langchain.com/python/langchain-core/runnables/base/RunnableParallel"}
+      - {title: "LangChain Reference - Runnable.batch", url: "https://reference.langchain.com/python/langchain-core/runnables/base/Runnable/batch"}
+
+  - id: d34-k4
+    name: create_agent 与中间件
+    level: P1
+    summary: LangChain 1.x 用 create_agent 一行搭出 ReAct Agent，循环、工具执行在内部完成，限流、重试、摘要、人工确认通过中间件插入
+    why: |
+      Day 31~33 手写了 Agent 循环和工具执行器，create_agent 就是这些东西的官方封装。
+      面试官会问「你用框架还是手写」，你需要能说清 create_agent 内部做了什么、怎么在它上面加最大步数和错误处理。
+    problem: |
+      每个项目都手写 ReAct 循环、工具分发、错误回传、调用次数限制，重复且容易漏。
+      旧版 AgentExecutor 封装太死，想在「调用模型前」「执行工具时」插入逻辑很难。v1 用中间件提供了标准插入点。
+    principle: |
+      **一、最小用法**
+
+      ```python
+      import os
+
+      from langchain.agents import create_agent
+      from langchain.agents.middleware import ModelCallLimitMiddleware, ToolCallLimitMiddleware
+
+      agent = create_agent(
+          model=os.environ["CHAT_MODEL"],          # 也可以传模型实例
+          tools=[get_order, get_logistics],        # @tool 函数
+          system_prompt="你是电商客服，只能依据工具结果回答。",
+          middleware=[
+              ModelCallLimitMiddleware(run_limit=8),   # 单次运行最多 8 次模型调用
+              ToolCallLimitMiddleware(run_limit=10),   # 单次运行最多 10 次工具调用
+          ],
+      )
+      result = agent.invoke({"messages": [{"role": "user", "content": "SO12345678 到哪了"}]})
+      print(result["messages"][-1].content)
+      ```
+
+      **二、内部结构**
+
+      create_agent 返回的是一个**编译好的 LangGraph 图**，核心节点是 `model` 和 `tools`，加上中间件对应的钩子节点：
+
+      ```mermaid
+      stateDiagram-v2
+        state "before_model 中间件" as BM
+        state "model 节点：调用模型" as MODEL
+        state "after_model 中间件" as AM
+        state "tools 节点：执行工具" as TOOLS
+        [*] --> BM
+        BM --> MODEL
+        MODEL --> AM
+        AM --> TOOLS: 有工具调用
+        AM --> [*]: 无工具调用或达到限制
+        TOOLS --> BM
+      ```
+
+      **三、常用内置中间件**
+
+      | 中间件 | 作用 |
+      |---|---|
+      | `ModelCallLimitMiddleware` | 限制模型调用次数（run_limit / thread_limit），默认到达上限后优雅结束 |
+      | `ToolCallLimitMiddleware` | 限制工具调用次数，可针对单个工具 |
+      | `ModelRetryMiddleware` / `ToolRetryMiddleware` | 模型或工具失败重试 |
+      | `SummarizationMiddleware` | 上下文过长时自动摘要旧消息（Day 32 的上下文膨胀） |
+      | `HumanInTheLoopMiddleware` | 指定工具执行前暂停等待人工确认（Day 36、40） |
+      | `@wrap_tool_call` 自定义 | 包住工具执行，统一错误处理（Day 33） |
+
+      **四、注意点**
+
+      - `create_agent` 只支持 TypedDict 形式的自定义状态（继承 `AgentState`），不再支持 Pydantic 状态。
+      - 不接受已经 `bind_tools` 的模型；工具通过 `tools` 参数传入。
+      - 结构化输出用 `response_format=ToolStrategy(...)` / `ProviderStrategy(...)`。
+    scenarios: |
+      - 标准工具型客服、查询助手：create_agent + 调用次数限制 + 工具错误中间件即可。
+      - 需要人工确认的写操作：加 HumanInTheLoopMiddleware 并配置 checkpointer。
+      - 需要复杂分支、多阶段审批、多个 Agent 协作：直接用 LangGraph 自定义图（Day 35、39）。
+    pitfalls: |
+      - **误区：create_agent 自带合理的步数上限。** 底层 LangGraph 默认递归上限在 1.1.4 后约为一万步，几乎等于没有限制，应显式加调用次数中间件或设置 recursion_limit。
+      - **误区：框架会自动兜住所有工具异常。** 默认只处理参数校验类错误，执行异常需要自己用中间件处理。
+      - **thread_limit 不生效**：线程级限制需要配置 checkpointer 才能跨多次调用累计。
+    interview_asks:
+      - create_agent 内部是怎么运行的？和你手写的 ReAct 循环有什么对应关系？
+      - 怎么在 create_agent 上限制最大步数、处理工具错误？
+    project_example: |
+      把手写的客服 Agent 迁移到 create_agent：工具直接复用 @tool 函数，手写的步数计数改为 `ModelCallLimitMiddleware(run_limit=8)`，手写的错误回传改为 `@wrap_tool_call` 中间件。
+      代码量从约 200 行降到 60 行左右；但我们保留了自研的工具注册表，用于按角色筛选工具后再传给 create_agent。
+    freshness: |
+      核对于 2026-11：LangChain Agents 文档与迁移指南确认 `from langchain.agents import create_agent`，参数 `model`、`tools`、`system_prompt`、`middleware`、`response_format`、`state_schema`、`context_schema`；内置中间件文档列出 `ModelCallLimitMiddleware(thread_limit, run_limit, exit_behavior="end")`、`ToolCallLimitMiddleware(tool_name, thread_limit, run_limit, exit_behavior="continue")`、`ModelRetryMiddleware`、`ToolRetryMiddleware`、`SummarizationMiddleware`、`HumanInTheLoopMiddleware`。本地 langchain 1.5.0 实测：限制 run_limit=3 时最后一条 AI 消息为「Model call limits exceeded: run limit (3/3)」，图节点包含 model、tools 与中间件钩子节点。旧写法：`create_react_agent(model, tools, prompt=...)`、`initialize_agent`、`AgentExecutor(max_iterations=...)`。
+    sources:
+      - {title: "LangChain Docs - Agents", url: "https://docs.langchain.com/oss/python/langchain/agents"}
+      - {title: "LangChain Docs - Prebuilt middleware", url: "https://docs.langchain.com/oss/python/langchain/middleware/built-in"}
+      - {title: "LangChain v1 migration guide", url: "https://docs.langchain.com/oss/python/migrate/langchain-v1"}
+
+  - id: d34-k5
+    name: LangChain 解决的问题与被诟病之处
+    level: P2
+    summary: 它带来统一接口和现成组件，也带来抽象过深、版本变动快、调试难的问题；理解底层再决定用多少
+    why: |
+      「你怎么看 LangChain」是常见的开放题，只夸或只骂都不加分。能说出具体优缺点并给出使用边界，才显得有工程判断。
+    problem: |
+      团队要决定：直接调用厂商 SDK、用 LangChain、还是用 LangGraph？选错的代价是要么重复造轮子，要么被框架绑住、出问题看不懂。
+    principle: |
+      **它解决的问题**：
+      - 统一的模型、消息、工具接口，切换厂商成本低；
+      - 大量现成集成（向量库、文档加载器、各家模型）；
+      - Runnable 自动提供流式、批量、异步和追踪；
+      - create_agent 和中间件把 Agent 常见需求标准化。
+
+      **被诟病之处**：
+      - **抽象层太深**：出错时堆栈很长，不清楚实际发给模型的 Prompt 是什么（Anthropic 也提醒框架可能「遮蔽底层的提示和响应」）；
+      - **版本变化快**：0.1 / 0.2 / 0.3 / 1.x 多次大改，旧教程大量失效；
+      - **简单需求被复杂化**：只调一次模型也要引入一堆依赖；
+      - **新特性滞后**：厂商刚发布的新参数，封装层可能晚一步支持。
+
+      ```mermaid
+      flowchart TD
+        A["需求"] --> B{"只调一个模型、逻辑简单"}
+        B -- "是" --> C["直接用厂商 SDK"]
+        B -- "否" --> D{"需要多厂商、现成集成或标准 Agent"}
+        D -- "是" --> E["LangChain：LCEL 或 create_agent"]
+        D -- "否，需要循环、状态、人工确认、复杂编排" --> F["LangGraph"]
+      ```
+
+      无论选哪个，都要能**打开日志看到真实的请求和响应**。
+    scenarios: |
+      - 原型验证：LangChain 快速接入多个模型对比效果。
+      - 高并发、只用一家模型的核心接口：直接用 SDK，减少依赖和开销。
+      - 复杂流程：LangGraph，必要时节点内部直接调 SDK。
+    pitfalls: |
+      - **误区：用框架就不需要懂底层。** 框架行为（默认重试、默认错误处理、默认递归上限）会随版本变化，不懂底层就无法排查。
+      - **误区：框架一定更慢。** 主要耗时在模型调用，框架开销通常很小；真正的问题是可控性和可调试性。
+    interview_asks:
+      - 你怎么评价 LangChain？
+      - 什么情况下你会选择不用 LangChain？
+    project_example: |
+      公司的智能写作接口只用一家模型、逻辑就是一次调用加流式输出，最初用 LangChain 实现。一次升级后流式事件格式变化导致前端断流。
+      评估后改为直接用厂商 SDK，代码更短、依赖更少；而知识库问答和客服 Agent 仍保留 LangChain / LangGraph，因为它们需要多模型切换和 Agent 中间件。
+    sources:
+      - {title: "Anthropic - Building effective agents（When and how to use frameworks）", url: "https://www.anthropic.com/engineering/building-effective-agents"}
+
+quiz:
+  - id: d34-q1
+    kp: d34-k1
+    type: single
+    question: 在 LangChain 1.x 的新项目中，要创建一个能调用工具的 Agent，推荐的入口是什么？
+    options:
+      - "from langchain.agents import initialize_agent, AgentExecutor"
+      - "from langgraph.prebuilt import create_react_agent"
+      - "from langchain.agents import create_agent"
+      - "from langchain.chains import LLMChain，再手动加工具"
+    answer: [2]
+    explain: |
+      LangChain 1.x 统一用 `langchain.agents.create_agent`，它构建在 LangGraph 之上并支持中间件。A 是 0.x 写法，1.x 中已移入 langchain-classic 并标记 2.0 移除；B 是 LangGraph 0.x 时代的预置 Agent，v1 已弃用并指向 create_agent；D 的 LLMChain 也已移入 langchain-classic，且本身不具备 Agent 循环。
+  - id: d34-q2
+    kp: d34-k3
+    type: judge
+    question: 调用 `chain.batch(inputs)` 处理 500 条数据时，如果第 37 条在模型调用时抛出异常，默认情况下其余 499 条的结果仍然会正常返回，只有第 37 条为 None。
+    answer: false
+    explain: |
+      `batch` 默认 `return_exceptions=False`，任意一个输入失败都会让整个 batch 调用抛出异常，调用方拿不到任何结果。要让单条失败不影响其他，需要传 `return_exceptions=True`，此时失败位置返回的是异常对象而不是 None，需逐个检查。
+  - id: d34-q3
+    kp: d34-k3
+    type: multi
+    question: 关于 `chain = prompt | model | StrOutputParser()`，以下哪些说法正确？
+    options:
+      - "`|` 把三个 Runnable 组合成一个 RunnableSequence，前一步输出作为后一步输入"
+      - "组合后的 chain 自动具备 invoke、batch、stream 以及对应的异步方法"
+      - "chain.ainvoke 一定是原生异步执行，不会用到线程池"
+      - "调用 chain.stream 时，模型产生的文本块会经过 StrOutputParser 逐块输出"
+    answer: [0, 1, 3]
+    explain: |
+      A、B 是 LCEL 的基本机制。D 正确：StrOutputParser 支持流式，会把模型的块逐个向后传递。C 错：Runnable 的异步方法默认实现是把同步版本放进线程池执行，只有组件自己重写了异步方法才是原生异步；ChatModel 一般有原生异步实现，但不能一概而论。
+  - id: d34-q4
+    kp: d34-k1
+    type: short
+    question: 请说明 LangChain 1.x 中 langchain-core、langchain、langchain-openai、langchain-classic、langgraph 五个包各自负责什么，以及 create_agent 和 LangGraph 的关系。
+    key_points:
+      - {text: "langchain-core 提供 Runnable、消息、Prompt、工具基类等核心抽象", dim: concept}
+      - {text: "langchain 提供 create_agent、中间件、init_chat_model 等应用入口", dim: concept}
+      - {text: "langchain-openai 是 provider 包，langchain-classic 存放 LLMChain、AgentExecutor 等旧功能", dim: concept}
+      - {text: "指出 create_agent 构建在 LangGraph 之上，返回编译后的图，需要自定义编排时下沉到 LangGraph", dim: principle}
+    reference: |
+      - **langchain-core**：最底层的核心抽象，Runnable 接口、消息类型、Prompt 模板、输出解析器、工具基类、ChatModel 基类。其他包都依赖它。
+      - **langchain**：面向应用的高层入口，`create_agent`、各种中间件、`init_chat_model`，以及消息和工具的便捷导出。v1 后包体被精简。
+      - **langchain-openai**：provider 包，实现 ChatOpenAI、OpenAIEmbeddings 等，按需安装具体厂商的包。
+      - **langchain-classic**：兼容旧代码，存放 LLMChain、旧检索器、hub、AgentExecutor、initialize_agent 等，标记为将来移除，新项目不应使用。
+      - **langgraph**：有状态的图运行时，提供 StateGraph、节点、边、checkpoint 等。
+
+      **关系**：`create_agent` 构建在 LangGraph 之上，返回的就是一个编译好的图（model 节点、tools 节点加中间件钩子）。标准 Agent 用 create_agent 快速起步；需要自定义分支、多阶段流程时直接用 LangGraph 编排。
+  - id: d34-q5
+    kp: d34-k3
+    type: scenario
+    question: |
+      夜间任务用 LCEL 链对 2 万条评论做「摘要 + 情感分类」，代码是 `chain.batch(all_comments, config={"max_concurrency": 32})`。
+      上线后：有时跑到一半整个任务失败、之前结果全部丢失；有时模型服务返回大量 429。请分析原因并给出改造方案。
+    key_points:
+      - {text: "指出 batch 默认 return_exceptions=False，单条失败导致整体抛异常、已完成结果丢失", dim: principle}
+      - {text: "指出并发 32 过高超过模型服务限流，导致 429", dim: engineering}
+      - {text: "提出分批处理并使用 return_exceptions=True，失败条目落库重试", dim: engineering}
+      - {text: "提出降低 max_concurrency、给模型设置超时和重试或 with_fallbacks 备用模型", dim: engineering}
+      - {text: "提出结果分批持久化和断点续跑，避免重跑已完成的数据", dim: project}
+    reference: |
+      **原因**：
+      1. `batch` 默认 `return_exceptions=False`，2 万条里任意一条失败（内容审核拒答、结构化输出解析失败、网络错误）都会让整个调用抛异常，内存里已完成的结果也丢失。
+      2. `max_concurrency=32` 超过了模型账号的限流，导致大量 429；虽然模型客户端会自动重试，但重试后仍超限就会失败，进一步触发问题一。
+
+      **改造方案**：
+      - **分批**：每 200 条一批，每批完成后立即写数据库，并记录处理进度，支持断点续跑。
+      - **错误隔离**：`batch(..., return_exceptions=True)`，逐个检查结果，异常条目写入失败表，次日重试。
+      - **限流**：按账号配额把 `max_concurrency` 降到例如 8，必要时在外层加令牌桶。
+      - **超时与重试**：模型初始化时设置 timeout 和 max_retries；主模型 `with_fallbacks([备用模型])`。
+      - **监控**：记录每批耗时、失败率、429 次数，超过阈值告警。
+    followup:
+      question: 如果某些评论总是导致结构化输出解析失败，你会怎么处理？
+      key_points: [记录原文和原始输出分析原因, 调整 Schema 或 Prompt 例如增加其他类别, 多次失败后标记人工处理]
+      reference: 先保存这些评论原文和模型原始输出分析原因，常见是类别枚举不全或内容触发拒答；可以在 Schema 中增加「其他」类别、调整提示；重试仍失败的条目标记为需人工处理，不无限重试。
+  - id: d34-q6
+    kp: d34-k5
+    type: design
+    question: |
+      团队要开发三个功能：①营销文案生成（只用一家模型，一次调用加流式输出）；②企业知识库问答（需要切换多家模型对比、检索加生成）；③售后 Agent（调用多个工具、需要人工确认退款、需要中断后恢复）。
+      请分别选择直接用 SDK、LangChain（LCEL / create_agent）还是 LangGraph，并说明理由。
+    key_points:
+      - {text: "文案生成逻辑简单只用一家模型，直接用厂商 SDK 减少依赖和抽象", dim: engineering}
+      - {text: "知识库问答需要多模型切换和检索加生成的确定流程，适合 LCEL 链", dim: engineering}
+      - {text: "售后 Agent 需要人工确认和中断恢复，适合 LangGraph 或 create_agent 加 HITL 中间件和 checkpointer", dim: engineering}
+      - {text: "说明无论用哪种方式都要能看到真实请求响应并设置超时、调用上限", dim: principle}
+    reference: |
+      **① 营销文案生成：直接用 SDK。** 只有一次调用加流式输出，没有多模型、没有工具，引入框架只增加依赖和一层抽象；直接用厂商 SDK 的流式接口，配合 SSE 返回前端，出问题也最好排查。
+
+      **② 知识库问答：LangChain LCEL。** 流程是确定的「检索 → 组装 Prompt → 模型 → 解析」，适合 `{"context": retriever, "question": RunnablePassthrough()} | prompt | model | parser`；用 `init_chat_model` 按配置切换模型方便对比；自带 stream 和 batch，评估时可以 batch 跑评估集。
+
+      **③ 售后 Agent：LangGraph（或 create_agent + 中间件）。** 需要多工具循环、退款前人工确认、中断后从断点恢复，这些依赖状态持久化（checkpointer）和中断机制。标准流程可用 create_agent 加 `HumanInTheLoopMiddleware` 和调用次数限制；如果还有多阶段审批等自定义分支，直接用 LangGraph 写 StateGraph。
+
+      三者共同要求：打开日志能看到真实的请求和响应；设置超时、重试和调用上限。
+code_reading:
+  id: d34-c1
+  kp: [d34-k2, d34-k3]
+  title: 用 LCEL 批量做工单摘要与分类
+  scenario: |
+    客服平台的夜间离线任务：从数据库读出前一天的工单（每条含 ticket_id 和 text），用一条 LCEL 链并行生成摘要和结构化分类，结果写回报表库供主管查看。由定时任务调用 `process_batch`。
+  language: python
+  code: |
+    import logging
+    import os
+    from typing import Literal
+
+    from langchain.chat_models import init_chat_model
+    from langchain_core.output_parsers import StrOutputParser
+    from langchain_core.prompts import ChatPromptTemplate
+    from langchain_core.runnables import RunnableLambda, RunnableParallel
+    from pydantic import BaseModel, Field
+
+    logger = logging.getLogger("ticket_chain")
+    model = init_chat_model(os.environ["CHAT_MODEL"], temperature=0)  # 例如 openai:模型名
+
+    class TicketLabel(BaseModel):
+        category: Literal["账号", "支付", "物流", "其他"]
+        urgency: int = Field(ge=1, le=3, description="1 低，2 中，3 高")
+
+    def clean(ticket: dict) -> dict:
+        return {"ticket_id": ticket["ticket_id"], "text": ticket["text"].strip()[:4000]}
+
+    summary_prompt = ChatPromptTemplate.from_messages([
+        ("system", "你是客服主管，用不超过 50 字总结工单要点。"),
+        ("human", "{text}"),
+    ])
+    label_prompt = ChatPromptTemplate.from_messages([
+        ("system", "根据工单内容判断分类和紧急程度。"),
+        ("human", "{text}"),
+    ])
+
+    summary_chain = summary_prompt | model | StrOutputParser()
+    label_chain = label_prompt | model.with_structured_output(TicketLabel)
+
+    ticket_chain = RunnableLambda(clean) | RunnableParallel(
+        ticket_id=lambda x: x["ticket_id"],
+        summary=summary_chain,
+        label=label_chain,
+    )
+
+    def process_batch(tickets: list[dict]) -> list[dict]:
+        results = ticket_chain.batch(tickets, config={"max_concurrency": 8})
+        rows = [
+            {"ticket_id": r["ticket_id"], "summary": r["summary"],
+             "category": r["label"].category, "urgency": r["label"].urgency}
+            for r in results
+        ]
+        logger.info("processed %d tickets", len(rows))
+        return rows
+  walkthrough:
+    function: |
+      对一批工单，每条先清洗，再**并行**做两件事：生成 50 字摘要（文本输出）和判断分类与紧急程度（结构化输出），最后把结果整理成可以写入报表库的行。
+    key_functions: |
+      - `clean`：RunnableLambda 包装的普通函数，去掉首尾空白并把正文截断到 4000 字符。
+      - `summary_chain`：Prompt 模板 → 模型 → StrOutputParser，输出字符串。
+      - `label_chain`：Prompt 模板 → `with_structured_output(TicketLabel)`，输出校验过的 Pydantic 对象。
+      - `ticket_chain`：`clean` 之后接 RunnableParallel，三个分支拿到同一个清洗后的字典，输出合并为 `{"ticket_id", "summary", "label"}`。
+      - `process_batch`：调用 `batch` 并发处理全部工单，再把 label 对象拆成两列。
+    params: |
+      每条工单字典进入 `clean`，输出 `{"ticket_id", "text"}`；RunnableParallel 把这个字典**原样**传给三个分支。两个 Prompt 模板从字典里取 `{text}` 变量（多出来的 ticket_id 被忽略）；`ticket_id` 分支是 lambda，被自动包装为 RunnableLambda。
+      `config={"max_concurrency": 8}` 限制 batch 同时处理的输入数；每条工单内部还会并行发起两次模型调用。
+    data_flow: |
+      ```mermaid
+      flowchart TD
+        A["tickets 列表"] --> B["batch：最多 8 条同时处理"]
+        B --> C["clean：strip 并截断到 4000 字符"]
+        C --> D{"RunnableParallel"}
+        D --> E["summary_prompt 到模型到 StrOutputParser"]
+        D --> F["label_prompt 到结构化输出模型"]
+        D --> G["取 ticket_id"]
+        E --> H["合并 dict"]
+        F --> H
+        G --> H
+        H --> I["process_batch 拆出 category 和 urgency"]
+        I --> J["rows 返回给定时任务写库"]
+      ```
+    failure_points: |
+      - **batch 没有 return_exceptions=True**：任意一条工单失败（结构化输出校验失败、内容审核拒答、网络错误、限流重试耗尽），`batch` 整体抛异常，`process_batch` 一行结果都拿不到，整晚任务白跑。
+      - **模型没有显式设置 timeout**：依赖 SDK 默认超时，某个请求卡住时会长时间占用并发槽位，拖慢整批；生产中应显式设置 timeout，并结合 max_retries 控制总耗时。
+      - `clean` 静默截断到 4000 字符，长工单后半部分的关键信息（例如最后补充的订单号）会丢失，且没有任何日志。
+      - 每条工单 2 次模型调用，`max_concurrency=8` 意味着最多约 16 个并发请求，可能触发账号限流。
+      - 列表推导中如果 `r` 是异常对象（改成 return_exceptions 之后），访问 `r["label"]` 会再次报错，需要先判断类型。
+    debugging: |
+      - 先单条 `ticket_chain.invoke(sample)` 验证链路，再小批量 batch。
+      - 用 `ticket_chain.batch(sample, return_exceptions=True)` 找出失败的是哪几条，打印异常类型，区分校验失败、拒答和网络错误。
+      - 打开 LangSmith 等追踪（或注册回调），查看每条工单两个分支实际发给模型的消息和耗时。
+      - 构造一条超过 4000 字、关键信息在末尾的工单，确认截断造成的分类错误。
+    change_request: |
+      如果需求改成「失败的工单不影响其他工单，失败条目第二天重试」：`batch` 加 `return_exceptions=True`；遍历结果时用 `isinstance(r, Exception)` 分流，成功的生成行，失败的连同 ticket_id 和异常类型写入重试表；`init_chat_model` 显式传 `timeout` 和 `max_retries`。
+      如果要「新增一个字段：是否需要回访」：在 `TicketLabel` 中加 `need_callback: bool` 并在 Prompt 中说明判断标准，`process_batch` 多拆一列即可，链结构不用改。
+  questions:
+    - id: d34-c1-q1
+      kp: d34-k3
+      type: code
+      question: |
+        以一条工单 `{"ticket_id": "T1", "text": "  支付成功但订单显示未付款  "}` 为例，按执行顺序说明它在 ticket_chain 中经过的每一步、每一步的输入输出类型，以及最终在 rows 中的样子。
+      key_points:
+        - {text: "clean 输出去掉空白的 dict，包含 ticket_id 和 text", dim: concept}
+        - {text: "RunnableParallel 把同一 dict 同时传给三个分支并行执行", dim: principle}
+        - {text: "summary 分支经过 Prompt 得到消息列表、模型得到 AIMessage、StrOutputParser 得到字符串", dim: principle}
+        - {text: "label 分支输出 TicketLabel 对象，process_batch 再拆成 category 和 urgency 两列", dim: concept}
+      reference: |
+        1. **clean**：输入原始 dict，输出 `{"ticket_id": "T1", "text": "支付成功但订单显示未付款"}`（去掉首尾空格，未超 4000 字不截断）。
+        2. **RunnableParallel**：把这个 dict 同时交给三个分支：
+           - `ticket_id` 分支：lambda 取值，输出 `"T1"`；
+           - `summary` 分支：summary_prompt 用 `{text}` 填充，输出包含 System 和 Human 两条消息的 PromptValue → 模型返回 AIMessage → StrOutputParser 取出文本，例如「用户支付成功但订单状态未同步」；
+           - `label` 分支：label_prompt 生成消息 → 结构化输出模型返回 `TicketLabel(category="支付", urgency=2)`。
+        3. 三个分支结果合并为 `{"ticket_id": "T1", "summary": "...", "label": TicketLabel(...)}`。
+        4. **process_batch** 把它整理成 `{"ticket_id": "T1", "summary": "...", "category": "支付", "urgency": 2}` 放进 rows。
+        这条工单总共发起两次模型调用，两者并行。
+    - id: d34-c1-q2
+      kp: d34-k3
+      type: code
+      question: 某天晚上 3000 条工单中有 1 条触发了模型的内容审核拒答，导致结构化输出校验失败。请说明当前代码会发生什么，并给出修改后的 process_batch 的关键改动。
+      key_points:
+        - {text: "说明 label_chain 对该条抛出异常，batch 默认 return_exceptions=False 使整个调用抛出", dim: principle}
+        - {text: "指出其余 2999 条已完成的结果全部丢失，rows 不会生成，任务失败", dim: engineering}
+        - {text: "修改为 return_exceptions=True，并用 isinstance 判断结果是否为异常分别处理", dim: engineering}
+        - {text: "提出失败条目记录 ticket_id 和异常类型写入重试表，并显式设置模型超时与重试", dim: project}
+      reference: |
+        **当前行为**：这条工单的 label 分支在结构化输出解析或校验时抛异常，RunnableParallel 把异常向上抛；`ticket_chain.batch` 默认 `return_exceptions=False`，于是整个 batch 调用抛出异常。`process_batch` 在第一行就失败，rows 不会生成，其他 2999 条已经花钱生成的结果全部丢失，定时任务报错退出。
+
+        **关键改动**：
+        ```python
+        results = ticket_chain.batch(tickets, config={"max_concurrency": 8}, return_exceptions=True)
+        rows, failed = [], []
+        for t, r in zip(tickets, results):
+            if isinstance(r, Exception):
+                failed.append({"ticket_id": t["ticket_id"], "error": type(r).__name__})
+                continue
+            rows.append({...})
+        ```
+        失败条目写入重试表，日志记录失败数量和类型；同时在 `init_chat_model` 显式设置 `timeout` 和 `max_retries`，必要时分批处理并逐批落库。
+interview:
+  - id: d34-i1
+    kp: d34-k1
+    type: oral
+    difficulty: 1
+    question: LangChain 是什么？1.0 之后有哪些主要变化？
+    key_points:
+      - {text: "说明 LangChain 是对模型、消息、工具等的统一抽象和组件框架", dim: concept}
+      - {text: "说出包结构：langchain-core、langchain、provider 包、langchain-classic、langgraph", dim: concept}
+      - {text: "说出 v1 变化：旧链移入 classic、create_agent 取代旧 Agent API、中间件、标准内容块", dim: principle}
+      - {text: "说明 create_agent 构建在 LangGraph 之上", dim: principle}
+      - {text: "结合项目说明一次版本迁移的做法", dim: project}
+    reference: |
+      **定位**：LangChain 是 LLM 应用开发框架，提供统一的模型、消息、Prompt、工具接口和大量集成，让切换模型厂商和组合组件更容易。
+
+      **包结构**：langchain-core 放核心抽象（Runnable、消息、Prompt、工具基类）；langchain 放应用入口（create_agent、中间件、init_chat_model）；langchain-openai 等是厂商实现；langchain-classic 存放旧功能；langgraph 是图运行时。
+
+      **1.0 的主要变化**（2025 年 10 月发布）：
+      1. 包瘦身，LLMChain、旧检索器、hub、AgentExecutor 等移到 langchain-classic；
+      2. Agent 统一用 `create_agent`，取代 initialize_agent 和 langgraph 的 create_react_agent，参数 prompt 改为 system_prompt；
+      3. 中间件机制，用于调用次数限制、重试、摘要、人工确认；
+      4. 消息的标准内容块 content_blocks；
+      5. 要求 Python 3.10+（目前最新版本要求 3.11+）。
+
+      create_agent 构建在 LangGraph 上，需要自定义流程时直接用 LangGraph。
+
+      我迁移过一个老项目：先改导入到 langchain_classic 恢复服务，再逐步改成 LCEL 和 create_agent。
+    oral: |
+      LangChain 是一个大模型应用框架，核心价值是统一的模型、消息、工具接口和大量现成集成。
+      1.0 之后变化挺大：包结构上，核心抽象在 langchain-core，应用入口在 langchain，厂商实现在 langchain-openai 这种 provider 包，旧的 LLMChain、AgentExecutor 挪到了 langchain-classic；Agent 统一用 create_agent，它底层就是 LangGraph；还加了中间件，用来做调用次数限制、重试、人工确认这些。
+      我迁移过一个老项目，先把导入改到 langchain_classic 保证能跑，再逐步改成 LCEL 和 create_agent。
+  - id: d34-i2
+    kp: d34-k3
+    type: oral
+    difficulty: 2
+    question: 讲讲 LangChain 的 Runnable 接口和 LCEL，`prompt | model | parser` 执行时发生了什么？
+    key_points:
+      - {text: "说明 Runnable 统一提供 invoke、batch、stream 及异步版本，并接收 config", dim: concept}
+      - {text: "说明 | 生成 RunnableSequence，前一步输出作为下一步输入，并描述三步的数据类型变化", dim: principle}
+      - {text: "说明字典组合生成 RunnableParallel，同一输入并行送给多个分支", dim: principle}
+      - {text: "说明 batch 默认线程池并行且默认遇错整体抛出，需要 return_exceptions", dim: engineering}
+      - {text: "说明简单流水线用 LCEL、复杂有状态流程用 LangGraph 的边界", dim: project}
+    reference: |
+      **Runnable** 是 langchain-core 的统一接口，Prompt、模型、解析器、工具、甚至编译后的 LangGraph 图都实现了它，提供 invoke（单个）、batch（批量）、stream（流式）以及 ainvoke、abatch、astream 等异步版本，都可以传 config 设置 tags、回调、max_concurrency。
+
+      **LCEL** 用 `|` 组合 Runnable，生成 RunnableSequence。`prompt | model | parser` 执行时：
+      1. prompt 接收变量字典，输出消息列表；
+      2. model 接收消息，调用模型返回 AIMessage；
+      3. StrOutputParser 取出文本字符串。
+      字典组合会变成 RunnableParallel，把同一输入并行交给多个分支，结果合并成字典。
+
+      组合后的链自动支持流式（模型的块逐块经过解析器）、批量和异步，还能用 with_retry、with_fallbacks 包装。
+
+      **注意**：batch 默认用线程池并行，`return_exceptions` 默认 False，一条失败整批抛出。
+
+      **边界**：确定的 Prompt → 模型 → 解析流程用 LCEL；有循环、状态、人工确认就用 LangGraph。
+    oral: |
+      Runnable 是 LangChain 最核心的接口，Prompt、模型、解析器、工具都实现了它，统一有 invoke、batch、stream 和对应的异步方法。
+      LCEL 就是用竖线把 Runnable 串起来，生成一个 RunnableSequence。prompt 竖线 model 竖线 parser 执行时，prompt 把变量字典变成消息列表，model 返回 AIMessage，parser 取出字符串。用字典组合的话就是 RunnableParallel，同一个输入并行跑多个分支。组合后的链自动支持流式、批量和异步。
+      有个坑是 batch 默认一条失败整批抛异常，我们夜间任务就踩过，后来加了 return_exceptions。简单流水线我用 LCEL，有循环和状态就换 LangGraph。
+  - id: d34-i3
+    kp: d34-k4
+    type: oral
+    difficulty: 3
+    question: 如果用 LangChain 1.x 的 create_agent 做线上客服 Agent，你会怎么保证它不会死循环、工具出错不会让请求失败、上下文不会无限增长？
+    key_points:
+      - {text: "说明 create_agent 返回 LangGraph 图，底层默认递归上限很大，不能依赖默认值", dim: principle}
+      - {text: "使用 ModelCallLimitMiddleware 和 ToolCallLimitMiddleware 限制调用次数并优雅结束", dim: engineering}
+      - {text: "用 wrap_tool_call 中间件或 ToolRetryMiddleware 处理工具错误和临时故障", dim: engineering}
+      - {text: "用 SummarizationMiddleware 或工具结果截断控制上下文长度", dim: engineering}
+      - {text: "结合项目说明 trace 监控或迁移前后的效果", dim: project}
+    reference: |
+      **背景**：create_agent 返回的是编译好的 LangGraph 图，model 和 tools 节点循环执行。LangGraph 1.1.4 之后默认递归上限是 10007 个 super-step，几乎等于没有限制，所以不能依赖默认值。
+
+      **防死循环**：
+      - `ModelCallLimitMiddleware(run_limit=8)`：单次运行最多 8 次模型调用，默认 `exit_behavior="end"` 会插入一条说明并结束，而不是抛异常；
+      - `ToolCallLimitMiddleware(run_limit=10)` 或针对昂贵工具单独限制；
+      - 外层再设整体超时，也可以在 invoke 的 config 中设置较小的 recursion_limit 作为最后防线。
+
+      **工具错误**：
+      - `ToolRetryMiddleware` 处理临时故障；
+      - 用 `@wrap_tool_call` 自定义中间件，把业务错误转为 ToolMessage 回传给模型；程序缺陷则告警上抛。框架默认只处理参数校验错误，执行异常会抛出。
+
+      **上下文增长**：工具层只返回必要字段并截断；`SummarizationMiddleware` 在消息过长时摘要旧消息。
+
+      **观测**：接入追踪，记录每次运行的模型调用数、工具调用数、Token 和耗时。我们把手写客服 Agent 迁移到 create_agent 后，用这套中间件替代了手写的计数和错误处理，代码量少了约三分之二。
+    oral: |
+      首先要知道 create_agent 底层是 LangGraph 图，默认递归上限现在是一万多步，等于没有限制，不能靠默认值。
+      防死循环我会加 ModelCallLimitMiddleware 和 ToolCallLimitMiddleware，比如单次最多 8 次模型调用，到上限优雅结束，外层再加整体超时。
+      工具错误上，临时故障用 ToolRetryMiddleware，业务错误用 wrap_tool_call 中间件转成工具消息回传给模型，代码 bug 就告警。因为框架默认只兜参数错误，执行异常会直接抛。
+      上下文方面，工具结果在源头截断，再加摘要中间件。我们迁移客服 Agent 时就是这样配的，代码量少了大约三分之二。
+  - id: d34-i4
+    kp: d34-k5
+    type: design
+    difficulty: 4
+    question: 你怎么评价 LangChain？如果让你为团队制定「什么时候用 SDK、LangChain、LangGraph」的技术规范，你会怎么写？
+    key_points:
+      - {text: "客观说出优点：统一接口、现成集成、Runnable 自动流式批量异步、create_agent 和中间件", dim: concept}
+      - {text: "客观说出问题：抽象深难调试、版本变化快、简单需求被复杂化、新特性滞后", dim: principle}
+      - {text: "给出选型规则：简单单模型用 SDK，确定流水线用 LCEL，标准 Agent 用 create_agent，复杂有状态编排用 LangGraph", dim: engineering}
+      - {text: "规范中要求锁定版本、可查看真实请求响应、设置超时重试和调用上限", dim: engineering}
+      - {text: "结合项目说明一次选型或回退到 SDK 的经历", dim: project}
+    reference: |
+      **评价**：
+      - 优点：统一的模型和工具接口，切换厂商成本低；大量现成集成；Runnable 让链自动具备流式、批量、异步和追踪；1.x 的 create_agent 和中间件把 Agent 常见需求标准化。
+      - 问题：抽象层深，出错时很难看出实际发给模型的内容；0.x 到 1.x 多次大改，旧代码和教程大量失效；简单需求引入框架反而复杂；厂商新特性可能晚一步支持。
+
+      **团队规范**：
+      1. **选型**：
+         - 单模型、单次调用或简单流式：直接用厂商 SDK；
+         - 确定的多步流水线（RAG、批处理）：LCEL；
+         - 标准工具型 Agent：create_agent + 调用上限 + 工具错误中间件；
+         - 有分支、循环、人工确认、持久化、多 Agent：LangGraph。
+      2. **版本**：锁定 langchain、langchain-core、langgraph 版本，升级前读 release notes 并跑回归评估集；禁止新代码使用 langchain-classic。
+      3. **可观测**：必须能查看每次模型调用的真实输入输出（追踪平台或回调日志）。
+      4. **防护**：模型统一设置 timeout、max_retries；Agent 必须有调用次数上限；batch 必须处理单条失败。
+      5. **封装边界**：业务代码依赖自己的接口层，框架只在适配层使用，方便将来替换。
+
+      我们的写作接口就因为框架升级导致流式断流，后来按这个规范回退到 SDK；知识库和客服 Agent 继续用 LangChain / LangGraph。
+    oral: |
+      我觉得 LangChain 的价值在统一接口和现成集成，Runnable 让链天然支持流式、批量、异步，1.x 的 create_agent 和中间件也把 Agent 的常见需求标准化了。问题是抽象深、难调试，版本变化快，简单需求用它反而复杂。
+      所以团队规范我会这么定：单模型简单调用直接用 SDK；确定流水线用 LCEL；标准 Agent 用 create_agent 加调用上限；有分支、人工确认、持久化的用 LangGraph。同时要求锁版本、升级跑回归评估、能看到真实请求响应、统一设超时和调用上限，业务代码只依赖自己的接口层。
+      我们写作接口就因为框架升级流式断了，按这个规范改回了 SDK。
+sources:
+  - {title: "LangChain v1 migration guide", url: "https://docs.langchain.com/oss/python/migrate/langchain-v1"}
+  - {title: "LangChain Docs - Models", url: "https://docs.langchain.com/oss/python/langchain/models"}
+  - {title: "LangChain Docs - Agents", url: "https://docs.langchain.com/oss/python/langchain/agents"}
+  - {title: "LangChain Docs - Prebuilt middleware", url: "https://docs.langchain.com/oss/python/langchain/middleware/built-in"}
+  - {title: "LangChain Reference - Runnable", url: "https://reference.langchain.com/python/langchain-core/runnables/Runnable"}
+  - {title: "PyPI - langchain", url: "https://pypi.org/project/langchain/"}

@@ -1,0 +1,1001 @@
+day: 3
+phase: 1
+title: 函数、类与类型注解
+goals:
+  - 能读懂位置参数、关键字参数、仅限关键字参数、*args / **kwargs，并指出可变默认参数和「定义时求值」导致的 bug
+  - 能用 LEGB 规则解释闭包、UnboundLocalError 和循环里 lambda 的延迟绑定
+  - 能判断类属性与实例属性的共享关系，用 dataclass 定义数据对象并正确处理可变默认值
+  - 能把 TS 类型对照成 Python 类型注解，并说清注解「不在运行时强制」以及 Pydantic 为什么能用它做校验
+minutes: 60
+resources:
+  - title: "Python 官方教程（中文）4.9 函数定义详解"
+    url: "https://docs.python.org/zh-cn/3/tutorial/controlflow.html"
+    kind: doc
+    lang: zh
+    minutes: 20
+    note: "只看 4.9.1 默认值参数（含「默认值只计算一次」的警告）、4.9.3 特殊参数（/ 和 *）、4.9.4~4.9.5 任意实参与解包，对应今天的参数知识点"
+  - title: "Python 官方教程（中文）第 9 章 类"
+    url: "https://docs.python.org/zh-cn/3/tutorial/classes.html"
+    kind: doc
+    lang: zh
+    minutes: 20
+    note: "看 9.2 作用域和命名空间（LEGB、nonlocal、global 的示例）和 9.3.5 类和实例变量（共享列表的反例），正好对应闭包和类属性两个坑"
+  - title: "mypy - Type hints cheat sheet"
+    url: "https://mypy.readthedocs.io/en/stable/cheat_sheet_py3.html"
+    kind: doc
+    lang: en
+    minutes: 15
+    note: "当作 TS 到 Python 的类型速查表：看 Useful built-in types、Functions、Classes 三节；Forward references 一节的说法在 Python 3.14 起已部分过时（注解改为延迟求值）"
+  - title: "Python 文档（中文）dataclasses 数据类"
+    url: "https://docs.python.org/zh-cn/3/library/dataclasses.html"
+    kind: doc
+    lang: zh
+    minutes: 10
+    note: "看开头示例和「可变默认值」一节，理解为什么必须用 field(default_factory=list)"
+knowledge_points:
+  - id: d03-k1
+    name: 参数形式与默认值陷阱
+    level: P0
+    summary: 参数可按位置或关键字传，* 后只能用关键字、/ 前只能按位置；默认值在定义时只求值一次
+    analogy: |
+      **对照 JS**：
+      - `*args` ≈ 剩余参数 `...args`；调用时 `f(*lst)` ≈ `f(...arr)`。
+      - **关键字参数 ≈ 传一个 options 对象**：JS 里你写 `request(url, { timeout: 10, retries: 3 })`，Python 直接写 `request(url, timeout=10, retries=3)`，`**kwargs` ≈ 剩余的 options 属性。
+      - 仅限关键字参数（`*` 后面）≈ 强制调用方「必须写属性名」。
+
+      **最大的不一样**：**JS 的默认参数每次调用时求值，Python 的默认参数在 `def` 执行时只求值一次**。`function f(x = [])` 每次都是新数组，`def f(x=[])` 所有调用共享同一个列表。
+    why: |
+      AI 写的后端代码里，`def chat(messages, *, model, temperature=0.7, **kwargs)`、`wrapper(*args, **kwargs)` 这类签名随处可见。**看不懂参数形式就读不懂 SDK 封装和装饰器**；而可变默认参数是 Python 面试必考、线上必踩的坑，会让不同用户的数据串在一起。
+    problem: |
+      参数机制解决「同一个函数要支持灵活调用又要保证可读」：关键字参数让调用处自解释，仅限关键字参数防止参数顺序写错，`*args/**kwargs` 让包装函数透传任意参数。理解默认值求值时机，才能避免共享状态和「时间戳永远是启动时间」这类 bug。
+    principle: |
+      **一、五种参数，按顺序排列**
+
+      ```python
+      def f(a, b, /, c, d=1, *args, e, f=2, **kwargs): ...
+      ```
+
+      | 部分 | 名称 | 怎么传 |
+      |---|---|---|
+      | `a, b, /` | 仅位置参数 | 只能按位置 |
+      | `c, d=1` | 普通参数 | 位置或关键字都行 |
+      | `*args` | 可变位置参数 | 多余的位置参数收集成 **tuple** |
+      | `e, f=2`（在 `*` 或 `*args` 之后） | **仅限关键字参数** | 必须写 `e=...` |
+      | `**kwargs` | 可变关键字参数 | 多余的关键字参数收集成 **dict**（键都是 str） |
+
+      工程上最常用的是**单独一个 `*`**：`def chat(messages, *, model, stream=False)`，强制调用方写 `stream=True`，避免 `chat(msgs, "qwen", True)` 这种看不懂的调用。
+
+      **二、调用时的解包**
+
+      `f(*lst, **d)` 把列表展开成位置参数、把 dict 展开成关键字参数。包装函数常写：
+
+      ```python
+      def wrapper(*args, **kwargs):
+          return real_func(*args, **kwargs)   # 原样透传
+      ```
+
+      **三、默认值在定义时只求值一次（核心坑）**
+
+      `def` 语句执行时（通常是模块被 import 时），默认值表达式被计算**一次**并保存在函数对象上（`f.__defaults__`）。之后每次调用不传该参数，用的都是**同一个对象**。
+
+      ```mermaid
+      sequenceDiagram
+        participant M as 模块导入
+        participant F as 函数对象
+        participant C as 调用方
+        M->>F: 执行 def 计算默认值 一个空列表
+        C->>F: add_msg a 未传 history
+        F-->>C: 往同一个列表追加 a
+        C->>F: add_msg b 未传 history
+        F-->>C: 还是同一个列表 现在有 a 和 b
+      ```
+
+      后果有两类：
+      - **可变默认值被共享**：`history=[]`、`cache={}` 跨调用累积。
+      - **动态值被冻结**：`ts=datetime.now()`、`request_id=uuid4()` 永远是导入时的那个值。
+
+      **标准写法：用 None 做哨兵**
+
+      ```python
+      def add_msg(m: str, history: list[str] | None = None) -> list[str]:
+          if history is None:
+              history = []
+          history.append(m)
+          return history
+      ```
+
+      ruff 的 B006 / B008 规则能自动发现这两类问题，建议在项目里开启。
+
+      **不这样理解会怎样**：用户 A 的对话历史出现在用户 B 的请求里；所有日志的时间戳都是服务启动时间；`chat(msgs, "qwen", True)` 这种调用改了参数顺序后悄悄传错。
+    scenarios: |
+      - **封装 LLM 客户端**：`def chat(messages, *, model, temperature=0.7, timeout=30)`，关键配置强制关键字传参。
+      - **装饰器与中间层**：`wrapper(*args, **kwargs)` 透传参数（Day 05）。
+      - **转发额外参数**：`def call(prompt, **extra)` 把 `extra` 原样传给 SDK，比如 `top_p`、`seed`。
+      - **代码评审**：搜索 `=[]`、`={}`、`=datetime.now()` 出现在函数签名里的地方。
+    code: |
+      ```python
+      from datetime import datetime
+
+      def add_msg(m, history=[]):              # 错误：默认列表只创建一次
+          history.append(m)
+          return history
+
+      print(add_msg("a"), add_msg("b"))        # ['a', 'b'] ['a', 'b']
+
+      def log(msg, ts=datetime.now()):         # 错误：时间在导入时就固定了
+          return f"{ts:%H:%M:%S} {msg}"
+
+      def chat(messages: list[dict], *, model: str, stream: bool = False, **extra) -> dict:
+          payload = {"model": model, "messages": messages, "stream": stream, **extra}
+          return payload
+
+      print(chat([{"role": "user", "content": "hi"}], model="qwen-plus", seed=42))
+      # chat(msgs, "qwen-plus") → TypeError：model 只能用关键字传
+      ```
+    pitfalls: |
+      - **误区：默认参数每次调用都重新计算（JS 习惯）。** Python 只在 def 时计算一次。
+      - **误区：默认值写 `None` 再用 `x = x or []`。** 调用方显式传入空列表时会被替换成新列表，通常无害，但要传「共享的空列表」时语义就错了；更稳妥是 `if x is None`。
+      - **误区：`**kwargs` 的键可以是任意类型。** 关键字参数名永远是字符串。
+      - **混淆：`*` 和 `*args`。** 单独的 `*` 只是分隔符，不收集参数。
+    interview_asks:
+      - question: "Python 函数默认参数为什么不能用可变对象？正确写法是什么？"
+        answer: "默认值在函数定义时只创建一次，之后每次调用共用同一个列表或字典。调用之间会串数据。正确写法是默认 None，函数里面再新建：def f(items=None): items = [] if items is None else items。"
+      - question: "*args 和 **kwargs 是什么？装饰器里为什么常用它们？"
+        answer: "*args 收多余的位置参数，**kwargs 收多余的关键字参数。装饰器要包住各种函数，事先不知道原函数有几个参数，所以用 *args, **kwargs 原样转交。"
+      - question: "参数列表里单独的 * 和 / 分别是什么意思？"
+        answer: "* 后面的参数必须用名字传递，避免几个布尔值位置传错。/ 前面的参数只能按位置传，不让调用方依赖参数名。这是接口约束，不是语法糖。"
+    project_example: |
+      在 p1 知识库项目中，AI 生成的 `def build_messages(question, history=[])` 在没有历史的新会话里被调用，结果不同用户的新会话共享了同一个 history 列表，用户 B 的上下文里出现了用户 A 的问题。修复为 `history: list[dict] | None = None` 加 `is None` 判断，并在 pyproject 的 ruff 配置里开启 B 规则（包含 B006/B008），CI 中自动拦截此类写法。LLM 客户端封装统一使用 `*` 强制关键字传参。
+    sources:
+      - {title: "Python 教程 - 函数定义详解", url: "https://docs.python.org/zh-cn/3/tutorial/controlflow.html"}
+      - {title: "Ruff rule B006 mutable-argument-default", url: "https://docs.astral.sh/ruff/rules/mutable-argument-default/"}
+
+  - id: d03-k2
+    name: 作用域与闭包
+    level: P1
+    summary: 名字按 局部→外层函数→全局→内置 查找；在函数里给名字赋值就让它变成局部变量；闭包按引用捕获变量
+    analogy: |
+      **和 JS 闭包几乎一样**：内层函数能记住外层函数的变量，外层返回后变量仍存活。`make_counter()` 返回计数函数、`debounce(fn)` 返回包装函数，两边写法同构。
+
+      **不一样的地方**：
+      - **Python 没有块级作用域**：`if`、`for`、`with` 不创建新作用域，只有函数、类、模块、推导式才创建。JS 的 `let/const` 有块级作用域。
+      - **JS 的 `for (let i ...)` 每轮创建新绑定**，循环里的回调各自捕获自己的 i；Python 的 for 只有一个 i，循环里的 lambda **全部捕获同一个变量**，执行时都看到最后的值。
+      - JS 里给外层变量赋值直接写就行；**Python 在函数里一旦出现赋值，这个名字就被当成局部变量**，要改外层变量必须声明 `nonlocal`（外层函数）或 `global`（模块）。
+    why: |
+      闭包是装饰器（Day 05）、FastAPI 依赖工厂、重试包装器的基础。**AI 生成的「在循环里注册回调」「在函数里改全局计数」代码，经常因为作用域规则跑出意外结果**：所有回调都用了最后一个值，或者直接报 UnboundLocalError。
+    problem: |
+      帮你解释三类现象：为什么函数里 `count += 1` 会报 UnboundLocalError；为什么循环里生成的多个 lambda 都返回同一个值；为什么模块里起名 `list = [...]` 之后 `list(x)` 报 not callable。并且能写出正确的闭包工厂。
+    principle: |
+      **一、LEGB 查找顺序**
+
+      读取一个名字时，Python 依次查：
+
+      ```mermaid
+      flowchart LR
+        L["L 局部 Local 当前函数"] --> E["E 外层函数 Enclosing"]
+        E --> G["G 全局 Global 当前模块"]
+        G --> B["B 内置 Builtins 如 len list print"]
+        B --> X["都找不到 NameError"]
+      ```
+
+      所以模块顶层写了 `list = [...]`，函数里的 `list(...)` 会先在全局找到这个列表，**遮蔽了内置的 list**，报 `'list' object is not callable`。
+
+      **二、「赋值即局部」规则**
+
+      Python 在**编译函数时**就决定每个名字属于哪个作用域：函数体里只要出现对某名字的赋值（`=`、`+=`、`for x in`、`import x`），它就是局部变量。
+
+      ```python
+      count = 0
+      def inc():
+          count += 1   # count 被判定为局部变量，读的时候还没赋值 → UnboundLocalError
+      ```
+
+      - 要改模块变量：`global count`（一般不推荐，全局可变状态难测试）。
+      - 要改外层函数的变量：`nonlocal count`。
+      - **只读外层变量不需要声明**；修改外层可变对象的内容（`lst.append`）也不需要，因为没有给名字重新赋值。
+
+      **三、闭包按引用捕获（延迟绑定）**
+
+      闭包捕获的是**变量本身**，不是当时的值。函数被调用时才去读变量当前的值：
+
+      ```python
+      fns = [lambda: i for i in range(3)]
+      print([f() for f in fns])          # [2, 2, 2]
+      fns = [lambda i=i: i for i in range(3)]
+      print([f() for f in fns])          # [0, 1, 2]，默认参数在定义时求值
+      ```
+
+      修复方法：用默认参数固定当前值，或用工厂函数 `make_handler(name)` 为每个值创建独立作用域，或用 `functools.partial`。
+
+      **四、闭包的典型用法：带配置的函数工厂**
+
+      ```python
+      def make_retry(max_retries: int):
+          def run(fn):
+              for i in range(max_retries):
+                  ...
+          return run
+      ```
+
+      **不这样理解会怎样**：在循环里给每个工具注册处理函数，结果全都调用了最后一个工具；用全局变量计数，在函数里一改就报错，然后被 AI 加上 `global` 变成难以测试的全局状态。
+    scenarios: |
+      - **装饰器与工厂**：`make_retry(3)`、`rate_limit(qps=5)` 返回带配置的函数。
+      - **循环注册回调**：为多个工具或事件注册处理函数时，用工厂函数或默认参数避免延迟绑定。
+      - **代码评审**：看到 `global` 要追问是否能改成参数传递或类属性；看到模块级变量名是 `list`、`id`、`type`、`input` 要求改名。
+    code: |
+      ```python
+      def make_counter():
+          count = 0
+          def inc() -> int:
+              nonlocal count        # 不声明就是 UnboundLocalError
+              count += 1
+              return count
+          return inc
+
+      c = make_counter()
+      print(c(), c())               # 1 2，外层返回后 count 仍存活
+
+      handlers = {}
+      for name in ["search", "sql"]:
+          handlers[name] = lambda q, name=name: f"{name}:{q}"   # 默认参数固定当前值
+      print(handlers["search"]("报修"))    # search:报修
+      ```
+    pitfalls: |
+      - **误区：`if`/`for` 里定义的变量出了代码块就没了。** Python 没有块级作用域，循环结束后循环变量还在。
+      - **误区：闭包捕获的是当时的值。** 捕获的是变量，调用时才读值。
+      - **误区：函数里读外层变量也要写 nonlocal/global。** 只有重新赋值才需要。
+      - **混淆：nonlocal 与 global。** nonlocal 指外层函数作用域，不能指模块级变量。
+    interview_asks:
+      - question: "什么是闭包？Python 闭包和 JS 闭包有什么区别？"
+        answer: "函数记住了它定义时外层的变量，离开外层还能用，这就是闭包。JS 里内层可以直接改外层的 let。Python 里内层赋值会被当成新的局部变量，要改外层必须写 nonlocal。"
+      - question: "为什么函数里写 count += 1 会报 UnboundLocalError？怎么解决？"
+        answer: "函数里只要出现对这个名字的赋值，Python 就把它当成局部变量。读的时候局部变量还不存在，就报错。要改外层变量就加 nonlocal count；只是读取则不用。"
+      - question: "循环里创建的 lambda 为什么都返回最后一个值？"
+        answer: "lambda 记住的是变量 i 本身，不是当时的数字。循环结束后 i 是最后一个值，所有 lambda 读到的都是它。要记住当时的值，写成 lambda i=i: i，默认参数在创建时就定下来。"
+    project_example: |
+      在 p2 园区 Agent 中，第一版用循环为「设备查询、告警查询、工单创建」三个工具注册执行函数：`for t in tools: registry[t.name] = lambda args: t.run(args)`。测试时发现无论调用哪个工具，执行的都是最后一个「工单创建」。原因是 lambda 捕获的是循环变量 t。修复为 `lambda args, t=t: t.run(args)`，最终重构成工厂函数 `make_executor(tool)`，并补了「每个工具名调用到正确实现」的测试。
+    sources:
+      - {title: "Python 教程 - 作用域和命名空间", url: "https://docs.python.org/zh-cn/3/tutorial/classes.html"}
+      - {title: "Python FAQ - 为什么在循环中定义的 lambda 都返回相同的结果", url: "https://docs.python.org/3/faq/programming.html"}
+
+  - id: d03-k3
+    name: 类与 dataclass
+    level: P1
+    summary: 类属性被所有实例共享，实例属性在 __init__ 里用 self 设置；dataclass 自动生成样板代码但不做类型校验
+    analogy: |
+      **对照 TS class**：`class Foo { constructor(x) { this.x = x } }` ≈ `class Foo: def __init__(self, x): self.x = x`。继承、`super()`、方法重写都很像。dataclass ≈ TS 里用 constructor 参数属性 `constructor(public model: string)` 少写样板代码。
+
+      **不一样的地方**：
+      - **`self` 必须显式写在每个方法的第一个参数**；JS 的 `this` 是隐式的，而且会因调用方式丢失，Python 的 self 不会。
+      - **没有 `private` / `protected` 关键字**：`_x` 只是「内部使用」的约定；`__x` 会被改名为 `_类名__x`，但仍可访问。
+      - **类体里直接写的属性是类属性**，所有实例共享，类似把属性挂在 prototype 上；TS 的类字段 `history = []` 每个实例一份，Python 的 `history = []` 写在类体里是**所有实例共用一个列表**。
+      - dataclass 字段上的类型注解**不会做运行时校验**，和 TS 一样只是「写给工具看的」；需要校验用 Pydantic（Day 07）。
+    why: |
+      AI 后端里大量用类组织代码：LLM 客户端、会话管理器、Repository、Agent 状态。**类属性和实例属性分不清，就会写出「所有用户共享一份会话历史」的严重 bug**。dataclass 则是定义纯数据对象（检索结果、工具调用记录）最轻量的方式。
+    problem: |
+      帮你判断：一个属性是每个实例一份还是全体共享；什么时候用普通类封装行为、什么时候用 dataclass 表达数据；dataclass 的可变默认值、`frozen` 只读、`__eq__` 比较是怎么工作的。
+    principle: |
+      **一、类属性 vs 实例属性**
+
+      ```python
+      class Session:
+          max_turns = 20          # 类属性：所有实例共享
+          def __init__(self, user_id: str):
+              self.user_id = user_id    # 实例属性：每个实例一份
+              self.history: list[dict] = []
+      ```
+
+      读取 `obj.x` 时先找实例自己的属性，找不到再找类属性。**给 `obj.x` 赋值会在实例上新建属性**，遮住类属性而不改它；**但 `obj.history.append(...)` 不是赋值**，如果 history 是类属性，改的就是全体共享的那一个。
+
+      ```mermaid
+      classDiagram
+        class Session {
+          max_turns 类属性 全体共享
+          user_id 实例属性
+          history 实例属性
+          add(msg)
+        }
+        class AdminSession {
+          can_export
+          add(msg) 重写并调用 super
+        }
+        Session <|-- AdminSession
+      ```
+
+      **二、继承与 super()**
+
+      `class AdminSession(Session)` 继承；重写方法时用 `super().add(msg)` 调用父类实现。`__init__` 里忘记 `super().__init__(...)` 会导致父类的实例属性不存在。
+
+      **三、常用特殊方法与 property**
+
+      - `__repr__`：调试打印时显示的内容；`__eq__`：`==` 的行为。
+      - `@property`：把方法伪装成属性，类似 TS 的 getter。
+
+      **四、dataclass：声明字段，自动生成样板**
+
+      ```python
+      from dataclasses import dataclass, field
+
+      @dataclass
+      class Chunk:
+          id: str
+          text: str
+          score: float = 0.0
+          tags: list[str] = field(default_factory=list)
+      ```
+
+      自动生成 `__init__`、`__repr__`、`__eq__`。要点：
+      - **可变默认值必须用 `field(default_factory=list)`**，直接写 `= []` 在**定义类时**就抛 ValueError（dataclass 帮你拦住了普通类里的那个坑）。
+      - `frozen=True`：创建后不能给字段赋值，且在字段可哈希时可以做 dict 键；**但只是浅冻结**，`tags.append` 仍能成功。
+      - `slots=True`：更省内存，禁止随意添加新属性。
+      - **不做类型校验**：`Chunk(id=1, text=None)` 照样创建成功。
+
+      **五、怎么选**
+
+      | 需求 | 选择 |
+      |---|---|
+      | 有行为、有依赖（客户端、服务） | 普通类 |
+      | 内部传递的纯数据，可信来源 | dataclass |
+      | 外部输入（接口参数、LLM 返回的 JSON）需要校验 | Pydantic BaseModel（Day 07、Day 16） |
+
+      **不这样理解会怎样**：把会话历史写成类属性，所有用户共享一份对话；以为 dataclass 会校验类型，结果脏数据一路传到数据库。
+    scenarios: |
+      - **会话管理**：`ChatSession` 的 history 必须是实例属性。
+      - **检索结果**：`@dataclass class Hit: chunk_id, score, source`，在检索、重排、组装 Prompt 之间传递。
+      - **只读配置**：`@dataclass(frozen=True) class ModelConfig`，防止运行中被改。
+      - **客户端封装**：`class LLMClient` 持有 base_url、超时、重试策略，提供 `chat()` 方法。
+    code: |
+      ```python
+      from dataclasses import dataclass, field
+
+      class BadSession:
+          history = []                         # 类属性：所有实例共享！
+          def add(self, msg: str) -> None:
+              self.history.append(msg)
+
+      a, b = BadSession(), BadSession()
+      a.add("我是用户 A")
+      print(b.history)                         # ['我是用户 A']
+
+      @dataclass(frozen=True)
+      class AgentConfig:
+          model: str
+          tools: list[str] = field(default_factory=list)
+
+      cfg = AgentConfig("qwen-plus")
+      cfg.tools.append("search")               # 成功：frozen 只是浅冻结
+      try:
+          cfg.model = "deepseek-chat"          # FrozenInstanceError
+      except Exception as e:
+          print(type(e).__name__)
+      print(AgentConfig(model=123))            # 不校验类型：AgentConfig(model=123, tools=[])
+      ```
+    pitfalls: |
+      - **误区：类体里写的 `history = []` 是每个实例一份。** 是类属性，全体共享。
+      - **误区：`_x`、`__x` 是真正的私有。** 只是约定和改名，外部仍可访问。
+      - **误区：dataclass 会按注解校验类型。** 不会，要校验用 Pydantic。
+      - **误区：`frozen=True` 的对象完全不可变。** 浅冻结，可变字段的内容仍可修改。
+    interview_asks:
+      - question: "Python 的类属性和实例属性有什么区别？什么情况下会出现数据共享 bug？"
+        answer: "类属性是全班共用一份，实例属性是每个对象自己一份。把 list 写在类体里，所有实例改的是同一个列表。可变数据要放在 __init__ 里，每个对象新建一份。"
+      - question: "dataclass 解决了什么问题？和 Pydantic BaseModel 有什么区别？"
+        answer: "dataclass 帮你生成初始化、比较和打印，适合进程内的数据结构，不校验外部输入。Pydantic 会按类型检查并转换请求数据，不合法就拒绝。接口入参用 Pydantic，内部传递可以用 dataclass。"
+      - question: "Python 有 private 吗？单下划线和双下划线有什么区别？"
+        answer: "没有真正的私有。单下划线是约定：这是内部的，别从外面用。双下划线会把名字改成 _类名__字段，只是避免子类撞名，挡不住别人硬访问。"
+    project_example: |
+      p2 园区 Agent 最早的 `class AgentMemory: messages = []` 是 AI 照着 TS 类字段写法生成的，结果两个运营人员同时使用时，对方的问题出现在自己的上下文里。改为在 `__init__` 里 `self.messages = []`，并把工具调用记录定义为 `@dataclass class ToolCall: name, args, result, elapsed_ms`，在 Agent 循环、日志和 Trace（Day 43）之间传递；外部输入统一用 Pydantic 校验。
+    freshness: |
+      核对于 2026-11：dataclass 的 `slots=True`、`kw_only=True` 自 Python 3.10 起可用；`copy.replace()`（3.13+）可对 dataclass 生成修改部分字段的新实例。Pydantic 最新为 v2.14.3，v1 的 `class Config` 为旧写法（Day 07 详讲）。
+    sources:
+      - {title: "Python 文档 - dataclasses 数据类", url: "https://docs.python.org/zh-cn/3/library/dataclasses.html"}
+      - {title: "Python 教程 - 类和实例变量", url: "https://docs.python.org/zh-cn/3/tutorial/classes.html"}
+
+  - id: d03-k4
+    name: typing 类型注解（对照 TS）
+    level: P0
+    summary: 注解和 TS 类型很像，但解释器不强制检查；静态检查靠 mypy/pyright，运行时校验靠 Pydantic 读取注解
+    analogy: |
+      **对照表**：
+
+      | TypeScript | Python |
+      |---|---|
+      | `string` / `number` / `boolean` | `str` / `int` 或 `float` / `bool` |
+      | `string[]` | `list[str]` |
+      | `Record<string, number>` | `dict[str, int]` |
+      | `string \| null` | `str \| None`（旧写法 `Optional[str]`） |
+      | `'low' \| 'high'` | `Literal["low", "high"]` |
+      | `interface Msg { role: string }`（描述对象形状） | `TypedDict` |
+      | `(x: string) => number` | `Callable[[str], int]` |
+      | `function first<T>(xs: T[]): T` | `def first[T](xs: list[T]) -> T`（3.12+） |
+      | `any` | `Any` |
+      | 结构类型（鸭子类型） | `Protocol` |
+
+      **不一样的地方**：
+      - TS 类型在编译后被擦除，tsc 不通过就不能构建；**Python 注解保留在运行时**（可以被读取），但**解释器完全不检查**，`add("1", "2")` 照样运行。
+      - TS 默认是**结构类型**；Python 类型检查器默认是**名义类型**（看继承关系），要结构类型得显式写 `Protocol`。
+      - Python 有一个 TS 没有的用法：**库在运行时读取注解做事**——Pydantic 按注解校验数据，FastAPI 按注解解析请求、生成 OpenAPI 文档。
+    why: |
+      FastAPI、Pydantic、LangChain、OpenAI SDK 全都重度依赖类型注解。**你主要靠 AI 写代码，注解就是你最快看懂一个函数「收什么、返回什么」的方式**；同时也要清楚注解不是运行时保护，外部输入必须另行校验。
+    problem: |
+      类型注解解决「动态类型代码难以阅读和重构」的问题：让 IDE 补全、AI 生成、静态检查都更准确，提前发现「把 None 当字符串用」这类错误。理解它不在运行时强制，你才会在接口边界用 Pydantic 做真正的校验。
+    principle: |
+      **一、注解是什么**
+
+      `def search(query: str, top_k: int = 5) -> list[Hit]:` 里的注解只是存到函数的 `__annotations__` 里，**执行时不做任何检查**。
+
+      ```mermaid
+      flowchart TB
+        A["源码中的类型注解"] --> B["mypy 或 pyright 静态检查 不运行代码"]
+        A --> C["IDE 补全 AI 生成代码参考"]
+        A --> D["运行时被库读取"]
+        D --> E["Pydantic 按注解校验和转换数据"]
+        D --> F["FastAPI 按注解解析参数 生成文档"]
+        A -.->|"解释器本身"| G["不检查 传错类型照样运行"]
+      ```
+
+      **二、常用写法（3.10+ 现代写法）**
+
+      - 内置容器直接下标：`list[str]`、`dict[str, Any]`、`tuple[int, str]`（不再需要 `from typing import List, Dict`）。
+      - 可空：`str | None`；默认值为 None 时**注解也要写 `| None`**。
+      - 字面量：`Literal["user", "assistant", "system"]`。
+      - 对象形状：`class Msg(TypedDict): role: str; content: str`，适合描述 JSON 风格的 dict。
+      - 可调用：`Callable[[str], Awaitable[str]]`（从 `collections.abc` 导入）。
+      - 泛型：3.12 起 `def first[T](xs: list[T]) -> T:`，以及 `type Messages = list[Msg]` 类型别名；旧写法是 `T = TypeVar("T")`。
+      - 结构类型：`class Embedder(Protocol): def embed(self, texts: list[str]) -> list[list[float]]: ...`，任何有这个方法的类都满足，**不需要继承**——这和 TS interface 的感觉最像。
+
+      **三、3.14 的变化：注解延迟求值**
+
+      Python 3.14 起，注解**不再在定义时立即求值**，而是在需要时才计算（PEP 649/749）。直接效果：**前向引用不用再加引号**，`def f() -> Node:` 即使 Node 定义在后面也能运行。旧代码里的 `from __future__ import annotations` 仍有效（会把注解变成字符串）。读取注解推荐用 `annotationlib.get_annotations()`。
+
+      **四、静态检查怎么落地**
+
+      - 编辑器装 Pylance/pyright，或在 CI 跑 `mypy` / `pyright`。
+      - 新代码要求公共函数写完整注解；`Any` 和 `# type: ignore` 要有理由。
+      - **外部输入（HTTP 请求、LLM 返回的 JSON、环境变量）一律在边界用 Pydantic 校验**，内部再靠注解 + 静态检查保证一致。
+
+      **不这样理解会怎样**：以为写了 `top_k: int` 就不会收到字符串，结果 LLM 返回的 `"5"` 一路传进向量库查询报错；看不懂 FastAPI 为什么「光写注解就能校验参数」。
+    scenarios: |
+      - **读 AI 代码**：先看函数签名的注解，判断输入输出是否合理，再看实现。
+      - **消息结构**：`messages: list[ChatMessage]`，`ChatMessage` 用 TypedDict 或 Pydantic 模型。
+      - **可替换组件**：Embedding、向量库、LLM 客户端用 `Protocol` 定义接口，测试时传假实现。
+      - **CI 门禁**：pyright/mypy 和 ruff 一起跑，阻止明显的 None 误用和类型不匹配。
+    code: |
+      ```python
+      from typing import Literal, Protocol, TypedDict
+
+      class ChatMessage(TypedDict):
+          role: Literal["system", "user", "assistant"]
+          content: str
+
+      class Embedder(Protocol):
+          def embed(self, texts: list[str]) -> list[list[float]]: ...
+
+      class FakeEmbedder:                       # 没有继承 Embedder，也满足 Protocol
+          def embed(self, texts: list[str]) -> list[list[float]]:
+              return [[0.0, 1.0] for _ in texts]
+
+      def first[T](xs: list[T]) -> T | None:    # 3.12+ 泛型语法
+          return xs[0] if xs else None
+
+      def index(docs: list[str], embedder: Embedder) -> int:
+          return len(embedder.embed(docs))
+
+      def add(a: int, b: int) -> int:
+          return a + b
+
+      print(index(["报修流程"], FakeEmbedder()))   # 1
+      print(add("1", "2"))                       # '12'：解释器不检查注解，pyright 会报错
+      ```
+    pitfalls: |
+      - **误区：写了类型注解，运行时传错类型会报错。** 解释器不检查，要靠静态检查或 Pydantic。
+      - **误区：`def f(x: str = None)` 没问题。** 注解应写 `str | None`，否则类型检查器会报错，读者也会误解。
+      - **误区：必须 `from typing import List, Dict`。** 3.9+ 直接用 `list[str]`、`dict[str, int]`，大写版本是旧写法。
+      - **混淆：TypedDict 和 dataclass。** TypedDict 描述 dict 的形状，运行时就是普通 dict；dataclass 创建真正的类实例。
+    interview_asks:
+      - question: "Python 类型注解会在运行时生效吗？那 Pydantic 和 FastAPI 为什么能用注解做校验？"
+        answer: "普通注解不生效，解释器不看。Pydantic 和 FastAPI 在运行时读这些注解，自己做检查和转换。没经过它们的函数，注解写错了照样能跑。"
+      - question: "Python 类型注解和 TypeScript 类型有什么异同？"
+        answer: "都是给人和工具看的类型说明。TS 在编译时就会拦住错误类型。Python 注解默认不拦，要另跑 pyright 或 mypy。Python 还允许多一个运行时库（Pydantic）把注解变成真校验。"
+      - question: "Protocol 是什么？和抽象基类 ABC 有什么区别？"
+        answer: "Protocol 是结构化类型：只要有这些方法就能用，不用继承，接近 TS 的 interface。ABC 必须显式继承，没实现就建不出对象。想「长得像就能传入」用 Protocol。"
+    project_example: |
+      在 p1 知识库项目中，Embedding 服务最初直接依赖某个厂商 SDK，单元测试必须联网。后来定义 `class Embedder(Protocol)`，生产实现和测试用的 `FakeEmbedder` 都只需实现 `embed` 方法，检索层只依赖 Protocol。接口层的请求体和 LLM 返回的 JSON 用 Pydantic 模型校验，内部函数用注解加 pyright 检查；CI 里 pyright 曾拦下一处把 `str | None` 直接传给 `len()` 的代码。
+    freshness: |
+      核对于 2026-11：Python 3.14（2025-10-07 发布）起注解延迟求值（PEP 649/749），前向引用不再需要加引号，新增 `annotationlib` 模块读取注解；`from __future__ import annotations` 在 3.14 中行为不变。3.12 起支持 `def f[T](...)` 泛型语法和 `type X = ...` 类型别名（PEP 695）。3.15 新增 `TypedDict` 的 `closed` / `extra_items`（PEP 728）等类型特性。**旧 vs 新**：`List[str]`、`Optional[str]`、`TypeVar` 仍可用，但新代码推荐 `list[str]`、`str | None`、3.12 泛型语法。
+    sources:
+      - {title: "What's new in Python 3.14 - PEP 649 & 749 注解延迟求值", url: "https://docs.python.org/3/whatsnew/3.14.html"}
+      - {title: "Python 文档 - typing 类型提示支持", url: "https://docs.python.org/zh-cn/3/library/typing.html"}
+      - {title: "mypy - Type hints cheat sheet", url: "https://mypy.readthedocs.io/en/stable/cheat_sheet_py3.html"}
+      - {title: "What's new in Python 3.15", url: "https://docs.python.org/3/whatsnew/3.15.html"}
+
+test:
+  - id: d03-t1
+    kp: d03-k1
+    type: single
+    question: 下面代码打印什么？
+    code: |
+      def add_msg(m, history=[]):
+          history.append(m)
+          return history
+
+      print(add_msg("a"), add_msg("b"))
+    options:
+      - "['a'] ['b']"
+      - "['a'] ['a', 'b']"
+      - "['a', 'b'] ['a', 'b']"
+      - "抛出 TypeError，默认参数不能是列表"
+    answer: [2]
+    explain: 默认列表在 def 执行时只创建一次，两次调用都往同一个列表追加，而且两次调用返回的是同一个对象，print 时它已经是 ['a', 'b']，所以两处都打印 ['a', 'b']。认为每次调用重新创建默认值是 JS 的习惯；Python 也不禁止列表做默认值，只是几乎总是 bug。
+
+  - id: d03-t2
+    kp: d03-k1
+    type: single
+    question: |
+      已知 `def f(a, /, b, *, c): ...`，下列哪个调用是合法的？
+    options:
+      - "f(1, 2, c=3)"
+      - "f(a=1, b=2, c=3)"
+      - "f(1, 2, 3)"
+      - "f(1, c=3)"
+    answer: [0]
+    explain: / 之前的 a 只能按位置传，* 之后的 c 只能按关键字传，b 两种方式都行，所以 f(1, 2, c=3) 合法。f(a=1, ...) 违反仅位置限制；f(1, 2, 3) 把 c 当位置参数传入，报参数过多；f(1, c=3) 漏了必填的 b。
+
+  - id: d03-t3
+    kp: d03-k1
+    type: judge
+    question: 和 JS 的 `function f(x = [])` 一样，Python 的 `def f(x=[])` 在每次调用且未传 x 时，都会创建一个新的空列表。
+    answer: false
+    explain: JS 的默认参数在每次调用时求值；Python 的默认值在 def 语句执行时只求值一次并保存在函数对象上，之后所有未传参的调用共享同一个对象。正确写法是默认 None，在函数内判断 is None 再创建新列表。
+
+  - id: d03-t4
+    kp: d03-k1
+    type: multi
+    question: 关于 *args 和 **kwargs，下列说法正确的是？
+    options:
+      - "def f(*args, **kwargs) 中，args 是 tuple，kwargs 是 dict"
+      - "调用时写 f(*lst, **d)，会把列表展开为位置参数、把字典展开为关键字参数"
+      - "装饰器的 wrapper 常写成 wrapper(*args, **kwargs)，以便原样透传任意参数"
+      - "**kwargs 收集到的键可以是 int 等任意可哈希类型"
+    answer: [0, 1, 2]
+    explain: |
+      多余的位置参数收集为 tuple、关键字参数收集为 dict；调用时 * 和 ** 做相反的展开；包装函数用它们透传参数。关键字参数名在语法上就是标识符，所以 kwargs 的键永远是字符串，用 **{1: 'x'} 调用会报 TypeError。
+
+  - id: d03-t5
+    kp: d03-k1
+    type: single
+    question: 封装 LLM 客户端 `def chat(messages, model, temperature=0.7, stream=False)` 后，发现有人写 `chat(msgs, "qwen-plus", 0, True)`，难以看懂且容易传错。最合适的改法是？
+    options:
+      - "在 messages 前面加 /，让所有参数只能按位置传"
+      - "把所有参数改成 **kwargs，在函数里自己取值"
+      - "给 stream 加上 bool 类型注解，解释器会阻止误传"
+      - "在 messages 后面加单独的 *，让后续参数只能用关键字传"
+    answer: [3]
+    explain: 单独的 * 之后的参数只能用关键字传，调用处必须写 model=、stream=，可读且不怕顺序写错。/ 的作用正好相反；全改成 **kwargs 会丢失签名和类型检查；类型注解不会在运行时阻止误传，只能靠静态检查。
+
+  - id: d03-t6
+    kp: d03-k2
+    type: single
+    question: 下面代码打印什么？
+    code: |
+      fns = []
+      for i in range(3):
+          fns.append(lambda: i)
+      print([f() for f in fns])
+    options:
+      - "[0, 1, 2]"
+      - "[2, 2, 2]"
+      - "[3, 3, 3]"
+      - "抛出 NameError，循环结束后 i 已不存在"
+    answer: [1]
+    explain: |
+      三个 lambda 捕获的是同一个变量 i，而不是当时的值；调用时循环已结束，i 的值是 2，所以都返回 2。Python 没有块级作用域，循环结束后 i 仍存在（不会 NameError），range(3) 的最后一个值是 2 不是 3。要固定当前值可写 lambda i=i: i。
+
+  - id: d03-t7
+    kp: d03-k2
+    type: single
+    question: 下面代码的运行结果是？
+    code: |
+      count = 0
+
+      def inc():
+          count += 1
+
+      inc()
+      print(count)
+    options:
+      - "打印 1"
+      - "打印 0，函数内修改的是局部副本"
+      - "抛出 UnboundLocalError"
+      - "抛出 NameError：count 未定义"
+    answer: [2]
+    explain: 函数体里对 count 赋值（+= 也是赋值），编译时 count 就被判定为局部变量；执行 count += 1 时要先读局部 count，而它还没被赋值，于是抛 UnboundLocalError（它是 NameError 的子类，但报错信息明确是局部变量未赋值）。要修改模块变量需声明 global count。
+
+  - id: d03-t8
+    kp: d03-k2
+    type: judge
+    question: Python 的 if、for 代码块和 JS 的 let 一样会创建块级作用域，在 for 循环里定义的变量出了循环就无法访问。
+    answer: false
+    explain: Python 只有模块、函数、类和推导式会创建作用域，if、for、with、try 都不会。for 循环结束后循环变量仍然存在，值是最后一次迭代的值，这也是循环里 lambda 延迟绑定问题的根源之一。
+
+  - id: d03-t9
+    kp: d03-k2
+    type: multi
+    question: 关于闭包，下列说法正确的是？
+    options:
+      - "内层函数可以直接读取外层函数的局部变量"
+      - "要在内层函数里给外层函数的变量重新赋值，需要声明 nonlocal"
+      - "外层函数返回后，被内层函数引用的变量依然存活"
+      - "global 和 nonlocal 作用相同，可以互相替换"
+    answer: [0, 1, 2]
+    explain: 读取外层变量不需要声明；重新赋值需要 nonlocal；闭包会让被引用的变量随内层函数一起存活，这是计数器、装饰器的基础。global 指向模块级作用域，nonlocal 指向最近的外层函数作用域，两者不能互换，nonlocal 也不能用于模块变量。
+
+  - id: d03-t10
+    kp: d03-k2
+    type: single
+    question: 下面代码运行结果是？
+    code: |
+      list = ["a.pdf", "b.pdf"]   # 模块顶层，AI 起的变量名
+
+      def unique(names):
+          return list(set(names))
+
+      print(unique(["x", "x"]))
+    options:
+      - "['x']，函数里的 list 仍是内置类型"
+      - "['a.pdf', 'b.pdf']，返回了全局列表"
+      - "NameError：name 'list' is not defined"
+      - "TypeError：'list' object is not callable"
+    answer: [3]
+    explain: 名字按局部、外层、全局、内置的顺序查找。模块顶层定义的 list 在全局作用域，先于内置的 list 被找到，于是 list(...) 实际是在调用一个列表对象，抛 not callable。这类遮蔽内置名（list、id、type、input）的写法要在评审中改名。
+
+  - id: d03-t11
+    kp: d03-k3
+    type: single
+    question: 下面代码打印什么？
+    code: |
+      class Session:
+          history = []
+          def add(self, msg):
+              self.history.append(msg)
+
+      a, b = Session(), Session()
+      a.add("hi")
+      print(b.history)
+    options:
+      - "['hi']"
+      - "[]"
+      - "抛出 AttributeError，b 没有 history"
+      - "['hi', 'hi']"
+    answer: [0]
+    explain: history 写在类体里，是所有实例共享的类属性；self.history.append 不是赋值，不会在实例上新建属性，改的就是那个共享列表，所以 b 也看到了 'hi'。实例属性要在 __init__ 里用 self.history = [] 创建。
+
+  - id: d03-t12
+    kp: d03-k3
+    type: single
+    question: AI 生成了下面的 dataclass。运行时会发生什么？
+    code: |
+      from dataclasses import dataclass
+
+      @dataclass
+      class Doc:
+          id: str
+          tags: list[str] = []
+    options:
+      - "能运行，但所有 Doc 实例共享同一个 tags 列表"
+      - "能运行，dataclass 会自动为每个实例复制一份列表"
+      - "定义类时就抛 ValueError，提示改用 default_factory"
+      - "只有 mypy 会报错，运行时完全没问题"
+    answer: [2]
+    explain: dataclass 在生成类时会检查默认值，发现 list、dict、set 这类可变默认值就直接抛 ValueError，提示使用 default_factory。所以不会出现共享列表的问题，也不会自动复制；这是运行时的检查，与 mypy 无关。
+
+  - id: d03-t13
+    kp: d03-k3
+    type: judge
+    question: |
+      用 @dataclass 定义了 `score: float` 字段后，如果创建实例时传入字符串，dataclass 会在运行时按注解校验并抛出错误。
+    answer: false
+    explain: dataclass 只利用注解来确定有哪些字段，不做任何类型校验，传入字符串会被原样保存。需要在运行时校验和转换类型（比如解析接口参数或 LLM 返回的 JSON）时，应使用 Pydantic BaseModel。
+
+  - id: d03-t14
+    kp: d03-k3
+    type: multi
+    question: 关于 Python 类与 TS/JS 类的差异，下列说法正确的是？
+    options:
+      - "Python 方法必须显式把 self 写成第一个参数"
+      - "以单下划线开头的属性只是「内部使用」的约定，外部仍能访问"
+      - "以双下划线开头的属性会被改名为 _类名__属性，仍可通过改名后的名字访问"
+      - "Python 有 private 关键字，可以真正禁止外部访问属性"
+    answer: [0, 1, 2]
+    explain: self 是显式参数，不会像 JS 的 this 那样因调用方式丢失；单下划线是约定，双下划线触发名称改写（主要用于避免子类属性冲突），都不是真正的访问控制。Python 没有 private 关键字。
+
+  - id: d03-t15
+    kp: d03-k3
+    type: single
+    question: 下面代码中，第 9 行和第 10 行分别会怎样？
+    code: |
+      from dataclasses import dataclass, field
+
+      @dataclass(frozen=True)
+      class AgentConfig:
+          model: str
+          tools: list[str] = field(default_factory=list)
+
+      cfg = AgentConfig("qwen-plus")
+      cfg.tools.append("search")
+      cfg.model = "deepseek-chat"
+    options:
+      - "第 9 行就抛 FrozenInstanceError，第 10 行不会执行"
+      - "第 9 行成功，第 10 行抛 FrozenInstanceError"
+      - "两行都成功，frozen 只影响哈希"
+      - "两行都抛错，frozen 会冻结所有内容"
+    answer: [1]
+    explain: frozen=True 阻止给字段重新赋值，所以第 10 行抛 FrozenInstanceError；但它是浅冻结，tools 列表本身仍可变，第 9 行的 append 不涉及给字段赋值，能成功。需要深度只读时，字段应使用 tuple 等不可变类型。
+
+  - id: d03-t16
+    kp: d03-k4
+    type: single
+    question: 下面代码运行时会怎样？
+    code: |
+      def add(a: int, b: int) -> int:
+          return a + b
+
+      result = add("1", "2")
+      print(repr(result))
+    options:
+      - "打印 3，Python 会按注解把字符串转成 int"
+      - "抛出 TypeError：参数类型与注解不匹配"
+      - "启动时就报错，类型注解与调用不一致"
+      - "打印 '12'，解释器不检查类型注解"
+    answer: [3]
+    explain: 类型注解只是元数据，解释器执行时不检查也不转换，两个字符串相加得到 '12'。mypy/pyright 静态检查会指出这里的类型错误；按注解转换类型是 Pydantic 才做的事，而且需要用它的模型来接收数据。
+
+  - id: d03-t17
+    kp: d03-k4
+    type: single
+    question: 把 TS 类型翻译成 Python 注解，下列哪个对应关系是错误的？
+    options:
+      - "string | null 对应 str | None"
+      - "'low' | 'high' 字面量联合对应 Literal['low', 'high']"
+      - "Record<string, number> 对应 dict[str, int]"
+      - "any 对应 object，二者都会关闭类型检查"
+    answer: [3]
+    explain: TS 的 any 对应 Python 的 Any，表示「不检查」；Python 的 object 恰恰相反，它是所有类型的父类，对 object 类型的值几乎做不了任何操作（类似 TS 的 unknown）。其余三项都是正确的对应关系。
+
+  - id: d03-t18
+    kp: d03-k4
+    type: judge
+    question: Python 3.14 起，类型注解默认延迟求值，因此注解里引用后面才定义的类（前向引用）时，不再需要给类名加引号。
+    answer: true
+    explain: 3.14 实现了 PEP 649/749，注解在定义时不立即求值，而是在需要时才计算，所以 def f() -> Node 即使 Node 在后面定义也能正常运行。需要兼容 3.13 及以前版本的代码，仍要用引号或 from __future__ import annotations。
+
+  - id: d03-t19
+    kp: d03-k4
+    type: multi
+    question: 关于类型注解的作用，下列说法正确的是？
+    options:
+      - "mypy、pyright 可以据此在不运行代码的情况下发现类型错误"
+      - "Pydantic、FastAPI 会在运行时读取注解，用来校验数据和生成接口文档"
+      - "解释器执行函数时会根据注解强制检查参数类型"
+      - "IDE 补全和 AI 生成代码会更准确"
+    answer: [0, 1, 3]
+    explain: 注解服务于静态检查、运行时被库读取、以及编辑器与 AI 工具。解释器本身不会根据注解检查参数类型，这是它和 Java 等静态类型语言、以及「写了注解就安全」这种误解的关键区别。
+
+  - id: d03-t20
+    kp: d03-k4
+    type: single
+    question: |
+      想声明「任何实现了 `embed(texts: list[str]) -> list[list[float]]` 方法的对象都能传进来」，且不要求它继承某个基类（类似 TS interface 的结构类型）。应该用什么？
+    options:
+      - "typing.Protocol 定义一个结构类型"
+      - "abc.ABC 抽象基类，要求子类显式继承"
+      - "TypedDict 描述 embed 字段"
+      - "直接把参数注解成 Any"
+    answer: [0]
+    explain: Protocol 是结构子类型：只要对象有匹配的方法签名，类型检查器就认为它满足，不需要继承，最接近 TS interface。ABC 要求显式继承（名义类型）；TypedDict 描述 dict 的键，不描述方法；Any 直接放弃检查。
+
+exam:
+  - id: d03-e1
+    kp: d03-k1
+    type: single
+    question: |
+      日志工具函数写成 `def log_event(msg, ts=datetime.now()): ...`，服务运行了一整天。日志里的 ts 会是什么？
+    options:
+      - "每次调用时的当前时间"
+      - "所有不传 ts 的调用，都是函数定义（模块导入）时的时间"
+      - "第一次调用 log_event 时的时间"
+      - "每次调用都抛出 TypeError，默认值不能是函数调用"
+    answer: [1]
+    explain: 默认值表达式在 def 执行时计算一次，模块导入时 datetime.now() 就被固定下来，之后所有不传 ts 的调用都用这个值，所以全天日志时间相同。不是首次调用时计算，也不会报错。应写 ts=None，函数内 if ts is None 再取当前时间。
+
+  - id: d03-e2
+    kp: d03-k2
+    type: single
+    question: 为多个工具在循环里注册处理函数，调用 search 的处理函数时打印什么？
+    code: |
+      handlers = {}
+      for name in ["search", "sql"]:
+          handlers[name] = lambda q: f"{name}:{q}"
+
+      print(handlers["search"]("报修"))
+    options:
+      - "search:报修"
+      - "抛出 NameError，name 在循环外不存在"
+      - "sql:报修"
+      - "抛出 KeyError，search 被覆盖了"
+    answer: [2]
+    explain: |
+      两个 lambda 都捕获同一个变量 name，调用时循环已结束，name 的值是 sql，所以调用 search 的处理函数也输出 sql:报修。字典里两个键都在，不会 KeyError；循环变量在循环后仍存在。修复用 lambda q, name=name: ... 或工厂函数。
+
+  - id: d03-e3
+    kp: d03-k3
+    type: single
+    question: 分别修改实例属性和类属性之后，下面代码打印什么？
+    code: |
+      class Client:
+          timeout = 30
+
+      a, b = Client(), Client()
+      a.timeout = 5
+      Client.timeout = 60
+      print(a.timeout, b.timeout)
+    options:
+      - "5 30"
+      - "60 60"
+      - "30 60"
+      - "5 60"
+    answer: [3]
+    explain: a.timeout = 5 是赋值，会在实例 a 上新建实例属性，遮住类属性；b 没有自己的 timeout，读取时找到类属性。之后修改类属性为 60，只影响没有自己实例属性的 b。所以输出 5 60。这说明对实例赋值不会修改类属性。
+
+  - id: d03-e4
+    kp: d03-k4
+    type: single
+    question: LLM 返回一段 JSON，需要在运行时检查字段类型、把 "5" 这样的字符串转成 int，并在不合格时拿到详细错误信息用于重试。最合适的工具是？
+    options:
+      - "TypedDict，因为它最接近 TS interface"
+      - "dataclass，自动生成的 __init__ 会检查类型"
+      - "Pydantic BaseModel，它在运行时按注解校验和转换"
+      - "只写类型注解，由 mypy 在运行时拦截"
+    answer: [2]
+    explain: Pydantic 在运行时读取注解执行校验和类型转换，失败时给出包含字段路径的错误，适合放在外部输入的边界（Day 16 会用它做结构化输出重试）。TypedDict 和 dataclass 都不做运行时校验；mypy 是静态工具，根本不参与运行。
+
+  - id: d03-e5
+    kp: d03-k1
+    type: multi
+    question: 下列哪些函数签名会因为「默认值只求值一次」而导致 bug？
+    options:
+      - "def add(item, bucket=[])，每次调用往 bucket 里追加 item"
+      - "def add(item, bucket=None)，函数内 if bucket is None 时创建新列表"
+      - "def log(msg, ts=time.time())，用 ts 记录日志时间"
+      - "def connect(timeout=30)，用 timeout 建立连接"
+    answer: [0, 2]
+    explain: 可变默认列表会在调用之间共享，time.time() 在定义时就被固定。用 None 做哨兵再在函数内创建是标准写法；整数 30 是不可变值，共享它没有任何副作用。ruff 的 B006、B008 规则分别检查这两类问题。
+
+  - id: d03-e6
+    kp: d03-k3
+    type: multi
+    question: 关于 dataclass，下列说法正确的是？
+    options:
+      - "会自动生成 __init__、__repr__、__eq__"
+      - "field(default_factory=list) 会为每个实例创建新的列表"
+      - "frozen=True 且字段都可哈希时，实例可以作为 dict 的键"
+      - "创建实例时会把传入的列表深拷贝一份，防止外部修改"
+    answer: [0, 1, 2]
+    explain: dataclass 根据字段生成样板方法；default_factory 每次创建实例时调用一次工厂函数；frozen=True 加上默认的 eq=True 会生成 __hash__，字段可哈希时实例可做键。dataclass 不会复制传入的对象，外部持有的列表引用和实例字段是同一个对象。
+
+  - id: d03-e7
+    kp: d03-k2
+    type: judge
+    question: 在函数里声明 `nonlocal config` 后，就可以给模块顶层定义的 config 变量重新赋值。
+    answer: false
+    explain: nonlocal 只能指向外层函数（嵌套作用域）里的变量，如果外层没有函数作用域定义它，会直接 SyntaxError。修改模块级变量要用 global，但全局可变状态难以测试，工程上更推荐通过参数、返回值或对象属性传递。
+
+  - id: d03-e8
+    kp: d03-k4
+    type: judge
+    question: 只要给所有函数加上完整的类型注解，并让 pyright 在 CI 中通过，就不再需要对 HTTP 请求参数和 LLM 返回的 JSON 做运行时校验。
+    answer: false
+    explain: 静态检查只能保证代码内部的类型一致，无法知道运行时外部数据真实长什么样：客户端可能传字符串，LLM 可能漏字段或返回错误格式。外部输入必须在边界用 Pydantic 等工具做运行时校验，静态检查和运行时校验是互补的。
+
+  - id: d03-e9
+    kp: d03-k3
+    type: case
+    question: |
+      园区运营 Agent 的会话类是 AI 照着 TS 写法生成的：`class AgentMemory:` 类体里写着 `messages: list[dict] = []`，方法 `def add(self, m): self.messages.append(m)`，每个运营人员登录后创建一个 `AgentMemory()` 实例。上线后，两个运营人员同时使用时，都在自己的对话里看到了对方的问题；单人测试时从没出现。最准确的根因和修复是？
+    options:
+      - "并发请求导致竞争条件，应给 add 方法加一把线程锁"
+      - "messages 是类属性被所有实例共享，应改在 __init__ 中创建"
+      - "LLM 服务端缓存了上下文，应在每次请求里关闭模型缓存"
+      - "类型注解 list[dict] 导致所有实例共享，删掉注解即可"
+    answer: [1]
+    explain: 写在类体里、带默认值的 messages 是类属性，所有实例共用一个列表；append 不是赋值，不会创建实例属性，所以两个用户的消息进了同一个列表。单人测试时只有一个实例，看不出问题。加锁只能避免并发写冲突，共享依旧存在；与模型侧缓存无关；注解本身不造成共享，问题在于类体里的赋值。修复是在 __init__ 中创建实例属性，或改用 dataclass 加 field(default_factory=list)。
+
+interview:
+  - id: d03-i1
+    kp: d03-k4
+    type: short
+    difficulty: 2
+    question: 你写了很多年 TypeScript，说说 Python 的类型注解和 TS 类型系统有什么异同？你在 Python 项目里会怎么用类型？
+    key_points:
+      - {text: "说明相同点：语法和表达能力接近，有联合类型、字面量、泛型、结构类型 Protocol", dim: concept}
+      - {text: "指出关键区别：解释器不在运行时检查注解，但注解会保留在运行时可被读取", dim: principle}
+      - {text: "说明 Pydantic、FastAPI 在运行时读取注解做校验和文档，外部输入必须在边界校验", dim: principle}
+      - {text: "落地做法：CI 跑 pyright 或 mypy，公共函数要求注解，用 Protocol 隔离外部依赖便于测试", dim: engineering}
+      - {text: "提到 3.14 注解延迟求值或 3.12 泛型新语法等版本差异", dim: concept}
+    reference: |
+      **相同点**：表达能力接近——`str | None` 对应 `string | null`，`Literal` 对应字面量联合，`TypedDict` 描述对象形状，泛型（3.12 起 `def f[T](x: T) -> T`），`Protocol` 提供结构类型。
+
+      **关键区别**：
+      1. **不强制**：TS 编译不过就不能构建；Python 解释器完全不看注解，传错类型照样运行，静态检查（pyright/mypy）是可选的外部工具。
+      2. **保留在运行时**：TS 类型编译后被擦除；Python 注解存在 `__annotations__` 里，库可以读取。Pydantic 按注解校验和转换数据，FastAPI 按注解解析请求、生成 OpenAPI 文档。
+      3. **默认名义类型**：TS 默认结构类型；Python 类型检查器默认看继承关系，结构类型要显式用 Protocol。
+      4. **版本差异**：3.14 起注解延迟求值，前向引用不用加引号。
+
+      **我的用法**：
+      - 外部输入（请求体、LLM 返回的 JSON、配置）在边界用 Pydantic 做**运行时校验**。
+      - 内部函数写完整注解，CI 跑 pyright + ruff，`Any` 和 `type: ignore` 需要说明理由。
+      - Embedding、向量库、LLM 客户端用 Protocol 定义接口，测试时注入假实现，不用联网。
+    oral: |
+      语法上两者很像，联合类型、字面量、泛型、结构类型都有，我把 TS 的经验基本能平移过来。最大的区别是 Python 解释器根本不检查注解，传错类型照样跑，所以静态检查要靠 pyright 或 mypy 放进 CI。另一个区别是 Python 注解在运行时还在，Pydantic 和 FastAPI 就是读注解来做校验和生成接口文档的。所以我的做法是：外部进来的数据，比如请求体和 LLM 返回的 JSON，一定在边界用 Pydantic 校验；内部代码靠注解加 pyright 保证一致。我在知识库项目里还用 Protocol 定义了 Embedder 接口，测试时传一个假实现，单元测试就不用联网了。
+
+  - id: d03-i2
+    kp: d03-k1
+    type: scenario
+    difficulty: 3
+    question: 用户反馈：AI 助手偶尔会「记得」别人问过的问题——新开的会话里，模型回答引用了另一个用户之前的提问。重启服务后一段时间正常。你怎么排查？
+    key_points:
+      - {text: "从重启后恢复、偶发跨用户推断是进程内共享的可变状态，而不是模型记忆", dim: principle}
+      - {text: "重点检查可变默认参数 history=[]、类体里的列表属性、模块级缓存", dim: principle}
+      - {text: "给出复现方法：连续以两个用户身份发起新会话，断言上下文互不包含", dim: engineering}
+      - {text: "修复：默认 None 加 is None 判断、实例属性在 __init__ 中创建、开启 ruff B006", dim: engineering}
+      - {text: "说明影响评估与数据安全处理：排查泄露范围、补回归测试、必要时通知", dim: project}
+    reference: |
+      **判断方向**：模型本身没有跨请求记忆，每次请求的上下文完全由后端拼出来。重启恢复、运行一段时间后出现，说明是**进程内的共享可变状态**把别人的消息拼了进来。这同时是一个**数据泄露**问题，优先级很高。
+
+      **重点排查三类代码**：
+      1. **可变默认参数**：`def build_messages(question, history=[])`——新会话不传 history 时，所有新会话共享同一个列表，越积越多。
+      2. **类属性**：`class ChatSession: messages = []` 写在类体里，所有实例共享。
+      3. **模块级缓存**：全局 dict 按错误的键（比如没带 user_id）缓存了会话。
+
+      **复现**：写测试，先以用户 A 身份新开会话提问，再以用户 B 身份新开会话，断言 B 发给 LLM 的 messages 里不包含 A 的内容；也可以在日志里打印 `id(history)` 看不同请求是否是同一个对象。
+
+      **修复**：
+      - 默认参数改为 `history: list | None = None` + `if history is None: history = []`。
+      - 会话数据放实例属性或按 `(tenant_id, user_id, session_id)` 存到 Redis/数据库。
+      - ruff 开启 B006/B008，CI 拦截可变默认值。
+
+      **收尾**：根据日志评估泄露的时间段和涉及用户，按公司流程上报；补回归测试。
+    oral: |
+      我会先明确一点：模型没有跨请求记忆，上下文全是我们后端拼的，而且重启就好，说明是进程内有共享的可变状态，这其实是个数据泄露问题，要优先处理。我会重点查三类代码：一是 history 等于空列表这种可变默认参数，新会话不传历史时所有人共用一个列表；二是类体里写的 messages 列表，所有实例共享；三是模块级缓存的键没带用户 ID。复现就写个测试，用户 A 新开会话提问，再让用户 B 新开会话，断言 B 发给模型的消息里没有 A 的内容。修复是默认值改成 None，会话放实例属性或者按用户存 Redis，再在 ruff 里开 B006 规则让 CI 拦住。最后评估泄露范围，按流程上报。
+
+  - id: d03-i3
+    kp: d03-k3
+    type: design
+    difficulty: 3
+    question: 你要为 RAG 服务设计几类数据对象：接口请求体、LLM 返回的结构化结果、检索命中结果（在检索、重排、组装 Prompt 之间传递）、模型配置。你会分别用普通类、dataclass、TypedDict 还是 Pydantic？说明理由和取舍。
+    key_points:
+      - {text: "按数据来源划分：外部不可信输入用 Pydantic 做运行时校验，内部可信数据用 dataclass", dim: principle}
+      - {text: "说明 dataclass 不做类型校验、可变默认值要用 default_factory、frozen 为浅冻结", dim: concept}
+      - {text: "说明 TypedDict 适合描述直接与 SDK 或 JSON 交互的 dict 形状，运行时仍是普通 dict", dim: concept}
+      - {text: "模型配置只读化，用 frozen dataclass 或 pydantic-settings，避免运行中被改", dim: engineering}
+      - {text: "考虑性能与序列化：高频内部对象避免重复校验，跨服务时用 Pydantic 序列化", dim: engineering}
+    reference: |
+      **划分原则：看数据来自哪里、要不要校验。**
+
+      | 对象 | 选择 | 理由 |
+      |---|---|---|
+      | 接口请求体 | **Pydantic BaseModel** | 外部不可信输入，需要运行时校验、类型转换、清晰的错误信息；FastAPI 直接集成并生成文档 |
+      | LLM 结构化结果 | **Pydantic BaseModel** | LLM 可能漏字段、给错类型，需要校验失败后重试（Day 16） |
+      | 检索命中结果 | **dataclass**（可加 `slots=True`） | 内部可信数据，在多个环节之间传递，创建频繁；不需要重复校验，dataclass 更轻 |
+      | 发给 SDK 的消息 | **TypedDict** | SDK 接收的就是 dict，TypedDict 只提供静态类型，运行时零开销 |
+      | 模型配置 | **frozen dataclass** 或 **pydantic-settings** | 来自环境变量时用 pydantic-settings 按类型解析（Day 04）；运行中只读 |
+      | LLM 客户端、检索服务 | **普通类** | 有行为、有依赖（连接、重试策略） |
+
+      **要注意的坑**：
+      - dataclass **不校验类型**，不能用于外部输入。
+      - 可变默认值必须 `field(default_factory=list)`；`frozen=True` 只是浅冻结，配置里的列表最好用 tuple。
+      - 普通类里不要把列表写成类属性。
+      - 不要处处 Pydantic：高频内部对象每次创建都校验有开销；但跨进程、跨服务传输时 Pydantic 的序列化很方便。
+
+      **总结一句**：边界用 Pydantic 守门，内部用 dataclass 和注解加静态检查保持轻量。
+    oral: |
+      我的原则是看数据从哪来。接口请求体和 LLM 返回的结构化结果都是外部不可信的，我用 Pydantic，它在运行时按注解校验和转换，出错能拿到字段级的错误信息，LLM 的结果还能据此重试。检索命中结果是内部数据，在检索、重排、拼 Prompt 之间频繁传递，我用 dataclass 加 slots，轻量也不重复校验。直接传给 SDK 的消息用 TypedDict，运行时就是普通 dict。模型配置从环境变量来，用 pydantic-settings 解析，运行中只读。客户端和服务这种有行为的就用普通类。要注意 dataclass 不校验类型，可变默认值要用 default_factory，frozen 也只是浅冻结。一句话就是边界用 Pydantic 守门，内部用 dataclass 保持轻量。

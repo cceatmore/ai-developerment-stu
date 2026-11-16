@@ -1,0 +1,851 @@
+day: 6
+phase: 1
+title: Python 并发：同步与异步、async/await、asyncio
+goals:
+  - 能用自己的话讲清同步、异步、并发、并行的区别，并说明 AI 后端为什么大量使用异步
+  - 能解释协程、await、事件循环三者如何配合，说出「调用 async 函数不等于执行它」
+  - 能分析在 async 路由里调用阻塞代码的后果，并给出 to_thread / 异步库 / 线程池等修复方案
+  - 能用 TaskGroup + asyncio.timeout 设计「并发调用多个 LLM、整体超时、部分失败可降级」的逻辑
+knowledge_points:
+  - id: d06-k1
+    name: 同步、异步、并发与并行
+    level: P1
+    summary: 并发是「同时处理很多事」，并行是「同时执行很多事」；异步让等待 I/O 的时间可以拿去干别的
+    why: |
+      AI 应用后端的大部分时间都在**等**：等 LLM 返回（几秒到几十秒）、等向量库检索、等数据库、等第三方接口。
+      如果分不清同步/异步、并发/并行，就无法判断「为什么 QPS 上不去」「为什么加机器没用」，也看不懂 FastAPI、httpx、asyncpg 这些库为什么都要写 `async`。
+    problem: |
+      解决的是**等待浪费**问题：同步代码在等 I/O 时整个线程什么都不干。
+      一个请求调用 LLM 要 8 秒，同步写法下这 8 秒里线程被占住；100 个用户同时来，要么开 100 个线程（内存和切换成本高），要么排队。
+      异步让一个线程在等待期间去处理别的请求，用很少的资源撑住大量「慢而闲」的连接。
+    principle: |
+      **一、四个词用人话说**
+
+      - **同步（synchronous）**：调用一个函数，**必须等它返回**才能做下一步。`requests.get()` 返回之前，当前线程卡住。
+      - **异步（asynchronous）**：发起操作后**不原地等**，先去干别的，结果好了再回来接着处理。JS 里的 `fetch().then()` / `await fetch()` 就是这个思路。
+      - **并发（concurrency）**：一段时间内**交替推进**多个任务。一个厨师同时看着三口锅，哪口开了就去处理哪口。
+      - **并行（parallelism）**：同一时刻**真正同时执行**多个任务，需要多个 CPU 核。三个厨师各看一口锅。
+
+      **关键关系：** 异步是实现并发的一种手段；并发不一定并行。asyncio 是**单线程并发**，同一时刻只执行一段 Python 代码，但能在等待时切换任务。
+
+      **二、为什么「等待」可以被利用**
+
+      网络请求发出去之后，真正干活的是对方服务器和网卡，CPU 只是在等数据回来。操作系统提供了「多路复用」机制（Linux 的 epoll、macOS 的 kqueue、Windows 的 IOCP），一个线程可以同时盯着成千上万个 socket，**哪个有数据就通知哪个**。asyncio 的事件循环就建立在这套机制之上。
+
+      ```mermaid
+      sequenceDiagram
+        participant S as 同步线程
+        participant A as 异步事件循环
+        participant L as LLM 服务
+        S->>L: 请求 1
+        L-->>S: 8 秒后返回
+        S->>L: 请求 2（必须等请求 1 完成）
+        L-->>S: 又 8 秒
+        A->>L: 请求 1
+        A->>L: 请求 2（不等请求 1）
+        A->>L: 请求 3
+        L-->>A: 约 8 秒后三个结果陆续返回
+      ```
+
+      **三、和 JavaScript 的类比**
+
+      - Node.js / 浏览器天生是单线程 + 事件循环，所有 I/O 默认异步，你写前端时已经在用这个模型。
+      - Python **默认是同步的**，异步要显式写 `async def` / `await` 并运行在事件循环里；同步库（`requests`、`time.sleep`）和异步库（`httpx.AsyncClient`、`asyncio.sleep`）是**两套 API**，不能混着用。
+
+      **四、什么时候异步有用、什么时候没用**
+
+      - **I/O 密集**（调 LLM、查库、读远程文件）：异步收益巨大。
+      - **CPU 密集**（解析大 PDF、本地跑 Embedding 模型、大 JSON 序列化）：异步**没有帮助**，因为 CPU 本身就是瓶颈，没有「等待时间」可以利用，需要多进程（见 Day 07）。
+    scenarios: |
+      - **LLM 网关 / 对话接口**：每个请求要等模型 5~30 秒，用异步框架（FastAPI + httpx.AsyncClient）一个进程就能挂住几百个并发连接。
+      - **RAG 检索**：同时查向量库、关键词索引、用户权限服务，三者并发而不是串行，总耗时取最慢的那个。
+      - **批量评估脚本**：对 500 条测试问题调用模型打分，用异步 + 并发上限，把 500 × 3 秒压缩到几十秒。
+    code: |
+      ```python
+      import asyncio
+      import time
+
+      async def fake_llm(name: str, seconds: float) -> str:
+          await asyncio.sleep(seconds)  # 模拟网络等待，等待期间让出控制权
+          return f"{name} done"
+
+      async def main() -> None:
+          start = time.perf_counter()
+          # 串行：总耗时约 3 + 2 + 1 = 6 秒
+          for n, s in [("a", 3), ("b", 2), ("c", 1)]:
+              await fake_llm(n, s)
+          print("serial", round(time.perf_counter() - start, 1))
+
+          start = time.perf_counter()
+          # 并发：总耗时约 max(3, 2, 1) = 3 秒
+          results = await asyncio.gather(fake_llm("a", 3), fake_llm("b", 2), fake_llm("c", 1))
+          print("concurrent", round(time.perf_counter() - start, 1), results)
+
+      asyncio.run(main())
+      ```
+    pitfalls: |
+      - **误区：异步 = 更快。** 单个请求的耗时不会因为异步变短，8 秒的 LLM 调用还是 8 秒；异步提升的是**吞吐量**（同样资源能同时服务更多请求）。
+      - **误区：并发 = 并行。** asyncio 只用一个线程，任何时刻只有一段 Python 代码在跑；CPU 密集任务放进 asyncio 只会把整个服务拖慢。
+      - **误区：写了 async def 就是异步了。** 如果函数体里调用的是 `requests.get()`、`time.sleep()`、同步数据库驱动，它照样阻塞，而且阻塞的是**整个事件循环**。
+      - **混淆：for 循环里逐个 await 仍是串行。** `for x in xs: await f(x)` 每次都等上一个完成，要并发必须先创建多个任务再一起等。
+    interview_asks:
+      - 同步、异步、并发、并行有什么区别？举一个你项目里的例子。
+      - 为什么 AI 应用后端普遍采用异步框架？什么情况下异步没有用？
+      - 异步能让单个请求变快吗？
+    project_example: |
+      在一个企业知识库问答服务里，一次回答需要：查用户权限（50ms）、向量检索（150ms）、关键词检索（120ms）、调用 LLM（6s）。
+      最初是同步 Flask + requests，4 个 worker 进程，压测时并发 20 就开始排队，P99 超过 40 秒。
+      改成 FastAPI + httpx.AsyncClient 后，权限/向量/关键词三路检索并发执行（约 150ms 而不是 320ms），LLM 等待期间事件循环去服务其他请求，同样 4 个进程并发 200 时 P99 约 8 秒，瓶颈从「线程不够」变成了「LLM 供应商限流」。
+  - id: d06-k2
+    name: 协程与 async/await 语义
+    level: P0
+    summary: 调用 async 函数只得到协程对象，await 才会驱动它执行，并在等待点把控制权交还事件循环
+    why: |
+      学员现在主要靠 AI 生成代码，最常见的异步 bug 都和 `await` 语义有关：忘了 await 导致逻辑没执行、在同步函数里调异步函数报错、以为 await 会开新线程。
+      不理解协程的「暂停 / 恢复」机制，就看不懂 FastAPI 路由、LangGraph 节点、MCP 客户端这些后面课程里到处都是的 `async def`。
+    problem: |
+      解决的是「**如何用顺序写法表达异步逻辑**」的问题。
+      早期异步代码靠回调（callback），层层嵌套难以阅读和处理异常（JS 的回调地狱）。
+      async/await 让你像写同步代码一样从上往下写，但在每个 `await` 处函数可以**暂停**，把线程让给别的任务，等结果到了再从暂停处**恢复**，异常也能用普通的 try/except 捕获。
+    principle: |
+      **一、协程是什么**
+
+      协程（coroutine）是一种**可以暂停、之后再恢复执行**的函数。它和 Day 05 学的生成器是近亲：生成器在 `yield` 处暂停，协程在 `await` 处暂停。
+
+      - `async def f(): ...` 定义的是**协程函数**。
+      - **调用 `f()` 不会执行函数体**，只返回一个**协程对象**（像一张「待执行的任务单」）。
+      - 只有当协程对象被 `await`，或被包装成 Task 交给事件循环时，函数体才会开始跑。
+
+      这一点和 JS 不同：JS 的 `async function` 一调用就立刻开始执行到第一个 await；Python 的协程调用后**一行都不执行**。
+
+      **二、await 做了什么**
+
+      `result = await something` 的含义是：
+
+      1. 驱动 `something`（协程、Task 或 Future）往下执行；
+      2. 如果它需要等待 I/O，就**把当前协程挂起**，控制权交回事件循环；
+      3. 事件循环去运行其他就绪的任务；
+      4. I/O 完成后，事件循环把当前协程标记为就绪，下次轮到它时**从 await 那一行恢复**，拿到结果。
+
+      ```mermaid
+      stateDiagram-v2
+        state "已创建 协程对象" as Created
+        state "运行中" as Running
+        state "挂起 等待 IO" as Suspended
+        state "已完成" as Done
+        [*] --> Created: 调用 async 函数
+        Created --> Running: 被 await 或包装成 Task
+        Running --> Suspended: 遇到真正需要等待的 await
+        Suspended --> Running: IO 完成 事件循环恢复它
+        Running --> Done: return 或抛出异常
+        Done --> [*]
+      ```
+
+      **三、await 不是「开线程」**
+
+      `await` 不创建线程，也不让代码并行。它只是一个**主动让出点**。如果 await 的东西本身不需要等待（比如一个立即返回的协程），根本不会发生切换。
+
+      **四、可等待对象（awaitable）的三种类型**
+
+      | 类型 | 怎么来 | 特点 |
+      |---|---|---|
+      | 协程对象 | 调用 `async def` 函数 | await 时才执行，只能被 await 一次 |
+      | Task | `asyncio.create_task(coro)` / `tg.create_task(coro)` | **创建后立刻被调度**，即使你还没 await 它 |
+      | Future | 底层对象，通常由库创建 | 代表「将来会有的结果」 |
+
+      **关键区别：** `await coro()` 是「现在就执行并等它完成」；`create_task(coro())` 是「交给事件循环在后台跑，我先往下走」。想要并发，必须先把多个协程变成 Task。
+
+      **五、async 的传染性**
+
+      - `await` 只能写在 `async def` 里面。
+      - 一个函数要等异步结果，它自己也得是 `async def`，调用它的函数也得是……一路向上直到入口 `asyncio.run(main())` 或框架（FastAPI 会帮你运行事件循环）。
+      - 在同步函数里不能直接 `await`，也**不要**在已经运行事件循环的地方再调用 `asyncio.run()`（会报 `RuntimeError`）。
+    scenarios: |
+      - **FastAPI 路由**：`async def chat(...)` 里 `await client.post(...)` 调用 LLM，等待期间同一进程继续接收其他请求。
+      - **流式输出**：`async for chunk in stream:` 每拿到一个 token 片段就推给前端（异步迭代器，SSE 详见 Day 17 / Day 43）。
+      - **Agent 工具调用**：LangGraph、MCP SDK 的节点和工具函数大多是 `async def`，需要理解 await 才能读懂执行顺序。
+    code: |
+      ```python
+      import asyncio
+
+      async def get_answer(q: str) -> str:
+          print("开始调用模型", q)
+          await asyncio.sleep(1)
+          return f"answer to {q}"
+
+      async def main() -> None:
+          coro = get_answer("hi")          # 这里什么都没打印：只创建了协程对象
+          print(type(coro))                 # <class 'coroutine'>
+          print(await coro)                 # 现在才执行函数体
+
+          task = asyncio.create_task(get_answer("bg"))  # Task 创建后立即被调度
+          await asyncio.sleep(0)            # 让出一次控制权，后台任务开始打印
+          print(await task)
+
+      asyncio.run(main())
+      ```
+    pitfalls: |
+      - **忘记 await**：`client.post(...)` 少写 await，拿到的是协程对象而不是响应，后面 `.json()` 报 `AttributeError`，并伴随 `RuntimeWarning: coroutine ... was never awaited`。日志里看到这句警告，第一反应就是漏了 await。
+      - **在同步函数里调异步函数**：直接调用只得到协程对象；用 `asyncio.run()` 包一下在 FastAPI 里又会因为事件循环已在运行而报错。正确做法是让调用链变成 async，或把同步函数改造。
+      - **创建了 Task 却不保存引用**：`asyncio.create_task(x())` 不保存返回值，事件循环只持有弱引用，任务可能在执行中被垃圾回收；官方文档明确要求保存引用。用 TaskGroup 可以避免这个问题。
+      - **混淆：await 一个协程 ≠ 并发。** `await a(); await b()` 是串行的；想并发要用 TaskGroup / gather。
+    interview_asks:
+      - 调用一个 async 函数但不 await，会发生什么？
+      - await 的时候到底发生了什么？它和多线程有什么区别？
+      - 协程和生成器有什么关系？
+    project_example: |
+      一个客服机器人上线后偶发「回答为空」。日志里有 `RuntimeWarning: coroutine 'save_message' was never awaited`。
+      排查发现保存会话记录的函数被改成了 `async def`，但调用处还是 `save_message(conv_id, text)` 没加 await，导致消息根本没写库，后续多轮对话拿不到上下文。
+      修复：补上 await，并在 CI 里开启 `PYTHONWARNINGS=error::RuntimeWarning` 让测试阶段直接失败；同时在类型检查中启用 pyright 的 `reportUnusedCoroutine`（检测调用了协程却未使用其结果），避免同类问题再次漏到线上。
+  - id: d06-k3
+    name: 事件循环与阻塞代码的代价
+    level: P0
+    summary: 事件循环单线程轮流执行任务；任何一段不让出控制权的阻塞代码，都会让整个进程里的所有请求一起卡住
+    why: |
+      这是 AI 后端**最常见、最致命**的性能事故：在 `async def` 路由里用了 `requests`、同步数据库驱动、`time.sleep` 或 CPU 密集计算。
+      本地单人测试完全正常，一上线并发就出现「所有接口一起变慢、健康检查超时、被负载均衡摘掉」。不理解事件循环，就很难定位这种问题。
+    problem: |
+      解决的是「**单线程如何同时服务成千上万个连接**」的问题，同时要求开发者理解它的前提条件：每个任务必须**及时让出控制权**。
+      事件循环是协作式调度——它不会强行打断一个正在运行的任务。理解这一点，才能知道哪些代码能放进 async 路由、哪些必须挪到线程池或进程池。
+    principle: |
+      **一、事件循环在做什么**
+
+      事件循环（event loop）可以理解为一个永不停止的 while 循环，每一轮大致做三件事：
+
+      1. **执行就绪队列**里的回调/任务：依次运行每个任务，直到它遇到 `await` 挂起或结束；
+      2. **询问操作系统**哪些 I/O 已经就绪（通过 epoll / kqueue / IOCP），并检查哪些定时器到期；
+      3. 把对应的任务**重新放回就绪队列**，进入下一轮。
+
+      ```mermaid
+      flowchart TD
+        A["就绪队列 取出一个任务"] --> B["运行该任务的 Python 代码"]
+        B --> C{"遇到 await 且需要等待"}
+        C -- "是" --> D["任务挂起 登记关心的 socket 或定时器"]
+        C -- "否 任务结束" --> E["设置结果 唤醒等待它的任务"]
+        D --> F["询问操作系统 哪些 IO 已就绪 哪些定时器到期"]
+        E --> F
+        F --> G["把就绪的任务放回就绪队列"]
+        G --> A
+        B -. "阻塞调用 如 time.sleep 或 requests.get" .-> H["整个循环停在这里 所有任务都无法推进"]
+      ```
+
+      **二、协作式调度：谁不让出，大家一起等**
+
+      - 事件循环**只有一个线程**。当任务 A 在运行 Python 代码时，任务 B、C、D 都在排队。
+      - 任务只有在 `await` 一个真正需要等待的对象时才会让出。
+      - 如果 A 调用了 `time.sleep(5)`：这是同步阻塞调用，线程被操作系统挂起 5 秒，**事件循环本身也停了**，期间：其他请求无法被处理、定时器无法触发（包括 `asyncio.timeout` 的超时！）、心跳和健康检查无响应。
+      - CPU 密集计算同理：一个请求做 2 秒的大 JSON 解析或文本切片，这 2 秒里进程对外「假死」。
+
+      **三、在 FastAPI 中的具体后果**
+
+      | 写法 | 实际运行位置 | 有阻塞调用时的后果 |
+      |---|---|---|
+      | `async def` 路由 + 异步库 | 事件循环线程 | 正常，高并发 |
+      | `async def` 路由 + 同步阻塞库 | 事件循环线程 | **整个 worker 进程卡住** |
+      | `def` 路由 + 同步阻塞库 | FastAPI 把它放进线程池（AnyIO 默认 40 个令牌） | 只占一个线程；并发超过线程池上限时排队 |
+
+      所以 FastAPI 官方建议：如果用的库不支持 await，就把路由写成普通 `def`，而不是写成 `async def` 再在里面阻塞。
+
+      **四、修复阻塞的三种办法**
+
+      1. **换异步库**（首选）：`requests` → `httpx.AsyncClient`；`psycopg2` → `asyncpg` / psycopg 3 异步模式；`time.sleep` → `asyncio.sleep`。
+      2. **把阻塞调用丢到线程**：`await asyncio.to_thread(func, *args)`（Python 3.9+），适合无法替换的同步 SDK、文件读写。
+      3. **CPU 密集丢到进程池**：`loop.run_in_executor(process_pool, func, *args)`，绕开 GIL（Day 07 详细讲）。
+
+      **五、如何发现阻塞**
+
+      - 开启 asyncio **debug 模式**（`PYTHONASYNCIODEBUG=1` 或 `asyncio.run(main(), debug=True)`），任务单次执行超过 `loop.slow_callback_duration`（默认 0.1 秒）会打印警告。
+      - Python 3.14 起可以用 `python -m asyncio ps PID` / `python -m asyncio pstree PID` 查看运行中进程的异步任务树，定位卡住的任务。
+      - 现象特征：**所有接口同时变慢**（而不是某一个接口慢），CPU 不高但延迟飙升，或者一个接口的耗时恰好叠加到了其他接口上。
+    scenarios: |
+      - **调用只有同步版本的厂商 SDK**（例如某些 OCR、语音识别 SDK）：用 `asyncio.to_thread` 包装，避免卡住事件循环。
+      - **本地 tokenizer 计算 Token 数**：短文本可以直接算；对几十万字的文档批量计算要放进线程池/进程池。
+      - **读写本地文件、上传文件落盘**：大文件 I/O 用 `to_thread` 或 `aiofiles`，否则上传高峰期整个服务抖动。
+    code: |
+      ```python
+      import asyncio
+      import time
+
+      import httpx
+      import requests
+
+      async def bad(url: str) -> int:
+          # 错误：同步库在 async 函数里阻塞整个事件循环
+          return requests.get(url, timeout=10).status_code
+
+      async def ok_async_lib(client: httpx.AsyncClient, url: str) -> int:
+          # 推荐：使用异步库，等待期间让出控制权
+          resp = await client.get(url)
+          return resp.status_code
+
+      def legacy_sdk_call(text: str) -> str:
+          time.sleep(2)  # 模拟只能同步调用的第三方 SDK
+          return text.upper()
+
+      async def ok_to_thread(text: str) -> str:
+          # 无法替换的同步调用：丢到线程中执行，事件循环继续服务其他任务
+          return await asyncio.to_thread(legacy_sdk_call, text)
+      ```
+    pitfalls: |
+      - **误区：只有我这个请求慢。** 在 async 路由里阻塞，慢的是**同进程所有请求**，这是它和普通「接口慢」最大的区别。
+      - **误区：`asyncio.timeout` 能兜住阻塞代码。** 超时依赖事件循环触发定时器；阻塞期间循环停摆，超时根本没机会生效，要等阻塞结束后才抛出。
+      - **误区：to_thread 能加速 CPU 密集任务。** 有 GIL 的标准 CPython 下，纯 Python 计算放到线程里依然只能用一个核，只是「不卡事件循环」而已；真要提速需要进程池。
+      - **混淆：`def` 路由也不是无限并发。** 默认线程池只有 40 个令牌，同步路由全部占满后新请求同样排队。
+      - **隐藏的阻塞点**：日志写到慢磁盘/网络、`json.dumps` 超大对象、同步的 Redis 客户端、在 async 函数里调用 `pandas.read_csv` 读大文件。
+    interview_asks:
+      - 在 FastAPI 的 async 路由里调用 requests.get 会有什么后果？怎么修？
+      - 事件循环是怎么工作的？为什么单线程能处理大量并发连接？
+      - 线上所有接口同时变慢，CPU 不高，你会怎么排查是不是事件循环被阻塞了？
+    project_example: |
+      某 RAG 服务上线后，压测 50 并发时健康检查 `/healthz` 也要 10 秒才返回，K8s 反复重启 Pod。
+      排查：开启 `PYTHONASYNCIODEBUG=1` 后日志出现大量 `Executing <Task ...> took 2.3 seconds`，定位到 `async def retrieve()` 里调用了同步的 `psycopg2` 做向量检索，同时用 `pypdf` 同步解析用户上传的 PDF。
+      修复：检索改为 SQLAlchemy AsyncSession + asyncpg；PDF 解析移到进程池并限制单文件大小；健康检查与业务路由分开部署检查。改造后 `/healthz` 稳定在 5ms，50 并发 P99 从 30 秒降到 7 秒。
+  - id: d06-k4
+    name: 并发编排：gather、TaskGroup、超时与取消
+    level: P0
+    summary: 多个异步调用要「一起发、一起等、统一超时、出错能收拾干净」，现代写法是 TaskGroup + asyncio.timeout
+    why: |
+      AI 应用里「同时调多个东西」非常普遍：多路检索、同时问多个模型做对比或兜底、批量给文档做 Embedding、Agent 并行执行多个工具。
+      写不好会出现：一个下游挂了导致整个请求卡死、超时后后台任务还在偷偷跑（浪费 Token 费用）、异常被吞掉没人知道。面试也常问 gather 和 TaskGroup 的区别。
+    problem: |
+      解决三个问题：
+      1. **并发执行**：多个 I/O 任务同时发起，总耗时接近最慢的那个，而不是全部相加；
+      2. **生命周期管理**：任何一个失败时，其他任务要不要取消？超时后如何保证没有「孤儿任务」？
+      3. **资源保护**：并发太高会触发 LLM 供应商 429 限流或打爆数据库，需要并发上限。
+    principle: |
+      **一、asyncio.gather：老牌的「一起等」**
+
+      `results = await asyncio.gather(a(), b(), c())`
+
+      - 把参数包装成 Task 并发执行，按**传入顺序**返回结果列表。
+      - 默认 `return_exceptions=False`：第一个异常会**立刻传播**给调用者，但**其他任务不会被取消**，会继续在后台运行（官方文档明确说明）。这在 LLM 场景下意味着：请求已经报错返回了，其他模型调用还在继续计费。
+      - `return_exceptions=True`：异常被当作结果放进列表，调用方必须逐个检查，否则异常会被**静默吞掉**。
+
+      **二、asyncio.TaskGroup：结构化并发（Python 3.11+）**
+
+      ```python
+      async with asyncio.TaskGroup() as tg:
+          t1 = tg.create_task(call_model_a(prompt))
+          t2 = tg.create_task(call_model_b(prompt))
+      # 离开 async with 时，组内所有任务都已结束
+      print(t1.result(), t2.result())
+      ```
+
+      - **结构化并发**的含义：任务的生命周期被限制在 `async with` 块内，块结束时保证所有子任务都已完成或已取消，不会有孤儿任务。
+      - 任何一个子任务抛出非取消类异常 → **自动取消组内其余任务** → 等它们退出 → 把所有异常打包成 `ExceptionGroup` 抛出，用 `except*` 按类型处理。
+      - 适合「要么全部成功，要么整体失败」的场景。如果想「部分失败也能继续」，就在子任务内部自己 try/except，把失败转成返回值。
+      - Python 3.14 起 `tg.create_task()` 透传 `eager_start` 等参数；Python 3.15 新增 `TaskGroup.cancel()`，可以在「目标已达成」（比如已经拿到最快的结果）时**主动、非异常地**提前结束整个组。
+
+      **三、asyncio.timeout：统一超时（Python 3.11+）**
+
+      ```python
+      try:
+          async with asyncio.timeout(10):
+              async with asyncio.TaskGroup() as tg:
+                  ...
+      except TimeoutError:
+          ...  # 降级处理
+      ```
+
+      - 到期时**取消当前任务**，在上下文管理器边界把 `CancelledError` 转换成 `TimeoutError`（3.11 起就是内置的 `TimeoutError`），所以只能在 `async with` **外面**捕获。
+      - 和 TaskGroup 组合：超时 → 外层任务被取消 → TaskGroup 取消所有子任务 → 干净退出。
+      - 旧写法 `asyncio.wait_for(aw, timeout)` 仍可用（3.12 起内部基于 `asyncio.timeout` 实现），但同时管理多个任务时 `timeout` + TaskGroup 更清晰。
+
+      ```mermaid
+      sequenceDiagram
+        participant R as 路由协程
+        participant G as TaskGroup
+        participant A as 模型 A
+        participant B as 模型 B
+        R->>G: 进入 timeout 10 秒 和 TaskGroup
+        G->>A: create_task 调用 A
+        G->>B: create_task 调用 B
+        A-->>G: 3 秒返回结果
+        Note over R,B: 第 10 秒 B 仍未返回 超时触发
+        R->>G: 取消外层任务
+        G->>B: 取消 B 的请求
+        B-->>G: 抛出 CancelledError 并退出
+        G-->>R: 转换为 TimeoutError 走降级逻辑
+      ```
+
+      **四、取消（cancellation）是这一切的基础**
+
+      - 取消 = 在任务下一次 await 处抛出 `asyncio.CancelledError`。
+      - `CancelledError` 继承自 `BaseException`（不是 `Exception`），所以 `except Exception` 不会误吞它——**不要**写 `except BaseException` 或裸 `except:` 吞掉它，否则 TaskGroup 和 timeout 都会失灵（官方文档专门警告）。
+      - 需要清理资源时用 `try/finally`，清理完让异常继续向上传播。
+
+      **五、并发上限：asyncio.Semaphore**
+
+      对 500 篇文档做 Embedding，不能一次性发 500 个请求。用 `sem = asyncio.Semaphore(10)`，每个任务 `async with sem:` 再调用，保证同时最多 10 个在飞，避免 429。
+    scenarios: |
+      - **多模型兜底**：同时请求主模型和备用模型，整体 8 秒超时，优先用主模型结果，主模型失败用备用。
+      - **多路召回**：向量检索 + BM25 + 知识图谱三路并发，任一路失败不影响其他路（子任务内部捕获异常返回空列表）。
+      - **批量 Embedding / 批量评估**：Semaphore 限制并发 + TaskGroup 管理生命周期 + 单条失败记录日志后跳过。
+    code: |
+      ```python
+      import asyncio
+      import logging
+
+      logger = logging.getLogger(__name__)
+
+      async def embed_one(sem: asyncio.Semaphore, text: str) -> list[float] | None:
+          async with sem:                       # 同时最多 N 个请求在飞
+              try:
+                  await asyncio.sleep(0.2)      # 这里换成真实的 Embedding API 调用
+                  return [0.1, 0.2]
+              except Exception:
+                  logger.exception("embed failed: %s", text[:30])
+                  return None                   # 单条失败不影响整体
+
+      async def embed_all(texts: list[str]) -> list[list[float] | None]:
+          sem = asyncio.Semaphore(10)
+          async with asyncio.timeout(60):       # 整批最多 60 秒
+              async with asyncio.TaskGroup() as tg:
+                  tasks = [tg.create_task(embed_one(sem, t)) for t in texts]
+          return [t.result() for t in tasks]
+      ```
+    pitfalls: |
+      - **误区：gather 出错会自动取消其他任务。** 默认不会，其他任务继续跑；需要「一错全停」用 TaskGroup。
+      - **`return_exceptions=True` 后不检查结果**：异常混在结果列表里被当成正常值，后面 `.text` 报错或者静默产生空回答。
+      - **用 `except Exception: pass` 包住整个 TaskGroup 子任务**：虽然不影响取消（取消是 BaseException），但真实错误全被吞掉，线上只看到「结果少了一个」。
+      - **超时设置在错误的层级**：只给单个 HTTP 请求设超时，没有给整个请求设总预算，重试 3 次 × 30 秒 = 用户等 90 秒。
+      - **不限制并发**：批量任务一次性创建上千个协程同时请求，被供应商 429 甚至封禁，或把数据库连接池打满。
+    interview_asks:
+      - asyncio.gather 和 TaskGroup 有什么区别？各适合什么场景？
+      - 如何给「并发调用 3 个模型」设置一个总超时？超时后还在跑的请求会怎样？
+      - 为什么不能吞掉 CancelledError？
+      - 批量调用 Embedding 接口时如何避免 429？
+    freshness: |
+      核对于 2026-11（当前稳定版 Python 3.15，2026-10-09 发布）：
+      - `asyncio.TaskGroup`、`asyncio.timeout()` / `timeout_at()` 均为 **3.11 新增**，3.11 起超时抛内置 `TimeoutError`（旧写法捕获 `asyncio.TimeoutError`）。
+      - 3.12：`asyncio.wait_for` 内部改为基于 `asyncio.timeout()` 实现。
+      - 3.14：`TaskGroup.create_task()` 透传 `eager_start` 等关键字参数；新增 `python -m asyncio ps / pstree` 检查运行中进程的任务树。
+      - 3.15：新增 `TaskGroup.cancel()` 用于非异常的提前结束；asyncio 事件循环策略（policy）系统被弃用，计划 3.16 移除，推荐用 `asyncio.run(..., loop_factory=...)` 或 `asyncio.Runner`。
+      - 旧写法：`loop = asyncio.get_event_loop(); loop.run_until_complete(main())` 不再推荐，入口统一用 `asyncio.run(main())`。
+    sources:
+      - {title: "Python Docs - Coroutines and Tasks (asyncio-task)", url: "https://docs.python.org/3/library/asyncio-task.html"}
+      - {title: "What's New in Python 3.15", url: "https://docs.python.org/3/whatsnew/3.15.html"}
+      - {title: "What's New in Python 3.14", url: "https://docs.python.org/3/whatsnew/3.14.html"}
+    project_example: |
+      一个「多模型对比回答」功能：用户提问后同时调用主模型（效果好但慢）和轻量模型（快但一般），前端展示主模型结果，轻量模型作为兜底。
+      第一版用 `asyncio.gather(main(), lite())`，主模型 504 时直接抛错给用户，而轻量模型其实 2 秒就成功了；而且报错返回后主模型请求仍在后台重试，Token 账单多出 15%。
+      第二版：子任务内部捕获异常返回 None，外层 `asyncio.timeout(12)` + TaskGroup；超时或主模型失败时使用轻量模型结果并在响应里标注 `degraded=true`。上线后报错率从 3.1% 降到 0.4%，超时后再无后台孤儿请求。
+quiz:
+  - id: d06-q1
+    kp: d06-k2
+    type: single
+    question: |
+      下面代码执行后，控制台会打印什么？
+
+      ```python
+      import asyncio
+
+      async def work():
+          print("working")
+          return 1
+
+      async def main():
+          x = work()
+          print("created")
+
+      asyncio.run(main())
+      ```
+    options:
+      - 先打印 working 再打印 created
+      - 先打印 created 再打印 working
+      - 只打印 created，并可能出现 coroutine was never awaited 警告
+      - 报错，因为 async 函数必须在 await 后面调用
+    answer: [2]
+    explain: |
+      调用 `work()` 只创建协程对象，函数体一行都不执行，所以不会打印 working。协程对象从未被 await 也没有包装成 Task，被回收时 Python 会发出 `RuntimeWarning: coroutine 'work' was never awaited`。
+      A 是 JS 的直觉（JS 的 async 函数调用后会立即执行到第一个 await）；B 误以为它在后台执行；D 错在调用 async 函数本身语法合法，只是不会执行。
+  - id: d06-q2
+    kp: d06-k3
+    type: judge
+    question: 在 FastAPI 的 async def 路由里调用 time.sleep(3)，只会让当前这个请求慢 3 秒，其他请求不受影响。
+    answer: false
+    explain: |
+      async def 路由运行在事件循环线程上。time.sleep 是同步阻塞调用，会让这个线程整体停住 3 秒，事件循环无法调度任何其他任务，所以同一个 worker 进程里的**所有请求**（包括健康检查）都会被卡住。
+      正确做法是换成 `await asyncio.sleep(3)`，或者对无法替换的同步调用用 `await asyncio.to_thread(...)`，或者把路由声明为普通 def 让 FastAPI 放进线程池。
+  - id: d06-q3
+    kp: d06-k4
+    type: multi
+    question: 关于 asyncio.gather 与 asyncio.TaskGroup，下列说法正确的有：
+    options:
+      - gather 默认情况下，一个任务抛异常后会立即把异常传给调用方，但其他任务不会被取消
+      - TaskGroup 中一个子任务抛出普通异常后，会取消组内其他任务，并以 ExceptionGroup 形式抛出
+      - gather 设置 return_exceptions=True 后，异常会作为结果放进列表，需要调用方自行检查
+      - TaskGroup 比 gather 快，因为它会把任务分配到多个线程并行执行
+      - asyncio.timeout 超时后抛出的 TimeoutError 可以在 async with 块内部捕获
+    answer: [0, 1, 2]
+    explain: |
+      A、B、C 都是官方文档描述的行为：gather 默认传播第一个异常但不取消其余任务；TaskGroup 实现结构化并发，失败时取消其余任务并抛 ExceptionGroup；return_exceptions=True 会把异常放进结果列表。
+      D 错：两者都在同一个事件循环线程里并发，不涉及多线程，也谈不上谁更快。E 错：asyncio.timeout 是在上下文管理器退出时把 CancelledError 转成 TimeoutError，因此只能在 async with 外面捕获。
+  - id: d06-q4
+    kp: d06-k1
+    type: short
+    question: 用一个 AI 应用里的例子，说明「并发」和「并行」的区别，并解释为什么 asyncio 能提高吞吐量却不能加速 CPU 密集任务。
+    key_points:
+      - {text: "说明并发是一段时间内交替推进多个任务，并行是同一时刻多个任务在不同 CPU 核上同时执行", dim: concept}
+      - {text: "指出 asyncio 是单线程并发，靠在 IO 等待点切换任务来利用等待时间", dim: principle}
+      - {text: "指出 CPU 密集任务没有等待时间可以利用，放进 asyncio 反而阻塞事件循环，需要多进程", dim: principle}
+      - {text: "给出贴近 AI 后端的例子，如并发调用多个 LLM 或多路检索属于并发", dim: project}
+    reference: |
+      并发是「同时处理很多事」：一段时间内多个任务交替推进，比如一个事件循环线程同时挂着 100 个 LLM 请求，谁的响应回来了就处理谁。并行是「同时执行很多事」：同一时刻多个 CPU 核各自在算，比如 4 个进程同时解析 4 份 PDF。
+      asyncio 是单线程并发：每个任务在 await 一个需要等待的 I/O 时挂起，事件循环转去执行其他就绪任务。LLM 调用 8 秒里 CPU 几乎是空闲的，这段等待被拿来服务其他请求，所以同样资源能处理更多请求，吞吐量上升，但单个请求的耗时不变。
+      CPU 密集任务（本地跑 Embedding 模型、大文本切片）一直在占用 CPU，没有等待时间可以「借」，而且它在运行时不会让出控制权，反而会把事件循环卡住，导致其他请求一起变慢。这类任务应该放进进程池或独立的 worker 服务，利用多核并行。
+    followup:
+      question: 如果一个请求里既有 6 秒的 LLM 调用，又有 1 秒的本地文本处理，你会怎么安排？
+      key_points:
+        - LLM 调用用异步客户端 await
+        - 本地处理用 to_thread 或进程池执行，避免阻塞事件循环
+        - 评估是否能把文本处理挪到离线入库阶段
+      reference: LLM 调用使用 httpx.AsyncClient 之类的异步客户端直接 await；1 秒的文本处理如果是纯 Python 计算，放到进程池（run_in_executor）中执行，避免卡住事件循环。更好的做法是看能否把这部分处理挪到文档入库的离线阶段，在线请求只做检索和生成。
+  - id: d06-q5
+    kp: d06-k3
+    type: scenario
+    question: |
+      团队把一个 Flask 同步服务迁移到 FastAPI，所有路由都改成了 async def，但代码里调用 LLM 用的仍是 requests，查库用的是 psycopg2。
+      上线后发现：单用户测试很快，但 30 个并发时所有接口（包括 /healthz）的延迟都飙到十几秒，CPU 占用却只有 15%。请分析原因，并给出排查步骤和修复方案。
+    key_points:
+      - {text: "指出 async def 路由运行在事件循环线程上，requests 与 psycopg2 是同步阻塞调用，会卡住整个事件循环", dim: principle}
+      - {text: "解释为什么所有接口一起变慢且 CPU 不高：线程在等 IO 但事件循环无法调度其他任务", dim: principle}
+      - {text: "给出排查手段：开启 asyncio debug 模式观察慢回调警告，或用 py-spy 等工具查看线程卡在哪个调用", dim: engineering}
+      - {text: "给出修复方案：换成 httpx.AsyncClient 与异步数据库驱动，或者把路由改回 def 交给线程池，或用 asyncio.to_thread 包装", dim: engineering}
+      - {text: "提到修复后要通过并发压测验证，并关注线程池默认上限等新瓶颈", dim: engineering}
+    reference: |
+      **原因：** FastAPI 中 async def 路由直接运行在事件循环线程上。requests.get 和 psycopg2 的查询都是同步阻塞调用，它们在等待网络时会让整个线程挂起，事件循环也就停住了。此时其他请求（包括 /healthz）全部在排队，所以表现是「所有接口一起慢」。CPU 只有 15% 是因为线程大部分时间都在等 I/O，而不是在计算——这正是事件循环被阻塞的典型特征。迁移前 Flask 是多线程/多进程模型，阻塞只影响一个线程，所以问题没暴露。
+
+      **排查：**
+      1. 设置 `PYTHONASYNCIODEBUG=1`，日志会出现「Executing Task ... took X seconds」，直接指向慢的协程；
+      2. 用 py-spy dump 查看 worker 进程的线程栈，确认主线程卡在 requests / psycopg2 的 socket 读写；
+      3. 对比实验：临时把一个路由改成 def，看并发表现是否明显改善。
+
+      **修复（按推荐顺序）：**
+      - LLM 调用改为共享的 `httpx.AsyncClient` 并 await；数据库改为 asyncpg / psycopg 3 异步 + SQLAlchemy AsyncSession；
+      - 短期内无法替换的模块，把对应路由改回 `def`，让 FastAPI 放进线程池；或在 async 路由里用 `await asyncio.to_thread(...)` 包装阻塞调用；
+      - 修复后重新压测，注意 def 路由共享默认 40 个线程令牌，并发更高时需要评估调整或彻底异步化。
+    followup:
+      question: 为什么在这种情况下，给 LLM 调用加的 asyncio.timeout(10) 没有生效，请求还是等了 15 秒？
+      key_points:
+        - asyncio.timeout 依赖事件循环在定时器到期时取消任务
+        - 同步阻塞期间事件循环停摆，定时器无法触发
+        - 只有阻塞调用返回后超时才会被处理
+      reference: asyncio.timeout 的原理是在事件循环里登记一个定时器，到期时取消当前任务。但 requests 的同步调用把事件循环线程整体阻塞住了，循环根本没机会检查定时器，所以超时只能在阻塞调用返回后才被处理。这也说明超时机制只对「会让出控制权的异步代码」有效。
+  - id: d06-q6
+    kp: d06-k4
+    type: design
+    question: |
+      设计一个函数 `answer_with_fallback(prompt)`：同时调用主模型和备用模型，整体最多等 8 秒；
+      主模型成功就用主模型结果，主模型失败或超时但备用模型成功就用备用结果，两者都失败返回友好错误。
+      请说明你会使用哪些 asyncio API、异常如何处理、如何避免超时后还有请求在后台计费。
+    key_points:
+      - {text: "使用 asyncio.timeout 设置整体 8 秒预算，并在 async with 外部捕获 TimeoutError", dim: concept}
+      - {text: "使用 TaskGroup 创建两个子任务，保证超时或退出时未完成的请求被取消", dim: principle}
+      - {text: "在子任务内部捕获普通异常并转换为 None 或错误对象，避免一个失败导致整组被取消", dim: engineering}
+      - {text: "不吞掉 CancelledError，保证取消能正常传播", dim: principle}
+      - {text: "记录降级标记与日志或指标，便于观察主模型失败率", dim: engineering}
+    reference: |
+      **API 选择：** 外层 `asyncio.timeout(8)` 控制总预算，内层 `asyncio.TaskGroup` 同时创建 `call_main` 和 `call_backup` 两个任务。
+
+      **异常处理：**
+      - 每个子任务内部用 `try/except Exception` 捕获业务异常（HTTP 错误、解析失败），记录日志后返回 None。这样主模型报错不会触发 TaskGroup「一错全停」，备用模型可以继续完成。
+      - 不捕获 `BaseException`，让 `CancelledError` 正常传播，否则超时取消会失效。
+      - 外层 `try: ... except TimeoutError:` 处理整体超时：此时 TaskGroup 已经取消了所有未完成的子任务，底层 httpx 请求会被中断，不会继续在后台跑。
+
+      **结果选择：** 退出 TaskGroup 后，主任务结果非 None 用主模型；否则备用结果非 None 用备用并标记 `degraded=True`；都为 None 返回「服务繁忙，请稍后重试」。超时场景下可以检查已完成任务的结果（`task.done()` 且未取消时取 `result()`），有备用结果就用备用。
+
+      **工程补充：** 给主/备分别打点（成功率、耗时、降级次数）；如果是 Python 3.15，也可以在拿到主模型结果后调用 `tg.cancel()` 提前结束，节省备用模型费用。
+    followup:
+      question: 如果业务改成「谁先返回就用谁」，你会怎么调整？
+      key_points:
+        - 拿到第一个成功结果后取消其他任务
+        - 可以用 asyncio.as_completed 或 Python 3.15 的 TaskGroup.cancel
+        - 注意失败的结果不能算作胜出
+      reference: 可以用 asyncio.as_completed 遍历，第一个成功（非 None）的结果出现后立即返回，并确保其他任务被取消；如果运行在 Python 3.15，可以在 TaskGroup 里由子任务拿到成功结果后调用 tg.cancel() 结束整个组。注意第一个完成的可能是失败结果，不能直接当作胜出。
+  - id: d06-q7
+    kp: d06-k2
+    type: short
+    question: 解释 `await asyncio.create_task(f())` 与 `await f()` 在单独使用时效果相近，但「先创建多个 Task 再等待」和「逐个 await 协程」在耗时上为什么完全不同。
+    key_points:
+      - {text: "指出 await 协程是立即执行并等待其完成，期间当前函数不会继续往下走", dim: concept}
+      - {text: "指出 create_task 创建后任务立即被事件循环调度，不需要等 await 才开始运行", dim: principle}
+      - {text: "说明先创建多个 Task 再等待时，它们的 IO 等待时间重叠，总耗时约等于最慢的一个", dim: principle}
+      - {text: "提到应保存 Task 引用或使用 TaskGroup，避免任务被垃圾回收或成为孤儿任务", dim: engineering}
+    reference: |
+      `await f()` 的意思是「现在就驱动 f 执行，并在这里等它完成」，所以 `await a(); await b(); await c()` 是严格串行的，总耗时是三者之和。
+      `asyncio.create_task(f())` 会把协程包装成 Task 并立即交给事件循环调度，即使还没 await，它也会在当前协程下次让出控制权时开始运行。所以 `t1 = create_task(a()); t2 = create_task(b()); t3 = create_task(c())` 之后再依次 await，三个任务的 I/O 等待是重叠的，总耗时约等于最慢的那个。
+      单独一个 `await create_task(f())` 和 `await f()` 效果相近，只是多了一层 Task 包装。
+      工程上要注意：create_task 返回的 Task 必须保存引用（事件循环只保留弱引用），推荐直接用 TaskGroup，它会持有引用并在退出时等待所有任务，异常和取消也能统一处理。
+interview:
+  - id: d06-i1
+    kp: d06-k1
+    type: oral
+    difficulty: 1
+    question: 同步、异步、并发、并行分别是什么意思？为什么 AI 应用后端普遍用异步框架？
+    key_points:
+      - {text: "准确区分同步与异步：是否原地等待操作完成", dim: concept}
+      - {text: "准确区分并发与并行：交替推进与同一时刻同时执行", dim: concept}
+      - {text: "指出 AI 后端是典型 IO 密集，大量时间在等 LLM、数据库、向量库", dim: principle}
+      - {text: "说明异步提升的是吞吐量而不是单请求速度，CPU 密集任务需要其他方案", dim: engineering}
+      - {text: "结合项目说明异步化带来的并发能力变化", dim: project}
+    reference: |
+      同步是调用后原地等待结果返回再继续；异步是发起操作后不阻塞，先做别的，结果就绪后再回来处理。并发是一段时间内交替推进多个任务；并行是同一时刻多个任务在不同 CPU 核上同时执行。异步是实现并发的手段之一，Python 的 asyncio 是单线程并发，不是并行。
+      AI 后端的典型请求包括鉴权、检索、调用 LLM、写库，其中 LLM 调用动辄几秒到几十秒，期间 CPU 几乎空闲。同步模型下每个在途请求都要占一个线程，几百并发就需要几百个线程，内存和上下文切换成本都很高；异步模型下一个事件循环线程在等待期间可以服务其他请求，单进程即可挂住大量慢连接。
+      需要强调两点：第一，异步不让单个请求变快，它提升的是吞吐量；第二，异步只对 I/O 密集有效，CPU 密集任务（本地模型推理、大文档解析）会阻塞事件循环，要放进进程池或独立服务。
+    oral: |
+      我先说结论：同步异步说的是「要不要原地等」，并发并行说的是「多个任务怎么推进」。同步就是调用完一直等结果，异步是发出去先干别的；并发是一段时间里交替推进多个任务，并行是多个核真正同时在算。
+      AI 后端用异步，是因为它是非常典型的 I/O 密集场景。比如我做的知识库问答，一次请求里 LLM 调用要 6 秒左右，这 6 秒 CPU 基本是空闲的。用异步之后，同样 4 个进程，并发能力从二十左右提升到两百左右。
+      但我也会注意两个边界：异步不会让单个请求变快，以及 CPU 密集的活，比如 PDF 解析，我会放到进程池里，不放在事件循环上。
+  - id: d06-i2
+    kp: d06-k2
+    type: oral
+    difficulty: 2
+    question: 讲讲 Python 的 async/await 是怎么工作的？调用一个 async 函数不 await 会怎样？
+    key_points:
+      - {text: "说明调用 async 函数只返回协程对象，函数体不会执行", dim: concept}
+      - {text: "说明 await 会驱动协程执行，在需要等待时挂起并把控制权交还事件循环，就绪后从原处恢复", dim: principle}
+      - {text: "指出协程与生成器同源，都是可暂停恢复的函数，await 不创建线程", dim: principle}
+      - {text: "说明漏写 await 的现象与排查：拿到协程对象、出现 never awaited 警告、逻辑未执行", dim: engineering}
+      - {text: "提到 create_task 与 await 的区别以及并发需要先创建任务", dim: engineering}
+    reference: |
+      async def 定义的是协程函数，调用它只会得到一个协程对象，函数体一行都不会执行，这点和 JS 的 async 函数不同。协程对象需要被 await，或者用 create_task / TaskGroup 包装成 Task 交给事件循环，才会真正运行。
+      await 的过程是：驱动被等待的对象往下执行，如果它需要等 I/O，就把当前协程挂起，控制权交回事件循环；事件循环去执行其他就绪任务，并通过操作系统的多路复用机制监听 I/O；数据就绪后把这个协程放回就绪队列，下次轮到它时从 await 那一行恢复并拿到结果。整个过程在一个线程里完成，await 本身不创建线程。协程的暂停恢复机制和生成器的 yield 是同源的。
+      如果漏写 await，拿到的是协程对象而不是结果，通常表现为后续属性访问报错，或者像保存消息这类「无返回值」的操作静默没有执行，并在日志中出现 RuntimeWarning: coroutine was never awaited。我会在测试中把这个警告升级为错误来提前发现。
+      另外，逐个 await 是串行的，想并发要先创建多个 Task 再统一等待，推荐用 TaskGroup。
+    oral: |
+      我的理解是：async def 定义的是协程函数，调用它只是拿到一个「待执行的任务单」，函数体不会跑，必须 await 或者包成 Task 才执行。
+      await 做的事情是：驱动这个协程往下跑，遇到要等网络的地方就把自己挂起，把线程让给事件循环去跑别的任务，等数据回来了再从这一行接着往下走。所以它不是开线程，只是一个主动让出点，原理和生成器的 yield 很像。
+      漏写 await 我踩过：保存会话的函数改成了 async，调用处没加 await，消息根本没入库，日志里只有一条 never awaited 警告。后来我们在测试里把这个警告设成报错，CI 就能直接拦住。
+  - id: d06-i3
+    kp: d06-k3
+    type: oral
+    difficulty: 3
+    question: 如果在 FastAPI 的 async 路由里调用了阻塞代码，会发生什么？你怎么发现和修复？
+    key_points:
+      - {text: "说明 async 路由运行在事件循环线程，阻塞调用会让整个 worker 进程的所有请求停滞", dim: principle}
+      - {text: "说明 def 路由会被放进线程池执行，以及线程池有默认上限", dim: principle}
+      - {text: "给出识别特征：所有接口同时变慢、CPU 不高、健康检查超时", dim: engineering}
+      - {text: "给出排查工具：asyncio debug 模式慢回调警告、py-spy 查看栈、Python 3.14 的 asyncio ps 或 pstree", dim: engineering}
+      - {text: "给出分层修复方案：换异步库、to_thread、进程池、改为 def 路由", dim: engineering}
+      - {text: "结合项目描述一次真实或模拟的定位过程与效果", dim: project}
+    reference: |
+      FastAPI 对 async def 路由会直接在事件循环线程上执行。事件循环是协作式调度，只有任务 await 一个需要等待的对象时才会切换。如果路由里调用了 requests、同步数据库驱动、time.sleep 或 CPU 密集计算，这个线程就被占住，整个 worker 进程里所有请求都无法推进，定时器（包括超时）也不会触发。
+      对比之下，普通 def 路由会被 FastAPI 通过 AnyIO 放进线程池执行，阻塞只占用一个线程，但默认线程令牌只有 40 个，并发更高时也会排队。
+      识别特征是：所有接口同时变慢而不是单个接口慢；CPU 不高但延迟高；健康检查超时导致容器被重启。排查时开启 PYTHONASYNCIODEBUG=1 看「Executing Task took X seconds」的慢回调警告；用 py-spy dump 看主线程卡在哪个调用；Python 3.14 起可以用 python -m asyncio pstree PID 看任务树。
+      修复按优先级：一是换成异步库（httpx.AsyncClient、asyncpg、asyncio.sleep）；二是无法替换的同步 SDK 用 asyncio.to_thread 包装；三是 CPU 密集任务放进进程池或独立 worker；四是短期止血把路由改成 def。修复后用压测验证，并给关键路径加上耗时指标。
+    oral: |
+      结论是：async 路由里有阻塞代码，坏的不是这一个请求，而是整个进程。因为 async 路由跑在事件循环线程上，它是协作式调度，你不让出，所有请求都得等，连超时都不会触发。
+      判断方法我一般看现象：所有接口一起变慢、CPU 不高、健康检查超时，基本就是事件循环被阻塞了。然后开 asyncio 的 debug 模式看慢回调警告，或者用 py-spy 看主线程卡在哪。
+      我之前遇到过一次：RAG 服务里向量检索用的是同步 psycopg2，五十并发时 healthz 要十秒。修法是检索改成 AsyncSession 加 asyncpg，PDF 解析挪到进程池，改完 P99 从三十秒降到七秒。如果短期换不了库，我会先把路由改成 def 交给线程池止血。
+  - id: d06-i4
+    kp: d06-k4
+    type: oral
+    difficulty: 3
+    question: asyncio.gather 和 TaskGroup 有什么区别？在并发调用多个 LLM 时如何处理超时和部分失败？
+    key_points:
+      - {text: "说明 gather 默认传播首个异常但不取消其他任务，return_exceptions 会把异常放入结果", dim: concept}
+      - {text: "说明 TaskGroup 是结构化并发：失败时取消其余任务并抛出 ExceptionGroup，退出时保证无孤儿任务", dim: principle}
+      - {text: "说明 asyncio.timeout 的取消机制及 TimeoutError 只能在块外捕获", dim: principle}
+      - {text: "给出部分失败策略：子任务内部捕获异常转成返回值，外层决定降级", dim: engineering}
+      - {text: "提到不吞 CancelledError、超时后避免后台继续计费、用 Semaphore 控制并发", dim: engineering}
+    reference: |
+      gather 把多个可等待对象并发执行并按顺序返回结果。默认 return_exceptions=False 时，第一个异常会立即传给调用方，但其他任务不会被取消，会继续在后台运行；设置 return_exceptions=True 时异常会作为结果放进列表，调用方必须逐个检查。
+      TaskGroup（3.11+）实现结构化并发：任务生命周期绑定在 async with 块上；任何子任务抛出非取消异常，组会取消其余任务、等待它们退出，再把异常打包成 ExceptionGroup 抛出，可以用 except* 分类处理。块退出时保证所有子任务都已结束，不会留下孤儿任务。
+      超时用 asyncio.timeout(N) 包住 TaskGroup：到期时取消当前任务，TaskGroup 随之取消所有子任务，然后在块边界转换为 TimeoutError，所以要在 async with 外面捕获。
+      部分失败的处理方式是在每个子任务内部 try/except Exception，记录日志后返回 None 或错误对象，这样一个模型失败不会连带取消其他模型；外层根据结果决定用主模型、备用模型还是返回降级提示。注意不能捕获 BaseException 吞掉 CancelledError，否则超时和取消失效。另外批量调用要用 Semaphore 限制并发，避免触发供应商 429。
+    oral: |
+      我会先讲区别：gather 是「一起等」，但默认一个出错其他的还继续跑，用了 return_exceptions 异常又容易被忽略；TaskGroup 是结构化并发，一个失败会把其他的取消掉，退出 async with 的时候保证没有孤儿任务，异常用 ExceptionGroup 统一抛出。
+      在多模型调用里，我的写法是外层 asyncio.timeout 控制总预算，里面用 TaskGroup 发请求。为了支持部分失败，每个子任务自己捕获业务异常返回 None，外层再决定用主模型还是备用模型。超时的时候 TaskGroup 会把还没回来的请求取消掉，不会在后台继续计费。
+      我们之前用 gather 的时候，主模型报错直接返回给用户，后台请求还在重试，Token 账单多了 15%，换成这套写法后就解决了。
+  - id: d06-i5
+    kp: d06-k4
+    type: design
+    difficulty: 4
+    question: 设计一个「批量文档 Embedding」异步任务：1 万个文本块，供应商限制每分钟 3000 次请求、单次最多 100 条输入。要求总体可控、单批失败可重试、服务重启后不重复计费。说说你的并发模型与关键代码结构。
+    key_points:
+      - {text: "按单次上限分批，计算所需请求数，并用 Semaphore 或令牌桶同时控制并发数与速率", dim: engineering}
+      - {text: "用 TaskGroup 管理批次任务生命周期，单批内部捕获异常并做带退避的有限重试", dim: principle}
+      - {text: "对 429 读取 Retry-After 或指数退避加抖动，且退避使用 asyncio.sleep 而不是 time.sleep", dim: principle}
+      - {text: "设置整体与单批超时，保证取消能传播，不吞 CancelledError", dim: principle}
+      - {text: "持久化每批处理状态，以内容哈希做幂等，重启后跳过已完成批次避免重复计费", dim: engineering}
+      - {text: "给出可观测性：进度、失败批次、耗时与费用指标", dim: project}
+    reference: |
+      **分批与限速：** 1 万个块按每批 100 条分成 100 批。每分钟 3000 次请求的限制对 100 次请求很宽松，但 Embedding 供应商通常还有 Token 维度限额，所以我会同时用 `asyncio.Semaphore(8)` 控制同时在飞的请求数，再加一个简单的令牌桶控制每秒请求数。
+
+      **生命周期：** 外层 `asyncio.timeout(总预算)` + `asyncio.TaskGroup`，为每个批次创建任务。每个批次函数内部：`async with sem:` → 调用 API → 成功写结果；失败时根据错误类型决定是否重试：429/503/网络超时可重试，400（输入过长）不重试并记录。重试最多 3 次，退避用 `await asyncio.sleep(delay)`，429 优先使用 Retry-After，否则指数退避加随机抖动。批次内部捕获 `Exception` 并把失败记到失败列表，保证单批失败不取消整个组；`CancelledError` 不捕获，以便总超时生效。
+
+      **幂等与断点续跑：** 每个文本块用内容哈希（如 sha256(模型名 + 文本)）作为键；批次处理前查表，已存在向量的块直接跳过；成功后在同一事务里写入向量与状态。服务重启后重新扫描只会处理未完成的块，不会重复计费。
+
+      **可观测性：** 记录已完成/失败批次数、平均耗时、429 次数、Token 消耗；失败批次落表，提供手动重放入口。
+
+      **为什么不放在 Web 请求里：** 1 万块的任务耗时分钟级，应作为后台任务或任务队列执行（Day 42 详细展开），Web 接口只负责提交任务和查询进度。
+    oral: |
+      我会分三层来设计。第一层是并发和限速：一万个块按每批一百条切成一百批，用 Semaphore 控制同时在飞的请求数，再加令牌桶控制速率，因为 Embedding 接口除了请求次数还有 Token 限额。
+      第二层是生命周期：外面一个 asyncio.timeout 控总时间，里面 TaskGroup 管所有批次。每个批次自己处理异常，429 和超时做最多三次退避重试，退避一定用 asyncio.sleep；400 这种不可重试的直接记失败。这样单批失败不会拖垮整个任务，超时时也能干净取消。
+      第三层是幂等：每个块用模型名加文本的哈希做键，写之前先查，已经有向量的跳过，所以重启后不会重复计费。
+      最后我会把它做成后台任务，接口只负责提交和查进度，并且记录进度、失败批次、429 次数和费用指标。
+code_reading:
+  id: d06-c1
+  kp: [d06-k3, d06-k4]
+  title: 多模型并发问答聚合器
+  scenario: |
+    这是一个 AI 客服后端的模型聚合模块。FastAPI 路由 `/ask` 收到用户问题后，调用 `ask_all()` 同时请求主模型和备用模型（两个内部 LLM 网关），整体最多等 8 秒，把拿到的结果返回给上层做选择。
+    最近线上反馈：高峰期偶尔整个服务卡顿几秒，而且有时返回结果为空却没有任何错误日志。
+  language: python
+  code: |
+    import asyncio
+    import logging
+    import os
+    import time
+
+    import httpx
+    from fastapi import FastAPI
+
+    logger = logging.getLogger(__name__)
+    app = FastAPI()
+
+    PROVIDERS = {
+        "primary": os.environ.get("LLM_PRIMARY_URL", "http://llm-a.internal/v1/chat"),
+        "backup": os.environ.get("LLM_BACKUP_URL", "http://llm-b.internal/v1/chat"),
+    }
+
+
+    async def call_provider(client: httpx.AsyncClient, name: str, prompt: str) -> str:
+        for attempt in range(3):
+            try:
+                resp = await client.post(PROVIDERS[name], json={"prompt": prompt})
+                resp.raise_for_status()
+                return resp.json()["text"]
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 429:
+                    time.sleep(2 ** attempt)  # 被限流时退避再试
+                    continue
+                raise
+        raise RuntimeError(f"{name}: retries exhausted")
+
+
+    async def ask_all(prompt: str, timeout_s: float = 8.0) -> dict[str, str]:
+        results: dict[str, str] = {}
+
+        async def run(name: str) -> None:
+            try:
+                results[name] = await call_provider(client, name, prompt)
+            except Exception:
+                pass
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            try:
+                async with asyncio.timeout(timeout_s):
+                    async with asyncio.TaskGroup() as tg:
+                        for name in PROVIDERS:
+                            tg.create_task(run(name))
+            except TimeoutError:
+                logger.warning("ask_all timeout, got=%s", list(results))
+        return results
+
+
+    @app.post("/ask")
+    async def ask(payload: dict) -> dict:
+        results = await ask_all(payload["question"])
+        answer = results.get("primary") or results.get("backup") or ""
+        return {"answer": answer, "sources": list(results)}
+  walkthrough:
+    function: |
+      实现「同时问两个模型、整体限时 8 秒、能拿到几个算几个」的聚合逻辑。`/ask` 路由把用户问题交给 `ask_all`，`ask_all` 并发调用主、备两个 LLM 网关，最后路由优先使用主模型结果，其次备用结果，都没有则返回空字符串。
+    key_functions: |
+      - `call_provider`：调用单个模型网关，遇到 429 时退避重试最多 3 次，其他 HTTP 错误直接抛出。
+      - `ask_all`：创建共享的 `httpx.AsyncClient`，用 `asyncio.timeout` 设置整体超时，用 `TaskGroup` 为每个供应商创建一个 `run` 子任务，结果写入共享字典 `results`。
+      - `run`（内部函数）：包装 `call_provider`，把成功结果写入字典；任何普通异常都被捕获（但没有记录）。
+      - `ask`：FastAPI 路由，选择最终答案并返回。
+    params: |
+      - 用户问题从请求体 `payload["question"]` 进入 `ask_all(prompt)`，再通过闭包传给 `run`，最终作为 JSON `{"prompt": ...}` 发送给网关。
+      - `client` 不是参数传入 `run`，而是通过闭包引用外层 `async with` 里创建的变量；`name` 来自 `PROVIDERS` 的键。
+      - `timeout_s` 默认 8 秒，是整体预算；`httpx.AsyncClient(timeout=10.0)` 是单次 HTTP 请求的超时，比整体预算还长。
+    data_flow: |
+      ```mermaid
+      flowchart TD
+        A["POST /ask 请求体 question"] --> B["ask_all 创建 AsyncClient"]
+        B --> C["asyncio.timeout 8 秒"]
+        C --> D["TaskGroup"]
+        D --> E["run primary"]
+        D --> F["run backup"]
+        E --> G["call_provider 发送 POST"]
+        F --> H["call_provider 发送 POST"]
+        G -- "429" --> I["time.sleep 退避 阻塞事件循环"]
+        I --> G
+        G -- "成功" --> J["写入 results 字典"]
+        H -- "成功" --> J
+        G -- "其他异常" --> K["except Exception pass 静默丢弃"]
+        J --> L["路由选择 primary 或 backup 或空字符串"]
+        K --> L
+      ```
+    failure_points: |
+      - **问题 1：429 退避使用了 `time.sleep`**。这是同步阻塞调用，会把整个事件循环卡住 1、2、4 秒。高峰期供应商频繁 429 时，这个 worker 进程上的所有请求都会一起卡顿——这正是「偶尔整个服务卡几秒」的原因。而且阻塞期间 `asyncio.timeout` 的定时器无法触发，整体超时也会被拖长。
+      - **问题 2：`run` 里 `except Exception: pass` 吞掉了所有异常**。主模型 500、JSON 里没有 `text` 字段（KeyError）、重试耗尽的 RuntimeError 都悄无声息地消失，只表现为 `results` 少了一项；两个都失败时用户拿到空答案，日志里什么都没有——对应「返回空却没有错误日志」。
+      - 单次请求超时 10 秒大于整体 8 秒预算，单次超时永远不会先触发，配置意图不清晰。
+      - `payload: dict` 没有校验，缺少 `question` 时抛 KeyError 返回 500 而不是 422（Day 09 用 Pydantic 解决）。
+      - 每次请求都新建 `AsyncClient`，无法复用连接池，高并发下 TCP/TLS 握手开销大（Day 09 用 lifespan 共享客户端）。
+    debugging: |
+      - 复现卡顿：用 mock 网关让 primary 固定返回 429，同时并发请求一个简单的 `/healthz`，观察健康检查是否被拖慢。
+      - 开启 `PYTHONASYNCIODEBUG=1`，日志会出现 `Executing <Task ...> took 1.0xx seconds`，并指向 `call_provider`。
+      - 对空答案问题：先在 `except` 中加 `logger.exception("provider %s failed", name)`，再回放线上请求，就能看到真实异常类型（HTTPStatusError / KeyError / RuntimeError）。
+      - 在 `call_provider` 前后打耗时日志，并记录每个供应商的状态码分布，确认失败集中在哪个网关。
+    change_request: |
+      **需求：改成「主模型优先，主模型失败或超时再用备用」，并在响应中标注是否降级。**
+      - `call_provider`：把 `time.sleep(2 ** attempt)` 改为 `await asyncio.sleep(...)`，优先读取响应头 Retry-After，并加入随机抖动；单次 HTTP 超时调到小于整体预算（例如 6 秒）。
+      - `run`：`except Exception` 中记录 `logger.exception`，并把错误类型写入另一个字典 `errors`，便于返回和统计。
+      - `ask` 路由：根据 `results` 与 `errors` 决定答案，返回 `{"answer": ..., "degraded": 主模型没有结果}`；两者都失败时返回 503 和友好提示，而不是 200 + 空字符串。
+      - 客户端改为在 lifespan 中创建、全局复用。
+  questions:
+    - id: d06-c1-q1
+      kp: d06-k3
+      type: code
+      question: 假设主模型网关连续返回 429，按执行顺序说明 `call_provider` 的行为，并解释为什么这会让同一进程里其他用户的请求也变慢，以及 8 秒的整体超时为什么可能被拖长。
+      key_points:
+        - {text: "按顺序说出三次尝试分别 sleep 1、2、4 秒后抛出 RuntimeError", dim: concept}
+        - {text: "指出 time.sleep 是同步阻塞调用，会让事件循环线程整体停住", dim: principle}
+        - {text: "说明阻塞期间其他任务与其他请求都无法被调度", dim: principle}
+        - {text: "说明 asyncio.timeout 依赖事件循环触发，阻塞期间定时器无法生效", dim: principle}
+        - {text: "给出修复：改为 await asyncio.sleep 并尊重 Retry-After", dim: engineering}
+      reference: |
+        执行顺序：attempt=0 时发请求，得到 429，`raise_for_status` 抛出 HTTPStatusError，被 except 捕获，状态码为 429，于是 `time.sleep(1)` 后 continue；attempt=1 同样 429，`time.sleep(2)`；attempt=2 再次 429，`time.sleep(4)`；循环结束后抛出 `RuntimeError("primary: retries exhausted")`，被 `run` 里的 `except Exception: pass` 吞掉。
+        `time.sleep` 是同步阻塞调用，它会让当前线程——也就是事件循环所在的线程——整体睡眠。这 7 秒里事件循环无法运行任何其他任务：备用模型的响应即使已经回来也没法处理，其他用户请求的路由协程也无法推进，所以整个进程表现为卡顿。
+        `asyncio.timeout(8)` 是在事件循环里登记定时器，到期时取消任务。阻塞期间循环停摆，定时器不会按时触发，只能等某次 sleep 结束、控制权回到事件循环后才处理，因此实际等待可能超过 8 秒。
+        修复：把退避改为 `await asyncio.sleep(delay)`，让出控制权；优先使用响应头 Retry-After，否则用指数退避加抖动，并确保重试的总时长落在整体预算之内。
+    - id: d06-c1-q2
+      kp: d06-k4
+      type: code
+      question: |
+        主模型网关返回的 JSON 某天改成了 `{"output": "..."}`（没有 text 字段），备用模型正常。说明此时数据如何流动、用户会看到什么、为什么日志里找不到原因；再说明如果把 `run` 里的 try/except 整个删掉，TaskGroup 的行为会如何变化。
+      key_points:
+        - {text: "指出 resp.json()[text] 抛 KeyError，不属于 HTTPStatusError，会直接向上抛出到 run", dim: concept}
+        - {text: "指出 run 的 except Exception pass 静默吞掉异常，results 中只有 backup", dim: concept}
+        - {text: "说明用户拿到备用模型答案，但主模型持续失败无日志无告警，问题被掩盖", dim: engineering}
+        - {text: "说明删除 try/except 后 KeyError 会让 TaskGroup 取消 backup 任务并抛出 ExceptionGroup，路由返回 500", dim: principle}
+        - {text: "提出正确做法：保留捕获但记录 logger.exception 并上报指标", dim: engineering}
+      reference: |
+        数据流：primary 的 `call_provider` 请求成功（200），`raise_for_status` 不抛异常，但 `resp.json()["text"]` 抛出 KeyError。KeyError 不是 HTTPStatusError，不会进入重试分支，直接向上传到 `run`，被 `except Exception: pass` 吞掉，`results` 里没有 primary。backup 正常写入 `results["backup"]`。
+        用户看到的是备用模型的答案，接口返回 200，看起来一切正常。但主模型其实 100% 失败，而代码没有任何日志或指标，监控上看不出异常，团队可能很久都不知道一直在用效果更差的备用模型；如果哪天备用也出问题，用户只会拿到空字符串。
+        如果删掉 `run` 里的 try/except：KeyError 会从 primary 子任务抛出，TaskGroup 立即取消仍在进行的 backup 任务，等它退出后抛出包含 KeyError 的 ExceptionGroup。这个异常不是 TimeoutError，不会被 `except TimeoutError` 捕获，会一路传到路由，FastAPI 返回 500。也就是从「静默降级」变成「一个失败全部失败」。
+        正确做法是保留捕获以支持部分失败，但在 except 中 `logger.exception("provider %s failed", name)`，并把失败计入指标和告警，必要时把降级信息返回给调用方。
+    - id: d06-c1-q3
+      kp: d06-k4
+      type: code
+      question: 如果整体 8 秒超时触发时，primary 已经返回、backup 还在等待网络响应，请按时间顺序描述 asyncio.timeout、TaskGroup、backup 子任务和 httpx 请求各自发生了什么，最终 `ask_all` 返回什么。
+      key_points:
+        - {text: "说明超时到期后外层 ask_all 所在任务被取消，CancelledError 传播到 TaskGroup", dim: principle}
+        - {text: "说明 TaskGroup 会取消尚未完成的 backup 子任务，httpx 的 await 处抛出 CancelledError 中断请求", dim: principle}
+        - {text: "指出 run 的 except Exception 不会捕获 CancelledError，因为它继承自 BaseException", dim: concept}
+        - {text: "说明 timeout 在块边界将取消转换为 TimeoutError，被捕获后记录 warning，返回只含 primary 的结果", dim: concept}
+      reference: |
+        时间线如下：第 8 秒定时器到期，`asyncio.timeout` 取消当前任务（即执行 `ask_all` 的任务）。此时该任务正挂起在 TaskGroup 的退出等待处，于是 CancelledError 在那里抛出，TaskGroup 收到取消后会取消组内仍未完成的子任务——也就是 backup 的 `run`。
+        backup 子任务正挂起在 `await client.post(...)`，取消导致这里抛出 CancelledError，httpx 中断这次请求。CancelledError 继承自 BaseException，不会被 `call_provider` 的 `except httpx.HTTPStatusError` 捕获，也不会被 `run` 的 `except Exception` 捕获，所以能正常向上传播，子任务结束。
+        TaskGroup 等所有子任务退出后把取消继续向上传播；到达 `asyncio.timeout` 的块边界时，它识别出这是自己触发的取消，把 CancelledError 转换为 TimeoutError。外层的 `except TimeoutError` 捕获后记录 `ask_all timeout, got=['primary']`。
+        最终 `ask_all` 返回 `{"primary": "..."}`，路由使用主模型答案。注意：如果当时 primary 正在 `time.sleep` 中，这一切都要等 sleep 结束才会发生。
+sources:
+  - {title: "Python Docs - Coroutines and Tasks", url: "https://docs.python.org/3/library/asyncio-task.html"}
+  - {title: "What's New in Python 3.15", url: "https://docs.python.org/3/whatsnew/3.15.html"}
+  - {title: "What's New in Python 3.14", url: "https://docs.python.org/3/whatsnew/3.14.html"}
+  - {title: "FastAPI - Concurrency and async / await", url: "https://fastapi.tiangolo.com/async/"}
+  - {title: "Starlette - Thread Pool", url: "https://starlette.dev/threadpool/"}

@@ -1,0 +1,787 @@
+day: 24
+phase: 3
+title: 向量数据库：pgvector、ANN 索引与过滤
+goals:
+  - 能用 pgvector 设计 chunk 表，选对向量类型、距离运算符，并写出能走向量索引的 Top-K 查询
+  - 能讲清 HNSW 和 IVFFlat 的原理差异、关键参数（m、ef_construction、ef_search、lists、probes）和召回与速度的取舍
+  - 能解释「元数据过滤 + 近似检索」为什么会少返回结果，并说出 pgvector、Qdrant、Milvus 各自的应对方式
+  - 能根据数据规模、团队运维能力和功能需求，在 pgvector 与专用向量库之间做出有理由的选型
+minutes: 60
+resources:
+  - title: "pgvector README"
+    url: "https://github.com/pgvector/pgvector"
+    kind: repo
+    lang: en
+    minutes: 25
+    note: "重点读 Querying、Indexing（HNSW、IVFFlat 两节的参数说明）、Filtering 和 Iterative Index Scans 四部分，其余安装和语言绑定部分跳过"
+  - title: "Qdrant：Vector Search Filtering"
+    url: "https://qdrant.tech/documentation/search-design/vector-search-filtering/"
+    kind: doc
+    lang: en
+    minutes: 15
+    note: "看「过滤为什么难」的解释和 Qdrant 的查询规划思路（直接打分 vs 带过滤的 HNSW 遍历），和 pgvector 的「先扫索引再过滤」对比着读"
+  - title: "Hello-Agents 第八章 8.3.4 构建私有化 RAG 系统"
+    url: "https://github.com/datawhalechina/hello-agents/blob/main/docs/chapter8/%E7%AC%AC%E5%85%AB%E7%AB%A0%20%E8%AE%B0%E5%BF%86%E4%B8%8E%E6%A3%80%E7%B4%A2.md"
+    kind: repo
+    lang: zh
+    minutes: 10
+    note: "只看「（3）统一嵌入与向量存储」：它用 Qdrant 存向量和 payload，对照今天 pgvector 的表设计，想想两者存 metadata 的方式有什么不同"
+knowledge_points:
+  - id: d24-k1
+    name: pgvector 基础：类型、距离运算符与表设计
+    level: P0
+    summary: pgvector 让 PostgreSQL 能存向量并按距离排序；选对类型和运算符，按「ORDER BY 距离 LIMIT K」写查询才能走索引
+    analogy: |
+      就像在已有的 PostgreSQL 上加一个**新的列类型和比较方式**：以前你只能 `ORDER BY created_at` 按时间排序，现在可以 `ORDER BY embedding <=> 查询向量` 按「语义距离」排序，其他 WHERE、JOIN、事务都照旧用。
+      **不一样的地方**：普通 B-tree 索引的排序结果是精确的；向量索引是**近似**的，加了索引后同一查询的结果可能和不加索引时不同（少了几个真正最近的），这是用召回换速度。
+    why: |
+      大多数企业项目已经有 PostgreSQL，用 pgvector 可以把向量、原文、metadata、权限放在同一个库里，事务一致、运维不增加，是 RAG 项目最常见的起步选型（见 Day 08）。
+      p1 的存储层就基于 pgvector，面试也常问「向量存在哪、怎么查」。
+    problem: |
+      向量检索的本质是「在几十万个高维向量里找离查询向量最近的 K 个」。如果没有合适的存储和查询方式，要么自己在内存里暴力计算（Day 21 的最小 RAG），数据一多就慢；要么引入一个新数据库，增加运维和数据同步的复杂度。
+    principle: |
+      **一、向量类型**
+
+      | 类型 | 说明 | 可建索引的维度上限 |
+      |---|---|---|
+      | `vector` | 单精度浮点，最常用 | 2000 |
+      | `halfvec` | 半精度，存储减半 | 4000 |
+      | `bit` | 二进制向量，配合量化 | 64000 |
+      | `sparsevec` | 稀疏向量 | 1000 个非零元素 |
+
+      `vector` 列本身最多可存 16000 维，但 HNSW 和 IVFFlat 索引只支持到 2000 维；超过时可以用 `halfvec` 建索引，或选择维度更低的模型。
+
+      **二、距离运算符**
+
+      | 运算符 | 含义 | 索引操作符类 |
+      |---|---|---|
+      | `<->` | L2 欧氏距离 | `vector_l2_ops` |
+      | `<#>` | **负**内积 | `vector_ip_ops` |
+      | `<=>` | 余弦距离（1 − 余弦相似度） | `vector_cosine_ops` |
+      | `<+>` | L1 距离 | `vector_l1_ops` |
+
+      - 这些运算符返回的都是**距离**，越小越相似，所以 `ORDER BY ... ASC`。
+      - 余弦相似度 = `1 - (embedding <=> q)`；`<#>` 返回负内积，要乘以 -1 才是内积。
+      - 向量已归一化时，内积、余弦、L2 的排序结果一致，常用 `<#>` 或 `<=>`（见 Day 18）。
+      - **建索引的操作符类必须和查询用的运算符一致**，用 `vector_cosine_ops` 建的索引，查询用 `<->` 不会走索引。
+
+      **三、能走索引的查询写法**
+
+      ```mermaid
+      flowchart TD
+        Q["向量查询 SQL"] --> A{"ORDER BY 是距离运算符 升序吗"}
+        A -->|"否 如按相似度降序"| F["不走向量索引 全表扫描"]
+        A -->|"是"| B{"有 LIMIT 吗"}
+        B -->|"否"| F
+        B -->|"是"| C{"运算符与索引操作符类一致吗"}
+        C -->|"否"| F
+        C -->|"是"| I["走 HNSW 或 IVFFlat 近似检索"]
+      ```
+
+      - 正确：`ORDER BY embedding <=> $1 LIMIT 10`。
+      - 不走索引：`ORDER BY 1 - (embedding <=> $1) DESC`——语义等价，但优化器不认识这个表达式。
+      - 相似度要展示给前端时，在 SELECT 里算，排序仍按距离升序。
+
+      **四、chunk 表设计**
+
+      ```mermaid
+      erDiagram
+        DOCUMENTS ||--o{ CHUNKS : has
+        DOCUMENTS {
+          bigint id
+          text title
+          text version
+          text status
+          int dept_id
+        }
+        CHUNKS {
+          bigint id
+          bigint doc_id
+          text content
+          text embed_text
+          vector embedding
+          text embedding_model
+          int page
+          text heading_path
+          int dept_id
+        }
+      ```
+
+      - 向量和原文、metadata 放在同一行，检索结果直接带出处，不用再回查。
+      - `embedding_model` 字段记录向量来自哪个模型，防止新旧模型混用（见 Day 21 的契约）。
+      - 常用过滤字段（`dept_id`、`status`）可以冗余到 chunk 表上，减少 JOIN。
+    scenarios: |
+      - **企业知识库**：chunk 表存原文、向量、页码、部门，一条 SQL 完成「按部门过滤 + 向量 Top-K」。
+      - **相似工单推荐**：工单表加一个向量列，新工单进来查最相似的历史工单。
+      - **商品语义搜索**：商品表直接加向量列，和价格、库存条件组合查询。
+    code: |
+      ```sql
+      -- 需要先 CREATE EXTENSION vector;
+      CREATE TABLE chunks (
+          id              bigserial PRIMARY KEY,
+          doc_id          bigint NOT NULL REFERENCES documents(id),
+          content         text NOT NULL,
+          embed_text      text NOT NULL,
+          embedding       vector(1024) NOT NULL,   -- 维度必须与 Embedding 模型一致
+          embedding_model text NOT NULL,
+          page            int,
+          heading_path    text,
+          dept_id         int NOT NULL
+      );
+
+      CREATE INDEX ON chunks USING hnsw (embedding vector_cosine_ops);
+      CREATE INDEX ON chunks (dept_id);
+
+      -- Top-K：按余弦距离升序 + LIMIT，才能走 HNSW 索引；相似度只在 SELECT 里展示
+      SELECT id, content, page, 1 - (embedding <=> $1) AS similarity
+      FROM chunks
+      WHERE dept_id = ANY($2)
+      ORDER BY embedding <=> $1
+      LIMIT 10;
+      ```
+    pitfalls: |
+      - **按相似度降序排序**：`ORDER BY 1 - (embedding <=> q) DESC` 不走索引，数据量一大就变成全表扫描。
+      - **索引操作符类和查询运算符不一致**：建了 `vector_cosine_ops`，查询却用 `<->`。
+      - **向量维度和模型不匹配**：换了 Embedding 模型维度变了，插入直接报错；维度相同但模型不同更危险，不报错但结果错乱。
+      - **把 `<#>` 当成内积直接用**：它返回负内积，排序方向和阈值判断都要注意。
+      - **选 3072 维的模型直接用 vector 建索引**：超过 2000 维上限，需要 halfvec 或降维。
+    interview_asks:
+      - question: "你们的向量存在哪里？表结构是怎么设计的？"
+        answer: "存在 PostgreSQL 的 pgvector 里，和文档、权限同一套库。向量列和切片 id 在一张表上，旁边是租户、文档、版本这些过滤字段。这样过滤和检索能在一条查询里做。"
+      - question: "pgvector 的几种距离运算符有什么区别？什么时候结果是一样的？"
+        answer: "有欧氏距离、内积、余弦距离几种运算符。向量已经归一化时，余弦和内积的排序一致。表上的索引类型必须和查询用的运算符一致，否则用不上索引。"
+      - question: "为什么有的向量查询不走索引？"
+        answer: "运算符和索引不一致、结果集太小优化器选择全表扫、或者过滤条件让它先走别的计划。用 EXPLAIN 看。近似索引本身也不是每条查询都保证走。"
+    project_example: |
+      **p1 企业知识库问答**的存储层：`documents` 表存文档级 metadata，`chunks` 表存原文、带前缀的 `embed_text`、`vector(1024)` 向量、页码、标题路径和冗余的 `dept_id`、`status`。
+      检索 SQL 一条完成：`WHERE dept_id = ANY(用户部门) AND status = 'active' ORDER BY embedding <=> q LIMIT 20`。
+      上线前用 `EXPLAIN` 确认查询走了 HNSW 索引；服务启动时校验配置的 Embedding 模型和库里 `embedding_model` 一致。
+    freshness: |
+      核对于 2026-11：pgvector 最新正式版为 0.8.7（2026-10-01），0.9.0 尚未发布（计划放弃对 Postgres 13、14 的支持）。HNSW 和 IVFFlat 可索引的维度上限：vector 2000、halfvec 4000、bit 64000、sparsevec 1000 个非零元素；vector 列本身最多 16000 维。运算符 `<->`、`<#>`、`<=>`、`<+>` 分别为 L2、负内积、余弦距离、L1。以 pgvector README 为准。
+    sources:
+      - {title: "pgvector README", url: "https://github.com/pgvector/pgvector"}
+      - {title: "pgvector CHANGELOG", url: "https://github.com/pgvector/pgvector/blob/master/CHANGELOG.md"}
+  - id: d24-k2
+    name: ANN 索引：HNSW 与 IVFFlat
+    level: P0
+    summary: 近似最近邻索引用少量召回损失换取数量级的速度提升；HNSW 是多层图，查询快、召回高但建索引慢占内存；IVFFlat 是聚类分桶，建得快但要先有数据
+    analogy: |
+      HNSW 像**地图导航**：先走高速（上层稀疏图）快速接近目的地，再下到省道、街道（下层稠密图）精确找到门牌号。IVFFlat 像**按区域分快递柜**：先找离你最近的几个片区（probes），只在这几个片区的柜子里翻找。
+      **不一样的地方**：导航能保证到达；ANN 索引**不保证**找到真正最近的 K 个，参数调小了会漏掉一些，所以要用召回率来衡量。
+    why: |
+      没有索引时 pgvector 做的是精确搜索，要和每一行计算距离，几十万条以上就会明显变慢。ANN 索引是向量检索能上生产的关键。
+      面试官常问「HNSW 原理是什么」「ef_search 调大调小有什么影响」「HNSW 和 IVFFlat 怎么选」。
+    problem: |
+      高维向量无法像数字一样排序后二分查找。暴力计算每个向量的距离，数据量翻倍耗时就翻倍。
+      ANN 索引通过图或聚类结构跳过大部分向量，但代价是可能漏掉一些真正最近的结果，需要在速度和召回之间调参。
+    principle: |
+      **一、精确搜索 vs 近似搜索**
+
+      - **不建索引**：pgvector 默认做精确最近邻搜索，召回 100%，但要全表计算。
+      - **建 ANN 索引**：只计算一部分向量，速度快几个数量级，召回略低于 100%。pgvector 文档特意提醒：**加了近似索引后，同一查询的结果可能和以前不同**。
+
+      **二、HNSW：多层图**
+
+      ```mermaid
+      flowchart TD
+        Q["查询向量"] --> L2["顶层 节点很少 大步跳跃"]
+        L2 --> L1["中间层 逐步靠近"]
+        L1 --> L0["底层 全部节点 精细搜索"]
+        L0 --> R["维护 ef_search 个候选 返回最近的 K 个"]
+      ```
+
+      - 每个向量是图里的一个节点，和若干个相近的节点相连；上层节点少、连接跨度大，下层节点多、连接精细。
+      - 查询时从顶层入口开始贪心地往更近的节点走，逐层下降，在底层维护一个候选列表。
+      - **参数**：
+        - `m`：每层每个节点的最大连接数，默认 16。越大召回越高、索引越大。
+        - `ef_construction`：建图时的候选列表大小，默认 64。越大图质量越好、建索引越慢。
+        - `hnsw.ef_search`：查询时的候选列表大小，默认 40。**越大召回越高、查询越慢**；而且它限制了单次最多返回的结果数，LIMIT 超过它时要调大。
+      - **特点**：查询的速度与召回权衡优于 IVFFlat；建索引慢、占内存多；不需要训练，空表也能建。
+
+      **三、IVFFlat：聚类分桶**
+
+      - 建索引时用 k-means 把向量分成 `lists` 个簇，每个向量归入最近的簇。
+      - 查询时只搜索离查询向量最近的 `ivfflat.probes` 个簇（默认 1）。
+      - **参数起点**（官方建议）：`lists` 在 100 万行以内取 `行数 / 1000`，超过取 `sqrt(行数)`；`probes` 从 `sqrt(lists)` 开始调。
+      - **特点**：建得快、内存少；但**必须在表里有数据后再建**（聚类需要样本），数据分布变化大时要重建；速度与召回权衡不如 HNSW。
+
+      **四、怎么选、怎么调**
+
+      | 维度 | HNSW | IVFFlat |
+      |---|---|---|
+      | 查询性能 | 更好 | 一般 |
+      | 建索引 | 慢、占内存 | 快、省内存 |
+      | 空表建索引 | 可以 | 不建议 |
+      | 数据持续写入 | 适应好 | 分布变化后需重建 |
+
+      - RAG 场景一般**默认选 HNSW**，参数先用默认值。
+      - 召回不够：先调大 `hnsw.ef_search`（可用 `SET LOCAL` 只对当前事务生效）。
+      - 衡量方法：拿一批查询，对比「精确搜索结果」和「索引搜索结果」的重合度，就是 ANN 召回率。
+      - 大批量导入：先导数据再建索引更快；调大 `maintenance_work_mem` 让图放进内存。
+    scenarios: |
+      - **知识库有几十万 chunk**：建 HNSW 索引，默认参数起步，用评测集确认召回。
+      - **一次性导入千万级历史数据、内存紧张**：可以考虑 IVFFlat，先导数据再建索引。
+      - **召回偶尔漏掉正确结果**：调大 `ef_search`，对比精确搜索验证。
+    pitfalls: |
+      - **在空表上建 IVFFlat 索引**：聚类没有样本，召回很差。
+      - **LIMIT 50 但 ef_search 还是 40**：最多只能返回 40 条，要同步调大。
+      - **以为加了索引结果和精确搜索完全一样**：ANN 是近似的，要量化召回。
+      - **边导入边维护 HNSW 索引**：大批量导入很慢，应先导数据后建索引。
+      - **盲目把 m 和 ef_construction 调到很大**：建索引时间和内存成倍增加，收益有限。
+    interview_asks:
+      - question: "HNSW 的原理是什么？有哪些关键参数？"
+        answer: "它建一张多层的近邻图，查询时从上层往下跳到最近的点。建图时的连接数和搜索时的候选宽度影响召回和速度。召回不够就加大搜索宽度，建索引更慢、更占内存则是代价。"
+      - question: "HNSW 和 IVFFlat 怎么选？"
+        answer: "HNSW 查询质量通常更好，建索引更慢、更占内存，数据会变的知识库更常用它。IVFFlat 把空间分桶，建得快，召回更依赖分桶参数，适合相对静态、要快速建索引的场景。"
+      - question: "怎么衡量向量索引的召回率？召回不够怎么调？"
+        answer: "拿同一批查询，用精确的全表距离做对照，看近似索引返回的前 K 里覆盖了多少真正的近邻。不够就增大 HNSW 的搜索宽度，或重建时提高连接数。不要只看速度。"
+    project_example: |
+      **p1 企业知识库问答**约 30 万个 chunk，选 HNSW + 余弦距离，参数先用默认值。
+      上线前做一次 ANN 召回测试：取 200 个评测问题，分别用精确搜索（临时关闭索引扫描）和 HNSW 搜索取 Top-20，计算重合率；若低于预期，把 `hnsw.ef_search` 调到 100 再测，同时记录 P95 延迟。
+      这样面试时你能说清「我们为什么用默认参数」或「为什么调到 100」，而不是只说「用了 HNSW」。
+    freshness: |
+      核对于 2026-11（pgvector 0.8.7 README）：HNSW 默认 m = 16、ef_construction = 64、hnsw.ef_search = 40；IVFFlat 默认 ivfflat.probes = 1，lists 建议起点为 100 万行以内 rows/1000、超过用 sqrt(rows)，probes 起点为 sqrt(lists)。以官方 README 为准。
+    sources:
+      - {title: "pgvector README - Indexing", url: "https://github.com/pgvector/pgvector#indexing"}
+  - id: d24-k3
+    name: 元数据过滤与 ANN 的冲突
+    level: P0
+    summary: 近似索引先找 K 个候选再过滤，过滤条件一严格结果就不够；pgvector 用迭代扫描、部分索引、分区缓解，Qdrant 和 Milvus 在索引遍历中处理过滤
+    analogy: |
+      像在电商列表页先**分页取前 40 条再在前端过滤**「只看有货的」：如果只有 10% 有货，一页就只剩 4 条，用户以为没商品了。正确做法是让后端带着过滤条件查询，或者不够时自动多拉几页。
+      **不一样的地方**：后端分页是精确的，多拉几页总能补齐；ANN 的「多拉」是继续在图里扩展搜索，有扫描上限，过滤太严时仍可能不够，而且越扫越慢。
+    why: |
+      企业知识库几乎每个查询都带过滤条件：部门、权限、文档状态、时间范围。过滤和向量检索的配合不好，会导致「明明有相关文档却返回很少甚至为空」，而且不报错。
+      这是 RAG 生产化中**最隐蔽的坑**之一，面试官常用它判断你是否真的在生产环境跑过。
+    problem: |
+      pgvector 的 HNSW 查询默认只维护 40 个候选（ef_search），过滤是在索引扫描**之后**做的。如果某部门只占全部数据的 5%，40 个候选里平均只有 2 个属于这个部门，用户要 Top-10 却只拿到 2 条。
+    principle: |
+      **一、问题从哪来**
+
+      ```mermaid
+      sequenceDiagram
+        participant U as 用户
+        participant PG as PostgreSQL
+        participant IDX as HNSW 索引
+        U->>PG: 查 dept 等于 7 的 Top-10
+        PG->>IDX: 取最近的 ef_search 个候选
+        IDX-->>PG: 返回 40 个候选 跨所有部门
+        PG->>PG: 按 dept 等于 7 过滤
+        PG-->>U: 只剩 2 条
+      ```
+
+      pgvector 文档原话的意思：使用近似索引时，过滤在索引扫描之后进行；如果条件只匹配 10% 的行，默认 ef_search 为 40 时平均只能返回 4 行。
+
+      **二、pgvector 的几种应对**
+
+      1. **迭代索引扫描（0.8.0 起）**：结果不够时自动继续扫描更多索引，直到凑够或达到上限。
+         - `SET hnsw.iterative_scan = strict_order;`（严格按距离顺序）或 `relaxed_order`（允许轻微乱序，召回更好）。
+         - 上限由 `hnsw.max_scan_tuples`（默认 20000）控制；IVFFlat 对应 `ivfflat.iterative_scan` 和 `ivfflat.max_probes`。
+      2. **给过滤列建普通索引**：过滤后剩下的行很少时（如某个小部门），优化器可以先按 B-tree 过滤，再对少量行做精确距离计算，结果反而精确。
+      3. **部分索引**：过滤值只有少数几种时，为每个值单独建 HNSW 索引，如 `WHERE (status = 'active')`。
+      4. **分区**：过滤值很多（如多租户），按租户 `PARTITION BY LIST`，每个分区独立建索引，也是官方推荐的租户隔离方式之一。
+
+      **三、专用向量库怎么做**
+
+      - **Qdrant**：在搜索过程中处理过滤，查询规划器根据过滤条件的选择性决定是直接对匹配点打分还是走带过滤的 HNSW 遍历；为建了 payload 索引的字段在 HNSW 图里补充额外的边（filterable HNSW），所以**最好在导入数据前就建好 payload 索引**；1.16 起引入 ACORN 处理多个严格过滤组合的情况。
+      - **Milvus**：标准过滤在向量搜索前先按标量条件筛选；多租户可以用 partition key 把租户映射到分区，并为其建标量索引。
+
+      **四、实践建议**
+
+      - **先测再调**：拿带过滤的真实查询，统计返回条数是否经常不足 K。
+      - 过滤后数据量很小时，精确搜索往往又快又准。
+      - 权限过滤**必须**在数据库查询里完成，不能检索完再在应用层过滤（见 Day 21、Day 30）。
+    scenarios: |
+      - **按部门过滤**：小部门的员工提问经常只返回一两条结果，开启迭代扫描并给 `dept_id` 建索引。
+      - **只检索有效版本**：`status = 'active'` 是固定条件，用部分索引。
+      - **SaaS 多租户知识库**：每个租户一个分区或单独的表，互不影响。
+    pitfalls: |
+      - **只在测试环境用全量数据测试**：测试时不带过滤条件，上线后带过滤的查询结果严重不足。
+      - **在应用层过滤权限**：先取 Top-10 再删掉无权限的，可能一条都不剩，而且敏感内容已经被读出来。
+      - **ef_search 调到很大来硬扛过滤问题**：所有查询都变慢，且仍不保证够数。
+      - **Qdrant 导入数据后才建 payload 索引**：过滤相关的图结构没有建立，需要重建才能生效。
+      - **以为迭代扫描能保证返回 K 条**：达到扫描上限仍可能不足。
+    interview_asks:
+      - question: "向量检索加上元数据过滤后返回结果变少，可能是什么原因？怎么解决？"
+        answer: "近似索引先找到一批近邻，再过滤，过滤掉之后就不够 K 条。要在索引搜索时就带上过滤，或用迭代扫描继续找下一批。租户过滤尤其不能等查完再筛。"
+      - question: "多租户的向量数据怎么隔离？"
+        answer: "每行带租户 id，查询条件里必须带，最好再加数据库行级权限做底。不要只在应用里查完再过滤。索引也要让「先按租户」可行，避免把别的租户的近邻占满候选。"
+      - question: "pgvector 的迭代扫描是做什么的？"
+        answer: "带过滤的近似查询如果第一批近邻被滤光了，就继续往下扫，直到凑够 K 条或到上限。用来解决「先近似、后过滤，结果变少」的问题。要确认你用的版本确实开了这个行为。"
+    project_example: |
+      **p1 企业知识库问答**上线后，法务部员工反馈「问什么都只返回一两条」。原因是法务文档只占全库约 3%，HNSW 候选里很少有法务的 chunk。
+      处理：开启 `hnsw.iterative_scan = relaxed_order`；`dept_id` 建 B-tree 索引；`status = 'active'` 建部分 HNSW 索引；并在评测集里加入各部门的过滤查询，统计「返回条数不足 K」的比例作为监控指标。
+      这个案例很适合面试讲：现象 → 定位到「先扫索引后过滤」 → 三种手段 → 用指标验证。
+    freshness: |
+      核对于 2026-11：pgvector 0.8.0（2024-10-30）起支持迭代索引扫描，hnsw.max_scan_tuples 默认 20000；README 推荐用部分索引应对少量过滤值、用 LIST 分区应对大量过滤值和租户隔离。Qdrant 最新为 1.20.x，使用 filterable HNSW（为已建 payload 索引的字段补充图的边）并自 1.16 起支持 ACORN。Milvus 最新为 v3.0.x，支持 partition key 多租户。各产品演进快，以官方文档为准。
+    sources:
+      - {title: "pgvector README - Filtering", url: "https://github.com/pgvector/pgvector#filtering"}
+      - {title: "Qdrant - Vector Search Filtering", url: "https://qdrant.tech/documentation/search-design/vector-search-filtering/"}
+      - {title: "Qdrant - Indexing", url: "https://qdrant.tech/documentation/manage-data/indexing/"}
+      - {title: "Milvus - Filtered Search", url: "https://milvus.io/docs/filtered-search.md"}
+  - id: d24-k4
+    name: pgvector 还是专用向量库
+    level: P1
+    summary: 已有 PostgreSQL、数据在千万级以内、需要事务和权限一体时优先 pgvector；超大规模、高并发或需要更丰富检索能力时考虑 Milvus、Qdrant
+    analogy: |
+      像前端状态管理：中小项目用 Pinia 就够了，和 Vue 生态无缝集成；只有在超大型应用、极端性能需求下才考虑更重的方案。先用顺手的，遇到瓶颈再换。
+      **不一样的地方**：换状态库主要改代码；换向量库要**迁移数据、重建索引、改同步链路**，所以代码里一开始就要把向量存储抽象成接口。
+    why: |
+      「为什么用 pgvector 不用 Milvus」「数据量大了怎么办」是面试必问题。答案不是哪个更好，而是在什么条件下选哪个，以及怎么给未来留退路。
+    problem: |
+      专用向量库功能强、规模上限高，但多一个系统意味着多一套部署、监控、备份和数据同步；pgvector 简单，但在超大规模和高并发下可能成为瓶颈。选错会导致过度设计或后期痛苦迁移。
+    principle: |
+      **一、对比**
+
+      | 维度 | pgvector | Milvus、Qdrant 等专用库 |
+      |---|---|---|
+      | 运维 | 复用现有 PostgreSQL | 新增一套系统 |
+      | 数据一致性 | 向量和业务数据同一事务 | 需要同步，可能短暂不一致 |
+      | 过滤和 JOIN | SQL 原生能力 | 依赖 payload 或标量字段 |
+      | 规模和并发 | 千万级以内通常够用，需要调优 | 面向更大规模，支持分布式 |
+      | 检索能力 | 向量 + PG 全文检索 | 内置稀疏向量、BM25、多向量等 |
+
+      **二、选型思路**
+
+      ```mermaid
+      flowchart TD
+        A["新 RAG 项目"] --> B{"已有 PostgreSQL 且团队熟悉吗"}
+        B -->|"是"| C{"预计数据量和并发 超出单库能力吗"}
+        B -->|"否"| E["按团队技术栈评估专用库"]
+        C -->|"否"| D["pgvector 起步"]
+        C -->|"是 或不确定"| F["压测后决定 可选 Milvus 或 Qdrant"]
+        D --> G["代码层抽象 VectorStore 接口 预留迁移"]
+        F --> G
+        E --> G
+      ```
+
+      - **pgvector 优先**：已有 PostgreSQL、数据量在千万级以内、需要和权限、业务数据一起查询、团队小。
+      - **考虑专用库**：数据量上亿、高并发检索、需要分布式扩展、需要更丰富的混合检索和多租户能力。
+      - 规模上限没有绝对数字，取决于维度、硬件、索引参数和并发，**要自己压测**。
+
+      **三、给迁移留退路**
+
+      在代码里定义 `VectorStore` 接口（`upsert`、`delete`、`search(query_vec, filters, k)`），业务代码只依赖接口。将来换库只需新增一个实现，并用评测集验证效果一致。
+    scenarios: |
+      - **企业内部知识库，几十万 chunk**：pgvector，和用户权限表在同一个库。
+      - **面向 C 端的语义搜索，亿级商品**：专用向量库，分布式部署。
+      - **SaaS 多租户，租户数很多**：评估 Milvus 的 partition key 或 Qdrant 的多租户能力，与 pgvector 分区方案对比。
+    pitfalls: |
+      - **项目第一天就上分布式向量库**：数据只有几万条，运维成本远超收益。
+      - **业务代码直接写死某个向量库的 SDK**：将来迁移要改遍全部代码。
+      - **专用库和业务库之间不做同步校验**：文档删除后向量库里还在，被检索出来。
+      - **用网上的性能对比代替自己压测**：维度、过滤、并发不同，结论差别很大。
+    interview_asks:
+      - question: "你们为什么选 pgvector 而不是 Milvus？"
+        answer: "数据量还没大到需要独立向量集群，事务、权限和业务表放在一个 PostgreSQL 里更简单。少一套系统就少一套运维。量级和延迟真的不够时再拆出去。"
+      - question: "如果数据量增长到十倍，你的方案怎么扩展？"
+        answer: "先看是索引内存、写入还是查询延迟。可以按租户分表或分区，加大内存，读写分离。仍不够再把向量拆到专用库，同时保住过滤和权限在查询里完成。"
+    project_example: |
+      **p1 企业知识库问答**选 pgvector 的理由：公司已有 PostgreSQL；约 30 万 chunk；检索必须和部门权限、文档状态一起过滤；团队没有专职运维。
+      同时在代码里定义 `VectorStore` 接口，`PgVectorStore` 是第一个实现。简历和面试里可以说：「当前规模 pgvector 足够，我们预留了接口；压测显示单库 P95 延迟在可接受范围，数据量增长十倍时再评估专用库」。
+    freshness: |
+      核对于 2026-11：Milvus 最新为 v3.0.6（2026-11-10），v2.6.x 仍在维护；Qdrant 最新为 1.20.0（2026-10-22），新增在全文 payload 索引上直接做 BM25 打分。两者版本迭代快，选型时以官方文档和自己的压测为准。
+    sources:
+      - {title: "Qdrant - Indexing", url: "https://qdrant.tech/documentation/manage-data/indexing/"}
+      - {title: "Milvus - Filtered Search", url: "https://milvus.io/docs/filtered-search.md"}
+test:
+  - id: d24-t1
+    kp: d24-k1
+    type: single
+    question: 下面的查询想取余弦相似度最高的 10 条。表上已有 `vector_cosine_ops` 的 HNSW 索引，但 EXPLAIN 显示是全表扫描。原因是？
+    code: |
+      SELECT id, content, 1 - (embedding <=> $1) AS similarity
+      FROM chunks
+      WHERE status = 'active'
+      ORDER BY 1 - (embedding <=> $1) DESC
+      LIMIT 10;
+    lang: sql
+    options:
+      - "WHERE 条件导致 PostgreSQL 禁用了所有索引"
+      - "LIMIT 10 太小，优化器认为全表扫描更快"
+      - "排序表达式不是「距离运算符升序」，优化器无法使用向量索引"
+      - "余弦距离不支持 HNSW 索引，只能用 IVFFlat"
+    answer: [2]
+    explain: |
+      向量索引只认 `ORDER BY embedding <=> $1`（升序）+ LIMIT 的形式。`1 - 距离` 降序在语义上等价，但优化器不识别这个表达式，只能全表计算。应改为按距离升序排序，相似度只在 SELECT 里计算展示。
+      A WHERE 不会禁用索引；B LIMIT 小正是走索引的条件；D 余弦距离可以用 HNSW（vector_cosine_ops）。
+  - id: d24-t2
+    kp: d24-k1
+    type: multi
+    question: 关于 pgvector 的距离运算符，以下哪些说法正确？
+    options:
+      - "<=> 返回余弦距离，余弦相似度等于 1 减去它"
+      - "<#> 返回负内积，要乘以 -1 才是内积"
+      - "这些运算符返回的值越大表示越相似"
+      - "向量已归一化时，按内积、余弦、L2 排序的结果一致"
+      - "建索引的操作符类必须和查询使用的运算符对应"
+    answer: [0, 1, 3, 4]
+    explain: |
+      A、B 是运算符定义；D 归一化后三种度量是单调关系，排序一致；E 用 vector_cosine_ops 建的索引只服务 <=> 查询。
+      C 错：这些运算符返回的都是距离（负内积也是越小越相似），越小越相似，所以排序用升序。
+  - id: d24-t3
+    kp: d24-k1
+    type: judge
+    question: 团队把 Embedding 模型换成了维度相同的新模型，只要新旧向量维度一致，就可以不重建旧数据直接混用。
+    answer: false
+    explain: |
+      错误。不同模型的向量空间不同，即使维度一样，新查询向量和旧文档向量之间的距离也没有意义。而且数据库不会报错，检索效果只会悄悄变差。
+      应该在 chunk 上记录 embedding_model，换模型时全量重建，并在服务启动时校验一致（见 Day 21）。
+  - id: d24-t4
+    kp: d24-k1
+    type: single
+    question: 团队想用一个输出 3072 维的 Embedding 模型，并在 pgvector 中建 HNSW 索引。以下哪个说法正确？
+    options:
+      - "vector 类型最多只能存 1024 维，必须换一个维度更低的模型"
+      - "vector 索引上限 2000 维，可改用 halfvec 建索引或选低维模型"
+      - "HNSW 索引没有维度限制，3072 维直接建索引即可正常使用"
+      - "超过上限就只能放弃索引，之后一直做全表精确搜索"
+    answer: [1]
+    explain: |
+      vector 列最多可存 16000 维，但 HNSW 和 IVFFlat 只支持对不超过 2000 维的 vector 建索引；halfvec 可建索引的上限是 4000 维，或者选择支持输出更低维度的模型。
+      A 存储上限远不止 1024；C 有限制；D 有其他方案。
+  - id: d24-t5
+    kp: d24-k2
+    type: single
+    question: 关于 HNSW 的 `hnsw.ef_search` 参数，以下哪个说法正确？
+    options:
+      - "它决定建图时每个节点的连接数，建完索引后无法修改"
+      - "它越小召回越高，因为搜索更集中"
+      - "它只影响 IVFFlat 索引，对 HNSW 无效"
+      - "它越大召回越高、查询越慢，并限制单次最多返回的结果数"
+    answer: [3]
+    explain: |
+      ef_search 是查询时维护的候选列表大小，默认 40，可以在会话或事务中随时调整。越大搜索越充分，召回越高但越慢；它也限制了单次查询能返回的结果数，LIMIT 超过它时要同步调大。
+      A 描述的是 m；B 方向相反；C 它是 HNSW 的参数，IVFFlat 对应的是 probes。
+  - id: d24-t6
+    kp: d24-k2
+    type: multi
+    question: 关于 IVFFlat 索引，以下哪些说法正确？
+    options:
+      - "建索引时用聚类把向量分成 lists 个簇"
+      - "应该在表里已有足够数据之后再建索引"
+      - "查询时默认只搜索 1 个最近的簇，可以通过 probes 调大"
+      - "它的查询速度与召回权衡通常优于 HNSW"
+      - "空表上建 IVFFlat 索引效果最好"
+    answer: [0, 1, 2]
+    explain: |
+      IVFFlat 依赖 k-means 聚类，所以要先有数据；默认 probes 为 1，官方建议从 sqrt(lists) 开始调。
+      D 错：官方文档说明 HNSW 的速度与召回权衡更好，IVFFlat 的优势是建得快、省内存；E 空表没有样本，聚类结果无意义。
+  - id: d24-t7
+    kp: d24-k2
+    type: judge
+    question: 给向量列加上 HNSW 索引后，同一个查询返回的结果可能和不加索引时的精确搜索结果不完全相同。
+    answer: true
+    explain: |
+      正确。HNSW 是近似最近邻索引，只搜索图的一部分，可能漏掉少数真正最近的向量。pgvector 文档也特别提醒了这一点。
+      所以要用「索引结果和精确结果的重合度」衡量 ANN 召回率，召回不够时调大 ef_search。
+  - id: d24-t8
+    kp: d24-k2
+    type: single
+    question: 需要一次性导入 500 万条向量并建 HNSW 索引，以下哪种做法通常最快？
+    options:
+      - "先导入全部数据再建索引，并调大 maintenance_work_mem"
+      - "先建好索引，再逐条插入数据，让索引随数据增量构建"
+      - "每导入 1 万条就删除索引重建一次，保证索引始终最新"
+      - "不建索引，导入后直接上线，依靠精确搜索保证召回"
+    answer: [0]
+    explain: |
+      pgvector 文档指出：和其他索引一样，在初始数据加载后再建索引更快；图能放进 maintenance_work_mem 时构建速度会明显提升，还可以增加并行 worker。
+      B 每次插入都要维护图结构，很慢；C 反复重建浪费；D 500 万条全表精确搜索太慢。
+  - id: d24-t9
+    kp: d24-k2
+    type: judge
+    question: 要检查 HNSW 索引的召回是否足够，可以拿一批查询分别做精确搜索和索引搜索，比较 Top-K 结果的重合率。
+    answer: true
+    explain: |
+      正确。精确搜索的结果就是「标准答案」，索引结果和它的重合比例就是 ANN 召回率。召回不够时先调大 hnsw.ef_search，同时观察延迟变化。
+      注意这衡量的是索引本身的召回，和「检索结果是否包含正确答案段落」的业务召回是两回事。
+  - id: d24-t10
+    kp: d24-k3
+    type: single
+    question: 某部门的 chunk 只占全库 5%。该部门员工查询 Top-10 时经常只返回一两条结果，查询使用 HNSW 索引并带 `WHERE dept_id = 7`。最可能的原因是？
+    options:
+      - "该部门的文档质量太差，向量化失败"
+      - "HNSW 只能存储一个部门的数据"
+      - "dept_id 字段类型不对，导致过滤出错"
+      - "近似索引先取有限候选再过滤，候选里该部门的很少"
+    answer: [3]
+    explain: |
+      pgvector 的近似索引在扫描之后才应用 WHERE 过滤。默认 ef_search 为 40，40 个候选里平均只有 2 个属于占比 5% 的部门。可以开启迭代扫描、给 dept_id 建 B-tree 索引或按部门分区。
+      A 向量化失败会是全部检索不到；B 没有这种限制；C 类型错误会报错或完全查不到。
+  - id: d24-t11
+    kp: d24-k3
+    type: multi
+    question: 在 pgvector 中缓解「过滤后结果不足」，以下哪些是官方文档提到的手段？
+    options:
+      - "开启迭代索引扫描 hnsw.iterative_scan"
+      - "给过滤列建普通索引，让优化器在过滤后行数少时走精确搜索"
+      - "过滤值只有少数几种时，建部分索引"
+      - "过滤值很多时（如多租户），按该列做 LIST 分区"
+      - "在应用层先取 Top-10，再过滤掉不符合条件的"
+    answer: [0, 1, 2, 3]
+    explain: |
+      A、B、C、D 都出自 pgvector README 的 Filtering 和 Iterative Index Scans 部分。
+      E 恰恰会让问题更严重：数据库只返回 10 条，过滤后可能一条不剩；如果过滤的是权限，还会让无权限内容被读出。
+  - id: d24-t12
+    kp: d24-k3
+    type: judge
+    question: 开启 pgvector 的迭代索引扫描后，带过滤条件的查询一定能返回 LIMIT 指定的条数。
+    answer: false
+    explain: |
+      错误。迭代扫描会在结果不够时继续扫描更多索引，但有上限（hnsw.max_scan_tuples 默认 20000，IVFFlat 由 ivfflat.max_probes 控制），达到上限仍可能不足。
+      过滤条件非常严格时，更好的办法是给过滤列建索引走精确搜索，或使用部分索引、分区。
+  - id: d24-t13
+    kp: d24-k3
+    type: single
+    question: 使用 Qdrant 时，团队先导入了 1000 万条数据，然后才为 `tenant_id` 创建 payload 索引，发现带租户过滤的检索效果没有明显改善。最可能的原因是？
+    options:
+      - "Qdrant 不支持按 payload 过滤"
+      - "过滤相关的额外图结构在建索引时才会补充，导入后才建需要重建图才能生效"
+      - "tenant_id 必须是字符串类型才能建索引"
+      - "1000 万条数据超出了 Qdrant 的容量上限"
+    answer: [1]
+    explain: |
+      Qdrant 的 filterable HNSW 会为已建 payload 索引的字段在图中补充额外的边，官方建议在导入数据前就建好 payload 索引，否则要重建 HNSW 才能获得这部分收益。
+      A Qdrant 支持过滤；C 整数也可以建索引；D 1000 万条不是容量问题。
+  - id: d24-t14
+    kp: d24-k4
+    type: single
+    question: 一家 200 人的公司要做内部制度知识库，已有 PostgreSQL，预计 chunk 数 20 万，检索要按部门权限过滤，团队没有专职运维。以下哪个选型最合理？
+    options:
+      - "pgvector，和权限表同库，在代码里抽象 VectorStore 接口"
+      - "部署分布式 Milvus 集群，为未来增长做准备"
+      - "不用数据库，把向量存在 JSON 文件里每次全部加载"
+      - "同时部署 Milvus 和 Qdrant，查询时两边都查"
+    answer: [0]
+    explain: |
+      规模不大、已有 PostgreSQL、需要和权限一起过滤、没有专职运维，这些条件都指向 pgvector；抽象接口为未来迁移留退路。
+      B 过度设计；C 没有并发和过滤能力，扩展性差；D 运维成本翻倍且没有收益。
+  - id: d24-t15
+    kp: d24-k4
+    type: multi
+    question: 以下哪些情况更值得考虑使用 Milvus、Qdrant 等专用向量库？
+    options:
+      - "向量数量达到亿级，需要分布式扩展"
+      - "检索 QPS 很高，单个 PostgreSQL 实例成为瓶颈"
+      - "需要内置的稀疏向量、多向量等更丰富的检索能力"
+      - "数据只有几千条，想体验一下新技术"
+      - "需要在同一事务里同时更新业务数据和向量"
+    answer: [0, 1, 2]
+    explain: |
+      规模、并发、检索能力是选择专用库的主要理由。
+      D 几千条用 pgvector 甚至内存都够，引入新系统得不偿失；E 恰恰是 pgvector 的优势，专用库和业务库在不同系统里，无法共享一个事务。
+  - id: d24-t16
+    kp: d24-k4
+    type: judge
+    question: 业务代码直接调用某个向量库的 SDK，比定义 VectorStore 接口更有利于将来更换向量库。
+    answer: false
+    explain: |
+      错误。直接依赖具体 SDK，更换时要修改所有调用点。定义 upsert、delete、search 等接口，业务代码只依赖接口，换库只需新增一个实现，再用评测集验证效果一致即可。
+exam:
+  - id: d24-e1
+    kp: d24-k1
+    type: single
+    question: 以下哪条 SQL 既能正确取出余弦最相近的 5 条，又能走 `vector_cosine_ops` 的 HNSW 索引？
+    options:
+      - "SELECT id FROM chunks ORDER BY embedding <-> $1 LIMIT 5"
+      - "SELECT id FROM chunks ORDER BY 1 - (embedding <=> $1) DESC LIMIT 5"
+      - "SELECT id FROM chunks ORDER BY embedding <=> $1 DESC LIMIT 5"
+      - "SELECT id FROM chunks ORDER BY embedding <=> $1 LIMIT 5"
+    answer: [3]
+    explain: |
+      余弦距离运算符 <=> 配合 vector_cosine_ops 索引，按距离升序加 LIMIT 才能走索引并取到最相近的结果。
+      A 用的是 L2 运算符，与余弦索引不匹配；B 表达式排序不走索引；C 按距离降序取到的是最不相似的。
+  - id: d24-e2
+    kp: d24-k2
+    type: single
+    question: 知识库需要返回 Top-60 供后续重排使用，但无论 LIMIT 设多少，HNSW 查询最多只返回 40 条。最可能的原因和处理是？
+    options:
+      - "HNSW 最多只能返回 40 条，必须换成 IVFFlat"
+      - "表里只有 40 条数据"
+      - "hnsw.ef_search 默认 40，限制了结果数，应调大到不小于 60"
+      - "LIMIT 超过 50 时 PostgreSQL 会自动截断"
+    answer: [2]
+    explain: |
+      HNSW 查询的结果数受候选列表大小 ef_search 限制，默认 40。需要 Top-60 时应在会话或事务中把 hnsw.ef_search 调到 60 以上（可以用 SET LOCAL 只影响当前事务）。
+      A 不需要换索引；B、D 不符合事实。
+  - id: d24-e3
+    kp: d24-k3
+    type: single
+    question: SaaS 知识库有 3000 个租户，数据量差异很大，要求租户间严格隔离且每个租户的检索结果数量稳定。在 pgvector 上，以下哪种方案最合适？
+    options:
+      - "所有租户共用一张表和一个 HNSW 索引，在应用层按 tenant_id 过滤"
+      - "按 tenant_id 做 LIST 分区（或大租户单独建表），每个分区独立建向量索引"
+      - "把 ef_search 调到 10000，确保过滤后结果足够"
+      - "为 3000 个租户各建一个部分索引，全部放在同一张表上"
+    answer: [1]
+    explain: |
+      pgvector 文档建议：过滤值很多时用分区，租户隔离用 LIST 分区或单独的表。每个分区索引只包含本租户数据，过滤问题和隔离问题一起解决。
+      A 应用层过滤既不安全又会结果不足；C 所有查询都变慢且不保证；D 部分索引适合少数几个值，3000 个难以维护。
+  - id: d24-e4
+    kp: d24-k4
+    type: single
+    question: 面试官问「你们为什么用 pgvector 而不是 Milvus」。以下哪个回答最有说服力？
+    options:
+      - "因为 pgvector 是开源免费的，而 Milvus 是商业收费产品，成本更高"
+      - "因为 pgvector 在所有场景下的检索性能和召回率都比 Milvus 更好"
+      - "因为团队成员只熟悉 SQL，项目工期紧，没有时间学习新的数据库"
+      - "已有 PG、规模在单库能力内、要和权限同库过滤，压测达标并预留了接口"
+    answer: [3]
+    explain: |
+      好的选型回答要包括约束条件（现有技术栈、规模、功能需求）、验证（压测）和退路（接口抽象）。
+      A Milvus 也是开源的；B 绝对化说法不成立；C 理由太弱，体现不了判断力。
+  - id: d24-e5
+    kp: d24-k2
+    type: multi
+    question: 关于 HNSW 和 IVFFlat 的选择，以下哪些说法正确？
+    options:
+      - "HNSW 不需要训练，空表上也能建索引"
+      - "IVFFlat 建索引更快、占用内存更少"
+      - "数据分布变化很大后，IVFFlat 的聚类可能失效，需要重建"
+      - "RAG 场景中 IVFFlat 永远比 HNSW 更好"
+      - "HNSW 的 ef_search 只能在建索引时指定"
+    answer: [0, 1, 2]
+    explain: |
+      A HNSW 没有聚类训练步骤；B IVFFlat 的优势是构建快、省内存；C IVFFlat 依赖建索引时的聚类中心。
+      D 一般 RAG 默认选 HNSW；E ef_search 是查询参数，可随时设置。
+  - id: d24-e6
+    kp: d24-k3
+    type: multi
+    question: 以下哪些做法能帮助发现或避免「带过滤的向量检索结果不足」的问题？
+    options:
+      - "在评测集中加入各部门、各租户的过滤查询"
+      - "监控「返回条数小于 K」的查询比例"
+      - "只用不带过滤条件的查询做性能测试"
+      - "对固定的过滤条件（如 status = active）建部分索引"
+      - "检索完成后在应用层补做权限过滤"
+    answer: [0, 1, 3]
+    explain: |
+      A、B 让问题可见；D 让固定条件下的索引只包含符合条件的数据。
+      C 测不出过滤带来的问题；E 是错误做法，既可能结果不足，也让无权限数据经过应用层。
+  - id: d24-e7
+    kp: d24-k1
+    type: judge
+    question: 用 pgvector 时，可以把向量、原文、页码和部门字段放在同一张 chunk 表里，一条 SQL 同时完成权限过滤和向量排序。
+    answer: true
+    explain: |
+      正确。这是 pgvector 相比独立向量库的主要优势之一：向量和业务数据在同一个库，可以直接用 WHERE、JOIN 和事务，检索结果也直接带出处。
+  - id: d24-e8
+    kp: d24-k4
+    type: judge
+    question: 只要使用了专用向量库，就不需要关心数据同步问题，因为它会自动和业务数据库保持一致。
+    answer: false
+    explain: |
+      错误。专用向量库和业务库是两个独立系统，文档删除、权限变更、版本更新都要同步到向量库，否则会检索到已删除或无权限的内容。
+      需要设计同步链路（如任务队列）和定期校验。
+  - id: d24-e9
+    kp: d24-k3
+    type: case
+    question: |
+      p1 企业知识库使用 pgvector + HNSW（默认参数），共 30 万个 chunk。上线后：
+      ① 法务部（约占全库 3%）员工反馈「问什么都只返回一两条，而且经常答不出」；
+      ② 研发部（约占 40%）员工没有类似反馈；
+      ③ 检索 SQL 为 `WHERE dept_id = $2 AND status = 'active' ORDER BY embedding <=> $1 LIMIT 10`。
+      以下哪个判断和处理方案最合理？
+    options:
+      - "法务文档解析质量差，应换用更强的解析工具重新解析法务部全部文档"
+      - "先扫索引后过滤导致小部门结果不足，应开启迭代扫描并给 dept_id 建索引"
+      - "HNSW 索引已经损坏，应删除索引并改为全表精确搜索以保证结果完整"
+      - "法务问题太专业，应为法务部单独微调一个 Embedding 模型再重建索引"
+    answer: [1]
+    explain: |
+      占比 3% 的部门结果不足、占比 40% 的部门正常，这正是「先扫索引后过滤」的特征：40 个候选里平均只有一个左右属于法务部。处理：开启 hnsw.iterative_scan，给 dept_id 建 B-tree 索引（小部门过滤后行数少时可走精确搜索），status 可建部分索引；再用各部门的过滤查询验证返回条数。
+      A 解析问题不会只体现为返回条数少；C 索引没坏，全表扫描会让所有查询变慢；D 与结果条数无关。
+interview:
+  - id: d24-i1
+    kp: d24-k3
+    type: scenario
+    difficulty: 2
+    question: 知识库上线后，部分部门的用户反馈「搜索结果特别少，经常答不出」，而其他部门正常。你会怎么排查？
+    key_points:
+      - {text: "先看规律：受影响部门是否数据占比小，查询是否带部门或权限过滤", dim: principle}
+      - {text: "解释近似索引先取 ef_search 个候选再过滤的机制", dim: concept}
+      - {text: "给出手段：迭代扫描、过滤列索引、部分索引、分区，权限过滤必须在库内完成", dim: engineering}
+      - {text: "用 EXPLAIN 和各部门查询统计返回条数，改完后持续监控", dim: engineering}
+      - {text: "结合项目说明具体数字和改进效果", dim: project}
+    reference: |
+      **第一步：找规律。** 统计受影响用户的部门，看这些部门在全库数据中的占比。如果都是小部门、且查询带 `dept_id` 过滤，基本可以锁定是过滤和近似索引的冲突。
+
+      **第二步：确认机制。** pgvector 的 HNSW 查询默认只维护 40 个候选，WHERE 过滤在索引扫描之后。占比 3% 的部门，40 个候选里平均只有一个左右属于它，用户要 Top-10 只能拿到一两条。用 EXPLAIN 看执行计划，再对比去掉过滤条件时的结果数验证。
+
+      **第三步：处理。**
+      - 开启迭代扫描：`SET hnsw.iterative_scan = relaxed_order`，不够时自动扫更多（有 max_scan_tuples 上限）。
+      - 给 `dept_id` 建 B-tree 索引：小部门过滤后行数少，优化器可以先过滤再精确计算距离。
+      - 固定条件（`status = 'active'`）建部分索引。
+      - 部门或租户很多且需要隔离时，按部门 LIST 分区。
+      - 强调：**权限过滤必须在 SQL 里**，不能取回来再在应用层删。
+
+      **第四步：验证和监控。** 每个部门准备几个查询，统计返回条数和检索命中率；上线后监控「返回条数小于 K」的比例。
+    oral: |
+      我会先看受影响的是哪些部门，如果都是数据占比很小的部门，而且查询带部门过滤，基本就能锁定原因。
+      pgvector 的 HNSW 默认只取 40 个候选，然后才按 WHERE 过滤，一个只占 3% 的部门，40 个候选里大概只有一个是它的，所以只能返回一两条。
+      处理上我会开启迭代扫描，不够时自动多扫一些；给部门字段建 B-tree 索引，小部门可以走精确搜索；固定的状态条件建部分索引。权限过滤一定要在 SQL 里做，不能拿回来再删。
+      最后每个部门准备几个测试查询看返回条数，上线后监控返回不足 K 条的比例。
+  - id: d24-i2
+    kp: d24-k2
+    type: scenario
+    difficulty: 3
+    question: 知识库检索的 P95 延迟从 80ms 涨到了 600ms，最近数据量从 20 万增长到 200 万。你会怎么分析和优化？
+    key_points:
+      - {text: "先用 EXPLAIN ANALYZE 确认是否走了向量索引，排查表达式排序、运算符不匹配等问题", dim: engineering}
+      - {text: "检查索引状态：HNSW 是否放得进内存、IVFFlat 的 lists 是否随数据量调整", dim: principle}
+      - {text: "理解 ef_search 等参数对延迟和召回的影响，调参后要验证召回", dim: concept}
+      - {text: "考虑过滤、迭代扫描带来的额外扫描，以及分区、halfvec 等手段", dim: engineering}
+      - {text: "用压测和召回测试评估，必要时评估专用向量库", dim: project}
+    reference: |
+      **第一步：确认有没有走索引。** 用 `EXPLAIN ANALYZE` 看慢查询的执行计划。常见问题：排序写成 `1 - 距离 DESC`、运算符和索引操作符类不匹配、新增的过滤条件让优化器选了其他计划。数据量涨十倍，全表扫描的耗时也大约涨十倍，和现象吻合。
+
+      **第二步：检查索引本身。**
+      - HNSW 索引是否还能放进内存（shared_buffers 和系统缓存），放不下会频繁读磁盘。
+      - 如果用的是 IVFFlat，lists 是否还按 20 万的规模设置，数据分布变化后要按新规模重建。
+      - 是否有大量删除和更新导致索引膨胀，需要 VACUUM 或重建。
+
+      **第三步：检查查询参数。** ef_search 是否被设得很大、迭代扫描是否因严格过滤扫了很多元组（max_scan_tuples），这些都会增加延迟。
+
+      **第四步：优化手段。**
+      - 修正查询写法，确保走索引。
+      - 内存不足时考虑 halfvec 减少索引体积，或增加内存。
+      - 按部门或租户分区，减少每次搜索的数据量。
+      - 调整 ef_search，在延迟和召回之间重新找平衡，**调完一定要测召回**。
+
+      **第五步：评估。** 压测 P95 和 QPS，同时用精确搜索对比召回。如果单库确实到了瓶颈，再评估读副本或专用向量库。
+    oral: |
+      数据量涨十倍、延迟也涨了七八倍，我第一反应是怀疑没走索引。我会先用 EXPLAIN ANALYZE 看执行计划，检查排序是不是写成了相似度降序、运算符和索引是否匹配。
+      如果走了索引，再看索引本身：HNSW 是否还放得进内存，用 IVFFlat 的话 lists 是不是还是按二十万设的。还要看 ef_search 和迭代扫描有没有让一次查询扫太多数据。
+      优化上，修正查询写法，内存不够可以用 halfvec 减小索引，或者按部门分区。任何参数调整我都会同时测召回，不能只看延迟。
+      压测之后如果单库确实扛不住，再考虑读副本或者专用向量库。
+  - id: d24-i3
+    kp: d24-k4
+    type: design
+    difficulty: 3
+    question: 请为一个预计从 50 万 chunk 增长到 5000 万 chunk 的企业知识库设计向量存储方案，并说明不同阶段的选择和迁移策略。
+    key_points:
+      - {text: "初期选 pgvector 的理由：复用 PostgreSQL、与权限同库、运维简单", dim: concept}
+      - {text: "表设计和索引：向量与 metadata 同表、HNSW、记录 embedding_model、过滤字段索引", dim: engineering}
+      - {text: "增长阶段的手段：分区、halfvec、读副本，以及何时评估专用库", dim: principle}
+      - {text: "代码层 VectorStore 接口抽象，迁移时双写、对比评测、灰度切换", dim: engineering}
+      - {text: "用压测数据和召回指标驱动阶段切换，而不是凭感觉", dim: project}
+    reference: |
+      **阶段一（50 万级）：pgvector 起步。**
+      - 理由：已有 PostgreSQL；向量、原文、权限、版本在一个库，一条 SQL 完成过滤加排序；运维成本最低。
+      - 设计：chunk 表存原文、向量、`embedding_model`、页码、部门、状态；HNSW + 余弦距离；部门字段 B-tree 索引，`status = 'active'` 部分索引；开启迭代扫描。
+      - 代码：定义 `VectorStore` 接口（upsert、delete、search），业务只依赖接口。
+
+      **阶段二（几百万到千万级）：优化单库。**
+      - 按部门或租户分区，每个分区独立索引；索引内存不足时用 halfvec。
+      - 读写分离，检索走读副本。
+      - 定期压测：P95 延迟、QPS、ANN 召回率，设定阈值（如 P95 超过 300ms 或召回低于 95%）作为评估专用库的触发条件。
+
+      **阶段三（5000 万级或高并发）：评估专用库。**
+      - 候选 Milvus、Qdrant，关注分布式扩展、过滤性能、多租户能力和运维成本。
+      - 迁移策略：新增 `MilvusStore` 或 `QdrantStore` 实现；**双写**一段时间；用评测集对比两边的检索结果和召回；灰度部分流量；确认后切换并保留回滚能力。
+      - 注意数据同步：删除和权限变更要同时作用于两边。
+    oral: |
+      我会分三个阶段。五十万级时直接用 pgvector，理由是已有 PostgreSQL，向量和权限、版本在一个库，一条 SQL 就能过滤加排序，运维最简单。表里记 embedding_model，HNSW 加余弦，部门字段建索引，代码里抽象一个 VectorStore 接口。
+      到几百万、上千万，先优化单库：按部门分区、内存不够用 halfvec、检索走读副本，同时定期压测延迟和召回，设好阈值作为换库的触发条件。
+      真到五千万或者并发很高，再评估 Milvus 或 Qdrant。迁移时新增一个实现，双写一段时间，用评测集对比结果，灰度切流量，保留回滚。整个过程靠数据驱动，不凭感觉。

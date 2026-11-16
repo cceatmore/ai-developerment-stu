@@ -1,0 +1,841 @@
+day: 9
+phase: 1
+title: FastAPI：路由、依赖注入、Pydantic 与请求校验
+goals:
+  - 能按顺序讲清一个请求在 FastAPI 中从进入到返回经过了哪些环节（ASGI、路由匹配、参数解析、校验、依赖、序列化）
+  - 能用 Pydantic v2 写出带约束的请求和响应模型，并解释 422 是如何产生的
+  - 能解释依赖注入的工作方式，用 Annotated + yield 依赖正确管理数据库 Session，并知道 yield 之后的代码何时执行
+  - 能用 lifespan 管理连接池、HTTP 客户端等应用级资源，区分应用级与请求级资源
+knowledge_points:
+  - id: d09-k1
+    name: FastAPI 架构与请求生命周期
+    level: P0
+    summary: FastAPI = Starlette（ASGI Web 层）+ Pydantic（数据校验）+ 依赖注入；靠类型注解自动完成参数解析、校验和文档生成
+    why: |
+      FastAPI 是目前 Python AI 后端的主流框架：OpenAI、LangChain 生态的大量示例、LangServe、各类 MCP/Agent 服务都基于它。
+      学员如果只会让 AI 生成路由代码，遇到「参数为什么跑到 body 里了」「为什么返回 422」「为什么 async 路由把服务卡住了」就无从下手。理解请求生命周期，是读懂和排查 FastAPI 代码的基础。
+    problem: |
+      解决「**如何用最少的样板代码写出类型安全、自带校验和文档的 API**」的问题。
+      传统框架里，开发者要手动从请求中取参数、转换类型、写校验、处理错误、再手写接口文档。FastAPI 通过函数签名上的类型注解，一次性完成这些工作，并自动生成 OpenAPI 文档（/docs）。
+    principle: |
+      **一、三层结构**
+
+      - **ASGI 服务器（uvicorn）**：负责监听端口、解析 HTTP 协议，把请求转换成 ASGI 调用交给应用。ASGI 是 Python 的异步 Web 服务器接口标准（同步时代的是 WSGI）。
+      - **Starlette**：FastAPI 的底层 Web 框架，提供路由、中间件、请求/响应对象、WebSocket、后台任务、线程池调度等。
+      - **FastAPI 自身**：在 Starlette 之上增加「根据函数签名做参数解析 + Pydantic 校验 + 依赖注入 + OpenAPI 生成」。
+
+      **二、一个请求的完整生命周期**
+
+      ```mermaid
+      flowchart TD
+        A["客户端 HTTP 请求"] --> B["uvicorn 解析协议 转为 ASGI 调用"]
+        B --> C["中间件链 如 CORS 日志 请求 ID"]
+        C --> D["路由匹配 方法加路径"]
+        D -- "无匹配" --> D1["404 或 405"]
+        D --> E["解析依赖树 按顺序执行依赖"]
+        E --> F["从路径 查询 头 请求体 提取参数"]
+        F --> G["Pydantic 校验与类型转换"]
+        G -- "校验失败" --> G1["RequestValidationError 返回 422"]
+        G --> H["执行路径操作函数"]
+        H -- "抛出 HTTPException" --> H1["异常处理器 生成错误响应"]
+        H --> I["按 response_model 过滤并序列化为 JSON"]
+        I --> J["响应经过中间件返回客户端"]
+        J --> K["yield 依赖的退出代码执行 默认在响应发送后"]
+      ```
+
+      **三、参数从哪里来：FastAPI 的推断规则**
+
+      | 函数参数 | FastAPI 的理解 |
+      |---|---|
+      | 名字出现在路径模板中，如 `/items/{item_id}` 的 `item_id: int` | **路径参数** |
+      | 简单类型（int、str、bool 等）且不在路径中 | **查询参数**，有默认值则可选 |
+      | 类型是 Pydantic 模型 | **请求体（JSON）** |
+      | 用 `Header()`、`Cookie()`、`Query()`、`Body()` 等显式声明 | 按声明来源提取 |
+      | `Annotated[T, Depends(fn)]` | **依赖**，由 FastAPI 调用 fn 得到值 |
+      | 类型是 `Request`、`BackgroundTasks` 等 | 框架直接注入 |
+
+      注意：`list[str]` 这类非简单类型如果不显式写 `Query()`，会被当作请求体。
+
+      **四、async def 与 def 路由**
+
+      - `async def` 路由直接在事件循环中运行，里面只能调用异步库，阻塞调用会卡住整个进程（Day 06）。
+      - `def` 路由（以及 `def` 依赖）会被 Starlette 通过 AnyIO 放进**线程池**运行，默认 40 个令牌，所有同步路由和同步依赖共享。
+      - 官方建议：用的库支持 await 就写 `async def`；不支持就写 `def`；拿不准就写 `def`。
+
+      **五、路由组织**
+
+      实际项目用 `APIRouter` 按业务拆分（conversations、knowledge_bases、admin），在主应用中 `app.include_router(router, prefix="/v1", tags=[...])`，可以给整组路由统一添加依赖（如鉴权）。
+
+      **六、自动文档**
+
+      FastAPI 根据路由、参数类型、Pydantic 模型生成 OpenAPI Schema，访问 `/docs` 可以直接调试。这份 Schema 还可以被前端生成客户端代码、被 Agent 框架转换成工具定义。
+    scenarios: |
+      - **对话接口**：`POST /v1/conversations/{conv_id}/messages`，路径参数是对话 ID，请求体是 Pydantic 模型，鉴权和数据库 Session 通过依赖注入。
+      - **健康检查**：`GET /healthz` 写成简单的 `async def`，不依赖数据库，供负载均衡探活。
+      - **接口文档联调**：前端直接在 `/docs` 上试调接口，减少沟通成本；生产环境可以关闭或加鉴权。
+    code: |
+      ```python
+      from typing import Annotated
+
+      from fastapi import APIRouter, FastAPI, Header, Query
+      from pydantic import BaseModel
+
+      router = APIRouter(prefix="/v1", tags=["conversations"])
+
+      class MessageIn(BaseModel):
+          content: str
+
+      @router.post("/conversations/{conv_id}/messages", status_code=201)
+      async def send_message(
+          conv_id: int,                                  # 路径参数，自动转换为 int
+          body: MessageIn,                               # Pydantic 模型 → JSON 请求体
+          stream: bool = False,                          # 简单类型 → 查询参数 ?stream=true
+          x_request_id: Annotated[str | None, Header()] = None,  # 请求头 X-Request-ID
+          tags: Annotated[list[str], Query()] = [],      # 列表需显式 Query，否则会被当作请求体
+      ) -> dict:
+          return {"conv_id": conv_id, "content": body.content, "stream": stream, "tags": tags}
+
+      app = FastAPI()
+      app.include_router(router)
+      ```
+    pitfalls: |
+      - **在 async def 路由里调用同步库**：requests、同步数据库驱动、time.sleep 会阻塞整个 worker（Day 06）。
+      - **误区：def 路由性能一定差。** def 路由在线程池运行，对于同步库是正确选择；只是要注意线程池默认 40 个令牌的上限。
+      - **参数来源搞错**：把 `list[str]` 写成函数参数却没有 `Query()`，前端按查询参数传就会得到 422；路径模板里的变量名和函数参数名不一致也会导致参数被当作查询参数。
+      - **路由顺序冲突**：`/users/me` 必须写在 `/users/{user_id}` 前面，否则 `me` 会被当作 user_id 去解析并返回 422。
+      - **生产环境开放 /docs**：暴露全部接口结构，应关闭（`docs_url=None`）或加鉴权。
+    interview_asks:
+      - FastAPI 和 Flask、Django 有什么区别？为什么 AI 后端常用 FastAPI？
+      - 一个请求进入 FastAPI 后经历了哪些步骤？
+      - FastAPI 中 async def 和 def 路由有什么区别？
+    project_example: |
+      团队把一个 Flask 写的 RAG 服务迁到 FastAPI。迁移中遇到的典型问题：
+      - 把 Flask 的 `request.args.getlist("tags")` 改写成 `tags: list[str]` 参数后，前端调用一直 422——原因是 FastAPI 把它当作请求体，补上 `Query()` 后解决；
+      - 部分路由写成 async def 却调用同步的 Elasticsearch 客户端，压测时整体卡顿，改为异步客户端；
+      - 用 APIRouter 按模块拆分并统一挂载鉴权依赖后，自动生成的 OpenAPI 文档让前端联调时间缩短了约一半。
+  - id: d09-k2
+    name: Pydantic v2 模型与请求校验
+    level: P0
+    summary: 用类型注解和约束描述数据形状，Pydantic 在边界处完成转换与校验；不合法的请求在进入业务代码前就被拦成 422
+    why: |
+      外部输入永远不可信：前端 bug、第三方误用、恶意请求、LLM 生成的工具参数都可能格式错误。
+      Pydantic 是 FastAPI 的校验引擎，也是后面 Structured Output（Day 19）、Function Calling 参数 Schema（Day 18）、LangGraph State 的基础。掌握 v2 写法、理解 422 的产生过程，是 AI 后端的必备能力。
+    problem: |
+      解决「**在系统边界上把不可信的原始数据转换成可信的、类型正确的对象**」的问题。
+      没有统一校验，业务代码里会到处是 `if "content" not in body`、`int(body.get("max_tokens", 0))`，漏掉一处就是 500 或者安全漏洞；同时也无法自动生成准确的接口文档。
+    principle: |
+      **一、模型就是数据契约**
+
+      ```python
+      from pydantic import BaseModel, ConfigDict, Field
+
+      class AskIn(BaseModel):
+          model_config = ConfigDict(extra="forbid")       # 出现未定义字段直接报错
+          content: str = Field(min_length=1, max_length=4000)
+          max_tokens: int = Field(default=512, ge=1, le=2048)
+          temperature: float = Field(default=0.7, ge=0, le=2)
+      ```
+
+      - 字段类型 + `Field` 约束（长度、范围、正则、默认值、描述）共同定义契约。
+      - Pydantic v2 的核心校验逻辑由 Rust 编写的 pydantic-core 实现，性能比 v1 大幅提升。
+
+      **二、校验与转换：lax 模式与 strict 模式**
+
+      - 默认是 **lax（宽松）模式**：`"512"` 会被转换为 `512`，`"true"` 转换为 `True`。这对查询参数（本来就是字符串）很方便。
+      - 需要严格类型时可以开启 strict 模式（`ConfigDict(strict=True)` 或字段级 `Field(strict=True)`），例如要求必须是 JSON 数字而不是字符串。
+
+      **三、422 是怎么产生的**
+
+      ```mermaid
+      sequenceDiagram
+        participant C as 客户端
+        participant F as FastAPI
+        participant P as Pydantic
+        participant R as 路由函数
+        C->>F: POST 请求体 content 为空 max_tokens 为 99999
+        F->>P: 用 AskIn 校验请求体
+        P-->>F: ValidationError 两条错误
+        F->>F: 转换为 RequestValidationError
+        F-->>C: 422 detail 为错误列表
+        Note over R: 路由函数完全没有被执行
+      ```
+
+      默认错误响应格式：
+
+      ```json
+      {"detail": [
+        {"type": "string_too_short", "loc": ["body", "content"], "msg": "String should have at least 1 character", "input": ""},
+        {"type": "less_than_equal", "loc": ["body", "max_tokens"], "msg": "Input should be less than or equal to 2048", "input": 99999}
+      ]}
+      ```
+
+      - `loc` 指出错误位置（body / query / path / header + 字段名），前端可以据此高亮表单字段。
+      - 可以用 `@app.exception_handler(RequestValidationError)` 自定义格式（例如转换成团队统一错误体），但要注意不要把内部细节原样暴露。
+
+      **四、自定义校验**
+
+      - `@field_validator("content")`：单字段规则，例如去掉首尾空白后不能为空。
+      - `@model_validator(mode="after")`：跨字段规则，例如「开启 stream 时不能同时要求返回 logprobs」。
+      - 校验函数里抛出 `ValueError`，会被汇总进 422 的错误列表。
+
+      **五、响应模型：不仅校验输入，也控制输出**
+
+      `response_model=AskOut` 或返回值注解 `-> AskOut`，FastAPI 会按模型**过滤和序列化**输出：ORM 对象里的 `password_hash`、`internal_cost` 等未在模型中声明的字段不会被返回。这是防止数据泄露的重要手段。
+
+      **六、v1 → v2 的写法变化（不要再用旧写法）**
+
+      | 用途 | v1（旧写法） | v2（当前写法） |
+      |---|---|---|
+      | 模型配置 | `class Config:` | `model_config = ConfigDict(...)` |
+      | 转字典 / JSON | `.dict()` / `.json()` | `.model_dump()` / `.model_dump_json()` |
+      | 从字典构造 | `.parse_obj()` | `.model_validate()` |
+      | 从 ORM 对象构造 | `orm_mode = True` | `from_attributes=True` |
+      | 字段校验器 | `@validator` | `@field_validator` |
+      | 根校验器 | `@root_validator` | `@model_validator` |
+    scenarios: |
+      - **限制成本**：`max_tokens` 加上 `le=2048`、`content` 加 `max_length`，防止单个请求消耗过多 Token 或撑爆上下文。
+      - **防止字段注入**：`extra="forbid"` 拒绝前端传入 `user_id`、`role` 这类不应由客户端决定的字段。
+      - **校验 LLM 输出**：用同一套 Pydantic 模型校验模型生成的 JSON（Day 19），失败时触发重试。
+    code: |
+      ```python
+      from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+
+      class AskIn(BaseModel):
+          model_config = ConfigDict(extra="forbid")
+          content: str = Field(min_length=1, max_length=4000, description="用户问题")
+          max_tokens: int = Field(default=512, ge=1, le=2048)
+
+          @field_validator("content")
+          @classmethod
+          def not_blank(cls, v: str) -> str:
+              v = v.strip()
+              if not v:
+                  raise ValueError("content 不能只包含空白")
+              return v
+
+      try:
+          AskIn.model_validate({"content": "  ", "max_tokens": "99999", "role": "admin"})
+      except ValidationError as e:
+          for err in e.errors():
+              print(err["loc"], err["type"], err["msg"])
+      # 会报告三处错误：content 为空白、max_tokens 超过上限、role 是多余字段
+
+      print(AskIn(content="你好").model_dump())  # {'content': '你好', 'max_tokens': 512}
+      ```
+    pitfalls: |
+      - **用 `dict` 接收请求体**：`body: dict` 完全没有校验，缺字段时在业务代码里 KeyError 变成 500，而且文档里看不到字段说明。
+      - **只限制类型不限制范围**：`max_tokens: int` 允许传 1000000，`content: str` 允许传 10MB 文本，直接变成成本和稳定性问题。
+      - **混用 v1 写法**：AI 工具经常生成 `class Config` 和 `.dict()`，在 v2 中要么报弃用警告要么行为不同；FastAPI 近期版本已移除对 Pydantic v1 的支持。
+      - **误区：422 是服务端错误。** 422 是客户端请求不符合契约，应检查调用方；但如果大量出现，可能是前后端版本不一致。
+      - **直接返回 ORM 对象且不声明响应模型**：可能把内部字段（成本、其他用户 ID）一并返回。
+    interview_asks:
+      - FastAPI 返回 422 是什么原因？请求校验是在什么时候发生的？
+      - Pydantic v2 和 v1 有哪些主要区别？
+      - 为什么建议声明 response_model？
+    freshness: |
+      核对于 2026-11：Pydantic 当前版本为 2.14.x（2.14.3 于 2026-11-04 发布），2.14 起不再支持 Python 3.9、增加对 Python 3.15 的支持。v2 的核心 API（`model_validate`、`model_dump`、`ConfigDict`、`field_validator`、`model_validator`）保持稳定。FastAPI 的发布记录显示已移除对 Pydantic v1 及 `pydantic.v1` 兼容层的支持，新项目只使用 v2 写法。
+    sources:
+      - {title: "Pydantic Docs - BaseModel API", url: "https://pydantic.dev/docs/validation/latest/api/pydantic/base%5Fmodel/"}
+      - {title: "Pydantic Changelog", url: "https://pydantic.dev/docs/validation/latest/get-started/changelog/"}
+      - {title: "Pydantic v2.14 Release", url: "https://pydantic.dev/articles/pydantic-v2-14-release"}
+      - {title: "FastAPI - Handling Errors", url: "https://fastapi.tiangolo.com/tutorial/handling-errors/"}
+    project_example: |
+      一个 AI 写作接口最初用 `body: dict` 接收参数，某天账单暴涨：有脚本传入 `max_tokens: 32000` 并循环调用，单次调用成本是正常的 60 倍；还有请求把 `user_id` 放进请求体冒充其他用户。
+      改造：定义 `WriteIn` 模型，`max_tokens` 限制在 1~2048，`content` 最长 8000 字符，`extra="forbid"`；用户 ID 只从鉴权依赖中获取；输出用 `WriteOut` 响应模型，去掉内部成本字段。同时自定义 422 处理器，把错误转成统一格式并记录调用方 ID，便于发现异常调用。
+  - id: d09-k3
+    name: 依赖注入：Depends、Annotated 与 yield 依赖
+    level: P0
+    summary: 依赖是「由框架负责调用并把结果传给你」的函数；yield 依赖把资源的获取和释放包在一次请求的生命周期里
+    why: |
+      鉴权、数据库 Session、当前用户、限流、租户隔离、LLM 客户端……几乎每个接口都要用到这些横切能力。
+      依赖注入让它们只写一次、在每个路由中声明即可；还能在测试中整体替换。数据库 Session 用错（不关闭、不回滚、跨请求复用）是连接泄漏和数据错乱的常见原因，面试也常问「FastAPI 怎么管理数据库会话」。
+    problem: |
+      解决两个问题：
+      1. **复用与解耦**：路由只声明「我需要当前用户和数据库会话」，不关心它们怎么来，鉴权逻辑改一处全局生效，测试时可以替换成假实现。
+      2. **资源生命周期**：每个请求获取的数据库连接必须在请求结束时归还，异常时要回滚；手动在每个路由里写 try/finally 容易遗漏。
+    principle: |
+      **一、基本形态**
+
+      ```python
+      async def current_user(authorization: Annotated[str, Header()]) -> User: ...
+
+      CurrentUser = Annotated[User, Depends(current_user)]   # 类型别名，处处复用
+
+      @app.get("/v1/me")
+      async def me(user: CurrentUser) -> UserOut: ...
+      ```
+
+      - 依赖就是一个普通函数（或类、可调用对象），它自己的参数也可以是查询参数、请求头或**其他依赖**——形成一棵**依赖树**。
+      - FastAPI 在调用路由前，先解析依赖树，按顺序调用每个依赖，再把结果注入。
+      - **同一请求内缓存**：同一个依赖在一次请求里被多处使用时，默认只调用一次（`Depends(..., use_cache=True)`），所以路由和子依赖拿到的是同一个 Session。
+      - 官方推荐写法是 `Annotated[类型, Depends(函数)]`，旧写法 `user: User = Depends(current_user)` 仍可用，但 Annotated 能让类型检查器正确理解、且可以抽成别名复用。
+
+      **二、yield 依赖：资源的获取与释放**
+
+      ```python
+      async def get_db(request: Request) -> AsyncIterator[AsyncSession]:
+          async with request.app.state.sessionmaker() as session:
+              yield session          # yield 之前：获取资源；yield 的值：注入给路由
+          # 离开 async with：关闭 Session，连接归还连接池
+      ```
+
+      - yield 之前的代码在路由执行**之前**运行；yield 出去的值被注入；yield 之后（或 finally / with 退出）的代码是**退出代码**。
+      - 路由或其他依赖抛出的异常会在 yield 处重新抛出，所以可以在依赖里 `try/except` 做回滚。注意：如果你在依赖里捕获了异常却**没有重新抛出**，FastAPI 也不会再把它交给异常处理器（0.110.0 起的行为），可能导致错误被吞。
+      - 多层 yield 依赖的退出顺序与进入顺序相反（像嵌套的 with）。
+
+      ```mermaid
+      sequenceDiagram
+        participant F as FastAPI
+        participant D as get_db 依赖
+        participant R as 路由函数
+        participant C as 客户端
+        F->>D: 调用 执行到 yield 之前 创建 Session
+        D-->>F: yield session
+        F->>R: 注入 session 执行路由
+        R-->>F: 返回结果 或抛出异常
+        F-->>C: 发送响应
+        F->>D: 恢复执行 yield 之后的代码 关闭 Session
+        Note over F,D: 默认 scope 为 request 时 退出代码在响应发送之后执行
+      ```
+
+      **三、退出代码什么时候执行：版本演变要知道**
+
+      - **0.106.0 之前**：退出代码在响应发送之后执行。
+      - **0.106.0 ~ 0.117.x**：改为在发送响应**之前**执行（避免网络传输期间占着数据库连接），但导致 `StreamingResponse` 流式输出时 Session 已被关闭。
+      - **0.118.0 起**：恢复为在响应发送**之后**执行。
+      - **0.121.0 起**：新增 `Depends(func, scope="function")`，让退出代码在路由函数结束后、响应发送前执行；默认 `scope="request"` 则在响应发送后执行。
+      - **工程含义**：流式输出（SSE）期间默认会一直持有依赖里的数据库 Session 和连接；如果流式过程不需要数据库，应在用完后尽早释放，或使用 `scope="function"`。
+
+      **四、提交事务放在哪里**
+
+      常见两种约定：
+      - 依赖只负责创建和关闭 Session，**路由显式 `await session.commit()`**（意图清晰，推荐给初学者）。
+      - 依赖在 yield 后统一提交、异常时回滚（路由更简洁，但要清楚提交发生在什么时机，并注意上面的退出时机问题）。
+      团队统一一种即可，关键是**异常路径一定会回滚、Session 一定会关闭**。
+
+      **五、测试时替换依赖**
+
+      `app.dependency_overrides[get_db] = fake_get_db`，可以把真实数据库替换成测试库，把鉴权替换成固定用户，无需改动业务代码。
+    scenarios: |
+      - **鉴权**：`CurrentUser` 依赖解析 Token、查询用户；`require_admin` 依赖再基于 `CurrentUser` 检查角色，挂在整个管理路由组上。
+      - **数据库 Session**：yield 依赖为每个请求创建一个 AsyncSession，请求结束关闭并归还连接。
+      - **多租户**：`TenantContext` 依赖从 Token 中取出租户 ID，后续所有查询都基于它过滤，避免越权（RAG 权限隔离见 Day 30）。
+    code: |
+      ```python
+      from collections.abc import AsyncIterator
+      from typing import Annotated
+
+      from fastapi import Depends, FastAPI, Header, HTTPException, Request
+      from sqlalchemy.ext.asyncio import AsyncSession
+
+      async def get_db(request: Request) -> AsyncIterator[AsyncSession]:
+          async with request.app.state.sessionmaker() as session:
+              try:
+                  yield session
+              except Exception:
+                  await session.rollback()   # 路由中出错时回滚
+                  raise                      # 必须重新抛出，否则异常被吞掉
+
+      async def current_user_id(authorization: Annotated[str, Header()]) -> int:
+          if not authorization.startswith("Bearer "):
+              raise HTTPException(status_code=401, detail="missing token")
+          return 42  # 实际项目中解析并验证 JWT（Day 45）
+
+      DB = Annotated[AsyncSession, Depends(get_db)]
+      UserId = Annotated[int, Depends(current_user_id)]
+
+      app = FastAPI()
+
+      @app.get("/v1/me")
+      async def me(user_id: UserId, db: DB) -> dict:
+          return {"user_id": user_id}
+      ```
+    pitfalls: |
+      - **把 Session 做成全局变量跨请求共享**：AsyncSession 不是并发安全的，多个请求同时使用会导致数据错乱和奇怪的异常。必须每个请求一个 Session。
+      - **依赖中吞掉异常**：`except Exception: pass` 或只记录不重新抛出，路由的错误被吞掉，客户端可能收到 200 或不明确的响应。
+      - **误区：yield 之后的代码一定在响应前执行。** 这取决于 FastAPI 版本和 `scope`；当前默认在响应发送之后执行。
+      - **在 BackgroundTasks 中使用依赖注入的 Session**：后台任务应该自己创建新的 Session，传 ID 而不是 ORM 对象。
+      - **同步依赖做重活**：`def` 依赖同样在线程池里运行，会占用共享的线程令牌。
+    interview_asks:
+      - FastAPI 的依赖注入是怎么工作的？有什么好处？
+      - 用 yield 依赖管理数据库 Session 时，执行顺序是怎样的？出错时怎么回滚？
+      - 同一个请求里多个地方依赖 get_db，会创建几个 Session？
+    freshness: |
+      核对于 2026-11：FastAPI 当前版本为 0.162.x（0.162.5 于 2026-11-11 发布），最低支持 Python 3.10。官方文档推荐使用 `Annotated[T, Depends(...)]` 写法。yield 依赖退出时机：0.106.0 改为响应前执行，0.118.0 恢复为响应后执行，0.121.0 新增 `Depends(scope="function" | "request")`，默认 `"request"`（响应发送后退出）。0.110.0 起依赖中捕获异常后若不重新抛出，异常不会再自动转发给异常处理器。
+    sources:
+      - {title: "FastAPI - Dependencies with yield", url: "https://fastapi.tiangolo.com/tutorial/dependencies/dependencies-with-yield/"}
+      - {title: "FastAPI - Advanced Dependencies", url: "https://fastapi.tiangolo.com/advanced/advanced-dependencies/"}
+      - {title: "FastAPI - Release Notes", url: "https://fastapi.tiangolo.com/release-notes/"}
+    project_example: |
+      一个对话服务上线后出现「QueuePool limit reached, connection timed out」错误，数据库连接耗尽。
+      排查发现：早期有人写了 `def get_db(): return SessionLocal()`（普通 return，不是 yield），Session 从不关闭，连接只能等垃圾回收才释放；另外流式输出接口在依赖中拿到 Session 后，整个 SSE 流（可能 60 秒）期间都占着连接。
+      修复：改为 `async with sessionmaker() as session: yield session`；流式接口在开始推流前完成所有数据库读取并显式关闭 Session，推流结束后用新的 Session 写入回答。连接池使用率从长期 100% 降到 30% 左右。
+  - id: d09-k4
+    name: lifespan 与应用级资源管理
+    level: P1
+    summary: 连接池、HTTP 客户端、模型这类「整个进程共享」的资源，在 lifespan 里启动时创建、关闭时释放，不要每个请求重建
+    why: |
+      AI 服务依赖很多重资源：数据库连接池、调用 LLM 的 httpx 客户端（内含连接池）、Redis 客户端、本地加载的小模型或 tokenizer。
+      如果每个请求都新建，会出现握手开销大、连接数爆炸、内存泄漏；如果用全局变量随意创建，又难以在关闭时正确释放、难以测试。FastAPI 推荐的 lifespan 正是为此设计的。
+    problem: |
+      解决「**应用级资源在何时创建、在哪里存放、何时释放**」的问题，并替代已弃用的 `@app.on_event("startup")` / `@app.on_event("shutdown")` 写法。
+    principle: |
+      **一、写法**
+
+      ```python
+      from contextlib import asynccontextmanager
+
+      @asynccontextmanager
+      async def lifespan(app: FastAPI):
+          # 启动阶段：在开始接收请求之前执行一次
+          app.state.http = httpx.AsyncClient(timeout=30.0)
+          app.state.engine = create_async_engine(DATABASE_URL, pool_size=10)
+          yield
+          # 关闭阶段：停止接收请求、处理完在途请求后执行一次
+          await app.state.http.aclose()
+          await app.state.engine.dispose()
+
+      app = FastAPI(lifespan=lifespan)
+      ```
+
+      - lifespan 是一个异步上下文管理器：yield 之前是启动逻辑，yield 之后是关闭逻辑。
+      - **每个 worker 进程都会执行一次** lifespan。4 个 worker 就有 4 个连接池、4 个 HTTP 客户端。
+      - 提供了 lifespan 后，旧的 startup/shutdown 事件处理器不会再被调用——两者只能二选一。
+
+      ```mermaid
+      stateDiagram-v2
+        state "进程启动" as Boot
+        state "lifespan yield 之前 创建连接池和客户端" as Startup
+        state "运行中 处理请求 共享 app.state 资源" as Running
+        state "收到停止信号 等待在途请求完成" as Draining
+        state "lifespan yield 之后 关闭客户端 释放连接池" as Shutdown
+        [*] --> Boot
+        Boot --> Startup
+        Startup --> Running: 启动成功
+        Startup --> [*]: 启动失败 进程退出
+        Running --> Draining: SIGTERM 或部署滚动更新
+        Draining --> Shutdown
+        Shutdown --> [*]
+      ```
+
+      **二、应用级 vs 请求级资源**
+
+      | 资源 | 生命周期 | 管理方式 |
+      |---|---|---|
+      | 数据库 Engine（连接池） | 应用级 | lifespan 创建，`dispose()` 释放 |
+      | AsyncSession | **请求级** | yield 依赖，每请求一个 |
+      | httpx.AsyncClient | 应用级（复用连接池） | lifespan 创建，`aclose()` 释放 |
+      | 当前用户、租户 | 请求级 | 依赖 |
+      | 本地 tokenizer、小模型 | 应用级 | lifespan 加载 |
+
+      **三、为什么 HTTP 客户端要复用**
+
+      `httpx.AsyncClient` 内部维护连接池，复用 TCP 和 TLS 连接。每个请求 `async with httpx.AsyncClient()` 新建一次，就要重新进行 TCP 握手和 TLS 握手，调用 LLM 时可能多出几十到上百毫秒，高并发下还会耗尽本地端口。
+
+      **四、启动失败要快速失败**
+
+      在 lifespan 中检查关键依赖（数据库能否连接、必需的环境变量是否存在），失败就直接抛异常让进程退出，比带病运行、在第一个用户请求时才报错要好。但不要在启动时做耗时很长的操作（如下载大模型），会让健康检查和滚动发布超时。
+    scenarios: |
+      - **LLM 客户端**：在 lifespan 中创建带超时配置的 `httpx.AsyncClient` 或官方 SDK 的异步客户端，全局复用。
+      - **数据库**：创建 AsyncEngine 和 sessionmaker，放在 `app.state`，yield 依赖从中取 sessionmaker。
+      - **调整线程池上限**：需要时在 lifespan 中修改 AnyIO 默认线程令牌数量（Starlette 文档给出的做法）。
+    pitfalls: |
+      - **继续使用 `@app.on_event`**：已弃用的旧写法，与 lifespan 不能混用；AI 工具生成的旧代码中很常见。
+      - **每个请求新建 HTTP 客户端或 Engine**：连接无法复用，握手开销大，Engine 每次新建还会产生新的连接池，迅速耗尽数据库连接。
+      - **忘记计算 worker 数量**：每个 worker 都执行 lifespan，`pool_size=20` 乘以 8 个 worker 就是 160 个数据库连接，可能超过数据库上限。
+      - **关闭阶段不释放资源**：滚动发布时连接没有正常关闭，数据库端堆积空闲连接。
+      - **把请求级对象放进 app.state**：例如把 Session 或当前用户放进 app.state，会被所有请求共享，造成数据串号。
+    interview_asks:
+      - FastAPI 的 lifespan 是做什么的？为什么不用 on_event？
+      - 哪些资源应该在应用级创建，哪些应该在请求级创建？
+    freshness: |
+      核对于 2026-11：FastAPI 官方文档推荐使用 `lifespan` 参数配合 `@asynccontextmanager`，`@app.on_event("startup"/"shutdown")` 标记为已弃用（deprecated）；0.128.3 为兼容新版 Starlette 重新实现了 `on_event` 以保持向后兼容，但仍不推荐新代码使用。提供 lifespan 后 startup/shutdown 事件不会再被调用。
+    sources:
+      - {title: "FastAPI - Lifespan Events", url: "https://fastapi.tiangolo.com/advanced/events/"}
+      - {title: "Starlette - Thread Pool", url: "https://starlette.dev/threadpool/"}
+    project_example: |
+      一个 RAG 服务在高峰期调用 Embedding API 的 P99 延迟比供应商公布的高出约 200ms。
+      排查发现检索函数里每次都 `async with httpx.AsyncClient() as client:` 新建客户端，每次请求都重新进行 TLS 握手。
+      改为在 lifespan 中创建一个配置了超时和连接池上限的客户端，存放在 `app.state.http`，通过依赖注入使用；关闭时 `aclose()`。P99 下降约 180ms，服务器上的 TIME_WAIT 连接数也从上万降到几百。
+quiz:
+  - id: d09-q1
+    kp: d09-k2
+    type: single
+    question: |
+      已知模型 `class AskIn(BaseModel): content: str = Field(min_length=1); max_tokens: int = 512`，路由为 `async def ask(body: AskIn)`。客户端发送请求体 `{"content": "hi", "max_tokens": "256"}`，默认配置下结果是什么？
+    options:
+      - 返回 422，因为 max_tokens 传的是字符串不是整数
+      - 校验通过，max_tokens 被转换为整数 256
+      - 校验通过，但 max_tokens 在路由中仍然是字符串 256
+      - 返回 400，因为请求体 JSON 类型不匹配
+    answer: [1]
+    explain: |
+      Pydantic v2 默认使用 lax（宽松）模式，会把能明确解析为整数的字符串 "256" 转换为 int 256，路由拿到的是整数。只有开启 strict 模式时才会因类型不符返回 422。
+      A 是把 strict 模式当成默认行为；C 错在 Pydantic 校验后的字段一定是声明的类型；D 错在 FastAPI 的校验失败统一返回 422 而不是 400，400 通常对应 JSON 本身无法解析。
+  - id: d09-q2
+    kp: d09-k3
+    type: judge
+    question: 在当前版本的 FastAPI 中，使用默认参数的 yield 依赖（如 get_db），yield 之后的清理代码一定会在响应发送给客户端之前执行。
+    answer: false
+    explain: |
+      0.118.0 起，默认（scope 为 request）的 yield 依赖退出代码在响应发送之后执行；只有显式使用 0.121.0 引入的 `Depends(func, scope="function")`，退出代码才会在路由函数结束后、响应发送前执行。
+      历史上 0.106.0 到 0.117.x 曾改为响应前执行，所以网上的旧资料说法不一。实际影响是：流式响应期间默认会一直持有依赖中的数据库 Session。
+  - id: d09-q3
+    kp: d09-k1
+    type: multi
+    question: 关于 FastAPI 的参数解析与路由执行，下列说法正确的有：
+    options:
+      - 路由函数中类型为 Pydantic 模型的参数，默认从 JSON 请求体中解析
+      - 函数参数 `tags list[str]` 不写 Query()，默认会被当作查询参数解析
+      - 普通 def 路由会被放到线程池中执行，不会阻塞事件循环
+      - 请求校验失败时，路由函数不会被执行，FastAPI 直接返回 422
+      - async def 路由会自动在独立线程中运行，所以里面调用 requests 也不会影响其他请求
+    answer: [0, 2, 3]
+    explain: |
+      A 正确：Pydantic 模型参数被识别为请求体。C 正确：def 路由由 Starlette 通过 AnyIO 放进线程池执行（默认 40 个令牌）。D 正确：参数解析和校验发生在调用路由之前，失败直接返回 422。
+      B 错：list 这类非简单类型不加 Query() 会被当作请求体，这是常见的 422 原因。E 错：async def 路由直接在事件循环中运行，调用 requests 会阻塞整个 worker。
+  - id: d09-q4
+    kp: d09-k3
+    type: short
+    question: 解释下面依赖在一次请求中的执行顺序；如果路由中执行 SQL 时抛出异常，会发生什么？如果把 except 块里的 raise 删掉又会怎样？
+    key_points:
+      - {text: "按顺序说明进入 async with 创建 Session、yield 注入路由、路由执行、退出代码关闭 Session", dim: concept}
+      - {text: "说明路由中的异常会在 yield 处重新抛出，进入 except 执行 rollback 后继续向上抛出", dim: principle}
+      - {text: "说明删除 raise 后异常被依赖吞掉，FastAPI 不会再把它交给异常处理器，客户端可能收不到正确的错误响应", dim: principle}
+      - {text: "指出 Session 无论是否异常都会因为 async with 退出而关闭，连接归还连接池", dim: engineering}
+    reference: |
+      依赖代码为：`async with sessionmaker() as session: try: yield session except Exception: await session.rollback(); raise`。
+      执行顺序：FastAPI 解析依赖树时调用 get_db，进入 `async with` 创建 AsyncSession，执行到 `yield session` 暂停，把 Session 注入路由；路由执行业务逻辑；路由正常结束后响应被发送（默认 scope 下退出代码在响应发送后执行），然后 get_db 从 yield 处恢复，离开 try 和 async with，Session 关闭，连接归还连接池。
+      如果路由执行 SQL 抛出异常，这个异常会在 get_db 的 yield 处被重新抛出，进入 except 块执行 `rollback()` 撤销本次事务中的修改，然后 `raise` 让异常继续向上传播，FastAPI 交给异常处理器返回 500（或对应的 HTTPException 状态码）；`async with` 退出时 Session 依然会关闭。
+      如果删掉 `raise`，异常在依赖中被吞掉。按 0.110.0 之后的行为，FastAPI 不会再自动把它转发给异常处理器，调用方可能收不到明确的错误响应，日志里也可能没有异常记录，问题被掩盖。所以依赖中捕获异常后必须重新抛出。
+  - id: d09-q5
+    kp: d09-k2
+    type: scenario
+    question: |
+      某 AI 问答接口定义为 `async def ask(body: dict, db: DB)`，业务代码中用 `body["question"]`、`body.get("max_tokens", 512)`、`body.get("user_id")` 取值。
+      最近出现三个问题：(1) 缺字段时返回 500；(2) 有人传 max_tokens=50000 导致单次成本暴涨；(3) 有人在 body 中伪造 user_id 查看他人的对话。请用 FastAPI 和 Pydantic v2 的机制给出修复方案，并说明每个问题是如何被解决的。
+    key_points:
+      - {text: "定义 Pydantic 请求模型替代 dict，缺字段在校验阶段返回 422 而不是在业务代码中 KeyError", dim: concept}
+      - {text: "用 Field 约束 question 长度与 max_tokens 范围，限制成本与上下文", dim: engineering}
+      - {text: "用户身份从鉴权依赖获取，不从请求体读取，并用 extra forbid 拒绝多余字段", dim: engineering}
+      - {text: "在查询对话时校验资源归属，防止越权访问", dim: engineering}
+      - {text: "声明响应模型过滤输出字段，必要时自定义 422 错误格式", dim: principle}
+    reference: |
+      **问题 1（缺字段 500）：** 定义 `class AskIn(BaseModel)`，`question: str = Field(min_length=1, max_length=4000)`，路由改为 `body: AskIn`。缺少 question 时 Pydantic 在路由执行前就报错，FastAPI 返回 422，`loc` 精确指出 `["body", "question"]`，不会再在业务代码中触发 KeyError 变成 500。
+      **问题 2（成本暴涨）：** `max_tokens: int = Field(default=512, ge=1, le=2048)`，超出范围直接 422。同时 question 的 `max_length` 限制输入 Token，避免撑爆上下文和成本。
+      **问题 3（伪造 user_id）：** 用户身份绝不从请求体获取。新增 `current_user_id` 依赖，从 `Authorization` 头解析并验证 Token；路由参数改为 `user_id: UserId`。模型设置 `model_config = ConfigDict(extra="forbid")`，客户端再传 user_id 会直接得到 422，便于发现异常调用。查询对话时校验 `conversation.user_id == user_id`，不属于当前用户则返回 404。
+      **补充：** 声明 `response_model=AskOut`，只返回需要的字段；自定义 RequestValidationError 处理器，把 422 转成团队统一错误格式并记录调用方，便于识别恶意请求。
+    followup:
+      question: 为什么越权检查不能只靠 Pydantic 校验完成？
+      key_points:
+        - Pydantic 只校验数据格式与约束
+        - 归属判断需要结合当前用户与数据库中的资源
+        - 应在依赖或业务层查询时完成
+      reference: Pydantic 只能判断数据格式是否符合契约（类型、长度、范围），而「这个对话是否属于当前用户」需要把鉴权得到的用户身份和数据库中的资源对比，属于业务授权逻辑。应该在依赖（如 get_owned_conversation）或业务层查询时完成，例如查询时直接带上 user_id 条件。
+  - id: d09-q6
+    kp: d09-k4
+    type: scenario
+    question: |
+      一个服务在每个路由里都写 `async with httpx.AsyncClient() as client:` 调用 LLM，并在模块顶层 `engine = create_async_engine(URL, pool_size=20)`。部署时 uvicorn 开了 8 个 worker，数据库 max_connections 为 100。
+      上线后出现：调用 LLM 的延迟比预期高、数据库偶发「too many connections」。请分析原因，并用 lifespan 和依赖注入重新设计资源管理。
+    key_points:
+      - {text: "指出每次请求新建 httpx 客户端无法复用连接，需要重复 TCP 与 TLS 握手导致延迟升高", dim: principle}
+      - {text: "计算 8 个 worker 乘以 pool_size 20 加默认溢出连接，远超数据库 100 个连接上限", dim: engineering}
+      - {text: "提出在 lifespan 中创建共享的 AsyncClient 与 Engine，并在关闭阶段 aclose 与 dispose", dim: concept}
+      - {text: "提出按 worker 数反推连接池大小，必要时引入连接池代理", dim: engineering}
+      - {text: "说明 Session 仍需每请求通过 yield 依赖创建，不能放进 app.state 共享", dim: principle}
+    reference: |
+      **延迟高：** 每个请求都新建 `httpx.AsyncClient`，连接池随客户端销毁而关闭，下一次调用 LLM 又要重新做 TCP 握手和 TLS 握手，额外增加几十到上百毫秒；高并发时还会产生大量 TIME_WAIT 连接。
+      **连接数超限：** 模块顶层创建的 Engine 在每个 worker 进程中各有一个。SQLAlchemy 的 QueuePool 默认还允许 `max_overflow=10` 个溢出连接，所以单个 worker 最多 30 个连接，8 个 worker 最多 240 个，远超数据库的 100 个上限，高峰期就会出现 too many connections。此外模块顶层创建也无法在进程关闭时正确释放。
+      **重新设计：**
+      - 在 lifespan 中创建 `app.state.http = httpx.AsyncClient(timeout=..., limits=...)` 和 `app.state.engine = create_async_engine(URL, pool_size=8, max_overflow=2, pool_pre_ping=True)`、`app.state.sessionmaker = async_sessionmaker(engine, expire_on_commit=False)`；yield 之后 `await http.aclose()`、`await engine.dispose()`。
+      - 连接池大小按「worker 数 ×（pool_size + max_overflow）≤ 数据库可用连接数 - 预留给运维与迁移的连接」来反推：8 × (8 + 2) = 80，留出余量。worker 很多或有多个服务共享数据库时，引入 PgBouncer 之类的连接池代理。
+      - 通过依赖注入使用：`get_http` 返回 `request.app.state.http`；`get_db` 用 yield 每请求创建一个 AsyncSession。Session 是请求级资源，不能放进 app.state 共享。
+interview:
+  - id: d09-i1
+    kp: d09-k1
+    type: oral
+    difficulty: 1
+    question: 介绍一下 FastAPI。为什么 AI 应用后端常用它？
+    key_points:
+      - {text: "说明 FastAPI 基于 Starlette 与 Pydantic，运行在 uvicorn 等 ASGI 服务器上", dim: concept}
+      - {text: "说明通过类型注解实现参数解析、校验、依赖注入与 OpenAPI 文档自动生成", dim: principle}
+      - {text: "说明原生支持 async，适合 LLM 调用等 IO 密集场景，同时能用线程池兼容同步代码", dim: principle}
+      - {text: "结合项目说明其带来的开发效率或性能收益，并提到需要注意的坑", dim: project}
+    reference: |
+      FastAPI 是一个基于 Python 类型注解的现代 Web 框架。它的底层是 Starlette（ASGI 框架，提供路由、中间件、请求响应、WebSocket 等），数据校验交给 Pydantic，运行在 uvicorn 这类 ASGI 服务器上。
+      它的核心机制是读取路由函数签名上的类型注解：自动判断参数来自路径、查询、请求头还是请求体，用 Pydantic 做类型转换和校验，校验失败返回 422；用 Depends 实现依赖注入；同时根据这些信息自动生成 OpenAPI 文档。
+      AI 后端常用它的原因：一是原生支持 async，LLM 调用、向量检索、数据库访问都是 I/O 密集，异步能显著提升并发；同步代码写成 def 路由会被放进线程池，也能兼容。二是 Pydantic 和 LLM 的结构化输出、工具参数 Schema 天然契合。三是自动文档和类型提示让前后端联调、生成工具定义都很方便，生态里大量 AI 项目示例都基于它。
+      需要注意的是：async 路由里不能写阻塞代码；要用 lifespan 管理连接池等资源；生产环境要关闭或保护 /docs。
+    oral: |
+      FastAPI 底层是 Starlette 加 Pydantic，跑在 uvicorn 这种 ASGI 服务器上。它最大的特点是用类型注解驱动一切：参数从哪来、怎么校验、文档怎么生成，都是看函数签名自动完成的。
+      AI 后端用它主要是三个原因：第一，原生异步，调 LLM、查向量库这种等待多的场景并发能力很好；第二，Pydantic 跟结构化输出、工具 Schema 是同一套东西；第三，自动生成的 OpenAPI 文档让联调很省事。
+      我们项目从 Flask 迁过来以后，联调时间大概省了一半。但我也会注意它的坑，比如 async 路由里不能用同步库，资源要放在 lifespan 里统一管理。
+  - id: d09-i2
+    kp: d09-k2
+    type: oral
+    difficulty: 2
+    question: FastAPI 返回 422 的完整过程是怎样的？Pydantic v2 相比 v1 有哪些写法上的变化？
+    key_points:
+      - {text: "说明路由执行前 FastAPI 提取参数并交给 Pydantic 校验，失败抛出 RequestValidationError，默认处理器返回 422 与 detail 列表", dim: principle}
+      - {text: "说明错误条目中 loc type msg 的含义，以及 lax 模式下的类型转换", dim: concept}
+      - {text: "说明可以自定义 RequestValidationError 处理器统一错误格式，同时避免泄露细节", dim: engineering}
+      - {text: "列举 v1 到 v2 的写法变化：ConfigDict、model_dump、model_validate、field_validator、from_attributes", dim: concept}
+      - {text: "结合项目说明用 Field 约束控制成本或防止字段注入", dim: project}
+    reference: |
+      FastAPI 在匹配到路由后、调用路由函数之前，会根据函数签名从路径、查询参数、请求头、请求体中提取原始数据，交给 Pydantic 按声明的类型和约束进行转换和校验。默认是 lax 模式，例如字符串 "256" 可以转换为整数。只要有任何一处不满足，就会收集所有错误并抛出 RequestValidationError，默认的异常处理器返回 422，响应体是 `{"detail": [...]}`，每个错误包含 loc（位置，如 body.content）、type（错误类型，如 string_too_short）、msg（说明）和 input。路由函数完全不会被执行。可以通过 `@app.exception_handler(RequestValidationError)` 把它转换成团队统一的错误格式，但要避免把内部细节原样返回。
+      v1 到 v2 的主要写法变化：配置从 `class Config` 改为 `model_config = ConfigDict(...)`；`.dict()` / `.json()` 改为 `.model_dump()` / `.model_dump_json()`；`parse_obj` 改为 `model_validate`；`orm_mode` 改为 `from_attributes`；`@validator` / `@root_validator` 改为 `@field_validator` / `@model_validator`。v2 的核心由 Rust 实现，性能更好。FastAPI 新版本已经不再支持 v1。
+      在项目中，我会用 Field 限制 content 长度和 max_tokens 范围控制成本，用 `extra="forbid"` 防止客户端注入 user_id 之类的字段。
+    oral: |
+      422 的过程是这样的：路由匹配上之后，FastAPI 先按函数签名把路径、查询、请求头、请求体里的数据取出来，交给 Pydantic 校验。有任何一处不合格，就收集所有错误抛 RequestValidationError，默认返回 422，detail 里每条有 loc、type、msg。关键是这时候路由函数根本没执行。
+      v2 的写法变化我常提醒同事的有这几个：Config 类换成 model_config 加 ConfigDict，dict 换成 model_dump，parse_obj 换成 model_validate，validator 换成 field_validator，orm_mode 换成 from_attributes。AI 工具经常生成旧写法，要注意改。
+      项目里我们用 Field 把 max_tokens 限制在两千以内，加了 extra forbid，之前有人在请求体里传 user_id 想冒充别人，现在直接就 422 了。
+  - id: d09-i3
+    kp: d09-k3
+    type: oral
+    difficulty: 3
+    question: 讲讲 FastAPI 的依赖注入。你是怎么用 yield 依赖管理数据库 Session 的？请说明执行顺序、异常处理和需要注意的版本差异。
+    key_points:
+      - {text: "说明依赖是由框架调用并注入结果的函数，可以嵌套成依赖树，同一请求内默认缓存", dim: concept}
+      - {text: "说明 Annotated 加 Depends 的推荐写法与类型别名复用", dim: concept}
+      - {text: "说明 yield 依赖执行顺序：yield 前获取资源、注入、路由执行、退出代码释放资源，异常在 yield 处重新抛出", dim: principle}
+      - {text: "说明异常时回滚并必须重新抛出，Session 每请求一个且不能跨请求共享", dim: engineering}
+      - {text: "说明退出代码默认在响应发送后执行，0.121.0 起可用 scope function，以及对流式响应的影响", dim: engineering}
+      - {text: "说明测试时用 dependency_overrides 替换依赖", dim: project}
+    reference: |
+      FastAPI 的依赖就是一个由框架负责调用的函数，路由通过 `Annotated[类型, Depends(函数)]` 声明需要它。依赖本身的参数可以是请求参数，也可以是其他依赖，形成依赖树；同一个请求中，同一个依赖默认只执行一次并缓存结果，所以路由和子依赖拿到的是同一个 Session。我一般会定义 `DB = Annotated[AsyncSession, Depends(get_db)]`、`CurrentUser = Annotated[User, Depends(current_user)]` 这样的别名，在各个路由中复用。
+      数据库 Session 用 yield 依赖管理：`async with app.state.sessionmaker() as session: try: yield session except Exception: await session.rollback(); raise`。执行顺序是：请求进来时创建 Session，执行到 yield 把它注入给路由；路由执行并显式 commit；之后 FastAPI 恢复依赖执行退出代码，离开 async with 关闭 Session、连接归还连接池。如果路由抛异常，异常会在 yield 处重新抛出，依赖里回滚后必须重新抛出，否则异常被吞掉，FastAPI 0.110.0 之后不会再把它交给异常处理器。Session 每请求一个，绝不能做成全局共享，因为 AsyncSession 不是并发安全的。
+      版本差异：0.118.0 起默认退出代码在响应发送之后执行，0.121.0 起可以用 `Depends(get_db, scope="function")` 让它在路由结束后、响应发送前执行。这对流式响应很重要：默认情况下 SSE 推流期间 Session 一直被占用，如果推流不需要数据库，应提前释放。
+      测试时用 `app.dependency_overrides[get_db] = override_get_db` 替换成测试数据库，鉴权也可以替换成固定用户。
+    oral: |
+      依赖注入我理解就是：路由只声明「我需要什么」，由框架负责调用并把结果塞进来。依赖还能依赖别的依赖，形成一棵树，同一个请求里同一个依赖默认只执行一次。写法上我用 Annotated 加 Depends，再抽成 DB、CurrentUser 这种别名复用。
+      数据库 Session 我用 yield 依赖：async with 创建 Session，yield 给路由，路由里显式 commit；出异常的话异常会在 yield 处抛回来，我回滚之后一定重新 raise，不然错误就被吞了。退出 async with 的时候 Session 关闭，连接还回池子。
+      版本上要注意，现在默认退出代码是在响应发完之后才执行，所以流式接口推流期间会一直占着连接。我们之前就因为这个连接池被打满过，后来推流前先把数据读完、把 Session 关掉，0.121 之后也可以用 scope function。测试的时候用 dependency_overrides 换成测试库。
+  - id: d09-i4
+    kp: d09-k1
+    type: oral
+    difficulty: 3
+    question: FastAPI 中 async def 路由和 def 路由有什么区别？什么时候用哪个？线程池满了会怎样？
+    key_points:
+      - {text: "说明 async def 路由直接在事件循环中执行，def 路由由 Starlette 通过 AnyIO 放进线程池", dim: concept}
+      - {text: "说明 async 路由中调用阻塞代码会卡住整个 worker，def 路由中的阻塞只占一个线程", dim: principle}
+      - {text: "说明线程池默认 40 个令牌且同步路由与同步依赖共享，满了后新请求排队", dim: principle}
+      - {text: "给出选择规则：使用异步库写 async def，同步库写 def，混合时用 to_thread 或 run_in_threadpool", dim: engineering}
+      - {text: "结合项目说明如何发现与调整，包括调整令牌数或彻底异步化", dim: project}
+    reference: |
+      FastAPI 在启动时判断路由函数是否是协程函数。async def 路由在请求到来时直接在事件循环中 await 执行，适合调用 httpx.AsyncClient、asyncpg、异步 SQLAlchemy 这类异步库；如果在其中调用 requests、同步数据库驱动、time.sleep 或做重计算，就会阻塞事件循环，整个 worker 的所有请求都会停滞。
+      def 路由（以及 def 依赖）则会被 Starlette 通过 `anyio.to_thread.run_sync` 放进线程池执行，阻塞只占用一个线程，事件循环可以继续服务其他请求。但线程池是有上限的：AnyIO 默认的线程限制器只有 40 个令牌，所有同步路由和同步依赖共享。如果每个请求阻塞 2 秒，第 41 个并发请求就要排队等待空闲线程，延迟成倍增加。
+      选择规则：路由中用的都是异步库就写 async def；用的是同步库就写 def；拿不准时写 def 更安全。大部分是异步、只有一两个同步调用时，写 async def 并用 `asyncio.to_thread` 或 `run_in_threadpool` 包装那一处。
+      如果线程池成为瓶颈，可以在 lifespan 中调整默认令牌数，但更多线程意味着更多内存和下游压力，根本解决办法是换成异步库或者增加 worker 进程。
+    oral: |
+      区别在于执行位置：async def 路由直接跑在事件循环上，def 路由会被扔到线程池里跑，线程池是 AnyIO 的，默认四十个令牌，所有同步路由和同步依赖一起用。
+      所以选择规则很简单：用的都是异步库就写 async def；用的是同步库就写 def；大部分异步只有一处同步调用，就 async def 里用 to_thread 包那一处。最怕的是 async def 里写同步调用，那会卡住整个进程。
+      线程池满了的话新请求就排队。我们压测过一个同步路由，并发超过四十以后耗时直接翻倍。当时的处理是先在 lifespan 里把令牌调大应急，然后把那个同步 SDK 换成了异步客户端。
+  - id: d09-i5
+    kp: d09-k4
+    type: design
+    difficulty: 4
+    question: 请设计一个 AI 对话服务的 FastAPI 项目结构：包括目录分层、配置管理、应用级资源、请求级依赖、错误处理和测试方案，并说明各层职责。
+    key_points:
+      - {text: "给出分层：路由层只做协议转换，服务层写业务逻辑，数据访问层封装 ORM，外部客户端层封装 LLM 调用", dim: concept}
+      - {text: "配置用 pydantic-settings 或环境变量集中管理，密钥不入代码库", dim: engineering}
+      - {text: "lifespan 管理 Engine、HTTP 客户端等应用级资源，yield 依赖管理 Session、当前用户等请求级资源", dim: principle}
+      - {text: "统一异常处理：业务异常映射为状态码与统一错误体，覆盖 RequestValidationError 与未处理异常", dim: engineering}
+      - {text: "测试方案：dependency_overrides 替换数据库与鉴权，mock LLM 客户端，覆盖 422 与异常路径", dim: engineering}
+      - {text: "结合 AI 场景提到超时、请求 ID、日志脱敏或流式接口的 Session 释放", dim: project}
+    reference: |
+      **目录分层：**
+      - `app/main.py`：创建 FastAPI、注册 lifespan、中间件、异常处理器、挂载路由。
+      - `app/api/`：路由层（conversations.py、knowledge_bases.py），只负责参数声明、依赖注入、调用服务层、把结果转换为响应模型。
+      - `app/schemas/`：Pydantic 请求和响应模型。
+      - `app/services/`：业务逻辑（如 ChatService：校验对话归属、组装上下文、调用 LLM、保存消息），不依赖 FastAPI 对象，方便单测。
+      - `app/repositories/` 与 `app/models/`：SQLAlchemy ORM 模型和数据访问封装（Day 10）。
+      - `app/clients/`：LLM、Embedding 等外部服务客户端封装，统一超时、重试、错误映射（Day 08、Day 20）。
+      - `app/core/`：配置、日志、安全、依赖定义（deps.py）。
+
+      **配置：** 用 pydantic-settings 定义 Settings 类，从环境变量和 .env 读取，启动时校验必填项；API Key 等密钥通过环境变量或密钥管理服务注入，不提交到代码库。
+
+      **资源：** lifespan 中创建 AsyncEngine、sessionmaker、httpx.AsyncClient（配置超时与连接上限），关闭时释放。请求级依赖：`get_db`（yield 每请求一个 Session，异常回滚并重新抛出）、`current_user`（解析 Token）、`get_chat_service`（组合 Session 与客户端构造服务对象）。
+
+      **错误处理：** 定义业务异常基类（NotFound、Forbidden、UpstreamTimeout 等），在全局异常处理器中映射为 404/403/504 和统一错误体（code、message、request_id）；覆盖 RequestValidationError 输出统一格式；未处理异常返回 500，只记录日志不暴露堆栈。中间件生成 X-Request-ID 并写入日志上下文，日志中对用户输入脱敏。
+
+      **测试：** 使用 httpx.AsyncClient 搭配 ASGITransport 或 TestClient 调用接口；`app.dependency_overrides` 把 get_db 换成测试数据库（每个测试用事务回滚隔离），把 current_user 换成固定用户；LLM 客户端注入 mock 实现，覆盖成功、超时、429、上游 500 等路径；专门测试 422（缺字段、超长、越界）与越权访问返回 404。
+
+      **AI 场景细节：** 调用 LLM 设置整体超时；流式接口推流前释放数据库 Session，推流结束后用新 Session 保存回答；不要在调用 LLM 期间持有数据库事务。
+    oral: |
+      我会按职责分层：路由层只做参数声明和响应转换；服务层写业务，比如校验对话归属、组装上下文、调模型、存消息，它不依赖 FastAPI，方便单测；数据访问层封装 ORM；外部客户端层封装 LLM 调用，统一处理超时、重试和错误映射。
+      配置用 pydantic-settings 从环境变量读，启动时校验，密钥不进代码库。资源分两类：Engine 和 HTTP 客户端在 lifespan 里创建和释放；Session、当前用户这些用 yield 依赖每个请求一份。
+      错误处理是业务异常统一映射成状态码和统一错误体，带 request_id，422 也转成统一格式，500 不暴露堆栈。
+      测试用 dependency_overrides 换测试库和固定用户，LLM 客户端换 mock，重点覆盖超时、429 和越权这些异常路径。还有一点 AI 场景特有的：调模型期间不要占着数据库事务，流式接口推流前先把 Session 释放。
+code_reading:
+  id: d09-c1
+  kp: [d09-k2, d09-k3, d09-k4]
+  title: 对话消息接口（lifespan + 依赖注入 + Pydantic）
+  scenario: |
+    这是一个企业 AI 助手的核心接口：已登录用户向自己的某个对话发送问题，服务调用 LLM 生成回答并保存到数据库，返回消息 ID 和回答。
+    代码用到了 lifespan、Annotated 依赖、yield Session 和 Pydantic 模型，看起来很「规范」。安全审计时却发现了越权问题，财务也注意到个别用户的 Token 消耗异常高。
+  language: python
+  code: |
+    import os
+    from collections.abc import AsyncIterator
+    from contextlib import asynccontextmanager
+    from typing import Annotated
+
+    import httpx
+    from fastapi import Depends, FastAPI, Header, HTTPException, Request
+    from pydantic import BaseModel, Field
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+    from .auth import decode_token
+    from .models import Conversation, Message
+
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        app.state.engine = create_async_engine(os.environ["DATABASE_URL"], pool_size=10)
+        app.state.sessions = async_sessionmaker(app.state.engine, expire_on_commit=False)
+        app.state.http = httpx.AsyncClient(base_url=os.environ["LLM_BASE_URL"], timeout=30.0)
+        yield
+        await app.state.http.aclose()
+        await app.state.engine.dispose()
+
+    app = FastAPI(lifespan=lifespan)
+
+
+    async def get_db(request: Request) -> AsyncIterator[AsyncSession]:
+        async with request.app.state.sessions() as session:
+            yield session
+
+
+    async def current_user_id(authorization: Annotated[str, Header()]) -> int:
+        payload = decode_token(authorization.removeprefix("Bearer "))
+        if payload is None:
+            raise HTTPException(status_code=401, detail="invalid token")
+        return payload["uid"]
+
+    DB = Annotated[AsyncSession, Depends(get_db)]
+    UserId = Annotated[int, Depends(current_user_id)]
+
+
+    class AskIn(BaseModel):
+        content: str = Field(min_length=1)
+        max_tokens: int = 512
+
+
+    class AskOut(BaseModel):
+        message_id: int
+        answer: str
+
+
+    @app.post("/v1/conversations/{conv_id}/messages", status_code=201)
+    async def ask(conv_id: int, body: AskIn, db: DB, user_id: UserId, request: Request) -> AskOut:
+        conv = await db.get(Conversation, conv_id)
+        if conv is None:
+            raise HTTPException(status_code=404, detail="conversation not found")
+        resp = await request.app.state.http.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": body.content}],
+            "max_tokens": body.max_tokens,
+        })
+        resp.raise_for_status()
+        answer = resp.json()["choices"][0]["message"]["content"]
+        msg = Message(conversation_id=conv.id, user_id=user_id, question=body.content, answer=answer)
+        db.add(msg)
+        await db.commit()
+        return AskOut(message_id=msg.id, answer=answer)
+  walkthrough:
+    function: |
+      应用启动时在 lifespan 中创建数据库引擎、Session 工厂和 LLM HTTP 客户端；每个请求通过依赖注入拿到数据库 Session 和当前用户 ID；`ask` 路由读取对话、调用 LLM、保存问答记录并返回 `AskOut`。
+    key_functions: |
+      - `lifespan`：应用级资源的创建与释放（Engine 连接池、sessionmaker、httpx 客户端）。
+      - `get_db`：yield 依赖，每请求创建一个 AsyncSession，请求结束关闭。
+      - `current_user_id`：从 `Authorization` 头解析 Token，无效返回 401，有效返回用户 ID。
+      - `AskIn` / `AskOut`：请求与响应模型；返回值注解 `-> AskOut` 让 FastAPI 按该模型序列化输出。
+      - `ask`：业务路由，按顺序执行查对话 → 调 LLM → 写消息 → 提交。
+    params: |
+      - `conv_id` 来自路径并转换为 int；`body` 来自 JSON 请求体并经 `AskIn` 校验；`db` 与 `user_id` 由依赖注入；`request` 由框架注入，用于访问 `app.state.http`。
+      - `authorization` 来自请求头 `Authorization`（FastAPI 会把参数名中的下划线转换为连字符，这里本身就是单词）。缺少该头时 FastAPI 返回 422。
+      - 用户问题 `body.content` 和 `body.max_tokens` 被原样转发给 LLM。
+    data_flow: |
+      ```mermaid
+      flowchart TD
+        A["POST /v1/conversations/{conv_id}/messages"] --> B["依赖 current_user_id 解析 Token"]
+        A --> C["依赖 get_db 创建 Session"]
+        A --> D["AskIn 校验 content 非空 max_tokens 无上限"]
+        B --> E["ask 路由"]
+        C --> E
+        D --> E
+        E --> F["db.get 按 ID 读取对话 未校验归属"]
+        F -- "不存在" --> G["404"]
+        F --> H["调用 LLM 期间 Session 与事务保持打开"]
+        H -- "上游 4xx 或 5xx" --> I["raise_for_status 未处理 变成 500"]
+        H --> J["写入 Message 并 commit"]
+        J --> K["返回 AskOut 201"]
+        K --> L["响应发送后 get_db 关闭 Session"]
+      ```
+    failure_points: |
+      - **问题 1：没有校验对话归属（越权 / IDOR）**。`db.get(Conversation, conv_id)` 只按 ID 查询，任何登录用户只要遍历 `conv_id` 就能往别人的对话里写消息；如果后续把历史消息作为上下文拼进 Prompt，还会把别人的对话内容泄露给攻击者。应检查 `conv.user_id == user_id`，不属于当前用户时返回 404。
+      - **问题 2：输入没有上限，成本不可控**。`content` 只有 `min_length=1` 没有 `max_length`，`max_tokens` 没有任何范围限制，用户可以提交超长文本并要求极大的输出长度，导致单次调用成本暴涨甚至超出模型上下文报错——对应「个别用户 Token 消耗异常高」。
+      - `resp.raise_for_status()` 抛出的 `httpx.HTTPStatusError` 以及超时异常没有处理，上游 429/503/超时都变成 500（Day 08 讲过的状态码映射问题）。
+      - 调用 LLM（可能 30 秒）期间 Session 已经因为 `db.get` 开启了事务并占用一个连接池连接，高并发下 `pool_size=10` 很快被占满（Day 10 详细讲）。
+      - `AskIn` 没有 `extra="forbid"`，多余字段被静默忽略，不便发现异常调用。
+    debugging: |
+      - 复现越权：用用户 A 的 Token 调用用户 B 的 `conv_id`，确认返回 201 且消息写入了 B 的对话。
+      - 成本异常：在调用 LLM 前记录 `len(body.content)` 和 `max_tokens`（不记录原文），按用户聚合，找出异常调用者。
+      - 上游错误：用 mock 让 LLM 返回 429，确认当前接口返回 500，对照期望的 503。
+      - 连接占用：压测时观察数据库 `pg_stat_activity` 中 `idle in transaction` 状态的连接数量，以及 SQLAlchemy 的连接池超时错误。
+    change_request: |
+      **需求：只允许用户向自己的对话发消息，并限制单次成本。**
+      - 新增依赖 `get_owned_conversation(conv_id, db, user_id)`：查询时带上 `user_id` 条件，查不到统一返回 404；路由改为注入该依赖。
+      - `AskIn`：`content: str = Field(min_length=1, max_length=4000)`，`max_tokens: int = Field(default=512, ge=1, le=2048)`，`model_config = ConfigDict(extra="forbid")`。
+      - LLM 调用改为通过封装好的客户端，捕获超时与上游状态码并映射为 504/503/502。
+      - 先读取所需数据并结束只读事务，调用 LLM 之后再写入消息，避免长时间占用连接（Day 10）。
+  questions:
+    - id: d09-c1-q1
+      kp: d09-k3
+      type: code
+      question: 按执行顺序说明一次正常请求中，lifespan、get_db、current_user_id、AskIn 校验、ask 路由、Session 关闭各自在什么时候发生；如果请求没有带 Authorization 头，会在哪一步结束、返回什么？
+      key_points:
+        - {text: "说明 lifespan 只在进程启动时执行一次，请求期间复用 app.state 中的资源", dim: concept}
+        - {text: "说明路由执行前先完成依赖解析与参数校验，包括 current_user_id、get_db 到 yield、AskIn 校验", dim: principle}
+        - {text: "说明路由执行完成并发送响应后，get_db 退出 async with 关闭 Session", dim: principle}
+        - {text: "指出缺少 Authorization 头时在参数校验阶段返回 422 而不是 401，路由不会执行", dim: concept}
+      reference: |
+        **启动时：** 进程启动时执行一次 lifespan 的 yield 之前部分，创建 Engine、sessionmaker、httpx 客户端并放到 `app.state`，之后所有请求复用。
+        **请求到来时：** 路由匹配成功后，FastAPI 先解析参数和依赖：从请求头提取 `authorization` 并调用 `current_user_id` 解析 Token；调用 `get_db`，执行到 `yield session` 暂停并得到 Session；从请求体提取 JSON 并用 `AskIn` 校验；从路径提取 `conv_id` 转换为 int。所有依赖和校验都成功后，才调用 `ask`。（依赖之间的具体调用先后由 FastAPI 内部决定，但都发生在路由执行之前。）
+        **路由执行：** 查对话 → 调用 LLM → 写消息 → commit → 返回 `AskOut`，FastAPI 按模型序列化并以 201 发送响应。
+        **请求结束：** 按当前默认行为（scope 为 request），响应发送后 `get_db` 从 yield 处恢复，离开 `async with`，Session 关闭，连接归还连接池。进程关闭时执行 lifespan 的 yield 之后部分，释放客户端和连接池。
+        **没有 Authorization 头：** `authorization: Annotated[str, Header()]` 是必填参数，缺失时在参数校验阶段就失败，FastAPI 返回 422（loc 为 `["header", "authorization"]`），`current_user_id` 的函数体和 `ask` 路由都不会执行。如果希望缺少凭证时返回 401，需要把参数改为可选并在函数内自行判断，或使用 FastAPI 的安全工具类。
+    - id: d09-c1-q2
+      kp: d09-k2
+      type: code
+      question: 从安全和成本角度审查 `ask` 路由与 `AskIn` 模型，指出最严重的两个问题，说明攻击者如何利用以及你的修复代码思路。
+      key_points:
+        - {text: "指出 db.get 仅按 ID 查询未校验 conv.user_id，任意登录用户可向他人对话写入并可能读取上下文", dim: engineering}
+        - {text: "指出 content 无 max_length 与 max_tokens 无范围限制，可被用于放大单次调用成本", dim: engineering}
+        - {text: "给出修复：查询时附加 user_id 条件或比较归属，不属于当前用户返回 404，并抽成依赖复用", dim: engineering}
+        - {text: "给出修复：Field 增加 max_length 与 ge le 约束并开启 extra forbid，校验失败返回 422", dim: concept}
+      reference: |
+        **问题 1：越权访问。** 路由用 `db.get(Conversation, conv_id)` 只按主键查询，没有比较 `conv.user_id` 与当前 `user_id`。攻击者登录自己的账号后遍历 `conv_id`（自增 ID 很容易猜），就能向任意用户的对话写入消息；如果系统在生成回答时会把对话历史拼进 Prompt，攻击者还能通过追问让模型复述别人的历史内容，造成数据泄露。修复：新增依赖 `get_owned_conversation`，执行 `select(Conversation).where(Conversation.id == conv_id, Conversation.user_id == user_id)`，查不到返回 404（不区分「不存在」与「无权访问」，避免泄露资源是否存在），路由改为注入该依赖。
+        **问题 2：成本不可控。** `content` 只有最小长度，`max_tokens` 完全不受限。攻击者可以提交几十万字的内容并设置极大的 `max_tokens`，单次调用就消耗大量输入和输出 Token；循环调用会迅速烧掉预算，或者因超出模型上下文而大量报错。修复：`content: str = Field(min_length=1, max_length=4000)`，`max_tokens: int = Field(default=512, ge=1, le=2048)`，并加 `model_config = ConfigDict(extra="forbid")`；超出限制在进入路由前就返回 422。在此基础上再配合按用户的限流和配额（Day 20、Day 46）。
+    - id: d09-c1-q3
+      kp: d09-k4
+      type: code
+      question: 如果 LLM 服务变慢，每次调用要 25 秒，同时有 30 个用户在发消息，这段代码中的数据库连接池会发生什么？为什么？请结合 get_db、db.get 与 lifespan 中的 pool_size 说明，并给出调整思路。
+      key_points:
+        - {text: "说明 db.get 执行查询时 Session 从连接池取出连接并开启事务，直到 commit 或 Session 关闭才归还", dim: principle}
+        - {text: "说明调用 LLM 的 25 秒内连接一直被占用，30 个并发超过 pool_size 10 加默认溢出 10，后续请求等待并可能在 30 秒后超时", dim: engineering}
+        - {text: "指出连接池耗尽会影响其他不调用 LLM 的接口", dim: engineering}
+        - {text: "给出调整：先完成读取并结束事务释放连接，LLM 调用后再用短事务写入，必要时调整池大小", dim: engineering}
+      reference: |
+        `db.get(Conversation, conv_id)` 需要执行 SELECT，此时 AsyncSession 从 Engine 的连接池中取出一个连接，并按 SQLAlchemy 的默认行为隐式开启事务。这个连接会一直被这个 Session 占用，直到 `commit()` / `rollback()` 结束事务，或者 Session 关闭。
+        在这段代码中，查询之后立刻调用 LLM，25 秒内事务一直处于打开状态，连接被占着却什么都不做（数据库中显示为 idle in transaction）。lifespan 中设置 `pool_size=10`，QueuePool 默认 `max_overflow=10`，单个 worker 最多 20 个连接。30 个用户同时发消息时，前 20 个请求各占一个连接，剩下 10 个请求在获取连接时排队；默认 `pool_timeout=30` 秒内拿不到连接就抛出超时错误，接口返回 500。更严重的是，连接池耗尽后，其他完全不调用 LLM 的接口（例如查看对话列表）也拿不到连接，整个服务都受影响。
+        调整思路：把「读」和「写」拆成两个短事务——先查询对话并校验归属，随后 `await db.commit()`（或在只读查询后结束事务）把连接归还连接池；然后调用 LLM；拿到回答后再用一个短事务写入消息并提交。也可以把读取放在独立的 Session 中。连接池大小要按 worker 数与数据库上限计算，而不是简单调大。
+sources:
+  - {title: "FastAPI - Lifespan Events", url: "https://fastapi.tiangolo.com/advanced/events/"}
+  - {title: "FastAPI - Dependencies with yield", url: "https://fastapi.tiangolo.com/tutorial/dependencies/dependencies-with-yield/"}
+  - {title: "FastAPI - Advanced Dependencies", url: "https://fastapi.tiangolo.com/advanced/advanced-dependencies/"}
+  - {title: "FastAPI - Concurrency and async / await", url: "https://fastapi.tiangolo.com/async/"}
+  - {title: "FastAPI - Handling Errors", url: "https://fastapi.tiangolo.com/tutorial/handling-errors/"}
+  - {title: "FastAPI - Release Notes", url: "https://fastapi.tiangolo.com/release-notes/"}
+  - {title: "Pydantic Docs - BaseModel API", url: "https://pydantic.dev/docs/validation/latest/api/pydantic/base%5Fmodel/"}
+  - {title: "Starlette - Thread Pool", url: "https://starlette.dev/threadpool/"}

@@ -1,0 +1,705 @@
+day: 27
+phase: 3
+title: RAG 优化：Rerank、Query Rewrite 与 Metadata Filter
+goals:
+  - 能解释 bi-encoder 与 cross-encoder 的区别，说明 Rerank 解决什么问题以及它的成本与延迟
+  - 能列举 Query Rewrite、多查询、HyDE 等方法，并处理多轮对话中的指代消解
+  - 能说明 Metadata Filter 前置与后置的差异，以及为什么权限过滤必须在检索层完成
+  - 能读懂「改写 → 召回 → 精排 → 过滤」流水线代码，找出阻塞事件循环、过滤后置等问题
+knowledge_points:
+  - id: d27-k1
+    name: Rerank：两阶段检索与 cross-encoder
+    level: P0
+    summary: 先用便宜的向量/BM25 召回几十条，再用 cross-encoder 逐条精读打分，只把最相关的几条交给模型
+    why: |
+      Day 26 的混合检索解决了「召回」——答案大概率在前 50 条里；但送进模型的只有前 3~8 条，**排序质量**决定了答案能不能进入 Prompt。
+      Rerank 是提升排序质量性价比最高的手段之一，也是面试官区分「跑通 Demo」和「做过调优」的常见问题。
+    problem: |
+      - 向量检索的排序是「问题向量」和「片段向量」的距离，两边**各自独立编码**，模型从未同时看到问题和片段，细粒度的相关性判断不准。
+      - 常见现象：真正回答问题的片段排在第 12 名，前 5 名是「话题相关但没有答案」的片段。
+      - RRF 融合只看名次，也不知道片段是否真的回答了问题。
+    principle: |
+      **一、bi-encoder 与 cross-encoder**
+
+      | | bi-encoder（Embedding 模型） | cross-encoder（Rerank 模型） |
+      |---|---|---|
+      | 输入 | 问题、片段**分别**编码成向量 | 问题和片段**拼在一起**输入 |
+      | 输出 | 两个向量，再算距离 | 直接输出一个相关度分数 |
+      | 能否预计算 | 片段向量可离线算好建索引 | 不能，每次查询都要对每个候选重新计算 |
+      | 速度 | 快，可在百万级数据上检索 | 慢，只适合几十到几百个候选 |
+      | 精度 | 粗 | 细：注意力能在问题词和片段词之间交互 |
+
+      直觉：bi-encoder 像「先分别给每本书写摘要，再拿问题的摘要去比」；cross-encoder 像「把问题和这一段原文放在一起逐字阅读后打分」。后者更准，但每个候选都要读一遍。
+
+      **二、两阶段检索流水线**
+
+      ```mermaid
+      flowchart LR
+        Q["用户问题"] --> R1["召回 向量加 BM25 取 50 条"]
+        R1 --> RR["Rerank cross-encoder 逐条打分"]
+        RR --> T{"最高分低于阈值"}
+        T -->|是| N["无答案分支"]
+        T -->|否| K["按 Token 预算取前 3 到 8 条"]
+        K --> P["组装 Prompt"]
+      ```
+
+      - 第一阶段追求**召回率**（Recall@50 高），第二阶段追求**精确率**（前几名都有用）。
+      - Rerank **只能重排已经召回的候选**，不能找回没被召回的片段。召回阶段漏了，Rerank 无能为力。
+      - Rerank 分数通常比向量相似度更适合做「无答案」阈值，但不同模型分数含义不同：bge-reranker 原始输出是无界 logit（可用 sigmoid 归一化到 0~1），Cohere 返回 0~1 的 relevance_score，**阈值不能跨模型沿用**。
+
+      **三、成本与延迟**
+
+      - 计算量 ≈ 候选数 × 每对（问题+片段）的 Token 数。50 条 × 512 Token 的批量推理，在 GPU 上通常几十到一两百毫秒，在 CPU 上可能达到秒级（具体取决于模型大小和硬件，要实测）。
+      - 控制手段：限制候选数（30~100）；截断片段长度；批量推理 + fp16；单独部署 Rerank 服务做批处理；对超时设置降级（超时就直接用融合顺序）。
+      - 托管 API（如 Cohere Rerank）按调用/搜索单元计费，有网络延迟，且数据要出域，涉及合规评估。
+
+      **四、常见选择（2026-11 核对）**
+
+      - **开源自部署**：BAAI `bge-reranker-v2-m3`（约 568M 参数，多语言，FlagEmbedding 的 `FlagReranker.compute_score`）、更大的 `bge-reranker-v2-gemma` 等；Qwen3-Reranker 系列（0.6B/4B/8B）。
+      - **托管 API**：Cohere Rerank（`rerank-v5.0-pro` / `rerank-v5.0-fast`，以及 v4.0、v3.5），端点 `POST /v2/rerank`。
+      - 选型看：中文效果（用自己的评估集测）、延迟预算、是否允许数据出域、GPU 资源。
+    scenarios: |
+      - **制度问答**：召回 50 条，bge-reranker-v2-m3 精排后取 5 条；最高分低于 0.2 时拒答。
+      - **客服知识库**：QPS 高、延迟敏感，候选数降到 20，使用较小的 Rerank 模型，Rerank 超时 300ms 自动降级。
+      - **金融/政务私有化项目**：数据不能出域，只能自部署开源 Rerank 模型。
+    code: |
+      ```python
+      # 开源模型：FlagEmbedding（pip install -U FlagEmbedding）
+      from FlagEmbedding import FlagReranker
+      reranker = FlagReranker("BAAI/bge-reranker-v2-m3", use_fp16=True)
+      scores = reranker.compute_score([[query, c] for c in chunks], normalize=True)  # sigmoid 到 0~1
+
+      # 托管 API：Cohere（pip install cohere，读取环境变量中的 API Key）
+      import cohere
+      co = cohere.ClientV2()
+      resp = co.rerank(model="rerank-v5.0-fast", query=query, documents=chunks, top_n=5)
+      for r in resp.results:
+          print(r.index, r.relevance_score)  # index 指向原 documents 的下标
+      ```
+    pitfalls: |
+      - **误区：Rerank 能提升召回率。** 它只能重排候选，候选里没有的答案找不回来；召回问题要在第一阶段解决。
+      - **候选数过大**：200 条全部 Rerank，延迟和成本线性上升，收益却很有限。
+      - **阈值跨模型复用**：bge 的 logit、sigmoid 后的分数、Cohere 的 relevance_score 含义都不同。
+      - **在 async 服务里同步调用本地 Rerank 模型**，阻塞事件循环，所有请求一起变慢。
+      - **把 Cohere 返回的 index 当成 chunk_id**：index 是传入 documents 列表的下标，需要映射回原候选。
+    interview_asks:
+      - 有了向量检索为什么还需要 Rerank？
+      - bi-encoder 和 cross-encoder 有什么区别？为什么不直接用 cross-encoder 检索全库？
+      - Rerank 会增加多少延迟？你们怎么控制？
+    project_example: |
+      在一个 HR 制度问答项目里，评估发现 Recall@50 有 0.94，但送入模型的前 5 条只覆盖了 0.68 的正确片段。
+      引入 bge-reranker-v2-m3（单卡 GPU、fp16、批量 50 条），前 5 条覆盖率提升到 0.87，P95 延迟增加约 120ms。
+      为了不阻塞 FastAPI 事件循环，把 Rerank 拆成独立的推理服务并设置 400ms 超时，超时后退回 RRF 顺序并在日志里打标，方便统计降级率。
+    freshness: |
+      核对于 2026-11：Cohere 文档列出的最新 Rerank 模型为 `rerank-v5.0-pro` 与 `rerank-v5.0-fast`（32k 上下文，多语言，支持半结构化数据），
+      此前有 `rerank-v4.0-pro/fast`（2025-12 发布，32k）和 `rerank-v3.5`（4k）；API 为 `POST https://api.cohere.com/v2/rerank`，参数 model、query、documents、top_n、max_tokens_per_doc（默认 4096），
+      结果字段 results[].index 与 results[].relevance_score（0~1）。Python SDK 写法为 `cohere.ClientV2().rerank(...)`。
+      BAAI `bge-reranker-v2-m3` 通过 FlagEmbedding 的 `FlagReranker(...).compute_score(pairs, normalize=True)` 使用，原始分数是无界 logit。
+      Qwen3-Reranker 有 0.6B/4B/8B 版本，具体用法以 Hugging Face 模型卡为准。模型迭代很快，选型前请以官方页面和自有评估集为准。
+    sources:
+      - {title: "Cohere Docs - Rerank models", url: "https://docs.cohere.com/docs/rerank"}
+      - {title: "Cohere API Reference - Rerank v2", url: "https://docs.cohere.com/reference/rerank"}
+      - {title: "Cohere Docs - Best Practices for using Rerank", url: "https://docs.cohere.com/docs/reranking-best-practices"}
+      - {title: "BAAI/bge-reranker-v2-m3 模型卡", url: "https://huggingface.co/BAAI/bge-reranker-v2-m3"}
+      - {title: "BGE 文档 - Reranker 教程", url: "https://bge-model.com/tutorial/5_Reranking/5.1.html"}
+  - id: d27-k2
+    name: Query Rewrite：改写、多查询、HyDE 与指代消解
+    level: P0
+    summary: 用户怎么问 ≠ 文档怎么写；先把问题改写成「适合检索的样子」，多轮对话先补全指代
+    why: |
+      检索的输入就是用户的问题。用户的问题常常**短、口语化、省略主语**，多轮对话里还会说「那外包呢？」「第二条具体怎么做？」。
+      直接拿这种问题去检索，召回质量会断崖式下降。Query Rewrite 是在检索之前提升召回的主要手段，也是多轮 RAG 必须解决的问题。
+    problem: |
+      - **指代与省略**：第二轮「那外包同事呢？」单独检索毫无意义，必须补全成「外包同事的年假规定」。
+      - **用词不一致**：用户说「请假」，文档写「休假管理办法」；用户说「OA」，文档写「协同办公平台」。
+      - **复合问题**：「试用期能不能请年假，工资怎么算」包含两个检索意图，单次检索很难同时召回。
+      - **问题和答案的表达形式不同**：问题是疑问句，文档是陈述句，向量距离天然有差距。
+    principle: |
+      **一、常见改写方法**
+
+      | 方法 | 做法 | 解决什么 | 代价与风险 |
+      |---|---|---|---|
+      | 指代消解 / 问题补全 | 结合历史把问题改写成独立完整的问题 | 多轮对话的省略和代词 | 一次 LLM 调用；可能改错意图 |
+      | 规范化与扩展 | 用业务词典展开缩写、补同义词 | 用词不一致 | 词典要维护 |
+      | 多查询（Multi-Query） | 让 LLM 生成 3~5 个不同角度的查询，分别检索后 RRF 合并 | 单一表述召回不全 | 检索次数翻倍，延迟增加 |
+      | 问题分解 | 复合问题拆成子问题分别检索 | 多意图问题 | 子问题质量依赖模型 |
+      | HyDE | 让 LLM 先写一段「假设答案」，用它的向量去检索 | 问句和陈述句的表达差距 | 假设答案可能带入错误术语，把检索带偏 |
+
+      **二、多轮对话中的指代消解（最常用）**
+
+      ```mermaid
+      sequenceDiagram
+        participant U as 用户
+        participant S as 问答服务
+        participant L as 改写模型
+        participant R as 检索
+        U->>S: 第一轮 正式员工年假几天
+        S-->>U: 回答 附引用
+        U->>S: 第二轮 那外包同事呢
+        S->>L: 最近几轮历史 加 当前问题
+        L-->>S: 外包员工的年假天数规定
+        S->>R: 用改写后的独立问题检索
+        R-->>S: 候选片段
+      ```
+
+      要点：
+      - 只带**最近几轮**历史（如 3 轮），避免 Token 膨胀和早期话题干扰。
+      - 改写 Prompt 要明确「只改写、不回答」，temperature 设 0。
+      - **第一轮且问题完整时跳过改写**，省一次 LLM 调用。
+      - 改写结果要**记日志**，和原问题一起保存，便于排查「改写把意思改错了」。
+      - 稳妥做法：原问题和改写后的问题**都检索**，再融合，降低改写出错的影响。
+
+      **三、HyDE 的直觉**
+
+      HyDE（Hypothetical Document Embeddings，Gao 等 2022）：问题「年假可以跨年使用吗？」和文档「当年未休年假可顺延至次年 3 月 31 日」表达形式差别大；让 LLM 先写一个假设答案「年假一般可以顺延到次年某个时间……」，假设答案和真实文档都是陈述句，向量更接近。
+      风险：假设答案里的**具体事实可能是编的**（例如写成「顺延 6 个月」），它会把检索引向错误方向；但最终回答仍以检索到的真实文档为准，假设答案不会出现在给用户的答案里。
+
+      **四、成本控制**
+
+      改写增加一次 LLM 调用（通常几百毫秒到一两秒），多查询还会放大检索次数。常见策略：用小模型做改写、设置短超时、超时直接用原问题、对高频问题缓存改写结果、多个查询**并发**检索。
+
+      ```mermaid
+      flowchart LR
+        Q["原问题"] --> G["LLM 生成 3 个改写查询"]
+        Q --> S0["检索 原问题"]
+        G --> S1["检索 查询1"]
+        G --> S2["检索 查询2"]
+        G --> S3["检索 查询3"]
+        S0 --> F["RRF 合并去重"]
+        S1 --> F
+        S2 --> F
+        S3 --> F
+        F --> RR["Rerank 用完整问题打分"]
+      ```
+    scenarios: |
+      - **多轮 HR 助手**：每轮先做指代消解，「那试用期呢」→「试用期员工的年假规定」。
+      - **IT 服务台**：用业务词典把「VPN 连不上」扩展为「VPN 连接失败 错误码 809 远程访问」。
+      - **研究报告检索**：对「比较 A 和 B 方案的优缺点」做问题分解，分别检索 A、B。
+      - **冷启动、没有标注数据的新领域**：HyDE 可以作为提升零样本召回的尝试，但要用评估集确认收益。
+    pitfalls: |
+      - **误区：改写一定有益。** 改写可能把用户意图改错（如把「外包」改成「外部合作」），一定要记录日志并用评估集验证，必要时原问题与改写一起检索。
+      - **改写时让模型「顺便回答」**：改写结果变成答案，检索被带偏。Prompt 要强调只输出问题。
+      - **历史带太多轮**：早期话题干扰，Token 成本上升。
+      - **多查询串行检索**：延迟成倍增加，应并发。
+      - **改写失败没有降级**：LLM 超时导致整个问答失败，应回退到原问题。
+      - 把用户传来的「历史」直接拼进改写 Prompt 而不校验来源，可能被伪造历史注入指令。
+    interview_asks:
+      - 多轮对话中用户说「那第二条呢？」，你的 RAG 怎么检索？
+      - 你了解哪些 Query Rewrite 方法？HyDE 的原理和风险是什么？
+      - Query Rewrite 会增加多少延迟？怎么控制？
+    project_example: |
+      在一个员工自助问答项目中，线上日志显示约 35% 的问题来自多轮追问，追问的检索命中率只有首轮的一半。
+      加入指代消解改写（小模型、temperature=0、只带最近 3 轮、超时 1.5 秒回退原问题）后，追问类问题的 Recall@20 从 0.48 提升到 0.81。
+      同时发现约 3% 的改写把意思改错，于是改成「原问题 + 改写问题」双路检索再 RRF，错误改写的影响基本消除。
+    sources:
+      - {title: "Gao et al. 2022 - Precise Zero-Shot Dense Retrieval without Relevance Labels（HyDE）", url: "https://arxiv.org/abs/2212.10496"}
+  - id: d27-k3
+    name: Metadata Filter：前置过滤、后置过滤与权限
+    level: P0
+    summary: 能用元数据确定的范围（租户、权限、版本、部门）就在检索时用 WHERE 限定，不要检索完再筛
+    why: |
+      企业知识库里不同部门、不同版本、不同权限的文档混在一起。很多「答错」不是语义问题，而是**检索了不该检索的范围**：
+      查到了旧版制度、别的子公司的规定，甚至无权查看的文档。Metadata Filter 是解决这类问题最直接、最可靠的手段。
+    problem: |
+      - 2021 版和 2025 版差旅制度语义几乎相同，向量相似度无法区分，只能靠 version/status/生效日期过滤。
+      - 用户只能看自己有权限的文档，如果检索不加过滤，再靠 Prompt 叫模型「不要说」，数据已经进入上下文，随时可能泄露。
+      - 「检索 Top-10 再过滤」会导致结果被过滤光，召回率莫名其妙地下降。
+    principle: |
+      **一、常见元数据字段**
+
+      tenant_id（租户）、kb_id（知识库）、dept（部门）、allowed_groups（可访问的用户组）、doc_type、version、status（生效/作废）、effective_date、language、source_url、page 等。**入库时就要写好**（Day 22、Day 23），检索时才能用。
+
+      **二、前置过滤 vs 后置过滤**
+
+      ```mermaid
+      flowchart TB
+        subgraph POST["后置过滤 不推荐"]
+          A1["全库检索 Top-10"] --> A2["应用层按部门或权限筛选"]
+          A2 --> A3["可能只剩 0 到 2 条"]
+        end
+        subgraph PRE["前置过滤 推荐"]
+          B1["WHERE 租户 权限 版本"] --> B2["在允许范围内检索 Top-10"]
+          B2 --> B3["结果都是可用且有权限的"]
+        end
+      ```
+
+      | | 后置过滤 | 前置过滤（检索时 WHERE） |
+      |---|---|---|
+      | 结果数量 | 可能被筛光，召回下降 | 在允许范围内取满 K 条 |
+      | 安全 | 无权数据已被读取，可能进入日志、缓存、Rerank、Prompt | 无权数据从一开始就不出库 |
+      | 计算 | 浪费在无关数据上 | 只算需要的 |
+
+      **三、过滤和向量索引的交互（pgvector）**
+
+      HNSW 是先在索引中找 `ef_search` 个候选再应用 WHERE，选择性高的过滤（只命中少量行）会导致结果不足。常见对策：
+      - pgvector 0.8.0+ 开启 iterative index scan（`hnsw.iterative_scan`）。
+      - 过滤条件命中行很少时，对过滤列建普通索引，让数据库在小范围内做**精确**检索。
+      - 按租户等高频过滤条件建**部分索引**或**分区**。
+
+      **四、过滤条件从哪来**
+
+      - **身份派生（必须服务端）**：租户、用户组、权限范围，来自登录态/JWT，**绝不能**来自前端参数或 LLM 输出。
+      - **用户显式选择**：界面上选择的知识库、文档类型。
+      - **从问题中推断**（Self-Query）：让 LLM 从「2024 年上海分公司的差旅标准」抽取 year=2024、branch=上海。这类过滤只用于**缩小范围、提升相关性**，要校验取值合法；抽取错误时要能放宽重试。
+      - **系统默认**：status = 生效、只看最新版本。
+
+      **五、权限过滤为什么必须在检索层**：Prompt 约束是「建议」不是「强制」，模型可能被提示注入绕过，也可能在引用、摘要中带出内容；而且数据已经出现在日志和缓存里。权限是**数据访问控制**问题，应由检索 SQL 的 WHERE（或数据库行级安全 RLS）保证。完整的多租户权限设计见 Day 30。
+    scenarios: |
+      - **集团多子公司**：按 company_id 前置过滤，避免上海分公司员工看到北京分公司的薪酬制度。
+      - **制度版本管理**：默认 `status='active'`，用户明确问历史版本时才放开。
+      - **项目文档权限**：`allowed_groups && :user_groups`（数组重叠，建 GIN 索引）只检索用户所在组可见的文档。
+    pitfalls: |
+      - **检索后再过滤**：结果被筛光；无权数据已进入内存、日志甚至 Rerank 服务。
+      - **用 Prompt 做权限控制**：「请不要透露用户无权查看的内容」不是安全边界。
+      - **过滤条件由前端传入**：用户改一下请求参数就能查别的部门。
+      - **混合检索只有一路加了过滤**（Day 26 的坑）。
+      - **LLM 抽取的过滤条件不校验**：抽出不存在的部门名导致零结果，或被注入扩大范围。
+      - 元数据入库时缺失（如 status 为空），过滤时被当作不匹配而丢掉整批文档。
+    interview_asks:
+      - 权限过滤你们是在检索前做还是检索后做？为什么？
+      - 新旧版本制度内容很像，怎么保证用户查到的是最新版？
+      - 用 pgvector 加了 WHERE 过滤后结果条数不够，是什么原因？
+    project_example: |
+      某集团知识库最初是「全库检索 Top-20 → 应用层按 company_id 和 allowed_groups 筛选」，结果小公司员工常常只剩 1~2 条甚至 0 条，
+      安全审计还发现 Rerank 服务的日志里出现了其他公司的薪酬片段。改为在 SQL 中前置过滤（company_id、status、allowed_groups 数组重叠），
+      并开启 pgvector iterative scan，小公司用户的 Recall@10 从 0.41 恢复到 0.86，审计问题同时关闭。
+    freshness: |
+      核对于 2026-11：pgvector README「Filtering」一节说明近似索引是在扫描后应用过滤，默认 `hnsw.ef_search=40`；
+      0.8.0 起支持 iterative index scan；对高选择性过滤建议对过滤列建索引做精确检索，或使用部分索引、分区。
+    sources:
+      - {title: "pgvector README - Filtering / Iterative Index Scans", url: "https://github.com/pgvector/pgvector"}
+  - id: d27-k4
+    name: 进阶范式：Agentic RAG 与 GraphRAG（了解）
+    level: P2
+    summary: Agentic RAG 让模型决定何时、去哪检索；GraphRAG 先建实体关系图，擅长全局性和多跳问题
+    why: |
+      面试中常被问「了解 GraphRAG / Agentic RAG 吗」。不需要会实现，但要能说清它们解决普通 RAG 的哪些短板、代价是什么、什么时候不该用。
+    problem: |
+      - 普通 RAG 一次检索、一次生成，遇到需要多步推理（先查 A 再根据 A 查 B）的问题会失败。
+      - 「这批文档主要讨论了哪些主题」这类**全局性问题**，任何 Top-K 片段都不能代表全集。
+    principle: |
+      **Agentic RAG**：把检索做成 Agent 的工具（Day 31 起讲 Agent），由模型判断是否需要检索、检索哪个知识库或数据源、结果不够时改写后再查，最后再回答。优点是能处理多跳问题和多数据源路由；代价是 LLM 调用次数不确定、延迟和成本上升、行为更难测试，需要最大步数、超时等控制（Day 37）。
+
+      **GraphRAG（以微软开源实现为例）**：
+      - 索引阶段：用 LLM 从文本中抽取实体和关系构成知识图谱，用 Leiden 算法做层次化社区划分，并为每个社区生成摘要报告（community reports）。
+      - 查询阶段：**Local Search** 从与问题相关的实体出发，组合实体、关系、社区报告和原文片段，适合具体实体的问题；**Global Search** 以 map-reduce 方式遍历社区报告，适合「整体主题是什么」这类全局问题，资源消耗大；另有 DRIFT Search、Basic Search。
+      - 代价：索引阶段需要大量 LLM 调用，成本高；文档更新后图谱和报告的增量维护复杂。
+
+      ```mermaid
+      flowchart LR
+        D["原始文档"] --> E["LLM 抽取实体与关系"]
+        E --> G["知识图谱"]
+        G --> C["社区划分与社区报告"]
+        Q["用户问题"] --> L["Local Search 实体为入口"]
+        Q --> GS["Global Search 遍历社区报告"]
+        G --> L
+        C --> L
+        C --> GS
+      ```
+
+      选型建议：先把普通 RAG（混合检索 + Rerank + 过滤 + 评估）做好；只有评估证明大量失败来自多跳或全局性问题时，再考虑这些范式。
+    scenarios: |
+      - **Agentic RAG**：一个助手同时接入制度库、工单系统和数据库，需要根据问题选择数据源并多步查询。
+      - **GraphRAG**：调研报告、情报分析等需要「跨大量文档总结主题、梳理实体关系」的场景。
+    pitfalls: |
+      - 把 GraphRAG 当作普通 RAG 的必然升级：多数企业问答是事实查找类问题，普通 RAG 更便宜也更好维护。
+      - 低估 GraphRAG 索引成本和更新难度。
+      - Agentic RAG 不设最大步数和超时，出现循环检索、成本失控。
+    interview_asks:
+      - 了解 GraphRAG 吗？它和普通 RAG 有什么区别？
+      - 什么情况下你会考虑 Agentic RAG？
+    project_example: |
+      某咨询团队想对 3000 份行业报告提问「近两年各厂商的技术路线有什么变化」，普通 RAG 只能基于十几个片段回答，结论片面。
+      试点 GraphRAG 的 Global Search 后，答案覆盖面明显更好，但一次全量索引的 LLM 费用是普通向量入库的数十倍，
+      最终只对这个低频、高价值的分析场景启用，日常问答仍走普通 RAG。
+    freshness: |
+      核对于 2026-11：微软 GraphRAG 官方文档的查询引擎包括 Local Search、Global Search、DRIFT Search、Basic Search 和 Question Generation；
+      Global Search 以 map-reduce 方式使用某一层级的社区报告，层级越低越细、成本越高。具体配置项与版本变化较快，以官方文档为准。
+    sources:
+      - {title: "Microsoft GraphRAG - Query Engine Overview", url: "https://microsoft.github.io/graphrag/query/overview/"}
+      - {title: "Microsoft GraphRAG - Global Search", url: "https://microsoft.github.io/graphrag/query/global_search/"}
+      - {title: "Edge et al. 2024 - From Local to Global: A Graph RAG Approach to Query-Focused Summarization", url: "https://arxiv.org/abs/2404.16130"}
+quiz:
+  - id: d27-q1
+    kp: d27-k1
+    type: single
+    question: 关于 bi-encoder（Embedding 模型）和 cross-encoder（Rerank 模型），下列说法正确的是？
+    options:
+      - "cross-encoder 精度更高，所以应该用它直接替代向量检索，对全库每个片段打分"
+      - "bi-encoder 把问题和片段分别编码，片段向量可以离线预计算；cross-encoder 把二者拼接输入，每次查询都要对每个候选重新计算"
+      - "cross-encoder 的输出也是向量，可以存进 pgvector 加速检索"
+      - "两者的分数含义相同，向量检索的相似度阈值可以直接用于 Rerank 分数"
+    answer: [1]
+    explain: |
+      B 正确，这正是两者的本质区别，也决定了「bi-encoder 负责大范围召回、cross-encoder 负责小范围精排」的两阶段架构。
+      A 错：cross-encoder 不能预计算，对百万级片段逐一打分延迟不可接受。C 错：cross-encoder 直接输出相关度分数，不产出可索引的向量。
+      D 错：不同模型分数分布和含义不同（如 bge 的 logit、Cohere 的 0~1 分），阈值必须分别标定。
+  - id: d27-q2
+    kp: d27-k1
+    type: judge
+    question: 引入 Rerank 后，召回阶段的 Recall@50（正确片段出现在前 50 个候选中的比例）会随之提高。
+    answer: false
+    explain: |
+      Rerank 只对已经召回的候选重新排序，不会往候选集里加入新片段，所以 Recall@50 不变。
+      它提高的是排在前面的质量（如前 5 条的命中率、MRR）。如果正确片段根本没被召回，要从召回阶段解决：混合检索、Query Rewrite、调整切片或 Embedding 模型。
+  - id: d27-q3
+    kp: d27-k3
+    type: multi
+    question: 某系统先「全库向量检索 Top-10」，再在应用层按用户部门筛选结果。这种后置过滤会带来哪些问题？
+    options:
+      - "筛选后可能只剩很少甚至 0 条结果，召回率下降"
+      - "用户无权查看的片段已经被读入服务内存，可能进入日志、缓存或下游 Rerank 服务"
+      - "过滤后的结果排序会被打乱，必须重新计算向量"
+      - "在无关数据上浪费了检索和后续处理的计算"
+      - "如果后续某个环节漏掉了这一步筛选，无权数据会直接进入 Prompt"
+    answer: [0, 1, 3, 4]
+    explain: |
+      后置过滤的核心问题是：结果被筛光导致召回下降（A）；无权数据已经出库，增加了泄露面（B、E）；计算浪费在不需要的数据上（D）。
+      C 不对：筛选只是删掉部分元素，剩余结果的相对顺序不变，也不需要重新计算向量。正确做法是在检索 SQL 中前置过滤。
+  - id: d27-q4
+    kp: d27-k2
+    type: single
+    question: 关于 HyDE（Hypothetical Document Embeddings），下列描述最准确的是？
+    options:
+      - "让 LLM 直接根据问题生成最终答案返回给用户，跳过检索以降低延迟"
+      - "让 LLM 先写一段假设性的答案，用这段文本的向量去检索真实文档，最终回答仍基于检索到的真实文档"
+      - "把文档切片改写成问题形式再入库，使问题与问题之间做匹配"
+      - "用 cross-encoder 生成假设文档，替代 Rerank 阶段"
+    answer: [1]
+    explain: |
+      HyDE 的直觉是：假设答案和真实文档都是陈述句，表达形式接近，向量距离更近，从而改善「问句 vs 文档」的匹配。假设答案只用于检索，不直接给用户。
+      A 跳过检索会导致幻觉；C 描述的是另一种思路（为片段生成假设问题入库），不是 HyDE；D 与 cross-encoder 无关。
+  - id: d27-q5
+    kp: d27-k2
+    type: scenario
+    question: |
+      多轮 HR 助手中，用户第一轮问「正式员工年假有几天？」，回答正确；第二轮问「那外包同事呢？」，系统回答「抱歉，未找到相关信息」。
+      日志显示第二轮直接用「那外包同事呢？」去检索。请分析原因并给出改进方案，包括延迟与出错的兜底设计。
+    key_points:
+      - {text: "指出追问省略了主语和话题，单独检索语义不完整，召回不到年假相关片段", dim: principle}
+      - {text: "提出结合最近几轮历史做指代消解，改写成独立完整的问题再检索", dim: concept}
+      - {text: "说明改写 Prompt 要只改写不回答、temperature 为 0、只带最近几轮", dim: engineering}
+      - {text: "设计超时回退原问题、首轮完整问题跳过改写、记录改写日志", dim: engineering}
+      - {text: "提到原问题与改写问题双路检索或用评估集验证，防止改写改错意图", dim: project}
+    reference: |
+      **原因**：「那外包同事呢」省略了「年假天数」这个话题，单独看只有「外包」一个有效信息，向量检索会召回外包管理、供应商合同等无关片段，没有达到阈值，于是系统回复未找到。
+      **改进**：在检索前加一步 **Query Rewrite（指代消解）**：把最近 2~3 轮对话和当前问题交给小模型，要求「把最后一个问题改写成可独立检索的完整问题，只输出问题」，得到「外包员工的年假天数规定」，再检索。
+      **工程细节**：
+      - temperature=0，Prompt 强调不要回答；只带最近几轮，控制 Token。
+      - 首轮且问题完整时跳过改写；改写设置 1~2 秒超时，失败回退原问题，避免整个问答失败。
+      - 日志记录原问题和改写结果；改写错误风险用「原问题 + 改写问题双路检索后 RRF」降低。
+      - 建立多轮追问的评估样本，对比改写前后的 Recall@K。
+    followup:
+      question: 改写结果用于检索之后，Rerank 时应该用原问题还是改写后的问题打分？为什么？
+      key_points:
+        - "用改写后的完整问题，原问题缺少上下文无法判断相关性"
+        - "可在日志中保留两者，必要时同时参考"
+      reference: 一般用改写后的完整问题，因为「那外包同事呢」本身缺少话题，cross-encoder 无法据此判断片段是否相关。原问题仍要保留在日志和最终生成的 Prompt 中，生成时可以同时给出原问题和改写问题，让回答贴合用户原话。
+  - id: d27-q6
+    kp: d27-k1
+    type: short
+    question: 团队准备在 FastAPI 问答服务中引入本地部署的 bge-reranker-v2-m3。请说明它会如何影响延迟和资源，以及你会采取哪些措施控制成本和风险。
+    key_points:
+      - {text: "说明计算量约等于候选数乘以每对 Token 数，每次查询都要实时计算", dim: principle}
+      - {text: "提出限制候选数、截断片段长度、批量推理与 fp16", dim: engineering}
+      - {text: "指出同步推理会阻塞事件循环，应放到线程池或独立推理服务", dim: engineering}
+      - {text: "设计超时降级回到融合顺序，并监控降级率和 P95 延迟", dim: engineering}
+    reference: |
+      cross-encoder 不能预计算，每次查询都要对每个（问题，片段）对做一次前向推理，计算量约等于「候选数 × 每对 Token 数」。50 条候选在 GPU 上批量推理通常是几十到一两百毫秒，在 CPU 上可能是秒级，需要实测。资源上需要 GPU 显存（fp16 下数 GB 量级）或接受较高的 CPU 延迟。
+      控制措施：
+      1. 候选数控制在 30~100，片段截断到合理长度（如 512 Token）。
+      2. 一次请求的所有候选**批量**送入，开启 fp16。
+      3. `compute_score` 是同步、计算密集的调用，在 async 接口里直接调用会**阻塞事件循环**，应使用 `asyncio.to_thread`，或更好地拆成独立的推理服务，统一做批处理和扩缩容。
+      4. 设置超时（如 400ms），超时降级为 RRF 顺序并打日志；监控 P95 延迟、降级率、GPU 利用率。
+      5. 用评估集确认 Rerank 带来的前 5 条命中率提升值得这部分延迟。
+  - id: d27-q7
+    kp: d27-k3
+    type: scenario
+    question: |
+      某公司知识库中，普通员工问「今年的薪酬调整政策是什么」，回答里出现了仅 HR 可见的「各职级调薪预算明细」。
+      开发同学解释：「我们在 System Prompt 里写了『不得透露用户无权查看的内容』，可能是模型没遵守。」
+      请分析根本原因，并给出正确的设计。
+    key_points:
+      - {text: "指出根因是检索没有按权限过滤，无权片段已进入上下文", dim: principle}
+      - {text: "说明 Prompt 约束不是安全边界，模型可能不遵守或被注入绕过", dim: principle}
+      - {text: "提出在检索 SQL 中按服务端身份前置过滤，如 allowed_groups 与用户组求交集", dim: engineering}
+      - {text: "指出过滤条件必须来自服务端登录态，而非前端参数或模型输出", dim: engineering}
+      - {text: "提到混合检索两路都要过滤，并检查日志、缓存等旁路泄露，补充越权测试", dim: project}
+    reference: |
+      **根本原因**：检索阶段没有做权限过滤，「调薪预算明细」与问题语义高度相关，被检索出来并放进 Prompt。一旦数据进入上下文，就只能指望模型「自觉不说」。
+      **为什么 Prompt 不可靠**：Prompt 是概率性的「建议」，模型可能忽略，也可能在总结、引用时带出内容；攻击者还可以用提示注入（「忽略之前的规则」）绕过。此外数据已经出现在日志、缓存、Rerank 服务里。
+      **正确设计**：
+      1. 入库时为每个 chunk 写入 allowed_groups / dept / company_id 等权限元数据。
+      2. 检索时由服务端根据 JWT/会话中的用户身份查出用户组，在 SQL 中前置过滤，如 `WHERE allowed_groups && :user_groups`（GIN 索引）；向量路和关键词路共用同一个过滤构造函数。也可用数据库 RLS 兜底。
+      3. 过滤条件绝不来自前端参数或 LLM 输出。
+      4. 缓存键包含权限范围，日志脱敏。
+      5. 增加越权测试：用普通员工身份检索 HR 专属关键词，断言结果为空。
+      完整的多租户隔离设计见 Day 30。
+    followup:
+      question: 如果权限变化频繁（员工调岗），chunk 上存 allowed_groups 会有什么问题？
+      key_points:
+        - "按组授权而不是按人授权，调岗只改用户组关系"
+        - "文档权限变化需要同步更新 chunk 元数据"
+      reference: 权限尽量授给「组/角色」而不是个人，chunk 上存组 ID，员工调岗只需修改用户与组的关系，查询时实时取用户当前所在组，不必改 chunk。若文档本身的可见范围变化，则需要通过增量同步任务批量更新该文档所有 chunk 的权限元数据，并让相关缓存失效。
+interview:
+  - id: d27-i1
+    kp: d27-k1
+    type: oral
+    difficulty: 1
+    question: 什么是 Rerank？有了向量检索为什么还需要它？
+    key_points:
+      - {text: "说明 Rerank 是在召回候选上做二次精排", dim: concept}
+      - {text: "解释向量检索是问题和片段分别编码，相关性判断粗糙", dim: principle}
+      - {text: "说明 cross-encoder 同时看问题和片段，精度高但不能预计算，只适合少量候选", dim: principle}
+      - {text: "结合项目说明 Rerank 前后指标或延迟变化", dim: project}
+    reference: |
+      Rerank 是两阶段检索中的第二阶段：先用向量检索、BM25 等便宜的方法召回几十个候选，再用 Rerank 模型逐条对（问题，片段）打分重新排序，只把最相关的几条送给 LLM。
+      之所以需要它，是因为向量检索用的是 bi-encoder：问题和片段**分别**编码成向量再算距离，模型从未同时看到二者，只能判断「话题接近」，判断不了「这段到底有没有回答问题」。
+      Rerank 用 cross-encoder，把问题和片段拼在一起输入，注意力可以在两者的词之间交互，相关性判断更准；代价是无法预计算，每次查询都要对每个候选推理，所以只能用于几十到几百个候选。
+      注意 Rerank 只能改排序，不能提升召回。工程上要控制候选数、批量推理、设置超时降级。
+    oral: |
+      Rerank 就是对召回结果做二次精排。向量检索是把问题和片段分别变成向量再比距离，它能判断话题相近，但判断不了这一段到底有没有回答问题。
+      Rerank 模型是 cross-encoder，会把问题和片段放在一起读，然后给一个相关度分数，所以更准，但它没法提前算，只能用在几十个候选上。
+      我们在 HR 制度问答里召回 50 条，用 bge-reranker-v2-m3 精排后取 5 条，前 5 条的命中率从 0.68 提到了 0.87，延迟大概多了一百多毫秒。
+  - id: d27-i2
+    kp: d27-k2
+    type: oral
+    difficulty: 2
+    question: 你了解哪些 Query Rewrite 方法？多轮对话中「那第二条呢？」这种问题你怎么处理？
+    key_points:
+      - {text: "列举指代消解、同义扩展、多查询、问题分解、HyDE 等方法", dim: concept}
+      - {text: "说明多轮追问要结合最近几轮历史改写成独立问题再检索", dim: principle}
+      - {text: "说明 HyDE 原理及假设答案可能把检索带偏的风险", dim: principle}
+      - {text: "给出工程兜底：超时回退原问题、首轮跳过、日志、双路检索", dim: engineering}
+    reference: |
+      常见方法：**指代消解/问题补全**（多轮追问必备）、**规范化与同义扩展**（业务词典展开缩写）、**多查询**（生成多个角度的查询分别检索后 RRF）、**问题分解**（复合问题拆子问题）、**HyDE**（先生成假设答案，用它的向量检索；表达形式更接近文档，但假设答案里的事实可能是编的，会把检索带偏）。
+      「那第二条呢？」的处理：把最近 2~3 轮对话（包括上一轮回答中的条目）和当前问题交给小模型，要求只输出一个可独立检索的完整问题，例如「年假申请流程第二步：部门审批的具体要求」，再用它检索。temperature 设 0；首轮完整问题跳过改写；超时回退原问题；记录原问题与改写结果；为降低改写错误风险，可以原问题和改写问题都检索后融合。效果用多轮追问评估集验证。
+    oral: |
+      我常用的有五种：指代消解、同义词扩展、多查询、问题分解和 HyDE。多轮场景最关键的是指代消解。
+      比如用户问「那第二条呢」，我会把最近两三轮对话和这个问题交给一个小模型，让它只输出一个能独立检索的完整问题，比如「年假申请流程中部门审批的要求」，再拿它去检索。
+      工程上我会设超时，超时就用原问题；第一轮问题完整就不改写；改写结果写日志。我们项目里追问类问题的召回从 0.48 提到了 0.81，后来又加了原问题和改写问题双路检索，防止改写改错意思。
+  - id: d27-i3
+    kp: d27-k1
+    type: oral
+    difficulty: 3
+    question: Rerank 模型你们是怎么选型和部署的？它带来的延迟和成本怎么控制？
+    key_points:
+      - {text: "说明选型维度：中文效果需在自有评估集测试、延迟预算、数据是否可出域、GPU 资源", dim: engineering}
+      - {text: "举出具体候选，如 bge-reranker-v2-m3 自部署或 Cohere Rerank 托管 API", dim: concept}
+      - {text: "说明候选数、片段截断、批量推理、fp16 对延迟的影响", dim: principle}
+      - {text: "提到独立推理服务、避免阻塞事件循环、超时降级与监控", dim: engineering}
+    reference: |
+      **选型**：先确定约束——数据能否出域（私有化项目只能自部署）、延迟预算（客服场景 P95 可能只给 Rerank 几百毫秒）、是否有 GPU。然后在自有中文评估集上比较候选模型：开源的 bge-reranker-v2-m3（约 568M，多语言，部署轻）、更大的 bge-reranker-v2-gemma 或 Qwen3-Reranker；托管的 Cohere Rerank（当前 rerank-v5.0-pro/fast，`/v2/rerank`）。指标看前 5 条命中率/MRR 的提升和延迟。
+      **部署**：自部署时做成独立推理服务，批量处理一次请求的全部候选，fp16，水平扩容；业务服务异步调用并设置超时。不要在 async Web 服务里同步调用模型推理，会阻塞事件循环。
+      **控制**：候选数 30~100；片段截断（Cohere 有 max_tokens_per_doc，默认 4096）；超时降级为 RRF 顺序；监控 P95、降级率、GPU 利用率；托管 API 关注调用费用与合规。
+    oral: |
+      选型我会先看约束：数据能不能出域、延迟预算多少、有没有 GPU。我们是私有化项目，所以只能自部署，最后在自己的中文评估集上比了几个模型，选了 bge-reranker-v2-m3，效果和速度比较平衡。如果允许用云服务，Cohere 的 Rerank API 也是常见选择。
+      部署上我们把它做成独立推理服务，一次请求的 50 个候选批量推理、开 fp16，业务服务异步调用、400 毫秒超时，超时就退回 RRF 顺序。
+      上线后 P95 多了一百多毫秒，降级率在 1% 以下，前 5 条命中率提升了接近 20 个点，我们认为值得。
+  - id: d27-i4
+    kp: d27-k3
+    type: oral
+    difficulty: 3
+    question: 企业知识库中的权限过滤和版本过滤，你会在 RAG 流程的哪个环节做？为什么？
+    key_points:
+      - {text: "明确在检索阶段用 WHERE 前置过滤，而不是检索后或靠 Prompt", dim: principle}
+      - {text: "说明后置过滤会筛光结果且无权数据已出库，Prompt 约束不是安全边界", dim: principle}
+      - {text: "说明过滤条件来自服务端身份，入库时写好权限和版本元数据", dim: engineering}
+      - {text: "提到 HNSW 过滤后结果不足的处理：iterative scan、部分索引或分区", dim: engineering}
+      - {text: "提到混合检索两路共用过滤、越权测试", dim: project}
+    reference: |
+      **在检索阶段前置过滤**。入库时为每个 chunk 写好 tenant_id、allowed_groups、version、status、effective_date 等元数据；检索 SQL 的 WHERE 中带上「用户有权限的范围 + 当前生效版本」。
+      不在检索后做：后置过滤会把 Top-K 筛光，召回下降；无权数据已被读入内存，可能进入日志、缓存、Rerank 服务。不靠 Prompt：Prompt 不是安全边界，模型可能不遵守或被提示注入绕过。
+      权限条件由服务端从登录态推导，绝不使用前端参数或模型输出；版本过滤默认只看生效版本，用户明确问历史版本时再放开。
+      pgvector 中 HNSW 是先扫描后过滤，过滤选择性高时结果不足，需要 0.8.0+ 的 iterative scan，或对过滤列建索引做精确检索、按租户建部分索引/分区。
+      混合检索两路必须共用同一个过滤构造函数，并有越权测试。
+    oral: |
+      我的原则是：权限和版本都在检索阶段用 WHERE 前置过滤，不能检索完再筛，更不能靠 Prompt。
+      检索完再筛有两个问题，一是 Top-K 可能被筛光，二是无权数据已经被读出来了，可能进日志、缓存。Prompt 就更不是安全边界了，模型可能不听，也可能被注入绕过。
+      具体做法是入库时给每个 chunk 写好租户、用户组、版本状态，查询时服务端根据登录态拿到用户组拼进 SQL，向量路和关键词路共用一个过滤函数。我们还遇到过加了过滤之后 HNSW 返回不够数，开了 pgvector 的 iterative scan 才解决。
+  - id: d27-i5
+    kp: d27-k2
+    type: design
+    difficulty: 4
+    question: 请设计一条完整的「检索优化流水线」（从用户问题到送入 Prompt 的片段），说明每一步的作用、带来的延迟/成本，以及你如何用数据决定是否保留这一步。什么情况下你会考虑 Agentic RAG？
+    key_points:
+      - {text: "给出顺序：改写、前置过滤、混合召回、RRF、Rerank、阈值、预算截断", dim: concept}
+      - {text: "说明每一步解决的问题以及延迟与成本代价", dim: principle}
+      - {text: "提出用分层评估集做消融实验，用 Recall@K、MRR、端到端正确率决定取舍", dim: engineering}
+      - {text: "设计降级策略：改写或 Rerank 超时时的回退路径", dim: engineering}
+      - {text: "说明 Agentic RAG 适用于多跳、多数据源问题，并指出其成本和可控性代价", dim: project}
+    reference: |
+      **流水线**：
+      1. **Query Rewrite**（多轮才启用）：指代消解，解决追问召回差；+1 次小模型调用（几百毫秒），超时回退原问题。
+      2. **前置过滤**：服务端身份 + 版本状态生成 WHERE；几乎无额外延迟，解决越权和旧版本问题。
+      3. **混合召回**：向量 + BM25 各取 40 条，并发执行；+几到几十毫秒，解决编号/专有名词召回差。
+      4. **RRF 融合**：几乎无成本。
+      5. **Rerank**：cross-encoder 精排 50 条；+几十到几百毫秒或 API 费用，解决排序粗糙；超时回退 RRF 顺序。
+      6. **阈值判断**：最高 Rerank 分低于阈值走拒答。
+      7. **按 Token 预算截断**：取 3~8 条送入 Prompt（Day 28）。
+      **用数据决定取舍**：建立分层评估集（事实类、编号类、多轮追问、无答案类），做**消融实验**：每去掉一步看 Recall@K、MRR、前 5 条命中率和端到端回答正确率的变化，同时记录 P95 延迟和成本。收益小于代价的步骤关闭或只对特定问题类型启用（如只对多轮追问改写）。
+      **Agentic RAG**：当评估发现大量失败来自多跳问题（需要先查 A 再查 B）、需要在多个数据源之间路由（制度库、工单、数据库），或需要根据中间结果决定是否继续检索时考虑；代价是调用次数不确定、延迟与成本上升、行为难测，需要最大步数、超时和完整的轨迹日志。
+    oral: |
+      我会按这个顺序搭：多轮时先做指代消解改写，然后根据服务端身份生成权限和版本过滤，接着向量和 BM25 并发各取 40 条，RRF 融合，再用 Rerank 精排，最高分低于阈值就拒答，否则按 Token 预算取 3 到 8 条进 Prompt。
+      每一步都有代价，改写多一次模型调用，Rerank 多一百毫秒左右，所以我会用分层评估集做消融实验，逐步去掉某一步看召回、MRR 和最终正确率的变化，再结合 P95 延迟决定保不保留。改写和 Rerank 都有超时回退。
+      Agentic RAG 我只会在评估显示很多失败来自多跳问题或者需要在多个数据源之间选择时才考虑，因为它的调用次数不确定，成本和可控性都更差。
+code_reading:
+  id: d27-c1
+  kp: [d27-k1, d27-k2, d27-k3]
+  title: 改写 + 召回 + Rerank 精排流水线
+  level: 2
+  scenario: |
+    FastAPI 问答服务中的检索编排函数。接口层拿到用户问题、最近对话历史和当前用户所属部门后调用 retrieve，
+    其中 search 是 Day 26 的混合检索（异步函数，返回带部门信息的候选）。返回的片段交给 Prompt 组装模块。
+    Rerank 使用本地加载的 bge-reranker-v2-m3。
+  language: python
+  code: |
+    import logging
+    import os
+    from collections.abc import Awaitable, Callable
+    from dataclasses import dataclass
+
+    from FlagEmbedding import FlagReranker
+    from openai import AsyncOpenAI
+
+    logger = logging.getLogger("rag.pipeline")
+    client = AsyncOpenAI()  # 读取环境变量 OPENAI_API_KEY
+    reranker = FlagReranker("BAAI/bge-reranker-v2-m3", use_fp16=True)
+
+    REWRITE_PROMPT = (
+        "根据对话历史，把用户最后一个问题改写成可以独立检索的完整问题，"
+        "补全代词和省略的主语。只输出改写后的问题，不要回答。"
+    )
+
+
+    @dataclass
+    class Candidate:
+        chunk_id: int
+        text: str
+        dept: str
+        score: float = 0.0
+
+
+    SearchFn = Callable[[str, int], Awaitable[list[Candidate]]]
+
+
+    async def rewrite_query(history: list[dict], question: str) -> str:
+        if not history:
+            return question
+        try:
+            resp = await client.chat.completions.create(
+                model=os.environ["REWRITE_MODEL"],
+                messages=[{"role": "system", "content": REWRITE_PROMPT},
+                          *history[-6:], {"role": "user", "content": question}],
+                temperature=0,
+                timeout=5,
+            )
+            return (resp.choices[0].message.content or "").strip() or question
+        except Exception:
+            logger.warning("rewrite failed, fallback to original", exc_info=True)
+            return question
+
+
+    async def retrieve(history: list[dict], question: str, user_dept: str, search: SearchFn,
+                       top_n: int = 5, min_score: float = 0.2) -> tuple[str, list[Candidate]]:
+        query = await rewrite_query(history, question)
+        candidates = await search(query, 50)
+        if not candidates:
+            return query, []
+        scores = reranker.compute_score([[query, c.text] for c in candidates], normalize=True)
+        for c, s in zip(candidates, scores):
+            c.score = float(s)
+        ranked = sorted(candidates, key=lambda c: c.score, reverse=True)
+        kept = [c for c in ranked if c.dept == user_dept and c.score >= min_score]
+        logger.info("q=%r rewrite=%r cand=%d kept=%d top=%.3f",
+                    question, query, len(candidates), len(kept), ranked[0].score)
+        return query, kept[:top_n]
+  walkthrough:
+    function: |
+      实现检索编排：有对话历史时先用 LLM 把追问改写成独立问题；用改写后的问题调用混合检索取 50 个候选；
+      用 bge-reranker-v2-m3 对每个（问题，片段）对打分（sigmoid 归一化到 0~1）并降序排列；
+      再筛掉不属于用户部门的片段和低于 min_score 的片段，返回改写后的问题和前 top_n 个片段。
+    key_functions: |
+      - `rewrite_query`：多轮改写。无历史直接返回原问题；有历史时带最近 6 条消息调用 LLM，temperature=0、超时 5 秒；任何异常都记录告警并回退原问题。
+      - `retrieve`：编排主流程——改写、召回、Rerank 打分、排序、部门与阈值过滤、截断。
+      - `reranker.compute_score(pairs, normalize=True)`：cross-encoder 批量打分，normalize=True 时对 logit 做 sigmoid。
+      - `Candidate`：候选片段的数据结构，score 字段在 Rerank 后被填充。
+    params: |
+      接口层传入 history（OpenAI 消息格式的列表）、question（原问题）、user_dept（当前用户部门，应来自服务端登录态）、search（检索函数，依赖注入，便于测试替换）。
+      top_n 和 min_score 有默认值，可由调用方按知识库配置覆盖。改写模型名通过环境变量 REWRITE_MODEL 注入，缺失时 os.environ 会抛 KeyError（被 except 捕获后回退原问题）。
+    data_flow: |
+      ```mermaid
+      flowchart TB
+        A["question 加 history"] --> B["rewrite_query 改写"]
+        B --> C["search 混合召回 50 条 全部门"]
+        C --> D["compute_score 同步批量推理"]
+        D --> E["按分数降序"]
+        E --> F["筛选 部门相同 且 分数达标"]
+        F --> G["返回 query 与前 top_n 条"]
+      ```
+    failure_points: |
+      - **阻塞事件循环（性能问题）**：`reranker.compute_score` 是同步、计算密集的调用，直接在 async 函数中执行，推理期间整个事件循环被占用，其他请求（包括健康检查）全部排队，高并发时 P99 暴涨。
+      - **部门过滤后置（效果 + 安全问题）**：search 召回的是全部门数据，Rerank 之后才按部门筛选。小部门用户的 50 个候选可能大部分属于其他部门，筛完只剩 0~2 条；其他部门的片段已经被读取并送入 Rerank 模型，若日志或调试输出包含候选内容会造成泄露。
+      - **compute_score 返回类型**：只有 1 个候选时，部分版本会返回单个 float 而不是列表，`zip` 会抛 TypeError，需要统一转为列表。
+      - **改写异常被宽泛捕获**：环境变量缺失这类配置错误也被当作「改写失败」静默回退，可能长期没人发现改写功能根本没生效。
+      - `ranked[0]` 在候选非空时安全，但若后续有人改动前面的空判断，这里会 IndexError。
+    debugging: |
+      - 看 `q=... rewrite=... cand=... kept=... top=...` 日志：cand 很大而 kept 很小，说明过滤后置把结果筛光了；top 很低说明召回质量差或真的无答案。
+      - 统计 `rewrite failed` 告警的频率，区分超时和 KeyError 等配置错误。
+      - 压测时观察事件循环延迟（如在中间件中记录请求排队时间），对比 Rerank 前后的 P99。
+      - 在单元测试中注入一个假的 search，返回不同部门的候选，验证过滤逻辑。
+      - 用 1 个候选的输入单独测试 compute_score 的返回类型。
+    change_request: |
+      - **改为前置过滤**：search 增加过滤参数（部门、权限、版本），在检索 SQL 中 WHERE；retrieve 中删除应用层部门筛选或只保留为防御性断言。
+      - **不阻塞事件循环**：`scores = await asyncio.to_thread(reranker.compute_score, pairs, normalize=True)`，更好的是把 Rerank 拆成独立推理服务并设置超时，超时时回退到召回顺序。
+      - **统一返回类型**：`if isinstance(scores, float): scores = [scores]`。
+      - **配置错误快速失败**：启动时校验 REWRITE_MODEL，而不是在每次请求中捕获 KeyError。
+      - **原问题与改写问题双路检索**：search 两次并发后 RRF，降低改写出错的影响。
+  questions:
+    - id: d27-c1-q1
+      kp: d27-k2
+      type: code
+      question: 按执行顺序说明：当 history 为空、以及 history 不为空但 LLM 调用超时这两种情况下，retrieve 中 query 的值分别是什么？后续步骤用的是哪个问题？
+      key_points:
+        - {text: "history 为空时 rewrite_query 直接返回原问题，不调用 LLM", dim: principle}
+        - {text: "超时抛出异常被 except 捕获，记录 warning 后返回原问题", dim: principle}
+        - {text: "后续 search 和 compute_score 都使用 query 变量即改写结果或原问题", dim: concept}
+        - {text: "指出宽泛的 except 也会吞掉配置错误，需要区分对待", dim: engineering}
+      reference: |
+        **history 为空**：`rewrite_query` 第一行判断 `not history` 为真，直接返回 question，不发起 LLM 调用；query 等于原问题。
+        **history 不为空但超时**：构造 messages（system 改写指令 + 最近 6 条历史 + 当前问题），`await client.chat.completions.create(..., timeout=5)` 超过 5 秒抛出超时异常，被 `except Exception` 捕获，记录带堆栈的 warning 日志后返回原问题；query 仍等于原问题。
+        **后续**：`search(query, 50)` 用 query 召回，`compute_score` 也用 query 组成（问题，片段）对，最终 retrieve 返回 query，供上层写日志或组装 Prompt。
+        注意：`except Exception` 同样会捕获 `os.environ["REWRITE_MODEL"]` 缺失导致的 KeyError，配置错误会被当作偶发超时静默处理，建议启动时校验配置，并对异常类型分别记录。
+    - id: d27-c1-q2
+      kp: d27-k3
+      type: code
+      question: 一个只有 20 人的法务部员工提问，日志显示 `cand=50 kept=1`。结合代码说明为什么会这样，这里还隐藏了什么风险？应该怎么改？
+      key_points:
+        - {text: "指出 search 召回全部门数据，部门过滤在 Rerank 之后才做", dim: principle}
+        - {text: "说明法务部文档占比小，50 个候选大部分属于其他部门，被筛掉后只剩 1 条", dim: principle}
+        - {text: "指出其他部门数据已被读取并送入 Rerank，存在泄露面且浪费计算", dim: engineering}
+        - {text: "提出把部门或权限条件下推到检索 SQL 前置过滤", dim: engineering}
+      reference: |
+        search(query, 50) 没有接收任何过滤条件，召回的是全公司所有部门的片段。法务部文档在全库中占比很小，50 个候选里可能只有一两条属于法务部；Rerank 对 50 条全部打分后，`c.dept == user_dept` 再把其他部门的 49 条筛掉，于是 kept=1，回答质量很差。
+        **隐藏风险**：其他部门（可能包括敏感部门）的片段已经被读入服务内存并发送给 Rerank 模型，任何调试日志、异常堆栈、缓存都可能把它们带出去；同时 Rerank 计算有 98% 浪费在不该看的数据上。
+        **修改**：给 SearchFn 增加 filters 参数，由服务端身份生成（部门、权限组、版本状态），在两路检索 SQL 中 WHERE 前置过滤；这样 50 个候选都属于法务部可见范围。应用层的部门判断可保留为断言（发现异常数据就报警），而不是主要过滤手段。
+    - id: d27-c1-q3
+      kp: d27-k1
+      type: code
+      question: 压测时发现：引入 Rerank 后，即使是不涉及检索的健康检查接口，P99 延迟也大幅上升。请结合代码解释原因，并给出两种改法及取舍。
+      key_points:
+        - {text: "指出 compute_score 是同步计算密集调用，在 async 函数中直接执行会阻塞事件循环", dim: principle}
+        - {text: "说明事件循环被阻塞时同进程所有协程都无法推进，包括健康检查", dim: principle}
+        - {text: "改法一：asyncio.to_thread 或线程池执行，简单但受进程内资源限制", dim: engineering}
+        - {text: "改法二：独立 Rerank 推理服务，异步 HTTP 调用加超时降级，可独立扩缩容", dim: engineering}
+      reference: |
+        FastAPI 的 async 路由运行在单个事件循环上（Day 06）。`reranker.compute_score` 是同步函数，内部做模型前向推理，耗时几十毫秒到秒级；在 async 函数里直接调用，这段时间事件循环无法切换到其他协程，同一进程中所有请求——包括健康检查——都被卡住，所以 P99 整体上升。
+        **改法一**：`scores = await asyncio.to_thread(reranker.compute_score, pairs, normalize=True)`，把推理放到线程池，事件循环可以继续处理其他请求。优点是改动小；缺点是模型仍占用本进程的 GPU/CPU 和内存，多个 worker 进程各加载一份模型，并发推理时互相争抢。
+        **改法二**：把 Rerank 拆成独立推理服务（统一批处理、单独扩缩容、GPU 集中管理），业务服务用异步 HTTP 客户端调用并设置超时（如 400ms），超时回退到召回顺序并记录降级。优点是隔离性和可扩展性好；缺点是多一次网络调用和一个需要运维的服务。
+        并发量大或多副本部署时推荐改法二。
+sources:
+  - {title: "Cohere Docs - Rerank", url: "https://docs.cohere.com/docs/rerank"}
+  - {title: "BAAI/bge-reranker-v2-m3", url: "https://huggingface.co/BAAI/bge-reranker-v2-m3"}
+  - {title: "HyDE 论文 arXiv:2212.10496", url: "https://arxiv.org/abs/2212.10496"}
+  - {title: "pgvector README", url: "https://github.com/pgvector/pgvector"}
+  - {title: "Microsoft GraphRAG 文档", url: "https://microsoft.github.io/graphrag/query/overview/"}

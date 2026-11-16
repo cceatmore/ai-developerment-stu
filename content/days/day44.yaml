@@ -1,0 +1,784 @@
+day: 44
+phase: 5
+title: 回归与发布：评测门禁、版本管理与灰度
+goals:
+  - 能在 CI 里搭一个 LLM 评测门禁：分层运行、按组门槛、基线对比、报错计失败
+  - 能用 Langfuse 的版本与标签管理 Prompt，说清发布单元要包含哪些版本信息、怎么秒级回滚
+  - 能设计影子流量、金丝雀、A/B 的上线流程，并给出护栏指标和回滚条件
+  - 能把线上反馈变成评测集的增量，同时避免对评测集过拟合
+minutes: 60
+resources:
+  - title: "Langfuse 文档：Prompt Version Control"
+    url: "https://langfuse.com/docs/prompt-management/features/prompt-version-control"
+    kind: doc
+    lang: en
+    minutes: 10
+    note: "看 Versions & Labels、How label resolution works 表格和 Rollbacks 三段，对应 k2 的标签发布与回滚"
+  - title: "promptfoo 文档：Testing Prompts with GitHub Actions"
+    url: "https://www.promptfoo.dev/docs/integrations/github-action/"
+    kind: doc
+    lang: en
+    minutes: 10
+    note: "看第一个 workflow 示例和参数表：PR 改了 prompts 目录就自动跑「改前 vs 改后」对比并评论到 PR，对应 k1"
+  - title: "DeepEval 文档：Unit Testing in CI/CD"
+    url: "https://deepeval.com/docs/evaluation-unit-testing-in-ci-cd"
+    kind: doc
+    lang: en
+    minutes: 15
+    note: "看开头的总览和「Without Tracing」示例：用 pytest 加 assert_test 写评测用例；页面也有 TypeScript 加 vitest 的写法，前端同学可以对照"
+  - title: "吴恩达 Agentic AI 课程 Module 4：Evaluations 与 Error analysis"
+    url: "https://www.deeplearning.ai/courses/agentic-ai"
+    kind: course
+    lang: en
+    minutes: 25
+    note: "复习 Module 4 的 Evaluations（15 分钟）和 Error analysis（9 分钟）两节，重点听「先建小评测集、每次改动都跑一遍」的工作流，对应 k1 和 k4"
+knowledge_points:
+  - id: d44-k1
+    name: CI 评测门禁：让 Prompt 改动像代码一样被测试
+    level: P0
+    summary: 改 Prompt、模型、检索配置都要跑回归评测；分层运行、按组门槛、与基线对比、报错计失败、未达标让 CI 变红
+    analogy: |
+      就像前端的 **快照测试 + E2E 测试 + Lighthouse CI 性能预算**：PR 一提交就跑，分数掉到预算以下就挡住合并。
+      **不一样的地方**：前端测试是确定的，同样输入结果不变；LLM 评测**有随机性**，同一版本跑两次分数也会差几个点，所以要固定版本、重复运行、和基线比、看分组，而不是「一个用例挂了就红」。
+    why: |
+      Prompt 改一句话、模型换一个快照、检索 top_k 改一下，都可能让某一类问题悄悄变差。没有自动回归，只能靠上线后用户投诉发现。
+      面试官常问「你怎么保证改 Prompt 不把别的地方改坏」，回答「我手动试了几个问题」基本就是减分项。
+    problem: |
+      解决三个问题：改动之后**有没有退化**、**退化在哪一类问题上**、**能不能自动挡住**。同时控制评测的时间和费用，不能让每个 PR 等 40 分钟。
+    principle: |
+      **一、什么改动要触发评测**
+
+      不只是代码：**Prompt、模型或模型快照、检索参数、工具描述、评审 rubric** 的改动都要触发。Day 41 讲过，这些都是「行为变更」。
+
+      **二、分层运行**
+
+      ```mermaid
+      flowchart LR
+        PR["提交 PR"] --> U["单元测试 解析器 工具函数"]
+        U --> S["冒烟评测 30 到 50 条 几分钟"]
+        S -->|"未达标"| BLOCK["CI 失败 禁止合并"]
+        S -->|"达标"| M["合并主干"]
+        M --> F["完整评测 数百条 夜间或发版前"]
+        F --> R["报告 分组对比 与基线差异"]
+        R -->|"有退化"| ISSUE["自动开 Issue 指派负责人"]
+      ```
+
+      - **PR 阶段**：冒烟集，覆盖每个分组的代表用例和全部安全用例，几分钟出结果。
+      - **主干或夜间**：完整评测集，重复多次，生成对比报告。
+      - **发版前**：完整集加红队用例（Day 45）。
+
+      **三、门禁规则**
+
+      1. **按组门槛**：整体通过率之外，每个分组单独看；**安全类要求 100%**。
+      2. **与基线对比**：基线是主干上一次的结果，任一分组下降超过允许幅度（如 5 个点）就拦截。整体分上升不代表没问题。
+      3. **报错算失败**：超时、解析失败、调用报错都计为失败，**不能从分母里剔除**，否则「改坏到输出无法解析」反而让分数变高。
+      4. **控制随机性**：固定被测模型快照、温度、评审模型版本；关键用例重复跑，看通过率或 pass^k（Day 42）。
+      5. **失败要能让 CI 变红**：脚本未达标时以非零退出码结束。
+
+      **四、常用工具**
+
+      | 工具 | 用法 |
+      |---|---|
+      | promptfoo | YAML 写用例和断言；官方 GitHub Action 在 PR 修改 Prompt 时跑改前改后对比，结果评论到 PR |
+      | DeepEval | 用 pytest 写评测，`assert_test` 断言，`deepeval test run` 执行；也提供 TypeScript 加 vitest 写法 |
+      | 自研脚本 | 读评测结果 JSONL，按组统计并与基线对比，最灵活 |
+
+      **缓存**：同一输入的模型输出可以缓存，未改动的部分不重复花钱（promptfoo 的 Action 示例就配置了缓存目录）。
+    scenarios: |
+      - 改了知识库的 System Prompt：PR 冒烟评测发现「多跳问题」组下降 18 个点，门禁拦截，作者补充示例后重跑通过。
+      - 模型厂商发布新快照：夜间完整评测对比新旧快照，延迟和成本也作为回归项。
+      - 改了评审 rubric：先在人工标注集上重新校准一致性（Day 42），再更新基线。
+    code: |
+      一个最小的门禁脚本：按组统计、与基线对比、报错计失败、未达标时让 CI 失败。
+
+      ```python
+      import json
+      import sys
+      from collections import defaultdict
+
+      THRESHOLDS = {"overall": 0.85, "safety": 1.0}  # 安全组必须全部通过
+      MAX_GROUP_DROP = 0.05                           # 任一分组比基线最多降 5 个点
+
+
+      def load(path: str) -> list[dict]:
+          with open(path, encoding="utf-8") as f:
+              return [json.loads(line) for line in f if line.strip()]
+
+
+      def pass_rates(rows: list[dict]) -> dict[str, float]:
+          groups: dict[str, list[bool]] = defaultdict(list)
+          for r in rows:
+              ok = r["status"] == "pass"  # error、timeout 都算失败
+              groups[r["group"]].append(ok)
+              groups["overall"].append(ok)
+          return {g: sum(v) / len(v) for g, v in groups.items()}
+
+
+      def main(current_path: str, baseline_path: str) -> None:
+          cur, base = pass_rates(load(current_path)), pass_rates(load(baseline_path))
+          failures = []
+          for g, rate in sorted(cur.items()):
+              need = THRESHOLDS.get(g)
+              if need is not None and rate < need:
+                  failures.append(f"{g}: {rate:.1%} 低于门槛 {need:.0%}")
+              if g in base and base[g] - rate > MAX_GROUP_DROP:
+                  failures.append(f"{g}: 比基线下降 {base[g] - rate:.1%}")
+          print("\n".join(failures) or "评测门禁通过")
+          sys.exit(1 if failures else 0)
+
+
+      if __name__ == "__main__":
+          main(sys.argv[1], sys.argv[2])
+      ```
+    pitfalls: |
+      - **误区：只看整体分。** 整体上升 2 个点，可能是简单题涨了、关键分组大跌。
+      - **误区：报错用例不计入统计。** 输出格式被改坏时，分母变小，通过率反而虚高。
+      - **误区：每个 PR 跑全量。** 又慢又贵，大家会想办法绕过门禁；分层运行更可持续。
+      - **误区：分数波动就自动重跑到通过。** 这是在掩盖不稳定，应重复运行后看统计结果。
+      - **误区：只打印结果不设退出码。** 脚本「失败」了 CI 却是绿的。
+    interview_asks:
+      - question: "你怎么保证改 Prompt 不会把别的地方改坏？"
+        answer: "提示和代码一样走评审，合并前跑评测集。按题型看分，不允许某一类掉下去。没有这道门禁，就当这次改动不可上线。"
+      - question: "LLM 评测有随机性，CI 里怎么设门槛？"
+        answer: "同一版本重复跑，看是否稳定过线，或者阈值留出波动。用规则能判的题优先。一次偶然变高不算过。随机仍然大的题，先把温度和判定方式固定。"
+      - question: "每次 PR 都跑评测太慢太贵，你怎么处理？"
+        answer: "小改动跑核心子集，夜间或发布前跑全量。改了哪类提示就必跑哪类题。缓存没变的用例。不能因为贵就完全不跑。"
+    project_example: |
+      **p3 前端 Coding Agent（沙箱与 CI 模块）**：仓库里维护 120 个任务的评测集，分为「组件新增」「跨文件重构」「测试修复」「安全（禁止删除文件、禁止联网）」四组。
+      PR 修改 Agent 的 System Prompt、工具描述或模型配置时，GitHub Actions 在 Docker 沙箱里跑 30 条冒烟任务，每个任务的判定是「vitest 全部通过且没有改动白名单外的文件」；门禁脚本按组对比主干基线，安全组必须 100%。合并后夜间跑完整 120 条，每条重复 3 次，报告写进 PR 评论和 Langfuse 实验。
+    freshness: |
+      核对于 2026-11：promptfoo 官方 GitHub Action 为 `promptfoo/promptfoo-action@v1`，在 PR 修改 Prompt 文件时运行改前改后对比并评论到 PR，必填参数为 github-token、prompts、config，要求运行环境 Node.js 22.22.0 以上（推荐 24 LTS）；promptfoo 于 2026-03 被 OpenAI 收购，仍为 MIT 开源。DeepEval 通过 pytest 的 `assert_test()` 与 `deepeval test run` 接入 CI，并提供 TypeScript 加 vitest 的写法。
+    sources:
+      - {title: "promptfoo - Testing Prompts with GitHub Actions", url: "https://www.promptfoo.dev/docs/integrations/github-action/"}
+      - {title: "DeepEval - Unit Testing in CI/CD", url: "https://deepeval.com/docs/evaluation-unit-testing-in-ci-cd"}
+  - id: d44-k2
+    name: Prompt 与模型的版本管理和回滚
+    level: P0
+    summary: Prompt 有版本和标签，模型用带日期的快照，发布单元一起记录；Trace 写入版本号，回滚就是把标签移回去
+    analogy: |
+      像前端的 **package-lock.json + 远程配置 / Feature Flag**：依赖锁到精确版本保证可复现，配置中心改个开关就能不重新发版切换行为。
+      **不一样的地方**：前端锁了版本，行为就确定了；LLM 即使 Prompt 和模型都锁住，输出仍有随机性，所以版本管理的目的是**可对比、可回滚**，不是「完全复现每个字」。
+    why: |
+      线上效果突然变差，第一个问题就是「最近改了什么」。如果 Prompt 写死在代码里、模型用的是会自动更新的别名，你连当时跑的是哪个版本都说不清，更谈不上快速回滚。
+    problem: |
+      解决「改 Prompt 必须重新发版」「不知道线上跑的是哪个版本」「出问题回滚要几十分钟」以及「模型厂商悄悄更新别名导致行为变化」的问题。
+    principle: |
+      **一、Langfuse 的版本和标签**
+
+      - 每次保存 Prompt 自动生成新**版本号**（v1、v2……），不可修改。
+      - **标签**指向某个版本：`production`、`staging`，也可以是租户或实验名。`latest` 自动指向最新版本。
+      - 读取规则（以官方文档为准）：
+        - 不传 label 和 version：返回 `production` 标签的版本；
+        - 传了不存在的 label：**直接 404，不会悄悄回退**到 production 或 latest；
+        - 同时传 label 和 version：400 错误。
+      - **回滚** = 在界面上把 `production` 标签移回上一个版本，应用下次拉取即生效，不需要重新部署。
+      - SDK 支持配置**兜底 Prompt**（fallback），平台不可用时也能工作；注意用兜底时不会关联到 Prompt 版本。
+      - 受保护标签（只有管理员能改 production）在自托管时属于企业版功能。
+
+      ```mermaid
+      sequenceDiagram
+        participant D as 开发者
+        participant L as Langfuse
+        participant E as 评测流水线
+        participant A as 线上应用
+        D->>L: 保存新版本 v13 打 staging 标签
+        E->>L: 拉取 staging 在数据集上跑实验
+        E-->>D: 报告 与 v12 分组对比
+        D->>L: 把 production 标签移到 v13
+        A->>L: 拉取 production 得到 v13
+        A->>A: 点踩率上升
+        D->>L: production 标签移回 v12 完成回滚
+      ```
+
+      **二、模型版本**
+
+      - 生产环境用**带日期的模型快照**，不要用会自动指向新版本的别名。
+      - 换快照当成一次发布：先跑完整评测，再灰度。
+
+      **三、发布单元**
+
+      一次发布要一起记录：**Prompt 名称与版本、模型快照与参数、检索配置版本、工具描述版本、评测集版本**。Trace 里写入这些版本号（Day 43），线上问题才能对上号。
+    scenarios: |
+      - 运营同学想改欢迎语和语气：在 Langfuse 改 Prompt 存成新版本，打 staging 标签，评测通过后移动 production 标签，不用找开发发版。
+      - 新 Prompt 上线后点踩率升高：值班同学把 production 标签移回上一版，几分钟内恢复。
+      - 多租户：给大客户单独打 `tenant-a` 标签，定制话术不影响其他租户。
+    code: |
+      从 Langfuse 拉取 production 版本的 Prompt，配置兜底，并把版本关联到 generation：
+
+      ```python
+      import os
+
+      from langfuse import get_client, observe
+      from openai import OpenAI
+
+      langfuse = get_client()
+      client = OpenAI()
+      MODEL_SNAPSHOT = os.environ["LLM_MODEL_SNAPSHOT"]  # 带日期的快照名，不用自动更新的别名
+
+      FALLBACK = "你是企业知识库助手。只根据资料回答并标注引用。\n资料：{{context}}\n问题：{{question}}"
+
+
+      @observe(as_type="generation", name="kb-answer")
+      def answer(question: str, context: str) -> str:
+          prompt = langfuse.get_prompt("kb-answer", fallback=FALLBACK)  # 不传 label 时取 production
+          text = prompt.compile(question=question, context=context)
+          resp = client.chat.completions.create(
+              model=MODEL_SNAPSHOT,
+              messages=[{"role": "user", "content": text}],
+              temperature=0.2,
+          )
+          langfuse.update_current_generation(prompt=prompt, model=resp.model)  # 按 Prompt 版本统计效果
+          return resp.choices[0].message.content or ""
+      ```
+    pitfalls: |
+      - **误区：Prompt 写死在代码里。** 每次调整都要发版，也无法按版本对比效果。
+      - **误区：生产用模型别名。** 厂商更新别名后行为会变，你却没有任何改动记录。
+      - **误区：Prompt 移出代码就不用评测。** 发布权限下放后，评测和审批更要严格，否则谁都能改线上行为。
+      - **误区：以为请求不存在的标签会回退到 production。** Langfuse 会直接返回 404，需要配置兜底 Prompt。
+      - **误区：只记录 Prompt 版本。** 模型快照、检索配置、工具描述也会改变行为，要作为一个发布单元记录。
+    interview_asks:
+      - question: "你们的 Prompt 怎么管理？改 Prompt 要不要重新发版？"
+        answer: "提示放在仓库里，有版本号，和代码一起发布。线上读的是某一个版本，不是有人在页面上随手改的最新文案。紧急改动也要留下版本，便于回滚。"
+      - question: "线上效果突然变差，怎么快速回滚？"
+        answer: "提示版本和模型版本都能单独切回上一版，不用等整包重发。切回后用几条线上坏例验证。同时停掉还在放量的灰度。"
+      - question: "为什么生产环境不建议用模型的「latest」别名？"
+        answer: "供应商更新别名指向后，你的效果和成本会在没有发布的情况下变化。生产写死模型快照 id。升级当成一次变更，先评测再切。"
+    project_example: |
+      **p1 企业知识库**：问答、查询改写、引用校验三个 Prompt 都放在自托管 Langfuse 里，生产代码只按 production 标签拉取并配置兜底。
+      每个版本发布前在 staging 标签上跑 Day 41 的评测集，报告附在版本说明里；`.env` 中模型使用带日期的快照名。Vue3 后台的「版本」页面展示当前线上的 Prompt 版本、模型快照和检索配置版本，并提供一键回滚到上一版的按钮（调用 Langfuse API 移动标签）。
+    freshness: |
+      核对于 2026-11（Langfuse 官方文档）：Prompt 通过 versions 与 labels 管理；不指定 label 时返回 production 标签的版本，请求不存在的 label 返回 404 且不会回退到 production 或 latest，同时传 label 和 version 返回 400；回滚方式为把 production 标签移回旧版本；SDK 可配置 fallback，使用 fallback 时不会关联 Prompt；受保护标签在自托管时属企业版功能。
+    sources:
+      - {title: "Langfuse - Prompt Version Control", url: "https://langfuse.com/docs/prompt-management/features/prompt-version-control"}
+      - {title: "Langfuse - Link Prompts to Traces", url: "https://langfuse.com/docs/prompt-management/features/link-to-traces"}
+  - id: d44-k3
+    name: 影子流量、金丝雀与 A/B：上线的节奏
+    level: P1
+    summary: 离线评测通过后用影子流量看真实输入，再按比例金丝雀扩量，用护栏指标决定继续还是回滚
+    analogy: |
+      就是前端的 **灰度发布 + A/B 实验平台**：先给 5% 用户开新版本，看错误率和转化率，没问题再扩大。
+      **不一样的地方**：LLM 版本的效果不能只看转化率，还要看**成本、步数、安全拦截、点踩率**；Agent 有写操作，影子流量要特别小心副作用。
+    why: |
+      离线评测集再好，也覆盖不了真实用户的全部问法。新模型或新 Prompt 直接全量，一旦出问题影响的是所有用户。分阶段上线是把风险控制在小范围内。
+    problem: |
+      解决「离线评测通过但线上表现未知」的问题，以及「怎么用真实数据判断新版本真的更好」「出问题时怎么在小范围内自动止损」。
+    principle: |
+      **一、三种方式**
+
+      | 方式 | 做法 | 用户感知 | 适合 |
+      |---|---|---|---|
+      | 影子流量 | 新版本并行处理线上请求的副本，结果不返回用户 | 无 | 看延迟、成本、输出差异 |
+      | 金丝雀 | 小比例用户由新版本真实响应 | 有，范围小 | 看真实质量与稳定性 |
+      | A/B 实验 | 按用户分两组，统计指标差异 | 有 | 判断哪个版本更好 |
+
+      **影子流量的坑**：Agent 的写操作工具（派单、发邮件）在影子模式下必须禁用或换成模拟实现，否则会重复执行。
+
+      **二、上线状态机**
+
+      ```mermaid
+      stateDiagram-v2
+        [*] --> 离线评测
+        离线评测 --> 影子流量: 门禁通过
+        影子流量 --> 内部试用: 延迟和成本可接受
+        内部试用 --> 金丝雀5: 内部无严重问题
+        金丝雀5 --> 金丝雀25: 护栏指标正常
+        金丝雀25 --> 全量: 护栏指标正常
+        金丝雀5 --> 回滚: 护栏指标异常
+        金丝雀25 --> 回滚: 护栏指标异常
+        回滚 --> 离线评测: 补充用例后重新评估
+        全量 --> [*]
+      ```
+
+      **三、分组与指标**
+
+      - **按用户或会话固定分组**（粘性分配），同一会话前后不能换版本，否则体验割裂、指标难归因。
+      - **护栏指标**（变差就停）：错误率、超时率、P95 延迟、单次成本与步数、安全拦截率。
+      - **效果指标**（决定是否更好）：点踩率、任务完成率、转人工率、线上评审分。
+      - 每档观察足够的样本量和时间，避免被几次随机波动误导。
+    scenarios: |
+      - 换更便宜的模型：先跑一周影子流量对比输出和成本，再 5% 金丝雀，点踩率无显著上升后扩量。
+      - Agent 新增派单工具：内部运营人员先用，派单前人工审批，再逐步开放给外部租户。
+      - 两版 Prompt 之争：按用户分组 A/B 两周，以任务完成率为主指标、成本为护栏指标做决策。
+    pitfalls: |
+      - **误区：离线评测通过就全量。** 离线集覆盖不了真实流量的长尾。
+      - **误区：按请求随机分组。** 同一会话前后版本不同，指标也被污染。
+      - **误区：影子流量不处理副作用。** 新版本的派单、发信会被真实执行一遍。
+      - **误区：只看效果指标不设护栏。** 点踩率略降，但成本翻倍、P95 延迟翻倍，同样不能上线。
+    interview_asks:
+      - question: "新模型评测通过了，你会怎么上线？"
+        answer: "先影子流量，只记录新模型会答成什么样，不影响用户。再按用户小流量灰度，看延迟、成本和点踩。没问题再全量。不要评测过了就 100% 切换。"
+      - question: "影子流量和金丝雀有什么区别？各适合什么场景？"
+        answer: "影子是新路径只旁路运行，用户仍看旧结果，用来比质量。金丝雀是一小部分用户真实用上新路径。先影子发现明显问题，再用金丝雀看真实体验。"
+      - question: "A/B 实验为什么要按用户分组？"
+        answer: "同一个人一会儿旧一会儿新，体验和数据都对不上，也无法看留存。按用户稳定分组，一个用户全程只看到一个版本。"
+    project_example: |
+      **p2 智慧园区运营 Agent**：新版 Agent 先接影子流量，`create_work_order`、`notify_owner` 等写操作工具在影子模式下替换为只记录参数的模拟实现，对比新旧版本的工具调用序列和步数。
+      之后对一个园区的运营人员开放（金丝雀），按运营账号固定分组；护栏指标是工具错误率、单次运行步数、人工审批被拒比例，任一超过对照组 1.5 倍就自动切回旧版本。
+  - id: d44-k4
+    name: 线上数据飞轮：反馈回流评测集
+    level: P1
+    summary: 点踩、转人工、线上低分是新失败案例的来源；复核、脱敏、分组后进评测集，并保留留出集防过拟合
+    analogy: |
+      像前端的 **Sentry 报错 → 修复 → 补一个回归测试用例**：每个线上 bug 修完都留下一条测试，下次不会再犯。
+      **不一样的地方**：LLM 的失败通常没有报错，要靠点踩和线上评审发现；而且「正确答案」要人工确认，不能直接拿模型输出当参考答案。
+    why: |
+      评测集如果一直是上线前写的那几百条，很快就和真实用户的问法脱节：分数一直很高，用户却在抱怨。线上数据是评测集最好的补充来源。
+    problem: |
+      解决「评测集和真实使用脱节」的问题，同时避免两个副作用：把未经确认或含隐私的数据塞进评测集，以及针对评测集反复调优导致的过拟合。
+    principle: |
+      **一、飞轮怎么转**
+
+      ```mermaid
+      flowchart LR
+        P["线上流量"] --> SIG["信号 点踩 转人工 重复提问 线上评审低分"]
+        SIG --> Q["标注队列 按 trace_id 打开 Trace"]
+        Q --> H["人工复核 确认问题与正确答案"]
+        H --> CLEAN["脱敏 去重 标注分组与来源"]
+        CLEAN --> DS["评测集新版本"]
+        DS --> FIX["修复与回归评测"]
+        FIX --> P
+      ```
+
+      **二、信号来源**
+
+      - **显式反馈**：点赞点踩、文字反馈。
+      - **隐式反馈**：转人工、同一问题换说法再问、复制答案后立刻追问。
+      - **线上评审**：对抽样 Trace 跑无参考评审（是否答非所问、是否有引用、是否泄露信息）。
+
+      **三、入库规范**
+
+      1. **人工复核**：确认确实是错误，并写出正确答案或判定标准；不要让被测模型自己生成参考答案。
+      2. **脱敏**：去掉姓名、手机号、内部敏感信息。
+      3. **去重和分组**：同类问题合并，标注问题类型、来源 trace_id、加入日期。
+      4. **评测集有版本**：每次更新生成新版本，基线要在同一版本上比较。
+
+      **四、防止过拟合**
+
+      不断针对评测集修 Prompt，分数会越来越高，却不一定代表真实效果变好（Goodhart 定律）。对策：
+      - 保留一份**留出集**，不参与日常调优，只在发版前看；
+      - 定期从最新线上流量**重新抽样**，检查评测分和线上满意度是否同向变化。
+    scenarios: |
+      - 每周例会：从标注队列里复核 50 条点踩样本，确认的 20 条加入评测集，评测集版本 v7 → v8。
+      - 新业务上线：前两周的线上问题快速补进评测集，覆盖新问法。
+      - 季度检查：留出集分数和线上点踩率同时对比，发现评测集已经过拟合，重新抽样构建。
+    pitfalls: |
+      - **误区：点踩样本直接全部入库。** 有的点踩是用户误操作或对政策本身不满，不是模型错误。
+      - **误区：用被测模型生成参考答案。** 错误答案会被当成标准，评测失去意义。
+      - **误区：评测集只增不管版本。** 分数变化分不清是模型变了还是题变了。
+      - **误区：所有样本都用于调优。** 没有留出集，就无法发现过拟合。
+    interview_asks:
+      - question: "你们的评测集是怎么持续更新的？"
+        answer: "线上点踩、人工发现的坏例，经过标注后进入候选，评审再并进正式集。每版记录增加了什么。不是把模型答错的题悄悄删掉。"
+      - question: "线上反馈数据怎么用起来？要注意什么？"
+        answer: "点踩要能对上那次 Trace，才能变成熟题。注意隐私和权限，不能把一个租户的对话放进大家都能看的评测。反馈有偏，只能当补充，不能只优化会抱怨的那一类。"
+      - question: "评测分越来越高但用户不满意，可能是什么原因？"
+        answer: "题和线上问法脱节，或者为了刷分把题出简单了。也可能指标不看延迟和拒答体验。把近期真实会话抽进来重标，看分还在不在。"
+    project_example: |
+      **p1 企业知识库**：Vue3 前端每条回答都有点赞点踩，点踩时可选原因（答错、没找到、引用不对、太啰嗦），提交时带 trace_id。
+      后台每天把点踩和转人工的 Trace 推进 Langfuse 标注队列，知识库管理员复核后补正确答案，脱敏后写入评测集新版本，标注来源 trace_id 和问题类型；另留 60 条留出集只在发版前使用。
+test:
+  - id: d44-t1
+    kp: d44-k1
+    type: single
+    question: 前端 Coding Agent 仓库每个 PR 都跑 300 条完整评测，要 40 分钟且费用不低，大家开始想办法绕过。最合理的调整是？
+    options:
+      - "取消 PR 评测，只在发版前人工抽查几条典型任务"
+      - "把评测集压缩到 10 条，所有阶段都只跑这 10 条"
+      - "PR 跑几十条冒烟集，合并主干后或夜间再跑完整集"
+      - "把评审模型换成最便宜的，继续每个 PR 跑全量"
+    answer: [2]
+    explain: |
+      分层运行兼顾反馈速度和覆盖面：PR 冒烟集覆盖每个分组的代表用例和全部安全用例，几分钟出结果；完整集在主干或夜间跑，发现漏网的退化。
+      取消 PR 评测或只留 10 条会大幅降低覆盖；换最便宜的评审会牺牲评审可靠性，且仍然很慢。
+  - id: d44-t2
+    kp: d44-k1
+    type: single
+    question: 新版 Prompt 的整体通过率从 86% 升到 88%，但「多跳问题」组从 80% 降到 62%。门禁应该怎么处理？
+    options:
+      - "拦截：分组下降超过允许幅度，先排查原因再合并"
+      - "放行：整体通过率上升了，说明新版本总体更好"
+      - "放行：多跳问题占比小，对整体平均影响不大"
+      - "取消分组统计，只看整体指标以减少误报"
+    answer: [0]
+    explain: |
+      整体分上升可能来自简单题的小幅提升，掩盖了关键分组的大幅退化。门禁要同时检查每个分组相对基线的下降幅度，下降 18 个点必须拦截。
+      占比小不代表不重要，多跳问题往往正是高价值场景。
+  - id: d44-t3
+    kp: d44-k1
+    type: single
+    question: 新版 Prompt 让 30% 的用例输出无法解析，评测结果记为 error。下面这段门禁代码会怎样？
+    code: |
+      def pass_rate(rows: list[dict]) -> float:
+          scored = [r for r in rows if r["status"] != "error"]
+          passed = [r for r in scored if r["status"] == "pass"]
+          return len(passed) / len(scored)
+
+      rate = pass_rate(load("results.jsonl"))
+      if rate >= 0.85:
+          print("评测门禁通过")
+      else:
+          print(f"通过率 {rate:.1%}，未达标")
+    lang: python
+    options:
+      - "门禁会失败，因为 error 用例会拉低整体通过率"
+      - "脚本会因为除以零而崩溃，CI 会自然变红"
+      - "取决于评审模型当天的状态，无法从代码判断"
+      - "error 不计分母会让通过率虚高，且未达标也不会让 CI 失败"
+    answer: [3]
+    explain: |
+      第一个问题：error 用例被排除在分母之外，输出越坏、被剔除的越多，剩下的通过率反而可能更高。第二个问题：未达标只打印信息，没有 `sys.exit(1)`，CI 永远是绿的。
+      应把 error 计为失败，并在未达标时以非零退出码结束。只有全部用例都报错时才会除以零，30% 报错不会。
+  - id: d44-t4
+    kp: d44-k1
+    type: multi
+    question: 为了让 CI 里的 LLM 评测结果稳定、可比较，哪些做法正确？
+    options:
+      - "固定被测模型快照、温度和评审模型版本"
+      - "关键用例重复运行，看通过率或 pass^k"
+      - "与同一评测集上的基线对比，而不只看绝对分"
+      - "分数波动时自动重跑，直到通过为止"
+    answer: [0, 1, 2]
+    explain: |
+      固定版本减少无关变量；重复运行把随机性变成可统计的通过率；与基线对比才能区分「本来就这样」和「这次改坏了」。
+      自动重跑到通过是在掩盖不稳定，等于把门禁变成摆设。
+  - id: d44-t5
+    kp: d44-k1
+    type: judge
+    question: 评测时出现超时、解析失败、调用报错的用例应计为失败，而不是从统计中剔除。
+    answer: true
+    explain: |
+      对用户来说，超时和格式错误就是失败。如果从分母中剔除，改坏输出格式的版本反而可能分数更高，门禁会放过最严重的退化。
+      可以单独统计 error 比例帮助排查，但通过率里必须算作失败。
+  - id: d44-t6
+    kp: d44-k2
+    type: single
+    question: 在 Langfuse 中，代码调用 `get_prompt("kb-answer")`，没有指定 label 或 version，会拿到哪个版本？
+    options:
+      - "最新创建的版本，也就是 latest 标签指向的版本"
+      - "带 production 标签的版本，没有则请求失败"
+      - "版本号为 1 的最早版本，作为最稳定的默认值"
+      - "当前带 staging 标签的版本，供灰度时使用"
+    answer: [1]
+    explain: |
+      Langfuse 规定不传 label 和 version 时返回 production 标签的版本；如果没有任何版本带 production，请求返回 404，不会回退到 latest。
+      这样「发布」就等于移动 production 标签，新建版本不会自动影响线上。
+  - id: d44-t7
+    kp: d44-k2
+    type: single
+    question: 新版 Prompt v13 上线一小时后点踩率明显上升。使用 Langfuse 标签管理时，最快的回滚方式是？
+    options:
+      - "修改代码里的 Prompt 字符串，重新构建并发布服务"
+      - "删除 v13 版本，让系统自动退回到上一个版本"
+      - "把代码里的 label 参数改成 latest，再重新部署"
+      - "把 production 标签移回 v12，应用下次拉取即生效"
+    answer: [3]
+    explain: |
+      Langfuse 的回滚就是把 production 标签指回旧版本，不需要改代码或重新部署，应用在 SDK 缓存刷新后拿到 v12。
+      改代码重新发版太慢；latest 指向的正是最新的 v13；删除版本不是回滚手段，也会丢失排查依据。
+  - id: d44-t8
+    kp: d44-k2
+    type: multi
+    question: 一次 LLM 应用发布，应该一起记录哪些版本信息，才能做到可对比、可回滚？
+    options:
+      - "Prompt 名称与版本号"
+      - "模型带日期的快照名与关键参数"
+      - "检索配置版本与评测集版本"
+      - "开发者本机的编辑器主题设置"
+    answer: [0, 1, 2]
+    explain: |
+      Prompt、模型快照与参数、检索配置都会改变行为，评测集版本决定分数能否比较，它们共同构成一个发布单元，并应写入 Trace。
+      编辑器主题与线上行为无关。
+  - id: d44-t9
+    kp: d44-k2
+    type: judge
+    question: 生产环境使用模型厂商提供的、会自动指向最新版本的模型别名，可以保证回归评测结果和线上行为一致。
+    answer: false
+    explain: |
+      别名会被厂商更新到新版本，线上行为可能在你没有任何改动时发生变化，回归评测也无法对齐。
+      生产环境应使用带日期的模型快照，切换快照当作一次发布，走评测和灰度。
+  - id: d44-t10
+    kp: d44-k2
+    type: judge
+    question: 在 Langfuse 中请求一个不存在的 label 会直接返回 404，不会悄悄回退到 production 或 latest，因此生产代码应配置兜底 Prompt。
+    answer: true
+    explain: |
+      官方文档明确说明缺失的 label 是错误而不是回退，这样拼错标签会立刻暴露。SDK 支持 fallback 参数，在拉取失败时使用兜底 Prompt 保证服务可用。
+      注意使用兜底时不会关联到 Prompt 版本，监控里要能看出这种情况。
+  - id: d44-t11
+    kp: d44-k3
+    type: single
+    question: 想在完全不影响用户的前提下，用真实线上流量检验新模型的延迟、成本和输出差异，应选哪种方式？
+    options:
+      - "影子流量：新版本处理请求副本，结果不返回给用户"
+      - "金丝雀：把 5% 用户的请求直接交给新版本响应"
+      - "全量切换：同时准备好回滚脚本以防万一"
+      - "离线评测：只在固定评测集上跑一遍新模型"
+    answer: [0]
+    explain: |
+      影子流量用真实输入驱动新版本，但结果只用于对比，用户无感知，适合在上线前看延迟、成本和输出差异。
+      金丝雀和全量都会让用户看到新版本的结果；离线评测用的是固定评测集，不是真实流量。
+  - id: d44-t12
+    kp: d44-k3
+    type: single
+    question: 做新旧 Prompt 的 A/B 实验时，为什么要按用户或会话固定分组，而不是每个请求随机分？
+    options:
+      - "按请求随机分组的计算量太大，系统承受不住"
+      - "按用户分组可以让新版本分到更多的流量"
+      - "同一会话前后版本不同会体验割裂，指标也难归因"
+      - "按请求随机分组会导致 Trace 无法正确上报"
+    answer: [2]
+    explain: |
+      多轮对话中前一轮用 A、后一轮用 B，用户体验不一致，点踩或转人工也无法归到某一个版本上。粘性分配保证一个用户或会话始终使用同一版本。
+      随机分组的计算量可以忽略；分组方式不决定流量比例；与 Trace 上报无关。
+  - id: d44-t13
+    kp: d44-k3
+    type: multi
+    question: 新版 Agent 灰度到 10% 流量时，哪些情况应触发自动回滚或暂停扩量？
+    options:
+      - "灰度组的错误率或超时率显著高于对照组"
+      - "灰度组的安全拦截或越权尝试明显增加"
+      - "灰度组的单次任务成本或步数大幅上涨"
+      - "灰度组用户的平均对话轮数有轻微波动"
+    answer: [0, 1, 2]
+    explain: |
+      错误率、安全事件、成本和步数都是护栏指标，显著变差就应停止扩量或回滚。
+      平均对话轮数的轻微波动在正常随机范围内，不能单独作为回滚依据，应结合样本量判断。
+  - id: d44-t14
+    kp: d44-k3
+    type: judge
+    question: 只要离线评测全部通过，新版本就可以直接全量上线，灰度和线上监控是多余的。
+    answer: false
+    explain: |
+      离线评测集只覆盖已知问题，真实流量有大量长尾问法和意外输入；延迟、成本、并发下的表现也只有在线上才能看清。
+      分阶段上线能把未知风险限制在小范围内，配合护栏指标及时止损。
+  - id: d44-t15
+    kp: d44-k4
+    type: single
+    question: 线上点踩样本进入评测集之前，最关键的一步是什么？
+    options:
+      - "直接全部加入评测集，样本越多覆盖就越全面"
+      - "人工复核确认问题和正确答案，并脱敏、去重、标注分组"
+      - "让 LLM 自动生成参考答案，然后立即加入评测集"
+      - "只保留点踩次数最多的那几个用户的样本"
+    answer: [1]
+    explain: |
+      点踩不一定代表模型错了，参考答案也必须由人确认；样本还要脱敏、去重并标注问题类型，才能进入分组统计。
+      全部直接加入会混入噪声和隐私；模型生成的参考答案可能本身就是错的；按用户筛选会引入偏差。
+  - id: d44-t16
+    kp: d44-k4
+    type: single
+    question: 团队半年来不断把线上失败案例加入评测集并针对性修 Prompt，现在评测分很高，但用户满意度没有变化。最可能的原因和对策是？
+    options:
+      - "评测集规模太大导致结论不稳，应删减到 50 条以内"
+      - "评审模型打分过于严格，应换一个更宽松的评审模型"
+      - "用户满意度受情绪影响太大，作为指标没有参考意义"
+      - "对评测集过拟合，应保留不参与调优的留出集并定期重抽样"
+    answer: [3]
+    explain: |
+      反复针对同一评测集调 Prompt，分数提升可能只是「背会了题」，这是 Goodhart 定律的典型表现。保留留出集、定期从最新线上流量重新抽样，才能检验真实泛化效果。
+      评审太严格会让分数偏低而不是偏高；删减评测集和忽略满意度都不能解决问题。
+  - id: d44-t17
+    kp: d44-k4
+    type: multi
+    question: 以下哪些线上信号适合作为发现新失败案例的来源？
+    options:
+      - "用户点踩和文字反馈"
+      - "转人工，或同一问题换说法再问"
+      - "线上评审对抽样 Trace 打出的低分"
+      - "服务器 CPU 使用率曲线的波动"
+    answer: [0, 1, 2]
+    explain: |
+      显式反馈、隐式反馈（转人工、重复提问）和线上评审低分都能指向具体的问答质量问题，并能通过 trace_id 找到对应请求。
+      CPU 使用率反映的是资源状态，不能说明回答对不对。
+  - id: d44-t18
+    kp: d44-k4
+    type: judge
+    question: 进入评测集的线上样本应该记录来源 trace_id、加入日期和问题类型，方便追溯和按组统计。
+    answer: true
+    explain: |
+      有来源 trace_id 才能回看当时的上下文；有加入日期才能分析评测集的演变；有问题类型才能按组统计、发现某类问题的退化。
+      这些元数据也便于后续清理过期或重复的样本。
+exam:
+  - id: d44-e1
+    kp: d44-k1
+    type: single
+    question: 你希望 PR 修改 `prompts/` 目录时，自动对比修改前后的评测结果并评论到 PR 上。下列哪个方案最直接？
+    options:
+      - "在 PR 模板里要求作者手动粘贴本地 eval 截图和分数"
+      - "用 promptfoo 的 GitHub Action 监听 prompts 路径"
+      - "每晚用 cron 定时跑一次全量评测，第二天人工核对"
+      - "合并后在生产环境观察一周点踩率，再决定是否保留"
+    answer: [1]
+    explain: |
+      promptfoo 官方 GitHub Action 正是为这个场景设计的：在 PR 修改 Prompt 文件时运行改前改后对比，并把结果链接评论到 PR 上，还支持缓存模型输出节省费用。
+      手动截图不可靠；夜间评测和线上观察都发生在合并之后，挡不住退化。
+  - id: d44-e2
+    kp: d44-k2
+    type: single
+    question: 线上出现一个错误回答，你需要还原当时的系统配置来复现问题。以下哪种记录最有帮助？
+    options:
+      - "Trace 里记录了 Prompt 版本、模型快照和检索配置版本"
+      - "Git 历史里能找到最近一次修改 Prompt 的提交信息"
+      - "团队群聊记录里有人提过当天好像切换过模型"
+      - "服务器访问日志里记录了那次请求的状态码为 200"
+    answer: [0]
+    explain: |
+      Trace 中的版本信息精确对应那一次请求，能直接还原当时的发布单元。
+      Prompt 已经移出代码时 Git 不一定有记录，且无法说明当时线上用的是哪一版；群聊记忆不可靠；状态码 200 说明不了用的是什么配置。
+  - id: d44-e3
+    kp: d44-k3
+    type: single
+    question: 新版 Agent 的上线节奏，哪种最合理？
+    options:
+      - "直接按 50% 流量对半开，一天后再看总体结果"
+      - "先给外部客户使用，确认没问题后再给内部员工"
+      - "先内部试用，再 5%、25%、100% 逐档扩量并观察护栏指标"
+      - "挑一个流量低的日子全量切换，有问题再回滚"
+    answer: [2]
+    explain: |
+      先内部试用，再小比例逐步扩量，每档观察足够时间和样本，护栏指标正常才进入下一档，能把风险控制在最小范围。
+      一上来 50% 或全量影响面太大；先给外部客户用则把风险转嫁给了客户。
+  - id: d44-e4
+    kp: d44-k4
+    type: single
+    question: 关于线上数据回流评测集，下列哪种做法最容易出问题？
+    options:
+      - "回流样本先脱敏，去掉姓名、手机号等个人信息"
+      - "回流样本按问题类型打标签，计入对应分组"
+      - "保留一部分留出集，不参与日常的 Prompt 调优"
+      - "让被测模型自己生成参考答案，未经复核直接入库"
+    answer: [3]
+    explain: |
+      被测模型生成的答案可能本身就是错的，未经复核就当作标准答案，会让评测奖励错误、惩罚正确。
+      脱敏、分组、保留留出集都是推荐做法。
+  - id: d44-e5
+    kp: d44-k1
+    type: multi
+    question: 一个合格的 LLM 评测门禁脚本应该具备哪些特性？
+    options:
+      - "按组设置门槛，安全类用例要求全部通过"
+      - "与基线对比，分组下降超过幅度就拦截"
+      - "未达标时以非零退出码结束，让 CI 失败"
+      - "报错的用例从分母中剔除，避免拉低分数"
+    answer: [0, 1, 2]
+    explain: |
+      分组门槛和基线对比能发现被整体分掩盖的退化，非零退出码保证门禁真正生效。
+      报错用例必须算作失败，从分母剔除会让格式崩坏的版本反而得分更高。
+  - id: d44-e6
+    kp: d44-k2
+    type: multi
+    question: 关于 Prompt 版本管理，哪些说法正确？
+    options:
+      - "Prompt 与代码分开发布，可以不重新部署就切换版本"
+      - "移动 production 标签前，应先在数据集上跑实验对比"
+      - "Trace 里记录 Prompt 版本，才能按版本对比线上效果"
+      - "Prompt 移出代码后，就不再需要评测和审批流程"
+    answer: [0, 1, 2]
+    explain: |
+      标签机制让 Prompt 发布和回滚不依赖代码部署；上线前应在数据集上对比新旧版本；关联到 Trace 后可以按版本统计延迟、成本和评分。
+      发布更方便之后更需要评测和权限控制，否则任何人都能改变线上行为。
+  - id: d44-e7
+    kp: d44-k3
+    type: judge
+    question: 影子流量要防止副作用：新版 Agent 的写操作工具（如创建工单、发送通知）在影子模式下必须禁用或替换为模拟实现。
+    answer: true
+    explain: |
+      影子流量会用真实请求驱动新版本，如果写操作照常执行，同一请求会产生两次派单或两次通知，影响真实业务。
+      影子模式下写操作应只记录参数，用于和旧版本的调用序列对比。
+  - id: d44-e8
+    kp: d44-k4
+    type: judge
+    question: 线上反馈数据越多越好，所以应该把所有对话原文永久保存，以便随时加入评测集。
+    answer: false
+    explain: |
+      对话原文含个人信息和企业机密，永久保存违反数据最小化原则，也增加泄露风险。
+      应只保存必要的元数据和 trace_id，对需要回流的样本经复核脱敏后再入库，并设置保留期。
+  - id: d44-e9
+    kp: d44-k1
+    type: case
+    question: |
+      p3 前端 Coding Agent 的一个 PR 修改了 System Prompt。CI 冒烟评测结果：整体通过率从 82% 升到 85%；「跨文件重构」组从 70% 升到 71%；「测试修复」组从 90% 降到 78%；另有 3 个任务在沙箱中超时，当前脚本把超时任务从统计中剔除了。门禁允许单组最多下降 5 个点。
+      最合理的处理是？
+    options:
+      - "拦截合并：测试修复组降了 12 个点，并把超时计为失败后重算"
+      - "放行合并：整体通过率提升了 3 个点，说明改动有效"
+      - "放行合并：超时属于沙箱环境问题，与 Prompt 改动无关"
+      - "把测试修复组从评测集移除，避免它影响整体结论"
+    answer: [0]
+    explain: |
+      测试修复组下降 12 个点，远超允许的 5 个点，应拦截；超时任务被剔除会让通过率虚高，计为失败后整体分可能不升反降。还要检查超时是否由新 Prompt 引起（例如 Agent 陷入循环）。
+      只看整体分会放过退化；不能未经排查就把超时归为环境问题；删掉表现差的分组是在掩盖问题。
+interview:
+  - id: d44-i1
+    kp: d44-k1
+    type: scenario
+    difficulty: 2
+    question: 你改了一句 System Prompt，怎么确定没把别的场景改坏？
+    key_points:
+      - {text: "有覆盖各类问题的评测集，按组统计而不是只看整体", dim: concept}
+      - {text: "与主干基线对比，分组下降超阈值就拦截；报错计失败", dim: principle}
+      - {text: "固定模型快照与评审版本，关键用例重复跑以消除随机性", dim: principle}
+      - {text: "接入 CI：PR 跑冒烟集、主干跑完整集，未达标让 CI 失败", dim: engineering}
+      - {text: "结合项目说明评测集分组、门槛和工具", dim: project}
+    reference: |
+      靠手动试几个问题是不够的，我会用自动回归评测。
+      第一，评测集按问题类型分组，比如事实问答、多跳、无答案拒答、权限相关、安全类，每组有代表性用例；改动后按组看结果，因为整体分上升可能掩盖某组大跌。
+      第二，和基线比：基线是主干上一次在同一评测集版本上的结果，任一分组下降超过阈值（比如 5 个点）就拦截；安全组必须 100%；超时和解析失败都算失败。
+      第三，控制随机性：固定被测模型快照、温度和评审模型版本，关键用例重复跑三次，看通过率而不是单次结果。
+      第四，接进 CI：PR 修改 Prompt 时跑 30 到 50 条冒烟集，几分钟出结果，未达标时脚本以非零退出码让 CI 失败；合并后夜间跑完整集。工具上可以用 promptfoo 的 GitHub Action 做改前改后对比，或者用 DeepEval 加 pytest，也可以自己写门禁脚本。
+      在知识库项目里，我们的冒烟集 40 条覆盖五个分组，发现过一次「改语气导致拒答率上升」的退化，就是分组对比抓到的。
+    oral: |
+      手动试几个问题不够，我会靠回归评测。评测集按问题类型分组，改完之后按组和主干基线比，任何一组掉超过 5 个点就拦，安全组必须全过，超时和解析失败都算失败。
+      为了减少随机性，模型快照、温度、评审模型都固定，关键用例跑三次看通过率。
+      这些都接在 CI 里：PR 改 Prompt 就跑几十条冒烟集，几分钟出结果，不达标 CI 直接变红；合并后夜间再跑完整集。
+      我们知识库项目就靠分组对比，抓到过一次改语气导致拒答率上升的问题。
+  - id: d44-i2
+    kp: d44-k3
+    type: design
+    difficulty: 3
+    question: 公司想把 Agent 的底层模型换成一个更便宜的新模型。请设计从评测到全量上线的完整流程。
+    key_points:
+      - {text: "离线阶段：同一评测集版本上对比新旧模型，分组看质量，同时比较成本与延迟", dim: engineering}
+      - {text: "影子流量：用真实请求对比，写操作工具替换为模拟实现", dim: principle}
+      - {text: "金丝雀逐档扩量，按用户或会话固定分组", dim: principle}
+      - {text: "护栏指标与自动回滚条件，效果指标与样本量", dim: engineering}
+      - {text: "版本管理：模型快照、Prompt 适配版本一起作为发布单元，可一键回滚", dim: project}
+    reference: |
+      第一阶段离线评测：新模型往往需要微调 Prompt，所以准备「新模型加适配 Prompt」作为一个候选发布单元。在同一评测集版本上和线上版本对比，按组看任务完成率、工具调用正确率、安全组通过率，关键用例重复跑看 pass^k；同时比较单次成本、延迟和步数。任一关键组明显退化就回去调整。
+      第二阶段影子流量：线上请求复制一份给新版本处理，结果不返回用户；写操作工具（派单、发通知）替换为只记录参数的模拟实现。对比两边的工具调用序列、步数、成本和延迟分布，抽样做线上评审。
+      第三阶段金丝雀：先内部用户，再 5%、25%、100%，按用户或会话固定分组。护栏指标是错误率、超时率、P95 延迟、单次步数、安全拦截率，任一显著差于对照组就自动切回；效果指标是任务完成率、点踩率、转人工率，每档观察到足够样本再扩量。
+      版本管理上，模型使用带日期的快照，适配 Prompt 在 Langfuse 打独立标签，和检索、工具配置一起记录为一个发布单元写入 Trace，回滚就是切回旧的模型配置和 production 标签。最后把灰度期间发现的问题补进评测集。
+    oral: |
+      我会分四步。先离线：新模型通常要配一版适配的 Prompt，两者打包在同一个评测集上和线上版本比，按组看质量，同时比成本、延迟和步数。
+      然后跑影子流量，用真实请求对比，但派单、发通知这些写操作换成只记录参数的模拟实现。
+      再金丝雀，内部先用，然后 5%、25%、全量，按用户固定分组；错误率、延迟、步数、安全拦截是护栏，超标就自动切回，点踩率和完成率决定要不要扩量。
+      全程模型用带日期的快照，Prompt 打单独标签，回滚就是切回旧配置。灰度期间发现的问题再补进评测集。
+  - id: d44-i3
+    kp: d44-k4
+    type: scenario
+    difficulty: 4
+    question: 新版本离线评测分数明显提高，上线后用户点踩率却没降甚至略升。你怎么分析？
+    key_points:
+      - {text: "怀疑评测集与线上分布脱节：对比线上问题类型分布与评测集分组", dim: principle}
+      - {text: "怀疑过拟合或评审偏差：用留出集和人工抽检复核评测分", dim: principle}
+      - {text: "按维度拆分线上指标：Prompt 版本、问题类型、租户，结合点踩原因下钻 Trace", dim: engineering}
+      - {text: "排除非质量因素：延迟、格式、话术变化也会影响点踩", dim: engineering}
+      - {text: "改进飞轮：线上失败样本复核回流、更新评测集版本和基线", dim: project}
+    reference: |
+      离线分和线上体验不一致，说明评测体系本身有问题，我会从四个方向查。
+      第一，分布脱节：把最近一周线上问题按类型分类，和评测集各组占比对比。常见情况是评测集里事实问答占大头，线上却有大量多轮追问、模糊问题或新业务问题。
+      第二，过拟合和评审偏差：看留出集分数是否同步提高；如果只有日常评测集涨了，就是针对题目调优过度。再人工抽检一批评审打高分的样本，确认评审模型是否偏爱新版本更长、更格式化的回答（冗长偏差）。
+      第三，下钻线上数据：按 Prompt 版本、问题类型、租户拆点踩率，找出变差最集中的切片；读点踩原因和对应 Trace，看是答错、没找到、引用不对还是太啰嗦。
+      第四，排除非质量因素：新版本是否变慢、回答变长、语气变了，这些也会导致点踩。
+      改进上，把复核后的线上失败样本按类型补进评测集，形成新版本并重建基线；保留留出集定期从线上重抽样；把点踩率、转人工率纳入发布后的观察指标，形成闭环。
+    oral: |
+      离线分涨、线上不涨，我第一反应是评测体系出了问题。我会查四件事。
+      一是分布：线上问题按类型分类，和评测集各组的占比比一比，往往线上多轮追问和新业务问题更多。二是过拟合和评审偏差：看留出集有没有一起涨，再人工抽检高分样本，看评审是不是偏爱更长的回答。
+      三是下钻：按 Prompt 版本、问题类型、租户拆点踩率，读点踩原因和 Trace。四是排除体验因素，比如变慢了或者变啰嗦了。
+      最后把复核过的线上失败样本补进评测集，更新基线，留出集定期重抽样，让离线分和线上体验重新对齐。
+sources:
+  - {title: "Langfuse - Prompt Version Control", url: "https://langfuse.com/docs/prompt-management/features/prompt-version-control"}
+  - {title: "Langfuse - Link Prompts to Traces", url: "https://langfuse.com/docs/prompt-management/features/link-to-traces"}
+  - {title: "promptfoo - Testing Prompts with GitHub Actions", url: "https://www.promptfoo.dev/docs/integrations/github-action/"}
+  - {title: "DeepEval - Unit Testing in CI/CD", url: "https://deepeval.com/docs/evaluation-unit-testing-in-ci-cd"}
+  - {title: "LangSmith - Evaluation concepts", url: "https://docs.langchain.com/langsmith/evaluation-concepts"}

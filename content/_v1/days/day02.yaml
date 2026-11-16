@@ -1,0 +1,674 @@
+day: 2
+phase: 1
+title: Python 数据结构
+goals:
+  - 能解释 list、tuple、dict、set 的底层结构和常见操作的时间复杂度，并据此选择合适的结构
+  - 能说清 dict 为什么有序、key 为什么必须可哈希，以及 __hash__ 与 __eq__ 的关系
+  - 能识别 AI 生成代码中的浅拷贝/别名问题，判断什么时候必须深拷贝
+  - 能读懂推导式、defaultdict、Counter、deque 等常见数据处理写法
+knowledge_points:
+  - id: d02-k1
+    name: list 与 tuple：动态数组与不可变序列
+    level: P0
+    summary: list 是可变的动态指针数组，尾部操作快、头部插入慢；tuple 不可变、可作 dict 的 key
+    why: |
+      AI 后端里几乎每个函数都在处理列表：检索结果的 chunk 列表、对话消息列表、批量 Embedding 的输入列表。**选错结构或用错操作，会让一个本该 O(n) 的处理变成 O(n²)**；而不理解 tuple 的不可变性，就看不懂为什么 AI 用 tuple 作为缓存 key、为什么函数返回多个值其实是返回一个 tuple。
+    problem: |
+      list 解决「顺序存储、按下标访问、动态增减元素」的需求；tuple 解决「一组固定的、不应被修改的值」的表达，例如坐标、(doc_id, page) 这样的复合键、函数的多返回值。两者的区分让代码表达意图更清楚，也让不可变数据可以安全地共享和哈希。
+    principle: |
+      **一、list 的底层：一段连续的指针数组**
+
+      CPython 的 list 内部是一块连续内存，存的是**指向元素对象的指针**，而不是元素本身。所以一个 list 可以混装 int、str、dict，每个槽位大小都一样（一个指针）。
+
+      ```mermaid
+      flowchart LR
+        L["list 对象 长度 3 容量 4"] --> S0["槽位 0 指针"]
+        L --> S1["槽位 1 指针"]
+        L --> S2["槽位 2 指针"]
+        L --> S3["槽位 3 预留空位"]
+        S0 --> O0["int 对象 42"]
+        S1 --> O1["str 对象 hello"]
+        S2 --> O2["dict 对象"]
+      ```
+
+      **二、为什么 append 快、insert(0) 慢**
+
+      - **按下标访问 `a[i]`**：起始地址 + i × 指针大小，O(1)。
+      - **`append`**：list 会**预留额外容量**（CPython 大约多留 1/8 再加一个小常数），大部分 append 只是写入预留槽位；容量满了才整体搬家扩容。均摊下来是 **O(1)**。
+      - **`insert(0, x)` / `pop(0)`**：要把后面所有指针整体挪一位，**O(n)**。在循环中对大列表做头部操作，总复杂度就是 O(n²)。需要两端操作用 `collections.deque`。
+      - **`x in a`**：只能从头到尾逐个比较，**O(n)**。在循环里对大 list 做 `in` 判断，是 AI 代码里最常见的性能问题，应改用 set。
+      - **切片 `a[1:5]`**：会**创建新 list**（浅拷贝那一段），不是视图。
+
+      **三、tuple：不可变的序列**
+
+      tuple 创建后长度和每个槽位的指向都不能变：不能 append、不能 `t[0] = x`。带来三个好处：
+
+      1. **可哈希**（前提是所有元素都可哈希），能作为 dict 的 key 或放进 set，例如 `(doc_id, page)`。
+      2. **可以安全共享**：传给别的函数不用担心被改。
+      3. **表达语义**：「这是一条固定结构的记录」，而 list 表达「同类元素的集合」。
+
+      **注意：tuple 不可变指的是槽位的指向不变，不是里面的对象不可变。** `t = ([1], 2)` 中 `t[0].append(3)` 完全合法，此时 t 也就无法被哈希了。
+
+      **四、打包与解包**
+
+      函数 `return a, b` 实际返回的是 tuple `(a, b)`；`x, y = f()` 是解包。`first, *rest = items` 可以把剩余元素收集到 list。这种写法在 AI 代码里极其常见，例如 `docs, scores = zip(*results)`。
+
+      **五、和 JS 对比**
+
+      JS 的 Array 对应 Python 的 list；JS 没有原生 tuple，TS 的元组类型只是编译期约束，运行时仍是可变数组。Python 的 tuple 是**运行时真正不可变**的。
+
+      **不这样理解会怎样**：会写出对大列表反复 `pop(0)` 或 `in` 判断导致接口超时的代码；会把 list 当 dict key 得到 `TypeError: unhashable type: 'list'`；会误以为 tuple 里装了 dict 就安全了。
+    scenarios: |
+      - **检索结果处理**：Top-K chunk 用 list 存储并按 score 排序；去重时用 `(doc_id, page)` 这样的 tuple 作为 set 元素。
+      - **对话历史窗口**：只保留最近 N 轮，用 `deque(maxlen=N)` 而不是 list 加 `pop(0)`。
+      - **多返回值**：`answer, sources = rag_answer(q)`，函数返回的其实是 tuple。
+      - **批量调用**：把待向量化的文本切成固定大小的批次：`[texts[i:i + 64] for i in range(0, len(texts), 64)]`。
+    code: |
+      ```python
+      from collections import deque
+
+      chunks = [{"doc_id": "a", "page": 1, "score": 0.82},
+                {"doc_id": "b", "page": 3, "score": 0.91}]
+
+      # tuple 作为复合 key
+      seen = {(c["doc_id"], c["page"]) for c in chunks}
+      print(("a", 1) in seen)        # True，O(1)
+
+      # 不能用 list 作为 key
+      try:
+          {["a", 1]: "x"}
+      except TypeError as e:
+          print(e)                   # 3.14+：cannot use 'list' as a dict key (unhashable type: 'list')
+
+      # tuple 内的可变对象仍然可变
+      t = ([1, 2], "x")
+      t[0].append(3)
+      print(t)                       # ([1, 2, 3], 'x')
+
+      # 只保留最近 3 轮对话
+      history = deque(maxlen=3)
+      for i in range(5):
+          history.append(i)
+      print(list(history))           # [2, 3, 4]
+      ```
+    pitfalls: |
+      - **误区：`a.sort()` 会返回排好序的列表。** 它原地排序并返回 None，`a = a.sort()` 会把 a 变成 None；需要新列表用 `sorted(a)`。
+      - **误区：切片是视图。** Python list 切片会复制出新 list（NumPy 数组切片才是视图）。
+      - **误区：tuple 里的东西都不能改。** 只是槽位指向不变，内部的 list/dict 仍可修改。
+      - **误区：单元素 tuple 写成 `(x)`。** 那只是带括号的 x，必须写 `(x,)`。
+      - **性能误区：在循环里对大 list 用 `in` 或 `pop(0)`。** 分别改用 set 和 deque。
+    interview_asks:
+      - "list 和 tuple 有什么区别？什么时候用 tuple？"
+      - "list 的 append 和 insert(0) 时间复杂度分别是多少？为什么？"
+      - "为什么 tuple 可以作为 dict 的 key，而 list 不行？所有 tuple 都可以吗？"
+    project_example: |
+      一个文档入库任务需要把 10 万个 chunk 按顺序取出处理，AI 生成的代码写成 `while chunks: c = chunks.pop(0)`，本地 100 条数据时毫无问题，线上 10 万条时单次任务跑了 20 多分钟。原因是每次 `pop(0)` 都要移动剩余所有元素，总体 O(n²)。改为 `for c in chunks:` 直接遍历（或 deque.popleft）后，耗时降到几秒。
+    sources:
+      - {title: "Python 文档 - collections.deque", url: "https://docs.python.org/3/library/collections.html"}
+
+  - id: d02-k2
+    name: dict 与 set：哈希表、有序性与可哈希
+    level: P0
+    summary: dict 和 set 基于哈希表，平均 O(1) 查找；dict 保持插入顺序，key 必须可哈希
+    why: |
+      JSON 请求体、LLM 消息、配置、缓存、Pydantic 的 `model_dump()` 结果，本质上都是 dict。**AI 后端可以说是在 dict 上运行的。** 不懂哈希表，你就解释不了为什么 set 查找比 list 快几个数量级、为什么自定义对象放进 set 去重失效、为什么一边遍历一边删 key 会报错。
+    problem: |
+      dict 解决「按键快速查找值」的问题，set 解决「快速判断是否存在、去重、集合运算」的问题。两者都把平均查找成本从 list 的 O(n) 降到 O(1)，代价是更多的内存，并要求 key 必须可哈希且在作为 key 期间不变。
+    principle: |
+      **一、哈希表怎么查找**
+
+      ```mermaid
+      flowchart TB
+        K["key 例如 doc_42"] --> H["调用 hash 计算哈希值"]
+        H --> I["哈希值按表大小取位得到槽位下标"]
+        I --> C{"槽位为空吗"}
+        C -->|"空"| MISS["不存在 抛 KeyError 或返回默认值"]
+        C -->|"有条目"| E{"哈希值相同且 key 用 == 比较也相等吗"}
+        E -->|"是"| HIT["命中 返回对应 value"]
+        E -->|"否 发生冲突"| P["按探测序列找下一个槽位"]
+        P --> C
+      ```
+
+      1. 对 key 调用 `hash()` 得到一个整数。
+      2. 用这个整数算出数组中的槽位位置。
+      3. 槽位里如果有条目，先比哈希值、再用 `==` 比 key，相等才算命中；不相等就是**哈希冲突**，CPython 用开放寻址法按探测序列找下一个槽位。
+
+      只要哈希分布均匀、表不太满，平均只需要看一两个槽位，所以是 **O(1)**。表的填充达到一定比例（约 2/3）时会扩容并重新分布所有条目，这一刻的单次插入较慢，但均摊仍是 O(1)。
+
+      **二、为什么 dict 有序**
+
+      CPython 3.6 起把 dict 改成「**紧凑布局**」：一个稀疏的**索引数组**负责哈希定位，另一个**按插入顺序追加的条目数组**存放 (hash, key, value)。遍历时按条目数组顺序走，自然就是插入顺序，而且更省内存。**Python 3.7 起，保持插入顺序成为语言规范的保证**，不再只是实现细节。
+
+      注意：**set 不保证顺序**，不要依赖 set 的遍历顺序生成结果（例如拼接 Prompt 中的来源列表）。
+
+      **三、可哈希的契约**
+
+      - 一个对象要作为 key，必须实现 `__hash__`，并且**在作为 key 期间哈希值不变**。所以不可变的 int、str、tuple（元素都可哈希时）可以作为 key，可变的 list、dict、set 不行。
+      - **`a == b` 则必须 `hash(a) == hash(b)`**，否则查找会失败。
+      - 类如果自定义了 `__eq__` 但没定义 `__hash__`，Python 会把它的 `__hash__` 设为 None，实例变成不可哈希。`@dataclass(frozen=True)` 会帮你同时生成两者（见 Day 03）。
+      - 字符串的 `hash()` 每个进程启动时随机加盐（防哈希碰撞攻击），**不要把 `hash()` 的结果持久化或用作跨进程的缓存 key**，需要稳定指纹请用 `hashlib.sha256`。
+
+      **四、常用操作与坑**
+
+      - `d[k]` 不存在抛 `KeyError`；`d.get(k, default)` 返回默认值；`d.setdefault(k, [])` 不存在时插入并返回。
+      - `d1 | d2`（3.9+）合并成新 dict，右边覆盖左边；`{**d1, **d2}` 效果类似。
+      - **遍历时不能增删 key**：`for k in d: del d[k]` 抛 `RuntimeError: dictionary changed size during iteration`，应遍历 `list(d)` 的副本。
+      - `json.dumps` 不能序列化 set，会抛 `TypeError`；tuple 会被序列化成 JSON 数组。
+
+      **不这样理解会怎样**：会用 list 做成员判断导致接口变慢；会因为依赖 set 的顺序而让同一问题每次生成的 Prompt 不同、缓存命中率为零；会把 `hash()` 存入数据库导致重启后缓存全部失效。
+    scenarios: |
+      - **去重**：多路召回（向量 + 关键词）的结果按 `chunk_id` 放进 set 或 dict 去重。
+      - **缓存**：用 `(model, prompt_hash)` 作为 dict key 做进程内缓存；跨进程用 Redis + sha256 指纹（见 Day 41）。
+      - **权限过滤**：用户可访问的部门 ID 放进 set，过滤检索结果时 `chunk.dept_id in allowed` 是 O(1)。
+      - **分组统计**：按文档来源统计命中次数，用 dict 或 Counter。
+    code: |
+      ```python
+      import hashlib
+
+      allowed_depts = {"hr", "finance"}            # set，O(1) 判断
+      chunks = [{"id": 1, "dept": "hr"}, {"id": 2, "dept": "it"}]
+      visible = [c for c in chunks if c["dept"] in allowed_depts]
+
+      # dict 保持插入顺序（3.7+ 语言保证）
+      d = {"b": 1, "a": 2}
+      print(list(d))                               # ['b', 'a']
+
+      # 遍历时删除要先复制 key
+      cache = {"k1": 1, "k2": None}
+      for k in list(cache):
+          if cache[k] is None:
+              del cache[k]
+
+      # 稳定的缓存指纹：不要用 hash()
+      prompt = "什么是 RAG"
+      key = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+
+      merged = {"temperature": 0.7} | {"temperature": 0.2, "top_p": 0.9}
+      print(merged)                                # {'temperature': 0.2, 'top_p': 0.9}
+      ```
+    pitfalls: |
+      - **误区：set 也是有序的。** 只有 dict 保证插入顺序，set 的遍历顺序不可依赖。
+      - **误区：`hash("abc")` 每次运行都一样。** 字符串哈希每个进程随机化，不能持久化。
+      - **误区：自定义类重写了 `__eq__` 就能用 set 去重。** 还必须提供一致的 `__hash__`，否则直接不可哈希。
+      - **误区：`d.keys()` 返回的是 list。** 它是动态视图，dict 变化时视图也变；遍历时修改 dict 仍会报错。
+      - **混淆：`d.get(k)` 返回 None 可能是 key 不存在，也可能是值本身就是 None**，需要区分时用 `k in d`。
+    interview_asks:
+      - "Python 的 dict 是有序的吗？从哪个版本开始？底层为什么能做到？"
+      - "dict 的查找为什么是 O(1)？哈希冲突怎么处理？"
+      - "什么样的对象可以作为 dict 的 key？__hash__ 和 __eq__ 有什么约束？"
+    project_example: |
+      一个 RAG 系统做「语义缓存」时，AI 生成的代码用 `cache_key = hash(question)` 作为 Redis key。单进程测试时命中率很好，上线多 worker 部署后命中率接近 0，重启后缓存全部失效。原因是字符串哈希在每个进程中随机加盐。改为 `hashlib.sha256(question.encode()).hexdigest()` 后，各 worker 的 key 一致，命中率恢复正常。
+    freshness: |
+      核对于 2026-11：dict 保持插入顺序自 Python 3.7 起是语言保证（3.6 为 CPython 实现细节）。Python 3.15 新增内置不可变映射 `frozendict`（PEP 814）：不是 dict 的子类，所有键和值可哈希时自身可哈希，保持插入顺序但比较时不考虑顺序。旧代码需要只读映射时常用 `types.MappingProxyType`，3.15+ 可考虑 frozendict，但要兼容旧版本时仍不能使用。
+    sources:
+      - {title: "What's new in Python 3.15 - PEP 814 frozendict", url: "https://docs.python.org/3.15/whatsnew/3.15.html"}
+
+  - id: d02-k3
+    name: 可变与不可变、浅拷贝与深拷贝
+    level: P0
+    summary: 浅拷贝只复制最外层容器，内部对象仍共享；嵌套的可变数据要深拷贝或重新构造
+    why: |
+      AI 生成代码最常见的隐蔽 bug 之一就是「**以为复制了，其实是共享**」：复制了一份 Prompt 模板再追加消息，结果模板本身被改了；复制了请求配置再改 metadata，结果所有请求都带上了上一个用户的标签。**这类 bug 本地测不出来，线上会造成跨用户数据串号，属于安全事故。**
+    problem: |
+      它让你准确判断：一次「复制」之后，修改新对象会不会影响原对象。掌握后，你能在审查代码时快速定位共享状态，并在浅拷贝、深拷贝、重新构造三种方案中选出成本和安全性都合适的那一个。
+    principle: |
+      **一、可变与不可变**
+
+      - **不可变**：int、float、bool、str、bytes、tuple、frozenset（以及 3.15 的 frozendict）。任何「修改」都会产生新对象。
+      - **可变**：list、dict、set、bytearray、大多数自定义类实例。可以原地修改，所有引用者都会看到变化。
+
+      不可变对象可以被放心共享；**共享可变对象才是 bug 的来源**。
+
+      **二、三种「复制」的层次**
+
+      ```mermaid
+      flowchart TB
+        subgraph ASSIGN["赋值 b = a"]
+          A1["a"] --> X1["外层 dict"]
+          B1["b"] --> X1
+          X1 --> N1["内层 messages 列表"]
+        end
+        subgraph SHALLOW["浅拷贝 b = copy.copy(a)"]
+          A2["a"] --> X2["外层 dict 原件"]
+          B2["b"] --> Y2["外层 dict 新副本"]
+          X2 --> N2["内层 messages 列表 共享"]
+          Y2 --> N2
+        end
+        subgraph DEEP["深拷贝 b = copy.deepcopy(a)"]
+          A3["a"] --> X3["外层 dict 原件"]
+          B3["b"] --> Y3["外层 dict 新副本"]
+          X3 --> N3["内层列表 原件"]
+          Y3 --> M3["内层列表 新副本"]
+        end
+      ```
+
+      1. **赋值**：不复制，两个名字指向同一个对象（Day 01）。
+      2. **浅拷贝**：创建新的外层容器，但里面存的仍是**原来那些元素对象的引用**。`copy.copy(x)`、`list(x)`、`x[:]`、`x.copy()`、`dict(x)`、`{**x}` 都是浅拷贝。修改外层（增删 key）互不影响；**修改内层的可变对象会互相影响**。
+      3. **深拷贝**：`copy.deepcopy(x)` 递归复制所有可变的内部对象。它用一个 `memo` 字典记录已复制对象，可以正确处理循环引用。
+
+      **三、深拷贝的代价**
+
+      - **慢**：要递归遍历整个对象图，大的嵌套结构（如整份检索结果、长对话历史）深拷贝开销可观。
+      - **可能复制过头**：本应共享的东西（比如一个数据库连接池、一个大的只读模型对象）也会被尝试复制；有些对象（文件、socket）根本不能复制。
+
+      所以工程上更推荐第三条路：**不要复制模板，而是每次构造新对象**。例如写一个函数 `def base_messages(): return [{"role": "system", "content": SYSTEM}]`，每次调用返回全新的列表。
+
+      **四、经典陷阱：`[[0] * 3] * 3`**
+
+      `*` 复制的是**引用**，三行其实是同一个内层 list，改 `grid[0][0]` 三行都变。正确写法是推导式 `[[0] * 3 for _ in range(3)]`，每次循环创建新列表。
+
+      **五、框架中的对应**
+
+      - Pydantic v2：`model.model_copy()` 默认是**浅拷贝**，`model_copy(deep=True)` 才是深拷贝；`model_copy(update={...})` 也不会做校验。
+      - `dict.copy()`、`{**d}` 只复制一层，嵌套的 `metadata`、`messages` 仍共享。
+
+      **不这样理解会怎样**：会出现「用户 A 的历史消息出现在用户 B 的 Prompt 里」这类数据泄露；或者为了保险到处 deepcopy，导致高并发下 CPU 飙升。
+    scenarios: |
+      - **Prompt 模板**：系统消息模板被每个请求 `copy.copy` 后 `extend` 历史消息，模板的 messages 列表越来越长。
+      - **请求参数合并**：`{**defaults, **overrides}` 对平铺参数足够；如果默认值里有嵌套 dict（如 `response_format`），就需要深拷贝或重新构造。
+      - **测试数据**：测试夹具里的 dict 被一个测试修改，影响后续测试，表现为「单独跑通过、一起跑失败」。
+    code: |
+      ```python
+      import copy
+
+      TEMPLATE = {"model": "chat-default", "messages": [{"role": "system", "content": "你是助手"}]}
+
+      shallow = copy.copy(TEMPLATE)
+      shallow["messages"].append({"role": "user", "content": "你好"})
+      print(len(TEMPLATE["messages"]))    # 2，模板被污染了
+
+      TEMPLATE["messages"] = TEMPLATE["messages"][:1]   # 复原
+      deep = copy.deepcopy(TEMPLATE)
+      deep["messages"].append({"role": "user", "content": "你好"})
+      print(len(TEMPLATE["messages"]))    # 1，互不影响
+
+      # 更推荐：每次构造新对象
+      def new_request(question: str) -> dict:
+          return {
+              "model": "chat-default",
+              "messages": [
+                  {"role": "system", "content": "你是助手"},
+                  {"role": "user", "content": question},
+              ],
+          }
+
+      grid = [[0] * 3] * 3
+      grid[0][0] = 1
+      print(grid)                          # [[1, 0, 0], [1, 0, 0], [1, 0, 0]]
+      ```
+    pitfalls: |
+      - **误区：`dict.copy()` / `{**d}` 就是完整复制。** 只复制一层，嵌套的 list/dict 仍共享。
+      - **误区：深拷贝总是更安全，所以到处用。** 代价高、可能复制不该复制的资源，优先「每次构造新对象」。
+      - **误区：tuple 是不可变的，所以 `copy.copy` 一个装着 list 的 tuple 就安全。** 内部 list 依然共享。
+      - **误区：Pydantic 的 `model_copy()` 是深拷贝。** 默认是浅拷贝，需要 `deep=True`。
+      - **混淆：`[[0]*3]*3` 与 `[[0]*3 for _ in range(3)]`。** 前者三行共享同一个列表。
+    interview_asks:
+      - "浅拷贝和深拷贝有什么区别？分别有哪些写法？"
+      - "什么时候必须用深拷贝？深拷贝有什么代价？"
+      - "你在项目中遇到过因为共享可变对象导致的 bug 吗？怎么排查的？"
+    project_example: |
+      一个客服机器人把系统 Prompt 定义为模块级 `BASE = {"messages": [system_msg]}`，每次请求 `req = BASE.copy()` 后 `req["messages"].append(user_msg)`。上线一天后，模型回复越来越慢、越来越离谱，日志显示单次请求的 messages 长度达到几千条，还包含其他用户的问题，构成跨用户数据泄露。修复为每次调用 `build_messages()` 构造新列表，并增加测试断言「连续调用两次，第二次的 messages 长度不变」。
+    sources:
+      - {title: "Python 文档 - copy 浅拷贝与深拷贝", url: "https://docs.python.org/3/library/copy.html"}
+
+  - id: d02-k4
+    name: 推导式与常用数据处理惯用法
+    level: P1
+    summary: 推导式是构造新容器的简洁写法；defaultdict、Counter、deque、sorted(key=) 覆盖大部分数据处理
+    why: |
+      AI 生成的 Python 代码特别爱用一行推导式、`sorted(..., key=lambda ...)`、`defaultdict(list)` 这类写法。**看不懂它们，你就读不懂检索结果过滤、分组、排序、去重的核心逻辑**，更无法判断它有没有写错。
+    problem: |
+      它们用更少、更声明式的代码完成「过滤、映射、分组、计数、排序、滑动窗口」这些高频数据处理任务，并且通常比手写循环更快、更不容易出错。掌握后能快速读懂并审查这类代码。
+    principle: |
+      **一、推导式：从旧容器构造新容器**
+
+      - 列表推导式：`[expr for x in items if cond]`，相当于 JS 的 `items.filter(cond).map(expr)`。
+      - 字典推导式：`{c["id"]: c for c in chunks}`，常用于按 id 建索引（相同 key 后者覆盖前者）。
+      - 集合推导式：`{c["doc_id"] for c in chunks}`，用于去重。
+      - 生成器表达式：`sum(c["tokens"] for c in chunks)`，用圆括号，**不创建中间列表**，逐个产出值（原理见 Day 05）。
+
+      推导式有自己的作用域，循环变量不会泄漏到外面。**嵌套超过两层或条件复杂时，改回普通循环更易读。**
+
+      **二、排序**
+
+      - `sorted(iterable, key=..., reverse=...)` 返回新列表；`list.sort()` 原地排序返回 None。
+      - `key` 是一个函数，对每个元素调用一次，按返回值比较：`sorted(chunks, key=lambda c: c["score"], reverse=True)`。
+      - Python 的排序是**稳定的**：分数相同的元素保持原有相对顺序，可以利用这一点做多级排序。
+      - 多字段排序用 tuple：`key=lambda c: (-c["score"], c["doc_id"])`。
+
+      **三、collections 里的三件套**
+
+      - `defaultdict(list)`：访问不存在的 key 时自动调用工厂函数创建默认值，适合分组：`groups[c["doc_id"]].append(c)`。**注意：仅仅读取 `groups[k]` 也会插入一个空列表**，用于判断存在性时要用 `k in groups`。
+      - `Counter`：计数器，`Counter(words).most_common(5)`。
+      - `deque(maxlen=N)`：双端队列，两端操作 O(1)，设置 `maxlen` 后自动丢弃最旧元素，适合对话窗口、滑动窗口。
+
+      **四、其他高频写法**
+
+      - `enumerate(items, start=1)`：同时拿到序号和元素，常用于给来源编号 `[1] [2]`。
+      - `zip(a, b, strict=True)`（3.10+）：并行遍历，`strict=True` 长度不一致时抛错，避免静默截断——批量 Embedding 时文本和向量数量对不上就该报错。
+      - `any()` / `all()`：短路判断。
+
+      **不这样理解会怎样**：会看不出 `{c["id"]: c for c in chunks}` 已经悄悄丢掉了重复 id 的 chunk；会因为 defaultdict 的读取副作用导致内存中堆满空列表；会因为 zip 静默截断导致向量和文本错位入库。
+    scenarios: |
+      - **检索后处理**：`[c for c in chunks if c["score"] >= threshold]` 过滤低分片段。
+      - **按文档分组展示来源**：`defaultdict(list)` 按 doc_id 分组。
+      - **统计**：`Counter(c["doc_id"] for c in hits)` 统计哪些文档最常被引用，用于评估。
+      - **批量入库**：`for text, vec in zip(texts, vectors, strict=True)` 确保一一对应。
+    code: |
+      ```python
+      from collections import Counter, defaultdict
+
+      hits = [
+          {"doc_id": "a", "page": 1, "score": 0.91},
+          {"doc_id": "b", "page": 2, "score": 0.75},
+          {"doc_id": "a", "page": 3, "score": 0.91},
+      ]
+
+      top = sorted(hits, key=lambda c: (-c["score"], c["page"]))[:2]
+      by_doc = defaultdict(list)
+      for c in hits:
+          by_doc[c["doc_id"]].append(c["page"])
+      print(dict(by_doc))                          # {'a': [1, 3], 'b': [2]}
+
+      print(Counter(c["doc_id"] for c in hits).most_common(1))   # [('a', 2)]
+
+      for i, c in enumerate(top, start=1):
+          print(f"[{i}] {c['doc_id']} p{c['page']}")
+
+      texts, vectors = ["t1", "t2"], [[0.1], [0.2], [0.3]]
+      try:
+          list(zip(texts, vectors, strict=True))
+      except ValueError as e:
+          print("长度不一致:", e)
+      ```
+    pitfalls: |
+      - **误区：字典推导式不会丢数据。** 重复的 key 会被后面的值覆盖。
+      - **误区：读取 defaultdict 没有副作用。** `d[k]` 在 k 不存在时会插入默认值。
+      - **误区：zip 会在长度不一致时报错。** 默认静默按最短截断，需要 `strict=True`。
+      - **可读性误区：一行推导式越长越专业。** 超过一个 for 加一个 if 就该考虑拆成循环。
+    interview_asks:
+      - "列表推导式和生成器表达式有什么区别？"
+      - "defaultdict 和普通 dict 有什么不同？有什么容易踩的坑？"
+    project_example: |
+      批量向量化入库任务中，Embedding 接口偶尔因为某条文本超长而少返回一条向量。代码用 `for text, vec in zip(texts, vectors)` 入库，zip 静默截断，导致从出错位置起后面所有文本和向量错位，检索结果「答非所问」。改为 `zip(..., strict=True)` 后，长度不一致立即报错并重试该批次，问题在入库阶段就被拦截。
+    sources:
+      - {title: "Python 文档 - collections 容器数据类型", url: "https://docs.python.org/3/library/collections.html"}
+
+quiz:
+  - id: d02-q1
+    kp: d02-k2
+    type: single
+    question: 想为检索结果做进程内缓存，key 需要同时包含问题文本和过滤条件中的部门列表。下列哪种 key 设计可以正常作为 dict 的 key？
+    options:
+      - "`(question, [\"hr\", \"finance\"])`"
+      - "`(question, (\"hr\", \"finance\"))`"
+      - "`{\"q\": question, \"depts\": (\"hr\", \"finance\")}`"
+      - "`[question, \"hr\", \"finance\"]`"
+    answer: [1]
+    explain: |
+      B 是一个所有元素都可哈希的 tuple（str 和元素为 str 的 tuple），可以作为 key。A 虽然是 tuple，但里面装了 list，list 不可哈希，所以整个 tuple 也不可哈希，会抛 TypeError。C 是 dict、D 是 list，都是可变对象，不可哈希。另外部门顺序不同会得到不同 key，实践中常先排序再转 tuple。
+  - id: d02-q2
+    kp: d02-k3
+    type: multi
+    question: |
+      已知 `a = {"tags": ["kb"], "n": 1}`，执行 `b = 某种复制` 后再执行 `b["tags"].append("x"); b["n"] = 2`。哪些复制方式会导致 `a["tags"]` 也变成 `["kb", "x"]`？
+    options:
+      - "`b = a`"
+      - "`b = a.copy()`"
+      - "`b = {**a}`"
+      - "`b = copy.deepcopy(a)`"
+      - "`b = dict(a)`"
+    answer: [0, 1, 2, 4]
+    explain: |
+      赋值 `b = a` 完全共享同一个 dict，tags 和 n 都会被改。`a.copy()`、`{**a}`、`dict(a)` 都是浅拷贝：外层 dict 是新的，所以 `b["n"] = 2` 不影响 a；但内层 tags 列表仍被共享，append 会影响 a。只有 `copy.deepcopy` 递归复制了 tags 列表，a 不受影响。
+  - id: d02-q3
+    kp: d02-k2
+    type: judge
+    question: 在 Python 3.12 中，dict 和 set 都保证按元素插入顺序遍历。
+    answer: false
+    explain: |
+      只有 dict 从 Python 3.7 起在语言规范层面保证插入顺序；set 不保证任何顺序，其遍历顺序取决于哈希值和表的状态。依赖 set 顺序生成 Prompt 或返回结果，会导致输出不稳定，需要时应先 sorted 或改用 dict（如 `dict.fromkeys(items)` 做有序去重）。
+  - id: d02-q4
+    kp: d02-k1
+    type: short
+    question: 解释为什么对一个大 list 反复执行 `pop(0)` 会很慢，而 `append()` 很快。如果业务需要「先进先出」，你会怎么改？
+    key_points:
+      - {text: "说明 list 底层是连续的指针数组", dim: principle}
+      - {text: "说明 pop(0) 需要把后面所有元素前移，单次 O(n)，循环下来 O(n²)", dim: principle}
+      - {text: "说明 append 利用预留容量，均摊 O(1)", dim: principle}
+      - {text: "给出改用 collections.deque 的 popleft 或直接 for 遍历的方案", dim: engineering}
+    reference: |
+      CPython 的 list 是一段连续内存，存放指向元素对象的指针。append 时 list 通常已经预留了额外容量，只需写入下一个空槽位，只有容量用完才扩容搬家，所以均摊是 O(1)。而 pop(0) 删除第一个元素后，为了保持连续，必须把后面所有指针都向前挪一位，单次就是 O(n)；对 n 个元素循环 pop(0)，总复杂度达到 O(n²)。需要先进先出时应使用 collections.deque，它的 append 和 popleft 都是 O(1)；如果只是顺序处理一遍，直接 `for item in items` 遍历即可，不需要弹出。
+  - id: d02-q5
+    kp: d02-k3
+    type: scenario
+    question: |
+      客服机器人上线一天后，模型响应越来越慢，日志显示单次请求的 messages 有上千条，并且包含其他用户的提问。核心代码如下，请分析原因、影响和修复方式。
+
+      ```python
+      BASE = {"model": "chat-default", "messages": [{"role": "system", "content": "你是客服助手"}]}
+
+      def build(question: str) -> dict:
+          req = BASE.copy()
+          req["messages"].append({"role": "user", "content": question})
+          return req
+      ```
+    key_points:
+      - {text: "指出 BASE.copy() 是浅拷贝，messages 列表在所有请求间共享", dim: principle}
+      - {text: "指出每次 append 都在修改模块级模板，导致列表无限增长", dim: concept}
+      - {text: "指出影响包括 token 成本和延迟上升，以及跨用户数据泄露的安全问题", dim: engineering}
+      - {text: "给出每次构造新 messages 列表或 deepcopy 的修复，并补充回归测试", dim: engineering}
+    reference: |
+      原因是 `BASE.copy()` 只复制了外层 dict，`req["messages"]` 和 `BASE["messages"]` 指向同一个列表对象。每次请求 append 用户问题，实际都追加到了模块级模板里。模块只导入一次，进程运行期间模板一直在变长。影响有三：一是每次请求都把历史所有用户的问题发给模型，token 成本和延迟持续上升，最终超过上下文窗口报错；二是用户 A 的问题出现在用户 B 的上下文里，构成跨用户数据泄露；三是模型回答被无关内容干扰。修复：每次构造全新的列表，例如 `messages = [dict(SYSTEM_MSG), {"role": "user", "content": question}]`，或 `copy.deepcopy(BASE)`；更推荐写成 `build_messages()` 函数每次返回新结构。补一个测试：连续调用 build 两次，断言第二次 messages 长度仍为 2，且 BASE 未变化。
+    followup:
+      question: 为什么这个问题在单元测试里通常发现不了？如何让测试能发现它？
+      key_points: ["单测往往只调用一次或每个测试重新导入", "需要在同一进程内连续调用多次并断言模板不变"]
+      reference: 很多单元测试只调用一次 build 并检查结果是否包含用户问题，这时结果完全正确。只有在同一进程里多次调用，共享列表的增长才会显现。测试应连续调用两次，断言第二次的 messages 长度和第一次相同，并断言 BASE["messages"] 的长度始终为 1。
+  - id: d02-q6
+    kp: d02-k4
+    type: code
+    question: |
+      说明下面代码的输出，并指出其中哪一步可能悄悄丢失数据、为什么。
+
+      ```python
+      from collections import defaultdict
+      hits = [{"id": 1, "doc": "a"}, {"id": 2, "doc": "b"}, {"id": 1, "doc": "c"}]
+      index = {h["id"]: h for h in hits}
+      groups = defaultdict(list)
+      for h in hits:
+          groups[h["doc"]].append(h["id"])
+      print(len(index), dict(groups))
+      print("x" in groups, len(groups["x"]), "x" in groups)
+      ```
+    key_points:
+      - {text: "第一行输出 2 和 {'a': [1], 'b': [2], 'c': [1]}", dim: concept}
+      - {text: "指出字典推导式中重复 id=1 的元素被后者覆盖，doc 为 a 的记录丢失", dim: principle}
+      - {text: "第二行输出 False 0 True，说明读取 defaultdict 不存在的 key 会插入默认值", dim: principle}
+      - {text: "提出需要检测重复 id 或改用分组结构，判断存在性用 in 而不是读取", dim: engineering}
+    reference: |
+      index 用 id 作为 key，hits 中有两个 id=1 的元素，后出现的 `{"id": 1, "doc": "c"}` 覆盖了前面的 doc=a 记录，所以 `len(index)` 是 2，doc=a 的那条被悄悄丢掉了——这就是可能丢数据的地方。groups 按 doc 分组，结果是 `{'a': [1], 'b': [2], 'c': [1]}`。第二行：一开始 "x" 不在 groups 中输出 False；`groups["x"]` 会触发 defaultdict 的工厂函数插入一个空列表，长度为 0；再判断时 "x" 已经存在，输出 True。工程上如果 id 应唯一，应在建索引前检测重复并告警；判断 key 是否存在用 `in` 或 `.get()`，不要直接读取 defaultdict。
+
+code_reading:
+  id: d02-c1
+  kp: [d02-k3, d02-k2, d02-k1]
+  title: 多会话对话历史与请求构造
+  scenario: |
+    企业知识库助手的 `chat_state.py`。FastAPI 接口每收到一个问题，先调用 `build_request(session_id, question)` 组装发给大模型的请求体，模型回答后再调用 `append_turn` 记录历史；检索到的片段用 `dedupe_sources` 去重后作为引用来源返回。服务以单进程多线程方式运行，状态保存在内存中。
+  language: python
+  code: |
+    import copy
+    import logging
+    from collections import defaultdict, deque
+
+    logger = logging.getLogger(__name__)
+
+    SYSTEM_MSG = {"role": "system", "content": "你是企业知识库助手，只根据提供的资料回答。"}
+    BASE_REQUEST = {
+        "model": "chat-default",
+        "messages": [SYSTEM_MSG],
+        "metadata": {"tags": ["kb"]},
+    }
+
+    _histories: dict[str, deque[dict]] = defaultdict(lambda: deque(maxlen=20))
+
+
+    def append_turn(session_id: str, role: str, content: str) -> None:
+        _histories[session_id].append({"role": role, "content": content})
+
+
+    def build_request(session_id: str, question: str, tags: list[str] | None = None) -> dict:
+        request = copy.copy(BASE_REQUEST)
+        request["messages"].extend(_histories[session_id])
+        request["messages"].append({"role": "user", "content": question})
+        if tags:
+            request["metadata"]["tags"] += tags
+        logger.debug("session=%s messages=%d", session_id, len(request["messages"]))
+        return request
+
+
+    def dedupe_sources(chunks: list[dict]) -> list[dict]:
+        seen: set[tuple[str, int]] = set()
+        result: list[dict] = []
+        for c in chunks:
+            key = (c["doc_id"], c["page"])
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(c)
+        return sorted(result, key=lambda c: c["score"], reverse=True)
+  walkthrough:
+    function: |
+      维护每个会话最近 20 条对话历史，并为每次提问组装大模型请求体（系统消息 + 历史 + 当前问题 + 标签元数据）；同时对检索片段按「文档 + 页码」去重，再按相似度从高到低排序，作为回答的引用来源。
+    key_functions: |
+      - `_histories`：`defaultdict`，key 是 session_id，value 是 `deque(maxlen=20)`，自动只保留最近 20 条消息。
+      - `append_turn()`：把一条消息追加到对应会话的历史。
+      - `build_request()`：以 `BASE_REQUEST` 为模板构造请求体，这是本段代码的核心，也是问题所在。
+      - `dedupe_sources()`：用 tuple `(doc_id, page)` 作为 set 元素去重，保留第一次出现的片段，再用 `sorted(key=...)` 排序。
+    params: |
+      `session_id` 由前端传入，用于定位历史；`question` 是当前用户问题；`tags` 是可选的业务标签列表，默认 None。`build_request` 返回的 dict 会被调用方直接序列化后发给大模型。`dedupe_sources` 接收检索层返回的 chunk 列表，每个 chunk 是包含 doc_id、page、score 的 dict。
+    data_flow: |
+      ```mermaid
+      flowchart TB
+        Q["前端请求 session_id 与 question"] --> B["build_request"]
+        T["模块级 BASE_REQUEST"] -->|"copy.copy 浅拷贝"| R["request 新外层 dict"]
+        T --> SM["共享的 messages 列表"]
+        R --> SM
+        H["_histories 中该会话的 deque"] -->|"extend"| SM
+        Q -->|"append 用户问题"| SM
+        SM --> LLM["序列化后发给大模型"]
+        LLM --> A["append_turn 记录回答"]
+        A --> H
+        C["检索片段列表"] --> D["dedupe_sources 用 tuple 去重"]
+        D --> S["按 score 降序排序后返回来源"]
+      ```
+    failure_points: |
+      - **问题一（值得审查）：`copy.copy(BASE_REQUEST)` 是浅拷贝。** `request["messages"]` 与模板共享同一个列表，`extend` 和 `append` 都在修改模块级模板；`metadata["tags"] += tags` 同样原地修改共享列表。结果是模板无限增长，并把 A 会话的历史和问题带进 B 会话的请求，造成**跨用户数据泄露**和 token 成本失控。
+      - **问题二（值得审查）：`_histories` 没有任何清理机制。** `deque(maxlen=20)` 只限制单个会话的长度，但会话数量无限增长；并且 `build_request` 中读取 `_histories[session_id]` 会为任意未知 session_id 创建新条目，恶意或异常的大量 session_id 会导致内存持续上涨。
+      - 内存状态在多 worker 部署时各进程不共享，同一会话的请求落到不同进程会丢失历史。
+      - chunk 缺少 `doc_id`/`page`/`score` 字段时会抛 `KeyError`。
+    debugging: |
+      - 在测试中连续调用两次 `build_request("s1", "q1")`、`build_request("s2", "q2")`，打印 `len(BASE_REQUEST["messages"])`，会看到它在增长。
+      - 打印 `request["messages"] is BASE_REQUEST["messages"]`，结果为 True 即可证明共享。
+      - 观察 debug 日志里 `messages=` 的数值是否随请求次数单调递增。
+      - 用 `len(_histories)` 或内存分析工具（如 tracemalloc）观察会话数和内存增长。
+    change_request: |
+      - 修复浅拷贝：把模板改成函数 `def base_request() -> dict`，每次返回全新的 dict 和 list；或者在 `build_request` 中用 `copy.deepcopy(BASE_REQUEST)`，`messages = [SYSTEM_MSG, *history, user_msg]` 构造新列表。
+      - 如果需求改成「历史保存 7 天并支持多实例部署」，应把 `_histories` 换成 Redis（按 session_id 存 list 并设置过期时间，见 Day 41），读取时用 `.get()` 而不是触发 defaultdict 插入。
+  questions:
+    - id: d02-c1-q1
+      kp: d02-k3
+      type: code
+      question: 服务刚启动，`_histories` 为空。依次执行 `build_request("A", "报销流程？")` 和 `build_request("B", "年假几天？")`，请按执行过程说明第二次返回的 `request["messages"]` 里有哪些内容，以及 `BASE_REQUEST` 此时的状态。
+      key_points:
+        - {text: "指出 copy.copy 只复制外层 dict，request 的 messages 与 BASE_REQUEST 共享同一列表", dim: principle}
+        - {text: "说明第一次调用后共享列表已包含系统消息和 A 的问题", dim: concept}
+        - {text: "说明第二次返回的 messages 包含系统消息、A 的问题和 B 的问题共 3 条", dim: concept}
+        - {text: "指出这构成跨会话数据泄露，并给出每次构造新列表的修复", dim: engineering}
+      reference: |
+        第一次调用：`copy.copy` 创建了新的外层 dict，但 messages 仍是 BASE_REQUEST 里那一个列表。会话 A 没有历史，extend 一个空 deque 不变；随后 append A 的问题，共享列表变成 [系统消息, A 的问题]。第二次调用：再次浅拷贝，拿到的还是同一个列表；会话 B 历史为空；append B 的问题后列表变成 [系统消息, A 的问题, B 的问题]。所以第二次返回的请求里包含了 A 的问题，BASE_REQUEST["messages"] 本身也已经是 3 条。如果此前有 append_turn 记录过历史，历史也会被不断累积进模板。这是跨会话数据泄露。修复为每次构造新列表：`messages = [dict(SYSTEM_MSG), *_histories.get(session_id, ()), {"role": "user", "content": question}]`，或者对模板 deepcopy。
+    - id: d02-c1-q2
+      kp: d02-k2
+      type: code
+      question: 说明 `dedupe_sources` 为什么用 `(doc_id, page)` 这个 tuple 作为 set 的元素，而不是直接把 chunk dict 放进 set；它的去重和排序结果有什么特点？
+      key_points:
+        - {text: "指出 dict 可变、不可哈希，不能放进 set", dim: principle}
+        - {text: "说明 tuple 由不可变的 str 和 int 组成，可哈希，set 判断是平均 O(1)", dim: principle}
+        - {text: "说明重复时保留第一次出现的片段，因为后出现的会被 continue 跳过", dim: concept}
+        - {text: "说明 sorted 稳定且返回新列表，score 相同的片段保持原有先后顺序", dim: concept}
+      reference: |
+        chunk 是 dict，dict 可变，没有可用的 __hash__，直接 `seen.add(c)` 会抛 TypeError（3.14+ 的提示为 cannot use 'dict' as a set element (unhashable type: 'dict')）。tuple `(doc_id, page)` 由 str 和 int 组成，都是不可变的，所以整个 tuple 可哈希，可以放进 set，`key in seen` 平均是 O(1)，比在 list 里查找快得多。遍历时遇到已出现的 key 就 continue，因此保留的是**第一次出现**的那个片段（如果后面的同页片段分数更高，会被丢掉，这是一个需要和业务确认的行为）。最后 sorted 返回一个新列表，按 score 降序；Python 排序是稳定的，score 相同的片段保持去重后的原有顺序。
+    - id: d02-c1-q3
+      kp: d02-k1
+      type: code
+      question: "`_histories` 的 value 用的是 `deque(maxlen=20)` 而不是 list。请解释 deque 在这里的作用；如果换成 list 并在超过 20 条时 `pop(0)`，会有什么区别？另外，这段代码的内存为什么仍可能无限增长？"
+      key_points:
+        - {text: "说明 deque(maxlen=20) 追加第 21 条时自动丢弃最旧的一条，两端操作 O(1)", dim: principle}
+        - {text: "说明 list 的 pop(0) 需要整体移动元素，是 O(n)", dim: principle}
+        - {text: "指出 maxlen 只限制单个会话，会话数量本身没有上限且没有过期清理", dim: engineering}
+        - {text: "指出读取 defaultdict 不存在的 session_id 会自动创建条目，加剧内存增长", dim: engineering}
+      reference: |
+        deque 是双端队列，设置 maxlen=20 后，追加第 21 条消息会自动从左端丢弃最旧的一条，两端追加和弹出都是 O(1)，非常适合「只保留最近 N 轮」的滑动窗口。换成 list 后需要手动判断长度并 pop(0)，而 pop(0) 要把剩余元素整体前移，是 O(n)；20 条时差异不大，但写法更啰嗦、更容易漏掉判断。内存仍可能无限增长的原因是：maxlen 只限制每个会话的长度，而 `_histories` 中会话的数量没有上限，也没有过期清理；更糟的是 `build_request` 里直接读取 `_histories[session_id]`，defaultdict 会为任何未知的 session_id 新建一个 deque。大量随机 session_id 的请求会让内存持续增长。应改为 `.get()` 读取，并用带过期时间的存储（如 Redis TTL）。
+
+interview:
+  - id: d02-i1
+    kp: d02-k1
+    type: oral
+    difficulty: 1
+    question: list 和 tuple 有什么区别？在什么场景下你会选择 tuple？
+    key_points:
+      - {text: "说明 list 可变、tuple 不可变，tuple 不可变指槽位指向不可变", dim: concept}
+      - {text: "说明 tuple 元素都可哈希时 tuple 可哈希，能作为 dict key 或 set 元素", dim: principle}
+      - {text: "说明 list 底层是动态指针数组，append 均摊 O(1)，头部插入 O(n)", dim: principle}
+      - {text: "举出项目中用 tuple 作为复合键或多返回值的例子", dim: project}
+    reference: |
+      list 是可变序列，底层是一段连续的指针数组，支持增删改，append 利用预留容量均摊 O(1)，头部插入和删除需要移动元素是 O(n)。tuple 是不可变序列，创建后长度和每个位置指向的对象都不能变，但如果里面装的是 list 这样的可变对象，那个对象本身仍能被修改。不可变带来的好处是：元素都可哈希时 tuple 本身可哈希，可以当 dict 的 key 或放进 set；可以安全地在函数之间共享；也表达了「固定结构的一条记录」的语义。项目中我会用 `(doc_id, page)` 作为检索片段去重的 key，用 `(model, prompt_hash)` 作为缓存 key；函数返回多个值时 `return answer, sources` 其实就是返回 tuple。
+    oral: |
+      最核心的区别是 list 可变、tuple 不可变。list 底层是动态数组，尾部追加很快，头部插入删除要挪元素比较慢。tuple 不可变，所以只要里面的元素都可哈希，它就能当字典的 key、放进 set。在 RAG 项目里，我对检索片段去重时就用 (doc_id, page) 这个 tuple 放进 set，判断是 O(1) 的。需要注意的是 tuple 的不可变只是浅层的，里面装 list 的话 list 还是能改，而且这时 tuple 也就不能哈希了。
+  - id: d02-i2
+    kp: d02-k2
+    type: oral
+    difficulty: 2
+    question: Python 的 dict 底层是怎么实现的？为什么查找是 O(1)？为什么现在是有序的？
+    key_points:
+      - {text: "说明基于哈希表：计算 hash 定位槽位，冲突时用开放寻址探测，命中需 hash 相同且 == 相等", dim: principle}
+      - {text: "说明负载过高时扩容重排，因此平均和均摊 O(1)，最坏情况会退化", dim: principle}
+      - {text: "说明 3.6 起采用紧凑布局（索引数组加按插入顺序的条目数组），3.7 起插入顺序成为语言保证", dim: concept}
+      - {text: "说明 key 必须可哈希、a == b 必须 hash 相等，且字符串 hash 每进程随机，不能持久化", dim: engineering}
+      - {text: "结合项目举例，如用 set 做权限过滤或用 sha256 而不是 hash 作缓存 key", dim: project}
+    reference: |
+      dict 是哈希表。查找时先对 key 调用 hash() 得到整数，用它算出槽位；槽位里有条目时先比 hash 再用 == 比 key，相等就命中；不相等说明发生冲突，CPython 用开放寻址法按探测序列找下一个槽位。只要哈希分布均匀、表不太满，平均只需检查很少的槽位，所以是 O(1)；表的使用率超过约 2/3 时会扩容并重新分布，单次插入较慢但均摊仍是 O(1)，极端冲突时最坏会退化到 O(n)。有序性来自 3.6 的紧凑布局：一个稀疏的索引数组负责定位，一个按插入顺序追加的条目数组存放 hash、key、value，遍历按条目数组进行，因此自然有序且更省内存；3.7 起这成为语言规范。由此 key 必须可哈希且作为 key 期间不变，并且 a == b 时 hash 必须相等。另外 str 的 hash 每个进程随机加盐，所以我在做语义缓存时用 sha256 生成 key，而不是 hash()。权限过滤时把允许的部门放进 set，过滤大量片段时每次判断都是 O(1)。
+    oral: |
+      dict 本质是哈希表。查一个 key 时先算 hash，定位到槽位，再比较 hash 和 == 确认是不是同一个 key，冲突了就按探测序列往下找，平均一两次就能命中，所以是 O(1)。它从 3.6 开始用了紧凑布局，一个索引数组加一个按插入顺序存条目的数组，所以遍历天然有序，3.7 写进了语言规范。这也决定了 key 必须可哈希。我在项目里踩过一个坑：用 hash(question) 做 Redis 缓存 key，多 worker 下命中率几乎为零，因为字符串 hash 每个进程随机，后来改成 sha256 就好了。
+  - id: d02-i3
+    kp: d02-k3
+    type: oral
+    difficulty: 3
+    question: 浅拷贝和深拷贝有什么区别？你在项目中如何避免共享可变对象带来的问题？
+    key_points:
+      - {text: "说明赋值不复制、浅拷贝只复制外层容器、深拷贝递归复制内部可变对象", dim: concept}
+      - {text: "列出浅拷贝的常见写法：copy.copy、dict.copy、list 切片、{**d}，以及 Pydantic model_copy 默认浅拷贝", dim: principle}
+      - {text: "说明深拷贝的代价：性能开销、可能复制不该复制的资源，用 memo 处理循环引用", dim: principle}
+      - {text: "提出工程策略：模板改为每次构造新对象、默认值不可变化、测试中连续调用验证无污染", dim: engineering}
+      - {text: "举出共享 Prompt 模板导致跨用户数据泄露的案例", dim: project}
+    reference: |
+      赋值只是多一个名字指向同一对象；浅拷贝创建新的外层容器，但内部元素仍是原对象的引用，常见写法有 copy.copy、dict.copy()、list(x)、x[:]、{**d}，Pydantic v2 的 model_copy() 默认也是浅拷贝；深拷贝 copy.deepcopy 递归复制所有可变的内部对象，用 memo 字典记录已复制对象以处理循环引用。深拷贝的代价是要遍历整个对象图，大结构下 CPU 开销明显，而且会尝试复制连接池、大模型对象这类本应共享的东西，有些对象（文件、socket）还无法复制。我的工程策略是：第一，模块级的模板和默认值尽量不可变，比如用 tuple、frozen 的 Pydantic 模型或只读映射；第二，需要「基于模板修改」时，写一个工厂函数每次构造新对象，而不是复制再修改；第三，确实要复制嵌套结构且体量不大时才 deepcopy；第四，测试里在同一进程连续调用两次并断言模板不变。我遇到过客服系统的系统 Prompt 模板被浅拷贝后 append，导致 messages 无限增长、包含其他用户的问题，后来就按这个思路修复。
+    oral: |
+      赋值是不复制，浅拷贝只复制最外层，里面的 list、dict 还是共享的，深拷贝会递归全部复制。像 dict.copy()、{**d}、切片、Pydantic 的 model_copy 默认都是浅拷贝。深拷贝虽然安全，但慢，还可能复制不该复制的资源，所以我一般不靠到处 deepcopy。我更喜欢的做法是模板写成函数，每次返回新对象。之前我们客服系统就出过事故：系统消息模板被浅拷贝后 append 用户问题，结果 messages 越来越长，还带上了别的用户的问题，token 成本暴涨，还是数据泄露。修复后我加了一个测试，连续调用两次断言模板长度不变。
+  - id: d02-i4
+    kp: d02-k4
+    type: oral
+    difficulty: 3
+    question: 检索返回了几百个片段，需要按分数过滤、按文档分组、去重并保留每组最高分，最后取前 5 组。你会用哪些 Python 数据结构和写法？要注意哪些坑？
+    key_points:
+      - {text: "使用列表推导式按阈值过滤，sorted 搭配 key 函数排序，并利用排序稳定性", dim: concept}
+      - {text: "使用 dict 或 defaultdict 按 doc_id 分组，并说明 defaultdict 读取会插入默认值的副作用", dim: principle}
+      - {text: "使用 tuple 作为复合去重键放入 set，说明 set 查找 O(1) 但不保证顺序", dim: principle}
+      - {text: "指出字典推导式重复 key 会被覆盖、zip 默认静默截断等数据丢失风险，并用测试或 strict 参数防护", dim: engineering}
+    reference: |
+      第一步用列表推导式过滤低分片段：`hits = [c for c in chunks if c["score"] >= th]`。第二步去重：用 `(doc_id, page)` 作为 tuple 放入 set，遍历时跳过已出现的，set 查找平均 O(1)，但 set 本身无序，所以结果仍用 list 保存。第三步分组并保留最高分：用普通 dict，`best = {}`，遍历时 `if doc not in best or c["score"] > best[doc]["score"]: best[doc] = c`；如果需要每组所有片段则用 `defaultdict(list)`，但要注意读取不存在的 key 会插入空列表，判断存在用 in。第四步排序取前 5：`sorted(best.values(), key=lambda c: c["score"], reverse=True)[:5]`，Python 排序稳定，分数相同的保持原顺序，需要确定性时可用 `(-score, doc_id)` 作为 key。要注意的坑：字典推导式 `{c["doc_id"]: c for c in hits}` 会让后出现的覆盖前面的，未必保留最高分；如果后续要把文本和向量配对，zip 要加 strict=True 防止静默截断；不要依赖 set 的遍历顺序生成 Prompt，否则同一问题每次 Prompt 不同。
+    oral: |
+      我会分四步：先用列表推导式按阈值过滤；再用 (doc_id, page) 这个 tuple 放进 set 去重；然后用一个普通 dict 按 doc_id 分组，只在分数更高时替换，保留每组最高分；最后用 sorted 按分数倒序取前 5。坑主要有几个：字典推导式遇到重复 key 会直接覆盖，不一定留下最高分；defaultdict 读一下就会插入空值；set 是无序的，不能直接拿来拼 Prompt，否则同样的问题每次 Prompt 都不一样，缓存也会失效。排序我会用 (-score, doc_id) 作为 key，保证结果稳定可复现。
+
+sources:
+  - {title: "Python 文档 - copy 浅拷贝与深拷贝", url: "https://docs.python.org/3/library/copy.html"}
+  - {title: "What's new in Python 3.15", url: "https://docs.python.org/3.15/whatsnew/3.15.html"}

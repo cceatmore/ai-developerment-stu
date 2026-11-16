@@ -1,0 +1,775 @@
+day: 19
+phase: 2
+title: LLM 工程化：重试、限流、缓存与成本
+goals:
+  - 能区分哪些错误该重试、哪些不该重试，写出带抖动、遵守 Retry-After、有总截止时间的重试，并避免多层重试叠加
+  - 能用客户端限流、熔断、降级保护系统，在上游故障时不被拖垮
+  - 能说清应用层缓存与 Prompt Caching 的区别，会按「稳定前缀在前」组织提示并从 usage 中确认命中
+  - 能建立 Token 成本账本，用模型路由、缓存、Batch 等手段在效果可控的前提下降本
+minutes: 60
+resources:
+  - title: "OpenAI Docs - Rate limits"
+    url: "https://developers.openai.com/api/docs/guides/rate-limits"
+    kind: doc
+    lang: en
+    minutes: 15
+    note: "看限流维度（RPM、TPM 等）、slow_down 与 server_is_overloaded 的区别、Retry-After 与指数退避一节，以及 max_tokens 如何计入限流"
+  - title: "OpenAI Docs - Prompt caching"
+    url: "https://developers.openai.com/api/docs/guides/prompt-caching"
+    kind: doc
+    lang: en
+    minutes: 20
+    note: "看 Which settings affect the cached prefix 表、GPT-5.6 及之后的写入与读取计费、How to optimize 里「稳定前缀、只追加历史」的建议和 usage 字段"
+  - title: "Claude Docs - Prompt caching"
+    url: "https://platform.claude.com/docs/en/build-with-claude/prompt-caching"
+    kind: doc
+    lang: en
+    minutes: 15
+    note: "看 automatic caching 与显式 cache_control 两种方式、tools 到 system 到 messages 的前缀顺序、5 分钟与 1 小时 TTL 的计费倍数"
+  - title: "DeepSeek API 文档 - 上下文硬盘缓存"
+    url: "https://api-docs.deepseek.com/zh-cn/guides/kv_cache"
+    kind: doc
+    lang: zh
+    minutes: 5
+    note: "整页都短，重点看「完整匹配缓存前缀单元才命中」的两个例子和 usage 里的命中字段，体会不同厂商缓存规则的差异"
+knowledge_points:
+  - id: d19-k1
+    name: 超时、重试与指数退避
+    level: P0
+    summary: 只重试临时性错误；退避要加抖动并遵守 Retry-After；限制次数和总时长；只保留一层重试；有副作用的操作要幂等
+    analogy: |
+      就是你在 axios 里写过的**响应拦截器重试**：401 去刷新 token 再重放、网络错误隔几秒再试。
+      - 「哪些状态码重试」≈ 拦截器里判断 `error.response.status`；
+      - 「指数退避 + 抖动」≈ axios-retry 的 `exponentialDelay`；
+      - 「只保留一层重试」≈ 不要在拦截器重试的同时，业务代码再包一层 `retry`。
+
+      **不一样的地方**：LLM 一次调用可能几十秒、按 Token 计费，**重试一次就多花一次钱**；流式输出开始后再重放，用户会看到两份不同的回答。
+    why: |
+      LLM API 的 429、5xx、超时远比普通后端接口常见，不做重试会频繁报错；重试做错更糟：
+      多层重试叠加把请求放大几十倍、触发更严格的限流，有副作用的工具被重复执行。这是从 Demo 到生产的第一道门槛。
+    problem: |
+      解决「**调用失败时，什么时候重试、等多久、重试几次、由谁来重试**」，
+      在提高成功率的同时不放大故障、不重复产生副作用、不让用户无限等待。
+    principle: |
+      **一、先分类：哪些错误能重试**
+
+      | 错误 | 是否重试 | 说明 |
+      |---|---|---|
+      | 连接错误、超时 | 是 | 临时性网络问题 |
+      | 429 速率超限 | 是 | 遵守 Retry-After，再加一点随机等待 |
+      | 500、502、503 过载 | 是 | 上游临时故障 |
+      | 429 但是额度、账单问题 | **否** | 重试也不会好，要人去处理 |
+      | 400 参数错误、401、403 | **否** | 请求本身有问题，重试结果一样 |
+
+      OpenAI 文档特别区分：`slow_down`（429）表示**请求量增长太快**，即使没超 RPM、TPM 也可能出现，要降速后逐步加量；`server_is_overloaded`（503）表示模型临时过载。
+
+      **二、怎么等：指数退避 + 抖动 + Retry-After**
+
+      ```mermaid
+      sequenceDiagram
+        participant C as 调用层
+        participant API as 模型 API
+        C->>API: 第 1 次请求
+        API-->>C: 429 Retry-After 5
+        Note over C: 等待 max(5, 退避) 加随机抖动
+        C->>API: 第 2 次请求
+        API-->>C: 503 无 Retry-After
+        Note over C: 退避翻倍 再加抖动
+        C->>API: 第 3 次请求
+        API-->>C: 200 成功
+      ```
+
+      - **指数退避**：1 秒、2 秒、4 秒……给上游恢复时间。
+      - **抖动**：加随机数，避免成百上千个客户端在同一时刻一起重试，形成新的尖峰。
+      - **Retry-After**：服务端给的是**最小等待时间**，要至少等这么久。
+
+      **三、限制：次数、总时长、层数**
+
+      - **单次超时 ≠ 整体截止时间**：每次 30 秒超时、重试 5 次，用户可能等 3 分钟。要给整个操作设一个总预算。
+      - **只保留一层重试**：openai-python 默认会自动重试 2 次（连接错误、408、409、429、5xx），默认超时 10 分钟。如果业务层自己管重试，就把 SDK 的 `max_retries` 设为 0，否则三层各重试 3 次就是 27 倍。
+      - **流式输出开始后不要自动重放**：已经展示给用户的内容无法撤回，应标记中断、让用户选择重新生成。
+
+      **四、有副作用的操作要幂等**
+
+      模型调用本身重试无副作用；但如果失败发生在「发邮件」「下工单」这类工具调用上，重试前要用**幂等键**或先查状态，否则重复执行（工具加固见 Day 33）。
+    scenarios: |
+      - **所有线上 LLM 调用**：统一封装在调用层，业务代码不各自写重试。
+      - **批量任务**：夜间批处理遇到 429，按 Retry-After 退避并降低并发。
+      - **Agent 工具调用**：写操作带幂等键，超时后先查结果再决定是否重试。
+      - **流式聊天**：中断后提示用户并提供「重新生成」，不自动重放。
+    code: |
+      import random, time
+      from openai import OpenAI, APIConnectionError, APIStatusError
+
+      client = OpenAI(timeout=30, max_retries=0)  # 由本层统一重试，关掉 SDK 重试
+      RETRYABLE = {408, 409, 429, 500, 502, 503, 504}
+
+      def call_with_retry(send, max_attempts=4, budget_s=60):
+          start = time.monotonic()
+          for attempt in range(max_attempts):
+              wait_hint = 0.0
+              try:
+                  return send()
+              except APIConnectionError:  # 含超时
+                  pass
+              except APIStatusError as e:
+                  if e.status_code not in RETRYABLE or e.code == "insufficient_quota":
+                      raise
+                  wait_hint = float(e.response.headers.get("retry-after", 0) or 0)
+              delay = max(wait_hint, min(2 ** attempt, 20)) + random.uniform(0, 1)
+              if attempt == max_attempts - 1 or time.monotonic() - start + delay > budget_s:
+                  break
+              time.sleep(delay)
+          raise TimeoutError("超出重试次数或总时间预算")
+    pitfalls: |
+      - **误区：所有错误都重试。** 400、401、额度不足重试只会浪费时间和配额。
+      - **多层重试叠加**：SDK、业务、网关各重试一遍，故障时请求数成倍放大。
+      - **固定间隔重试不加抖动**：所有客户端同时醒来，再次打爆上游。
+      - **只设单次超时不设总截止时间**：用户等几分钟才看到报错。
+      - **流式中途断开自动重放**：用户看到两段不一致的回答。
+      - **有副作用的工具调用直接重试**：重复发邮件、重复下单。
+    interview_asks:
+      - question: "调用大模型 API 时，你的重试策略是怎么设计的？"
+        answer: "只对 429、超时和 5xx 重试，最多两三次。间隔指数增长，并加随机抖动。每次都有总时间上限。4xx 参数错误立刻失败。重试次数和原因记在日志里。"
+      - question: "为什么要做指数退避和抖动？"
+        answer: "立刻重试会在故障时把上游打得更死。间隔一次比一次长，给它恢复时间。抖动是让很多客户端不要在同一秒一起重试，避免二次拥挤。"
+      - question: "哪些错误不应该重试？"
+        answer: "401、403、400、Schema 不合法、上下文超长。这些再试还是错。用户取消、非幂等操作已经可能执行成功时，也不要盲目重试。"
+    project_example: |
+      **p2 智慧园区运营 Agent**：早期 SDK 默认重试、业务层 tenacity 重试 5 次、网关又重试 3 次，上游一次 503 高峰时请求被放大几十倍，随后持续收到 429 slow_down。
+      整改为只在统一调用层重试：关闭 SDK 和网关重试，最多 4 次，指数退避加抖动，优先遵守 Retry-After，总预算 60 秒；「派发工单」工具带幂等键，超时后先查工单是否已创建。
+    freshness: |
+      核对于 2026-11：openai-python README 说明默认超时 10 分钟，默认对连接错误、408、409、429、5xx 自动重试 2 次，可用 max_retries 配置；
+      OpenAI Rate limits 指南说明 Retry-After 是最小等待时间并应加随机延迟，429 slow_down 表示流量增长过快、503 server_is_overloaded 表示模型过载，
+      单次超时不等于整体截止时间，自管重试时应关闭 SDK 重试以免嵌套放大，不要重试额度和账单类错误，流式开始后不要自动重放。
+    sources:
+      - {title: "OpenAI Docs - Rate limits", url: "https://developers.openai.com/api/docs/guides/rate-limits"}
+      - {title: "openai-python README（Retries / Timeouts）", url: "https://github.com/openai/openai-python"}
+
+  - id: d19-k2
+    name: 限流、熔断与降级
+    level: P1
+    summary: 客户端主动限流避免撞上配额；上游持续故障时熔断快速失败；准备备用模型、缓存答案等降级路径
+    analogy: |
+      - **客户端限流** ≈ 前端的 `throttle`：输入框每秒最多发一次搜索请求，主动控制节奏。
+      - **熔断** ≈ 家里的空气开关：短路时直接跳闸，不让故障蔓延，过一会儿再试着合闸。
+      - **降级** ≈ nginx 的 `upstream backup`，或图片加载失败显示占位图。
+
+      **不一样的地方**：LLM 的配额按**请求数和 Token 数**双重计算，一个超长请求就可能吃掉大量额度，所以限流要同时数「次数」和「Token」。
+    why: |
+      重试只能应对偶发错误。上游持续故障时，所有请求都在等超时、再重试，线程和连接被占满，
+      连不依赖 LLM 的功能也会被拖垮。限流、熔断、降级是让故障「只影响一部分、可以恢复」的关键。
+    problem: |
+      解决「**多个服务共享配额时如何不互相挤占**」「**上游长时间故障时如何快速失败而不是全部卡死**」，
+      以及「**主链路不可用时给用户什么**」。
+    principle: |
+      **一、限流：先在自己这边排队**
+
+      - OpenAI 的限流维度有 RPM、RPD、TPM、TPD 等，**任一先到就触发**。
+      - TPM 计数按「请求字符估算的 Token」与 `max_tokens` 中**较大者**计，所以 `max_tokens` 设得远超实际需要会更早撞限流。
+      - 多个服务共享一个 Key 时，用集中式**令牌桶**同时按请求数和 Token 数分配，在线请求优先，批量任务限速或改用 Batch API。
+      - 流量要**逐步爬升**：文档建议达到每分钟百万 Token 量级后，每 15 分钟增长不超过 50%，否则可能收到 slow_down。
+
+      **二、熔断：故障时快速失败**
+
+      ```mermaid
+      stateDiagram-v2
+        [*] --> Closed
+        Closed --> Open: 错误率或超时率超过阈值
+        Open --> HalfOpen: 冷却时间到
+        HalfOpen --> Closed: 探测请求成功
+        HalfOpen --> Open: 探测请求失败
+      ```
+
+      - **Closed（闭合）**：正常放行，统计错误率。
+      - **Open（打开）**：直接走降级，不调用上游，不占线程。
+      - **HalfOpen（半开）**：放少量探测请求，成功就恢复。
+
+      **三、降级：准备 B 计划**
+
+      ```mermaid
+      flowchart LR
+        A["请求"] --> B{"主模型熔断"}
+        B -->|否| C["主模型"]
+        B -->|是| D{"有备用模型"}
+        D -->|是| E["备用模型 或 另一家厂商"]
+        D -->|否| F{"缓存或 FAQ 命中"}
+        F -->|是| G["返回缓存答案 并注明"]
+        F -->|否| H["友好提示 稍后再试 保留输入"]
+      ```
+
+      - 备用模型的提示词、输出格式可能不同，**需要单独评测**，不能假设能无缝替换。
+      - 降级时**不能绕过安全检查**（Day 45）。
+    scenarios: |
+      - **多业务共享 API Key**：在线问答优先，批量摘要限速。
+      - **厂商故障**：主厂商熔断后切换到备用厂商或私有化模型。
+      - **大促或活动高峰**：提前预估 TPM，逐步放量。
+      - **知识库问答**：模型不可用时，先返回 FAQ 或检索到的原文片段。
+    code: |
+      import time
+
+      class CircuitBreaker:
+          def __init__(self, fail_threshold=5, cooldown_s=30):
+              self.fail_threshold, self.cooldown_s = fail_threshold, cooldown_s
+              self.fails, self.opened_at = 0, None
+
+          def allow(self) -> bool:
+              if self.opened_at is None:
+                  return True
+              return time.monotonic() - self.opened_at >= self.cooldown_s  # 半开：放行探测
+
+          def record(self, ok: bool):
+              if ok:
+                  self.fails, self.opened_at = 0, None
+              else:
+                  self.fails += 1
+                  if self.fails >= self.fail_threshold:
+                      self.opened_at = time.monotonic()
+    pitfalls: |
+      - **误区：撞了 429 再重试就行，不需要主动限流。** 共享配额时会互相挤占，重试还会加剧拥塞。
+      - **max_tokens 随手设成最大值**：占用更多 TPM 额度。
+      - **没有熔断，故障时所有请求都等满超时**：线程池耗尽，连带其他功能不可用。
+      - **备用模型没评测过**：切换后输出格式变了，下游解析失败。
+      - **降级时跳过内容审核或权限检查**。
+    interview_asks:
+      - question: "多个业务共用一个模型配额，你怎么避免互相影响？"
+        answer: "按业务设单独的并发和速率上限，不要大家抢同一个无上限的池。核心业务预留配额。某个业务打满时只限制它，不拖垮别的。"
+      - question: "上游大模型服务挂了，你的系统会怎样？"
+        answer: "熔断打开后，短时间内不再把所有请求打到已经失败的上游，直接走降级：排队稍后、换备用模型，或明确告诉用户暂不可用。不能让每个请求都卡满超时。"
+      - question: "熔断器的几个状态分别是什么？"
+        answer: "关闭是正常放行。失败到阈值就打开，直接拒绝或降级。过一段时间进半开，放少量请求试探，成功再关闭，失败就回到打开。"
+    project_example: |
+      **p2 智慧园区运营 Agent**：实时告警分析与夜间报表生成共用一个 Key。上线初期夜间报表把 TPM 打满，凌晨的告警分析全部 429。
+      改为集中令牌桶，告警分析独享 60% 额度，报表改用 Batch API；主厂商连续失败时熔断 30 秒，切到私有化部署的备用模型，告警摘要格式经过单独评测确认可用。
+    freshness: |
+      核对于 2026-11：OpenAI Rate limits 指南列出 RPM、RPD、TPM、TPD、IPM 等维度，任一先到即触发；限流按 max_tokens 与按字符估算 Token 中的较大者计；
+      流量达到每分钟百万输入 Token 后建议每 15 分钟增长不超过 50%；建议非实时任务使用 Batch API。
+    sources:
+      - {title: "OpenAI Docs - Rate limits", url: "https://developers.openai.com/api/docs/guides/rate-limits"}
+
+  - id: d19-k3
+    name: 缓存：应用层缓存与 Prompt Caching
+    level: P0
+    summary: 应用层缓存跳过整次调用但要处理失效与权限；Prompt Caching 复用完全相同的前缀计算，省输入成本和首字延迟，靠「稳定在前、变化在后」命中
+    analogy: |
+      - **应用层缓存** ≈ 前端的接口缓存（如 SWR、Vue Query）：同样的请求直接返回上次结果，要考虑什么时候失效。
+      - **Prompt Caching** ≈ webpack 的 **contenthash 文件名缓存**：文件内容一个字节没变，浏览器就复用；**改了一个字符，哈希就变，缓存全失效**。所以要把不常变的 vendor 拆出来放前面。
+
+      **不一样的地方**：Prompt Caching 是**前缀匹配**，前面某处变了，后面全部失效；而且它只省「读输入」的计算，**回答仍然重新生成**，temperature 照样起作用。
+    why: |
+      Agent 和多轮对话里，系统提示、工具定义、历史消息每轮都要重发，输入 Token 往往占成本大头。
+      Prompt Caching 用得好，能把这部分成本降到原来的十分之一左右并缩短首字延迟；用不好（比如在开头放时间戳），命中率是 0 而你毫不知情。
+    problem: |
+      解决「**重复内容如何不重复付费、不重复计算**」，并分清两种缓存各自适合什么，避免把一个用户的答案返回给另一个用户这类事故。
+    principle: |
+      **一、两种缓存对比**
+
+      | 对比项 | 应用层缓存 | Prompt Caching（厂商侧） |
+      |---|---|---|
+      | 缓存什么 | 整个回答 | 前缀的中间计算结果（KV） |
+      | 是否调用模型 | 命中就不调用 | 仍调用，仍生成新回答 |
+      | 命中条件 | 你定义的 key（精确或语义相似） | 前缀**完全一致** |
+      | 风险 | 失效、权限、答案过期 | 前缀里放了动态内容导致不命中 |
+
+      **二、Prompt Caching 的命中规则（以 OpenAI 为例）**
+
+      ```mermaid
+      flowchart LR
+        A["工具定义"] --> B["系统提示 稳定部分"]
+        B --> C["历史消息 只追加"]
+        C --> D["缓存断点"]
+        D --> E["动态内容 时间 用户信息"]
+        E --> F["当前问题"]
+      ```
+
+      - **整段前缀完全一致才命中**，模型、工具定义及顺序、`reasoning.effort`、Structured Outputs 的格式等设置都会影响前缀。
+      - GPT-5.6 及之后模型：前缀至少 1024 Token 才可缓存；默认写入按普通输入价 **1.25 倍**（30 分钟），Responses 中可选 12 小时（2.5 倍）；读取一般为 **0.1 倍**。所以**只用一次的前缀开缓存反而更贵**，复用两次以上才划算。更早的模型不收写入费。
+      - 用 `usage.input_tokens_details.cached_tokens` 确认命中，`cache_write_tokens` 看写入量。
+      - 最佳实践：**稳定内容放前面，动态内容放后面，历史只追加不改写**；临时禁用工具用 `tool_choice: none` 而不是删掉工具定义。
+
+      **三、三家厂商差异**
+
+      | 厂商 | 开启方式 | 关键规则 |
+      |---|---|---|
+      | OpenAI | 支持的模型默认开启 | 前缀完全匹配；新模型有写入费 |
+      | Anthropic | 顶层 `cache_control` 自动缓存，或在块上加显式断点（最多 4 个） | 前缀顺序 tools、system、messages；默认 5 分钟 TTL 且命中即刷新；写入 1.25 倍、1 小时 TTL 写入 2 倍、读取 0.1 倍；不够最小长度不报错只是不缓存 |
+      | DeepSeek | 默认开启，无需改代码 | 必须**完整匹配**已落盘的前缀单元；usage 中看 `prompt_cache_hit_tokens`；尽力而为，几小时到几天后清除 |
+
+      **四、应用层缓存的注意点**
+
+      - key 里要包含**模型、提示版本、用户权限范围**，否则可能把 A 部门的答案给了 B 部门。
+      - 知识库更新后相关缓存要失效。
+      - 语义缓存（问题向量相似就复用）要用 Day 18 的阈值校准思路，宁可少命中也不能答错。
+    scenarios: |
+      - **Agent 多轮循环**：工具定义和系统提示固定在前，历史只追加，Prompt Caching 命中率最高。
+      - **长文档多次问答**：同一份合同反复提问，文档放在前缀中。
+      - **高频 FAQ**：应用层缓存直接返回，省掉整次调用。
+      - **多租户**：OpenAI 可用 `prompt_cache_key` 做分组统计；应用层缓存按租户隔离。
+    code: |
+      resp = client.responses.create(
+          model=MODEL,
+          input=[
+              {"role": "developer", "content": STABLE_RULES},   # 稳定内容在前
+              *history,                                          # 历史只追加
+              {"role": "user", "content": f"当前时间 {now}\n{question}"},  # 动态内容在后
+          ],
+          tools=TOOLS,  # 定义与顺序保持不变
+      )
+      details = resp.usage.input_tokens_details
+      print(resp.usage.input_tokens, details.cached_tokens, details.cache_write_tokens)
+    pitfalls: |
+      - **在系统提示开头拼时间戳、用户名、请求 ID**：前缀每次都不同，命中率为 0。
+      - **误区：Prompt Caching 会缓存回答。** 它只缓存输入前缀的计算，回答照常生成。
+      - **改写或压缩早期历史**：从改动处往后全部失效，要权衡压缩收益和缓存损失（Day 20）。
+      - **每轮动态增删工具定义**：工具在前缀最前面，一变全失效。
+      - **应用层缓存 key 不含权限维度**：越权泄露。
+      - **只看账单不看 usage**：不知道缓存到底有没有生效。
+    interview_asks:
+      - question: "Prompt Caching 的原理是什么？怎么提高命中率？"
+        answer: "供应商缓存相同前缀已经算过的结果。前缀越稳定，命中越高。系统提示和工具定义放前面并且少改，用户内容和日期放后面。改一个空格都可能让前缀失效。"
+      - question: "应用层缓存和 Prompt Caching 有什么区别？"
+        answer: "应用层缓存是你自己按问题存最终答案或检索结果，命中就不再调用模型。Prompt Caching 仍会调用模型，只是相同前缀少算一些、少花一些。两者可以一起用，key 里必须有租户和权限。"
+      - question: "你怎么确认缓存真的生效了？"
+        answer: "看响应里的缓存 Token 数或供应商给的命中字段，不要只看自己感觉变快。应用层缓存则看命中日志和实际没有发出模型请求。上线后拿重复请求对一次账单。"
+    project_example: |
+      **p3 前端 Coding Agent**：每轮请求都带约 6000 Token 的系统规则和 20 个工具定义。上线后发现 cached_tokens 始终为 0，排查发现系统提示第一行是「当前时间：精确到秒」。
+      把时间移到最后一条用户消息里，工具定义固定顺序、临时不用的工具改为 tool_choice 控制而非删除，之后输入 Token 中缓存命中占比提升到七成以上，首字延迟也明显下降。
+    freshness: |
+      核对于 2026-11：OpenAI Prompt caching 指南说明支持的模型默认开启，读取最多可省 95%；GPT-5.6 及之后最小可缓存前缀 1024 Token，写入 30 分钟为 1.25 倍、12 小时为 2.5 倍，读取多数为 0.1 倍（GPT-6.1 Sol 和 Terra 为 0.05 倍），更早模型无写入费；
+      Claude 文档：顶层 cache_control 自动缓存或最多 4 个显式断点，前缀顺序 tools、system、messages，默认 5 分钟并在命中时免费刷新，5 分钟写入 1.25 倍、1 小时写入 2 倍、读取 0.1 倍，低于最小长度不报错只是不缓存；
+      DeepSeek 文档：硬盘缓存默认开启，需完整匹配缓存前缀单元，usage 含 prompt_cache_hit_tokens 和 prompt_cache_miss_tokens，尽力而为，几小时到几天清空。
+    sources:
+      - {title: "OpenAI Docs - Prompt caching", url: "https://developers.openai.com/api/docs/guides/prompt-caching"}
+      - {title: "Claude Docs - Prompt caching", url: "https://platform.claude.com/docs/en/build-with-claude/prompt-caching"}
+      - {title: "DeepSeek API 文档 - 上下文硬盘缓存", url: "https://api-docs.deepseek.com/zh-cn/guides/kv_cache"}
+
+  - id: d19-k4
+    name: 成本与延迟：Token 账本与模型路由
+    level: P1
+    summary: 先按功能记录每次调用的 Token 与费用，再用模型路由、缓存、控制输出长度、Batch 等手段降本，并用评测确认效果没掉
+    analogy: |
+      像前端的**性能预算**：先用 Lighthouse 量出哪个资源最大，再决定压缩图片、懒加载还是拆包，而不是凭感觉优化。
+      模型路由则像**图片按设备分级加载**：小屏给小图，大屏才给高清图。
+
+      **不一样的地方**：前端优化一般不影响功能正确性；换小模型**可能直接让答案变差**，所以每次降本都要跑评测集确认。
+    why: |
+      LLM 应用的成本和调用量线性相关，Demo 阶段几块钱，上线后可能每月几万。不记账就不知道钱花在哪，
+      盲目换便宜模型又可能让效果下滑。面试中「怎么控制成本」几乎必问。
+    problem: |
+      解决「**钱花在哪里、怎么在效果可接受的前提下降本、怎么降低用户感知的延迟**」，
+      并避免「换了便宜模型、账单降了、用户投诉却多了」这种只看成本不看效果的优化。
+    principle: |
+      **一、先记账：每次调用记录什么**
+
+      功能名、模型、输入 Token、缓存命中 Token、输出 Token、重试次数、耗时、费用。按功能和用户汇总，才知道大头在哪（可观测见 Day 43）。
+
+      **二、算一笔账（价格为假设，仅演示方法）**
+
+      假设输入 1 元每百万 Token，缓存读取按 0.1 倍，输出 4 元每百万 Token。某功能每天 10 万次请求，每次输入 3000 Token（其中 2000 是固定的系统提示和工具定义），输出 300 Token：
+      - 不缓存：输入 3 亿 Token 约 300 元，输出 3000 万 Token 约 120 元，**每天约 420 元**。
+      - 固定部分命中缓存（忽略少量写入）：输入约 100 加 20 等于 120 元，**每天约 240 元**。
+
+      **三、降本手段**
+
+      ```mermaid
+      flowchart TD
+        A["请求"] --> B{"应用层缓存命中"}
+        B -->|是| Z["直接返回"]
+        B -->|否| C{"任务难度"}
+        C -->|简单 分类 抽取| D["小模型"]
+        C -->|复杂 推理| E["大模型"]
+        D --> F{"置信度够吗"}
+        F -->|否| E
+        F -->|是| G["返回"]
+        E --> G
+      ```
+
+      - **模型路由**：意图识别、抽取等简单任务用小模型，复杂推理才用大模型；不确定时升级。
+      - **Prompt Caching**：稳定前缀在前（d19-k3）。
+      - **控制输出**：要求简洁、设合理的输出上限；输出单价通常比输入贵。
+      - **Batch API**：非实时任务（夜间报表、批量打标）用批处理接口，换取更低价格和独立额度。
+      - **精简上下文**：只放必要内容（Day 20 上下文工程）。
+
+      **四、延迟**
+
+      - 用户感知的是**首字延迟（TTFT）**：受输入长度、排队、缓存命中影响；流式输出能让用户更早看到内容，但不减少总生成时间。
+      - 总耗时主要受**输出 Token 数**影响，所以控制输出长度同时降本又提速。
+    scenarios: |
+      - **月度账单评审**：按功能拆分 Token 和费用，找最大头先优化。
+      - **意图识别和路由**：小模型足够，省下大模型调用。
+      - **夜间批量摘要**：改用 Batch API。
+      - **聊天产品**：开流式输出，优化首字延迟。
+    pitfalls: |
+      - **误区：所有请求都用最强模型最稳妥。** 成本高、延迟高，简单任务没有收益。
+      - **误区：换小模型只要跑几条看看就行。** 需要用评测集按问题类型对比，否则长尾问题悄悄变差。
+      - **只看总账单不按功能拆分**：不知道该优化哪里。
+      - **忽略重试和 Agent 循环的放大效应**：一次用户请求可能触发十几次模型调用。
+      - **路由失败再升级却不统计升级比例**：小模型失败率高时反而更贵更慢。
+    interview_asks:
+      - question: "你们的 LLM 成本是怎么控制的？"
+        answer: "每次调用记下模型、输入输出 Token 和业务 id。设预算和告警。能缓存的缓存，简单任务用小模型，提示保持短。没有账本就谈不上控制。"
+      - question: "模型路由怎么做？怎么保证效果不下降？"
+        answer: "按任务把分类、抽取路由到小模型，复杂问答留大模型。路由规则要明确。用同一评测集看小模型掉了多少，掉出可接受范围就不要路由过去。"
+      - question: "用户觉得回答慢，你会从哪些方面优化？"
+        answer: "先拆时间：排队、检索、首字、生成。再对症缩短提示、减少检索次数、换更快的模型、流式输出、缓存重复问题。不要不看拆分就加机器。"
+    project_example: |
+      **p1 企业知识库**：账单显示 70% 的费用来自「问题改写 + 意图识别」两个前置步骤，它们却一直用的是最大的模型。
+      改为小模型处理这两步，用意图识别标注集验证准确率基本不变；同时把系统提示固定在前缀，月成本下降约一半。之后每次换模型都先跑评测集再上线。
+    freshness: |
+      核对于 2026-11：OpenAI Rate limits 指南建议非实时任务使用 Batch API；Prompt caching 指南给出按 usage 中 cached_tokens 与 cache_write_tokens 计算输入成本的方法。文中价格为假设值，实际以各厂商定价页为准。
+    sources:
+      - {title: "OpenAI Docs - Prompt caching（Monitor cache performance）", url: "https://developers.openai.com/api/docs/guides/prompt-caching"}
+      - {title: "OpenAI Docs - Rate limits", url: "https://developers.openai.com/api/docs/guides/rate-limits"}
+
+test:
+  - id: d19-t1
+    kp: d19-k1
+    type: single
+    question: 上游持续返回 503 时，下面这段代码最多会向 API 发出多少次 HTTP 请求？
+    code: |
+      from openai import OpenAI
+      from tenacity import retry, stop_after_attempt, wait_random_exponential
+
+      client = OpenAI()  # 没有设置 max_retries
+
+      @retry(stop=stop_after_attempt(3), wait=wait_random_exponential(max=20))
+      def ask(q: str):
+          return client.responses.create(model=MODEL, input=q)
+    options:
+      - "3 次：外层装饰器只允许尝试 3 次"
+      - "5 次：SDK 先重试 2 次，外层再补 3 次"
+      - "6 次：外层 3 轮乘以 SDK 默认的 2 次"
+      - "9 次：每轮 SDK 最多发 3 次，外层共 3 轮"
+    answer: [3]
+    explain: openai-python 默认对 5xx 自动重试 2 次，所以每次调用 ask 内部最多发 3 次请求；tenacity 再尝试 3 轮，合计 3 乘 3 等于 9 次。这就是嵌套重试的放大效应，业务层自管重试时应把 SDK 的 max_retries 设为 0。
+  - id: d19-t2
+    kp: d19-k1
+    type: multi
+    question: 调用 LLM API 时，下列哪些错误适合自动退避重试？
+    options:
+      - "连接错误或请求超时"
+      - "429 速率超限（非额度问题）"
+      - "500 或 503 服务端临时故障"
+      - "400 请求参数校验失败"
+      - "429 且错误码为 insufficient_quota"
+    answer: [0, 1, 2]
+    explain: 网络错误、临时限流、服务端临时故障都可能在等待后恢复。400 是请求本身有错，重试结果一样；额度不足、账单类错误需要人去处理，OpenAI 文档明确建议不要重试这类错误。
+  - id: d19-t3
+    kp: d19-k1
+    type: judge
+    question: 收到带 Retry-After 响应头的 429 时，应至少等待该时长，再加上一点随机延迟后重试。
+    answer: true
+    explain: OpenAI 文档说明 Retry-After 是重试前的最小等待秒数，应当把它当作下限，并加一点随机延迟，避免多个客户端同时重试。没有 Retry-After 时，再退回指数退避加抖动。
+  - id: d19-t4
+    kp: d19-k1
+    type: single
+    question: 指数退避为什么还要加随机抖动（jitter）？
+    options:
+      - "让每次重试的等待时间更短，尽快拿到结果"
+      - "避免大量客户端在同一时刻一起重试，形成新尖峰"
+      - "随机等待能让服务端优先处理这一个请求"
+      - "SDK 要求重试必须带随机数，否则直接报错"
+    answer: [1]
+    explain: 上游故障时，大量客户端几乎同时失败。如果都按 1、2、4 秒整齐重试，会在同一时刻一起醒来，再次打爆上游。抖动把重试时间打散。它不会让等待更短，服务端也不会因此优先处理。
+  - id: d19-t5
+    kp: d19-k1
+    type: single
+    question: 流式输出到一半连接断开，前端已经显示了半段回答。最合理的处理是？
+    options:
+      - "SDK 会自动从断点续传，业务代码无需处理"
+      - "立即用相同请求自动重放，把新内容接在后面"
+      - "标记中断并提示用户，提供重新生成；有工具副作用时先确认状态"
+      - "忽略错误，把收到的半段内容当作完整答案存库"
+    answer: [2]
+    explain: openai-python 不会重试已经开始消费的流，OpenAI 文档也建议流开始后不要自动重放。重放得到的是一段新的、可能不一致的回答，接在后面会前后矛盾。半段内容不能当完整答案。若对话中涉及工具调用，重新生成前要确认副作用是否已经发生。
+  - id: d19-t6
+    kp: d19-k2
+    type: single
+    question: 按 OpenAI 文档，一个请求计入 TPM（每分钟 Token）限流时按什么计算？
+    options:
+      - "只按实际生成的输出 Token 计，与 max_tokens 无关"
+      - "只计入输入 Token，输出 Token 不计入速率限制"
+      - "按字符估算的 Token 与 max_tokens 中的较大者计算"
+      - "每个请求固定按 1000 Token 计，与内容长度无关"
+    answer: [2]
+    explain: 文档写明限流按 max_tokens 与基于请求字符数估算的 Token 数中的最大值计算，因此 max_tokens 设得远大于实际需要会更早撞上 TPM 限制，建议设得接近预期回答长度。
+  - id: d19-t7
+    kp: d19-k2
+    type: judge
+    question: 熔断器处于打开状态时，请求直接走降级而不调用上游；冷却时间到后进入半开状态，放少量探测请求。
+    answer: true
+    explain: 打开状态的意义就是快速失败，不再占用线程和连接等待必然失败的上游。冷却后进入半开，用少量请求探测，成功则闭合恢复，失败则重新打开。
+  - id: d19-t8
+    kp: d19-k2
+    type: multi
+    question: 主模型持续不可用时，下列哪些降级做法是合理的？
+    options:
+      - "切换到经过评测的备用模型或备用厂商"
+      - "返回缓存或 FAQ 中的答案，并注明来源"
+      - "提示用户稍后再试，并保留用户输入"
+      - "降级期间跳过内容安全检查以减少延迟"
+      - "让请求无限排队，直到上游恢复再处理"
+    answer: [0, 1, 2]
+    explain: 备用模型、缓存答案、友好提示都能让用户有可接受的体验。备用模型要提前评测，避免格式不兼容。降级不能牺牲安全检查；无限排队会耗尽资源并让用户无限等待，正是熔断要避免的情况。
+  - id: d19-t9
+    kp: d19-k2
+    type: single
+    question: 多个服务共用一个 API Key，夜间批量任务经常把在线问答挤到 429。最合理的做法是？
+    options:
+      - "每个服务各自无限重试，谁先成功算谁的"
+      - "集中令牌桶按请求数和 Token 分配额度，在线优先，批量改 Batch 或限速"
+      - "把 max_tokens 调到模型上限，以减少总请求次数"
+      - "关闭所有重试，失败的请求直接丢弃不处理"
+    answer: [1]
+    explain: 共享配额要在客户端集中分配，同时数请求数和 Token 数，并给在线请求优先级；非实时批量任务适合 Batch API。无限重试会加剧拥塞；max_tokens 过大反而更早撞 TPM；直接丢弃会影响业务。
+  - id: d19-t10
+    kp: d19-k3
+    type: single
+    question: OpenAI 的 Prompt Caching 什么情况下能命中？
+    options:
+      - "语义相近的提示即可命中，不要求逐字一致"
+      - "只缓存最后一条用户消息，与前面内容无关"
+      - "整段前缀完全一致且达到最小长度，所以稳定内容放前面"
+      - "必须先调用专门接口上传内容，之后才会生效"
+    answer: [2]
+    explain: Prompt Caching 复用的是前缀的计算结果，要求整段前缀完全一致，并达到最小可缓存长度（GPT-5.6 及之后为 1024 Token）。所以稳定的工具定义和系统提示放前面，动态内容放后面。它不是语义匹配，支持的模型默认开启，不需要上传。
+  - id: d19-t11
+    kp: d19-k3
+    type: judge
+    question: 在系统提示开头加入精确到秒的当前时间，不会影响 Prompt Caching 的命中率。
+    answer: false
+    explain: 缓存要求前缀完全一致，开头的时间戳每次都不同，从第一个字符起就无法匹配，后面的系统提示、工具、历史全部无法命中。应把时间等动态内容放到最后的用户消息中。
+  - id: d19-t12
+    kp: d19-k3
+    type: multi
+    question: 在使用 OpenAI Prompt Caching 的多轮 Agent 中，下列哪些操作会让后续请求无法复用之前的缓存前缀？
+    options:
+      - "调整工具定义的顺序"
+      - "修改请求顶层的 reasoning.effort"
+      - "把早期对话改写成一段摘要"
+      - "在对话末尾追加一条新的用户消息"
+      - "把请求切换到另一个模型"
+    answer: [0, 1, 2, 4]
+    explain: 工具定义、reasoning.effort、模型都会影响前缀，改写早期历史会从改动处起失效。在末尾追加消息不改变已有前缀，正是文档推荐的「只追加」做法。OpenAI 文档还提到 GPT-6 可通过追加 configuration_update 来调整推理力度而保留前缀。
+  - id: d19-t13
+    kp: d19-k3
+    type: single
+    question: 关于 Claude 的 Prompt Caching，下列说法与官方文档一致的是？
+    options:
+      - "默认 5 分钟且命中即刷新；写入 1.25 倍，读取 0.1 倍"
+      - "默认 24 小时，不收写入费用，读取完全免费"
+      - "默认 1 小时，写入 2 倍，读取与普通输入同价"
+      - "缓存永久有效，直到调用删除接口手动清除"
+    answer: [0]
+    explain: Claude 默认缓存 5 分钟，每次命中免费刷新；5 分钟 TTL 的写入是基础输入价的 1.25 倍，读取是 0.1 倍。1 小时 TTL 是可选项，写入为 2 倍。前缀顺序是 tools、system、messages。
+  - id: d19-t14
+    kp: d19-k3
+    type: single
+    question: 应用层回答缓存与厂商侧 Prompt Caching 的主要区别是？
+    options:
+      - "两者相同，都是把模型的回答存下来下次直接返回"
+      - "前者命中可跳过整次调用但要管失效和权限；后者只省前缀计算，仍会生成"
+      - "Prompt Caching 会缓存回答，所以 temperature 不再起作用"
+      - "应用层缓存由模型厂商自动完成，不需要自己实现"
+    answer: [1]
+    explain: 应用层缓存存的是回答，命中就不调用模型，但要自己设计 key、失效和权限隔离。Prompt Caching 缓存的是输入前缀的中间计算，模型仍然生成新回答，temperature 照常生效，DeepSeek 文档也明确说明输出仍受 temperature 影响。
+  - id: d19-t15
+    kp: d19-k4
+    type: single
+    question: 假设输入 1 元每百万 Token、缓存读取按 0.1 倍、输出 4 元每百万 Token。某功能每天 10 万次请求，每次输入 3000 Token（其中 2000 为固定前缀）、输出 300 Token。不缓存与固定前缀全部命中（忽略写入）时，每天费用分别约为？
+    options:
+      - "约 420 元和约 240 元"
+      - "约 420 元和约 120 元"
+      - "约 330 元和约 240 元"
+      - "约 420 元和约 400 元"
+    answer: [0]
+    explain: 不缓存时输入 3 亿 Token 约 300 元，输出 3000 万 Token 约 120 元，共 420 元。命中后，非固定的 1000 Token 部分为 1 亿 Token 约 100 元，固定 2000 Token 部分按 0.1 倍约 20 元，加输出 120 元，共约 240 元。注意输出不受 Prompt Caching 影响。
+  - id: d19-t16
+    kp: d19-k4
+    type: multi
+    question: 下列哪些做法能在效果基本不变的前提下降低 LLM 成本？
+    options:
+      - "简单任务用小模型，复杂问题再升级到大模型"
+      - "稳定前缀放在前面，提高缓存命中率"
+      - "非实时的批量任务改用 Batch API"
+      - "所有请求统一使用最强的模型"
+      - "要求回答简洁，并设置合理的输出上限"
+    answer: [0, 1, 2, 4]
+    explain: 路由、缓存、批处理、控制输出长度都是常见的降本手段，但路由和换模型都要用评测集确认效果。所有请求都用最强模型只会增加成本和延迟。
+  - id: d19-t17
+    kp: d19-k4
+    type: judge
+    question: 流式输出能让用户更早看到内容、降低感知延迟，但并不会减少生成完整回答所需的总时间。
+    answer: true
+    explain: 流式输出把已生成的 Token 边生成边推送，改善的是首字延迟带来的体验；总生成时间主要由输出 Token 数决定。要缩短总时间，需要控制输出长度或换更快的模型。
+  - id: d19-t18
+    kp: d19-k4
+    type: single
+    question: 引入「小模型优先、必要时升级大模型」的路由后，下列做法最合理的是？
+    options:
+      - "路由规则上线后就固定下来，不需要再做评估"
+      - "所有请求先走小模型，失败再走大模型，延迟不受影响"
+      - "按用户付费等级路由即可，与问题难度无关"
+      - "按问题类型用评测集比较效果，不确定时升级，并监控升级比例"
+    answer: [3]
+    explain: 路由是否划算取决于小模型在各类问题上的效果和升级比例。需要评测集分类型比较，置信度不足时升级，并持续监控升级比例和效果。先小后大在失败时会增加延迟和费用；只按付费等级路由不看难度会让复杂问题效果变差。
+exam:
+  - id: d19-e1
+    kp: d19-k1
+    type: single
+    question: Agent 的「生成报告并发送邮件」工具调用超时后被自动重试，客户收到了两封相同的邮件。最根本的改进是？
+    options:
+      - "副作用操作不幂等却被重试，应带幂等键并在重试前查询执行状态"
+      - "超时设置太短，把超时调到 10 分钟以后就不会再发生"
+      - "邮件服务不够稳定，应该更换一家更可靠的邮件服务商"
+      - "重试次数设置太少，应增加重试次数来确保一次成功"
+    answer: [0]
+    explain: 超时只说明调用方没等到结果，邮件可能已经发出。有副作用的操作直接重试就会重复执行，应带幂等键让服务端去重，或重试前先查询是否已执行。调大超时只能降低概率，换服务商和加重试次数都没有触及根因。
+  - id: d19-e2
+    kp: d19-k3
+    type: single
+    question: 多租户客服机器人每次请求都带同样 3000 Token 的系统提示和工具定义，但 usage 中的 cached_tokens 一直是 0。检查发现系统提示第一行是「租户名和当前时间」。最合理的改法是？
+    options:
+      - "调大 max_tokens，给缓存留出足够的空间"
+      - "每次请求换一个随机的 prompt_cache_key 分散负载"
+      - "把系统提示压缩到 500 Token 以内降低成本"
+      - "把租户名和时间移到前缀之后，保持系统提示与工具不变"
+    answer: [3]
+    explain: 前缀从第一行起就因租户名和时间而不同，后面的内容全部无法匹配。把动态内容移到稳定内容之后，就能复用系统提示和工具定义。max_tokens 与缓存无关；随机 cache key 只会让命中更差；压缩到 500 Token 会低于最小可缓存长度，也不解决根因。
+  - id: d19-e3
+    kp: d19-k2
+    type: single
+    question: 某次上游厂商故障持续 10 分钟，所有请求都等满 60 秒超时再重试 3 次，线程池被占满，连不依赖 LLM 的接口也不可用了。最关键的改进是？
+    options:
+      - "加熔断：错误率超过阈值后快速失败走降级，半开状态探测恢复"
+      - "把超时从 60 秒提高到 120 秒，给上游更多恢复时间"
+      - "把重试次数从 3 次提高到 10 次，提高最终成功率"
+      - "扩大线程池容量，让更多请求可以同时等待上游"
+    answer: [0]
+    explain: 问题在于持续故障时仍让每个请求等满超时并重试，资源被耗尽。熔断在错误率超阈值后直接走降级，不再占用线程，半开时探测恢复。加长超时、增加重试、扩大线程池都只会让占用更久、更多。
+  - id: d19-e4
+    kp: d19-k4
+    type: single
+    question: 某知识库应用 70% 的调用是意图识别、问题改写等简单任务，却全部用最大的模型，月成本超预算。最合理的做法是？
+    options:
+      - "全部改用最小的模型，复杂问题效果下降也可以接受"
+      - "对所有回答做应用层缓存，相同问题都直接返回"
+      - "按任务路由：简单任务用小模型，复杂用大模型，并用评测集验证各路效果"
+      - "把所有调用的输出上限统一压到 50 Token 以内"
+    answer: [2]
+    explain: 简单任务用小模型通常足够，复杂推理才需要大模型，按任务路由兼顾成本与效果，但必须用评测集确认。全部换小模型会伤害复杂问题；缓存只对重复问题有效；统一压输出长度会截断正常回答。
+  - id: d19-e5
+    kp: d19-k1
+    type: multi
+    question: 关于 openai-python SDK 的默认行为，下列说法正确的是？
+    options:
+      - "默认请求超时为 10 分钟"
+      - "默认对连接错误、408、409、429 和 5xx 自动重试 2 次"
+      - "把 max_retries 设为 0 可以关闭 SDK 的自动重试"
+      - "流式输出开始后中断，SDK 会自动从断点续传"
+      - "400 参数错误也会被默认重试"
+    answer: [0, 1, 2]
+    explain: README 说明默认超时 10 分钟，默认对连接错误、408、409、429、5xx 用短指数退避重试 2 次，max_retries 可配置，设为 0 即关闭。已经开始消费的流不会被重试，更没有断点续传；400 不在默认重试范围内。
+  - id: d19-e6
+    kp: d19-k3
+    type: multi
+    question: 关于 DeepSeek 的上下文硬盘缓存，下列说法正确的是？
+    options:
+      - "默认开启，用户无需修改代码"
+      - "后续请求必须完整匹配已落盘的缓存前缀单元才能命中"
+      - "可通过 usage 中的 prompt_cache_hit_tokens 查看命中量"
+      - "缓存保证 100% 命中，相同前缀一定走缓存"
+      - "缓存永久保存，除非用户主动删除"
+    answer: [0, 1, 2]
+    explain: DeepSeek 文档说明硬盘缓存对所有用户默认开启，只有完整匹配缓存前缀单元才能命中，usage 中有 prompt_cache_hit_tokens 和 prompt_cache_miss_tokens。缓存是尽力而为，不保证 100% 命中，不再使用后一般几小时到几天自动清空。
+  - id: d19-e7
+    kp: d19-k2
+    type: judge
+    question: 只要收到 429，就说明请求发得太快，退避一段时间后重试一定能成功。
+    answer: false
+    explain: 429 也可能来自额度用尽、达到硬性消费上限等需要人工处理的情况，重试不会好转。即使是临时限流，若流量增长过快（slow_down），也需要降低请求速率并逐步爬升，而不是简单重试。
+  - id: d19-e8
+    kp: d19-k3
+    type: judge
+    question: 对 OpenAI GPT-5.6 及之后的模型，缓存写入按普通输入价的 1.25 倍计费，所以一个只会被使用一次的前缀开启缓存反而更贵。
+    answer: true
+    explain: 默认 30 分钟写入是 1.25 倍，读取一般是 0.1 倍。前缀只用一次时只付了更贵的写入，没有享受读取折扣；复用一次即为 1.35 倍对比不缓存的 2 倍，复用越多越划算。可用 explicit 模式避免为不会复用的内容写缓存。
+  - id: d19-e9
+    kp: d19-k1
+    type: case
+    question: |
+      园区运营 Agent 每晚批量巡检上千台设备，调用链是：业务代码用 tenacity 重试 5 次，内部用 openai-python 默认配置，公司 API 网关对 5xx 也会重试 3 次。
+      某晚上游出现 503 高峰，日志显示请求量暴涨到平时的几十倍，随后账号持续收到 429 slow_down，上游恢复后巡检仍在大量失败，直到早上才完成。最合理的根因判断和改进是？
+    options:
+      - "退避等待太久拖慢了巡检，应把三层重试都改为固定 1 秒间隔以加快恢复"
+      - "上游不稳定是唯一原因，应去掉退避改为立即重试，以便尽快完成巡检任务"
+      - "账号限额太低才导致 slow_down，提高限额后保持现有的三层重试配置不变即可"
+      - "三层重试相乘放大流量，应只保留一层带抖动退避与 Retry-After 的重试并加总预算和限速"
+    answer: [3]
+    explain: SDK 默认 3 次、tenacity 5 轮、网关 3 次相乘，最坏一次巡检放大到几十次请求，流量骤增触发 slow_down，恢复后仍在重试风暴中。应关闭 SDK 和网关重试，只在统一调用层重试，指数退避加抖动并遵守 Retry-After，设总时间预算，批量任务按令牌桶限速并逐步爬升。固定间隔和立即重试会加剧风暴；提高限额不解决放大问题。
+interview:
+  - id: d19-i1
+    kp: d19-k1
+    type: oral
+    difficulty: 2
+    question: 线上调用大模型 API，你的超时和重试策略是怎么设计的？
+    key_points:
+      - {text: "区分可重试错误（网络、429 临时限流、5xx）与不可重试错误（400、401、额度不足）", dim: concept}
+      - {text: "指数退避加抖动，遵守 Retry-After 作为最小等待", dim: principle}
+      - {text: "限制次数与总时间预算，只保留一层重试，关闭 SDK 重试避免嵌套", dim: engineering}
+      - {text: "流式开始后不自动重放，有副作用的工具调用带幂等键", dim: engineering}
+      - {text: "结合项目说明多层重试放大或重复执行的教训", dim: project}
+    reference: |
+      第一步是分类：连接错误、超时、临时性的 429、500 和 503 可以重试；400 参数错误、401 鉴权、额度或账单类的 429 不重试，直接报错或告警。OpenAI 文档还区分了 slow_down（流量增长太快，要降速后逐步加量）和 server_is_overloaded（模型临时过载）。
+      等待策略：指数退避加随机抖动，避免大量客户端同时重试；响应带 Retry-After 时把它当最小等待时间。
+      限制：最多 3 到 4 次，并设整体时间预算，因为单次超时不等于整体截止时间。重试只在统一调用层做一层，openai-python 默认会重试 2 次，所以自管重试时把 max_retries 设为 0，网关也不再重试，否则层层相乘。
+      特殊情况：流式输出开始后不自动重放，提示用户重新生成；有副作用的工具调用要用幂等键或先查状态，避免重复执行。
+    oral: |
+      我的原则是：只重试临时错误、等得聪明、只重试一层。
+      网络错误、临时 429 和 5xx 会重试，400、401 和额度不足不重试。等待用指数退避加抖动，有 Retry-After 就至少等那么久。最多重试三四次，并且给整个操作设一个总时间预算。
+      我们踩过一个坑：SDK 默认重试、业务层 tenacity、网关又各自重试，一次故障把请求放大了几十倍，还触发了 slow_down。后来统一只在调用层重试，SDK 的 max_retries 设成 0。另外流式中断不自动重放，派工单这类写操作都带幂等键。
+  - id: d19-i2
+    kp: d19-k3
+    type: scenario
+    difficulty: 3
+    question: |
+      你负责的 Agent 产品这个月 LLM 账单比上个月涨了近 3 倍，但用户量只涨了 20%。老板让你一周内查清原因并给出方案。你会怎么做？
+    key_points:
+      - {text: "按功能、模型拆分输入、缓存命中、输出 Token 和重试次数，先定位大头", dim: engineering}
+      - {text: "检查缓存命中率是否下降，例如前缀中引入了动态内容或改了工具顺序", dim: principle}
+      - {text: "检查重试放大、Agent 循环轮数增加、输出变长、模型被换成更贵的版本", dim: engineering}
+      - {text: "提出路由、缓存、控制输出、Batch 等改进，并用评测集验证效果不降", dim: project}
+      - {text: "建立按功能的成本监控与告警，防止再次发生", dim: engineering}
+    reference: |
+      先用数据定位，不凭感觉：从调用日志或 usage 按功能、模型汇总输入 Token、缓存命中 Token、输出 Token、每次用户请求触发的模型调用数和重试次数，与上个月对比，看是哪个功能、哪一项涨了。
+      常见原因逐一排查：一是缓存命中率下降，比如有人在系统提示开头加了时间戳或用户信息，或每轮动态增删工具、改了顺序，cached_tokens 从七成掉到零；二是重试放大，比如新加了网关重试；三是 Agent 循环轮数变多或上下文没裁剪，历史越来越长；四是输出变长或 max_tokens 放开；五是模型被换成了更贵的版本。
+      方案：恢复稳定前缀，动态内容放后面；只保留一层重试；简单步骤路由到小模型；控制输出长度；夜间任务改 Batch；对上下文做裁剪（Day 20）。每项改动都用评测集验证效果没有下降。
+      防复发：按功能建立 Token 和费用看板，缓存命中率、平均调用次数设告警阈值。
+    oral: |
+      我会先把账拆开，而不是先猜。按功能和模型拉出输入、缓存命中、输出 Token，以及每个用户请求触发了多少次模型调用和重试，和上个月对比。
+      用户只涨了 20%，费用涨 3 倍，大概率是单次请求变贵了。我最先查的是缓存命中率，我们就遇到过有人在系统提示第一行加了时间，cached_tokens 直接归零。其次查重试放大、Agent 循环轮数、输出长度和模型版本。
+      找到原因后对症修，比如恢复稳定前缀、合并重试、简单步骤换小模型，每项都用评测集确认效果不掉。最后加按功能的成本看板和命中率告警，下次一周内就能发现。
+  - id: d19-i3
+    kp: d19-k2
+    type: design
+    difficulty: 4
+    question: |
+      公司有知识库问答、园区运营 Agent、前端 Coding Agent 三个产品，都直接调用多家模型厂商。请设计一个统一的 LLM 调用层，
+      要求：稳定（上游故障不拖垮业务）、可控（配额与成本可分配）、省钱、可观测。请说明核心模块和关键设计。
+    key_points:
+      - {text: "统一接口适配多厂商，集中做重试（单层、抖动、Retry-After、预算）与超时", dim: engineering}
+      - {text: "按产品和优先级的令牌桶限流，同时计请求数与 Token，批量任务走 Batch", dim: engineering}
+      - {text: "熔断状态机与降级链：备用模型、缓存或 FAQ、友好提示，备用模型需评测", dim: principle}
+      - {text: "Prompt Caching 友好的请求组装与应用层缓存的 key 设计（含权限与版本）", dim: principle}
+      - {text: "按产品和功能记录 Token、命中、重试、延迟、费用，设看板与告警，配合评测支持路由", dim: project}
+    reference: |
+      接口层：业务只调用统一的 chat 和 embed 接口，传入功能名、优先级、期望模型档位；调用层负责适配各厂商的请求格式和 usage 字段（cached_tokens、cache_read_input_tokens、prompt_cache_hit_tokens 统一成一个字段）。
+      稳定性：所有重试只在这一层做，关闭 SDK 和网关重试；可重试错误分类、指数退避加抖动、遵守 Retry-After、总时间预算；流式中断不重放。每个厂商加模型维度一个熔断器，打开后按降级链走：同档备用模型、另一家厂商或私有化模型，然后是缓存或 FAQ，最后友好提示。备用模型提前用评测集验证输出格式和效果。
+      配额：集中令牌桶按产品和优先级分配 RPM 和 TPM，在线请求优先，批量任务限速或走 Batch；流量逐步爬升避免 slow_down；max_tokens 按功能设合理值。
+      省钱：提供请求组装工具，强制稳定内容在前、动态内容在后、工具定义排序固定；应用层缓存 key 包含模型、提示版本、租户和权限范围，知识库更新时失效。支持按任务档位路由，路由规则用各产品的评测集验证。
+      可观测：每次调用记录产品、功能、模型、各类 Token、重试次数、熔断状态、首字延迟和费用，按产品出看板，对费用突增、命中率下跌、错误率上升告警（Day 43 深入）。
+    oral: |
+      我会把它做成一个所有产品都必须经过的调用层，核心五块。
+      第一是统一接口，业务只说要什么档位的模型，厂商差异和 usage 字段在这层抹平。第二是稳定性，重试只在这层做一层，退避加抖动、遵守 Retry-After、有总预算；每个厂商每个模型一个熔断器，打开后走备用模型、缓存、友好提示这条降级链，备用模型都提前评测过。
+      第三是配额，按产品和优先级做令牌桶，同时数请求和 Token，批量任务走 Batch。第四是省钱，请求组装强制稳定前缀在前，应用层缓存的 key 带上租户和权限，路由规则用评测集验证。
+      第五是可观测，每次调用记 Token、命中、重试、延迟和费用，按产品出看板，费用突增或命中率下降就告警。
